@@ -1,0 +1,124 @@
+# ===========================================
+# Vanguard .gitignore
+# ===========================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# Environment
+.env
+.env.local
+.env.*
+.env.*.local
+*.env
+*.env.local
+
+# Frontend environment (keep templates)
+!.env.example
+!.env.*.example
+!**/.env.example
+!**/.env.*.example
+!frontend/.env.development
+!frontend/.env.production
+!frontend/.env.local.example
+
+# Node dependencies
+node_modules/
+
+# Docker
+docker-compose.override.yml
+
+# Build archives
+*.tar
+*.tar.gz
+*.zip
+
+# Logs
+*.log
+logs/
+data/logs/
+
+# Database backups
+backups/
+*.sql
+*.dump
+
+# SSL certificates
+*.pem
+*.key
+nginx/ssl/
+
+# Certbot
+data/certbot/
+
+# Uploads
+data/uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive files
+*.secret
+*.credentials
+credentials.json
+secrets.yml
+
+# Bot data
+bot-matrix/data/
+sessions/
+*.session
+*.session-journal
+
+# Local automation / verification state
+.chrome-vanguard-verify/
+.codex-ssh/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+telegram-config.md
+nginx-config.md
+telegram-config.md
+DEPLOYMENT.md

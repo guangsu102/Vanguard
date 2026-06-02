@@ -1,0 +1,49 @@
+# =============================================================================
+# Docker Ignore Configuration
+# =============================================================================
+
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__
+*.py[cod]
+venv/
+.venv/
+
+# Node (for backend)
+node_modules/
+
+# Logs
+logs/
+*.log
+
+# Sessions (should be mounted as volume)
+sessions/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary
+tmp/
+temp/

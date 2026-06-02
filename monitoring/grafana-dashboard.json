@@ -1,0 +1,102 @@
+# ===========================================
+# Grafana Dashboard for Vanguard
+# ===========================================
+
+{
+  "dashboard": {
+    "title": "Vanguard Dashboard",
+    "tags": ["vanguard", "telegram", "bot"],
+    "timezone": "browser",
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "API Response Time",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"vanguard-backend\"}[5m])) by (le))",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"vanguard-backend\"}[5m])) by (le))",
+            "legendFormat": "p99"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 2,
+        "title": "Request Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{job=\"vanguard-backend\"}[5m]))",
+            "legendFormat": "Requests/sec"
+          }
+        ],
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}
+      },
+      {
+        "id": 3,
+        "title": "Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(http_requests_total{status=~\"5..\",job=\"vanguard-backend\"}[5m])) / sum(rate(http_requests_total{job=\"vanguard-backend\"}[5m])) * 100",
+            "legendFormat": "Error Rate %"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}
+      },
+      {
+        "id": 4,
+        "title": "Active Users",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "vanguard_active_users",
+            "legendFormat": "Active Users"
+          }
+        ],
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}
+      },
+      {
+        "id": 5,
+        "title": "Database Connections",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "pg_stat_database_numbackends{datname=\"vanguard\"}",
+            "legendFormat": "Connections"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 16, "w": 8, "h": 8}
+      },
+      {
+        "id": 6,
+        "title": "Redis Memory",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "redis_memory_used_bytes{job=\"redis\"} / redis_memory_max_bytes{job=\"redis\"} * 100",
+            "legendFormat": "Memory Usage %"
+          }
+        ],
+        "gridPos": {"x": 8, "y": 16, "w": 8, "h": 8}
+      },
+      {
+        "id": 7,
+        "title": "CPU Usage",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "rate(process_cpu_seconds_total{job=\"vanguard-backend\"}[5m]) * 100",
+            "legendFormat": "CPU %"
+          }
+        ],
+        "gridPos": {"x": 16, "y": 16, "w": 8, "h": 8}
+      }
+    ]
+  }
+}

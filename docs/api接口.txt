@@ -1,0 +1,123 @@
+Decodo API v2 接口文档
+基础信息 (Base Information)
+Base URL: https://api.decodo.com/v2
+
+数据格式: application/json (默认)，支持通过参数修改返回格式。
+
+认证方式 (Authentication): 请求需要在 Header 中携带 Authorization 字段。
+
+1. 获取订阅信息 (Get Subscriptions)
+获取当前账户的代理服务订阅详情、流量限制及有效期。
+
+请求方式: GET
+
+请求路径: /subscriptions
+
+请求头: accept: application/json
+
+成功响应 (200 OK):
+
+JSON
+{
+  "traffic_limit": "50",
+  "traffic_per_period": "0.15",
+  "users_limit": 3,
+  "ip_address_limit": 2,
+  "valid_from": "2018-11-08",
+  "valid_until": "2019-06-30",
+  "service_type": "residential_proxies"
+}
+2. 获取节点类型列表 (Get Endpoints)
+获取可用的代理节点类型及可用地区数量。
+
+请求方式: GET
+
+请求路径: /endpoints
+
+成功响应 (200 OK): 返回包含 random 和 sticky 类型的节点信息。
+
+3. 获取指定类型的节点连接详情 (Get Endpoint Details by Type)
+获取特定类型（随机或粘性）的代理节点位置、连接地址和端口范围。
+
+请求方式: GET
+
+请求路径: /endpoints/{type}
+
+路径参数 (Path Parameters):
+
+type (字符串, 必填): 允许的值为 random（随机） 或 sticky（粘性）。
+
+成功响应 (200 OK):
+
+JSON
+[
+  {
+    "location": "Random",
+    "hostname": "gate.smartproxy.com",
+    "port_range": "7000"
+  },
+  {
+    "location": "Canada",
+    "hostname": "ca.smartproxy.com",
+    "port_range": "20000"
+  }
+]
+4. 获取自定义代理提取列表 - 通用 (Get Custom Endpoints)
+生成并获取自定义配置的代理列表（支持通过 location 参数进行混合定位）。
+
+请求方式: GET
+
+请求路径: /endpoints-custom
+
+查询参数 (Query Parameters):
+| 参数名 | 类型 | 默认值 | 描述 |
+| :--- | :--- | :--- | :--- |
+| proxyType | string | residential_proxies | 代理类型。允许值：residential_proxies。 |
+| authType | string | basic | 授权类型。允许值：basic, whitelist。 |
+| username | string | - | 授权用户名。当 authType 为 basic 时必填。 |
+| password | string | - | 授权密码。当 authType 为 basic 时必填。 |
+| sessionType | string | sticky | 会话类型。允许值：sticky (粘性), random (轮换)。 |
+| sessionDuration| int32 | 10 | 会话时间（分钟）。范围：1-1440。当会话类型为 sticky 时生效。 |
+| location | string | random | 代理位置。可以是国家/地区 Alpha-2 代码、城市或州名称。 |
+| outputFormat | string | protocol:auth@endpoint | 输出格式。允许值：protocol:auth@endpoint, endpoint:auth, auth@endpoint。 |
+| count | int32 | 10 | 生成并返回的代理数量。最小值为 1。 |
+| page | int32 | 1 | 代理页码（分页）。最小值为 1。 |
+| responseType | string | json | 返回格式。允许值：json, txt, html。 |
+| newline | string | \n | 换行符（当格式为 txt 时使用）。允许值：\n, \r\n, \r, \t。 |
+| domain | string | decodo.com | 路由域名。如果值为 ip 则使用 IP 地址。 |
+| ip | string | - | 用来代替域名的指定 IP 地址（当 domain 设为 ip 时）。 |
+
+5. 获取自定义代理提取列表 - 精确定位 (Get Custom Endpoints by Location)
+生成并获取精确到国家、州、城市的自定义代理列表。
+
+请求方式: GET
+
+请求路径: /endpoints-custom/location (根据图1 URL推测)
+
+查询参数 (Query Parameters):
+| 参数名 | 类型 | 默认值 | 描述 |
+| :--- | :--- | :--- | :--- |
+| username | string | - | 必填。授权用户名。 |
+| password | string | - | 必填。授权密码。 |
+| sessionType | string | sticky | 会话类型。允许值：sticky, random。 |
+| sessionDuration| int32 | 10 | 会话时间（分钟）。范围：1-1440。 |
+| country | string | - | 小写的国家 Alpha-2 代码 (例如: us)。 |
+| state | string | - | 州名（如果国家是美国）。需使用小写及下划线 (例如: new_york)。 |
+| city | string | - | 城市名。需使用小写及下划线 (例如: new_orleans)。 |
+| outputFormat | string | protocol:auth@endpoint | 输出格式选项。 |
+| count | int32 | 10 | 代理数量。最小为 1。 |
+| page | int32 | 1 | 分页页码。最小为 1。 |
+| responseType | string | json | 响应格式：json, txt, html。 |
+| newline | string | \n | txt格式的换行符。 |
+| domain | string | gate.decodo.com | 路由域名，如选择 ip 则使用 IP 地址。 |
+| ip | string | - | 指定的IP地址，末尾需包含端口（例如：1.1.1.1:7000）。 |
+| protocol | string | http | 代理协议。允许值：http, https。 |
+
+成功响应 (200 OK) - /endpoints-custom 及相关接口示例:
+
+JSON
+[
+  "http://user-smith-sessionduration-1:ao5nf23j4n@gate.smartproxy.com:7000",
+  "http://user-smith-sessionduration-1:ao5nf23j4n@gate.smartproxy.com:7001",
+  "http://user-smith-sessionduration-1:ao5nf23j4n@gate.smartproxy.com:7002"
+]

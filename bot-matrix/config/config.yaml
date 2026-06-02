@@ -1,0 +1,215 @@
+# XBoard Bot Matrix Configuration
+# 所有配置项可通过环境变量覆盖
+
+app:
+  name: "XBoard Bot Matrix"
+  env: "development"
+  debug: true
+  log_level: "DEBUG"
+
+# Telegram 用户账号矩阵
+telegram:
+  # 模块 A: 引流空投账号矩阵
+  lead_gen:
+    - name: "引流主号1"
+      enabled: true
+      session_name: "lead_gen_main_1"
+      phone: "${LEAD_GEN_MAIN1_PHONE}"
+      api_id: ${LEAD_GEN_MAIN1_API_ID}
+      api_hash: "${LEAD_GEN_MAIN1_API_HASH}"
+    - name: "引流辅号1"
+      enabled: true
+      session_name: "lead_gen_aux1_1"
+      phone: "${LEAD_GEN_AUX1_PHONE}"
+      api_id: ${LEAD_GEN_AUX1_API_ID}
+      api_hash: "${LEAD_GEN_AUX1_API_HASH}"
+
+  # 模块 B: 运营客服账号矩阵
+  service:
+    - name: "客服1号"
+      enabled: true
+      session_name: "service_1"
+      phone: "${SERVICE_PHONE_1}"
+      api_id: ${SERVICE_API_ID_1}
+      api_hash: "${SERVICE_API_HASH_1}"
+
+  # 模块 C: 社群管理账号矩阵
+  group_ops:
+    - name: "管理员1号"
+      enabled: true
+      session_name: "admin_1"
+      phone: "${ADMIN_PHONE_1}"
+      api_id: ${ADMIN_API_ID_1}
+      api_hash: "${ADMIN_API_HASH_1}"
+
+  # 强制订阅的官方频道
+  official_channels:
+    - "@YourOfficialChannel1"
+
+# XBoard API 配置
+xboard_api:
+  base_url: "${XBOARD_API_URL}"
+  api_key: "${XBOARD_API_KEY}"
+  timeout: 30
+  retry_times: 3
+  retry_delay: 5
+
+# 数据库配置
+database:
+  host: "${POSTGRES_HOST:localhost}"
+  port: ${POSTGRES_PORT:5432}
+  user: "${POSTGRES_USER:xboard_bot}"
+  password: "${POSTGRES_PASSWORD}"
+  database: "${POSTGRES_DB:xboard_bot_matrix}"
+
+# Redis 配置
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  password: "${REDIS_PASSWORD:}"
+  db: 0
+  ssl: false
+
+# ============ 模块 A: 引流空投配置 ============
+lead_gen:
+  # 账号矩阵配置
+  account_matrix:
+    max_per_group: 3        # 每群最多3个账号
+    roles:
+      main:
+        priority: 1
+        behavior: "marketing"      # 主动营销
+      aux1:
+        priority: 2
+        behavior: "integration"   # 融入互动
+      aux2:
+        priority: 3
+        behavior: "monitor"       # 监控
+
+  # 试用账号配置
+  trial:
+    enabled: true
+    validity_hours: 24
+    traffic_gb: 50
+    enable_duplicate_check: true
+
+  # 风控配置
+  risk_control:
+    max_requests_per_ip_per_hour: 10
+    max_trials_per_uid_per_day: 1
+    block_duration_minutes: 30
+
+  # 群组管理
+  group_management:
+    # 自动加入配置
+    auto_join:
+      enabled: true
+      max_groups_per_day: 10       # 每天最多加群数
+      min_group_members: 100       # 最小群人数
+      max_group_members: 5000      # 最大群人数
+
+    # 群组分群
+    grade_a:
+      description: "可直接营销"
+      can_post: true
+      can_send_links: true
+      max_posts_per_day: 10
+    grade_b:
+      description: "先融入再营销"
+      can_post: false
+      integration_required: true
+      min_wait_hours: 24
+    grade_c:
+      description: "仅监控"
+      can_post: false
+      monitor_enabled: true
+      collect_users: true
+    grade_d:
+      description: "黑名单"
+      auto_join: false
+
+  # 防封号配置
+  anti_ban:
+    message_interval: 30           # 发消息间隔（秒）
+    max_messages_per_day: 30       # 每账号每天最大消息数
+    max_groups_per_day: 10        # 每天最大加群数
+    typing_delay: [2000, 8000]    # 打字延迟（毫秒）
+    random_timing: true
+
+  # 动态关键词管理
+  keywords:
+    # 可通过 Bot 命令动态增删
+    # /keyword add target <词>
+    # /keyword add trigger <词>
+    # /keyword add exclude <词>
+
+    defaults:
+      target:
+        - "翻墙"
+        - "机场"
+        - "VPN"
+        - "节点"
+        - "梯子"
+        - "代理"
+        - "科学上网"
+        - "加速器"
+      trigger:
+        - "哪里买"
+        - "怎么购买"
+        - "多少钱"
+        - "价格"
+        - "怎么用"
+        - "如何使用"
+        - "教程"
+        - "怎么连接"
+        - "试用"
+        - "免费"
+        - "优惠"
+      exclude:
+        - "菠菜"
+        - "赌博"
+        - "色情"
+        - "诈骗"
+
+# ============ 模块 B: 核心运营配置 ============
+service:
+  checkin:
+    enabled: true
+    min_traffic_mb: 100
+    max_traffic_mb: 1024
+    cooldown_hours: 24
+
+  abandoned_cart:
+    enabled: true
+    unpaid_timeout_minutes: 30
+    discount_percent: 20
+    coupon_validity_hours: 2
+
+  poster:
+    enabled: true
+    width: 800
+    height: 1200
+    qr_size: 200
+    output_dir: "./assets/posters"
+
+# ============ 模块 C: 社群风纪配置 ============
+group_ops:
+  competitor_keywords:
+    - "机场|节点出售|翻墙|VPN"
+    - "t\\.me/\\w+"
+    - "(aff|邀请).*t\\.me"
+    - "\\.vip|\\.xyz|\\.top"
+
+  warning:
+    max_warnings: 3
+    ban_duration_hours: 0
+
+  node_report:
+    enabled: true
+    schedule: "20:30"
+    timezone: "Asia/Shanghai"
+
+# 监控与告警
+monitoring:
+  sentry_dsn: "${SENTRY_DSN:}"
+  admin_chat_id: "${ADMIN_CHAT_ID:}"

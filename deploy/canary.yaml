@@ -1,0 +1,119 @@
+# ===========================================
+# Vanguard 灰度发布配置
+# ===========================================
+
+# 灰度策略说明:
+# - 初始阶段: 10% 流量 (1-2个用户组)
+# - 扩展阶段: 30% 流量 (5-10个用户组)
+# - 稳定阶段: 50% 流量 (更多用户组)
+# - 全量发布: 100% 流量
+
+# ==================== 阶段定义 ====================
+
+PHASES:
+  # 阶段1: 内部测试 (Day 1)
+  - name: "internal"
+    traffic: 0%
+    duration: "1天"
+    users:
+      - "test_group_1"
+      - "test_group_2"
+    criteria:
+      error_rate: "< 1%"
+      response_time: "< 500ms"
+      p99: "< 2s"
+
+  # 阶段2: 小范围灰度 (Day 2)
+  - name: "canary_10"
+    traffic: 10%
+    duration: "1天"
+    users:
+      - "early_adopters_group"
+    criteria:
+      error_rate: "< 0.5%"
+      response_time: "< 300ms"
+      p99: "< 1.5s"
+
+  # 阶段3: 中等范围 (Day 3)
+  - name: "canary_30"
+    traffic: 30%
+    duration: "1天"
+    users:
+      - "beta_users_group"
+      - "vip_group"
+    criteria:
+      error_rate: "< 0.3%"
+      response_time: "< 200ms"
+      p99: "< 1s"
+
+  # 阶段4: 大范围测试 (Day 4)
+  - name: "canary_50"
+    traffic: 50%
+    duration: "1天"
+    users:
+      - "general_users_group"
+    criteria:
+      error_rate: "< 0.2%"
+      response_time: "< 150ms"
+      p99: "< 800ms"
+
+  # 阶段5: 全量发布 (Day 5)
+  - name: "full_rollout"
+    traffic: 100%
+    duration: "持续"
+    users: "all"
+    criteria:
+      error_rate: "< 0.1%"
+      response_time: "< 100ms"
+      p99: "< 500ms"
+
+# ==================== 回滚条件 ====================
+
+ROLLBACK_CONDITIONS:
+  - metric: "error_rate"
+    threshold: 5%
+    duration: "5分钟"
+    action: "自动回滚"
+
+  - metric: "response_time_p99"
+    threshold: "5s"
+    duration: "10分钟"
+    action: "自动回滚"
+
+  - metric: "cpu_usage"
+    threshold: 90%
+    duration: "5分钟"
+    action: "告警"
+
+  - metric: "memory_usage"
+    threshold: 85%
+    duration: "5分钟"
+    action: "告警"
+
+  - metric: "health_check_failure"
+    threshold: 3
+    duration: "1分钟"
+    action: "自动回滚"
+
+# ==================== 健康检查 ====================
+
+HEALTH_CHECKS:
+  interval: "30秒"
+  timeout: "10秒"
+  retries: 3
+  endpoints:
+    - "http://backend:8000/health"
+    - "http://nginx:80/health"
+
+# ==================== 发布前检查清单 ====================
+
+PRE_RELEASE_CHECKLIST:
+  - "所有单元测试通过"
+  - "所有集成测试通过"
+  - "性能测试达标"
+  - "安全扫描无高危漏洞"
+  - "数据库迁移测试通过"
+  - "回滚计划已准备"
+  - "监控告警已配置"
+  - "值班人员已通知"
+  - "回滚脚本已测试"

@@ -1,0 +1,152 @@
+# ===========================================
+# Vanguard Docker Compose Configuration
+# ===========================================
+
+services:
+  # ==================== Backend API ====================
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - JWT_SECRET=${JWT_SECRET}
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - PROXY_PROVIDER=${PROXY_PROVIDER:-evomi}
+      - PROMOTER_PROXY_REQUIRED=${PROMOTER_PROXY_REQUIRED:-true}
+      - EVOMI_API_KEY=${EVOMI_API_KEY}
+      - EVOMI_PRODUCT_CODE=${EVOMI_PRODUCT_CODE:-rp}
+      - EVOMI_PROTOCOL=${EVOMI_PROTOCOL:-http}
+      - EVOMI_SESSION_TYPE=${EVOMI_SESSION_TYPE:-sticky}
+      - EVOMI_SESSION_LIFETIME_MINUTES=${EVOMI_SESSION_LIFETIME_MINUTES:-30}
+      - EVOMI_SESSION_NAMESPACE=${EVOMI_SESSION_NAMESPACE:-vanguard}
+      - EVOMI_ADBLOCK=${EVOMI_ADBLOCK:-false}
+      - DECODO_API_KEY=${DECODO_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - vanguard-network
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/uploads:/app/uploads
+
+  # ==================== Bot Matrix ====================
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: vanguard-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - API_BASE_URL=http://backend:8000
+      - REDIS_URL=${REDIS_URL}
+    depends_on:
+      - backend
+      - redis
+    networks:
+      - vanguard-network
+
+  # ==================== PostgreSQL Database ====================
+  postgres:
+    image: postgres:15-alpine
+    container_name: vanguard-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-vanguard}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-vanguard}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vanguard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vanguard-network
+
+  # ==================== Redis Cache ====================
+  redis:
+    image: redis:7-alpine
+    container_name: vanguard-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-change_me_in_production}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-change_me_in_production}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vanguard-network
+
+  # ==================== Nginx Reverse Proxy ====================
+  nginx:
+    image: nginx:alpine
+    container_name: vanguard-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./data/certbot/www:/var/www/certbot/:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - backend
+    networks:
+      - vanguard-network
+
+  # ==================== Certbot (SSL) ====================
+  certbot:
+    image: certbot/certbot
+    container_name: vanguard-certbot
+    volumes:
+      - ./data/certbot/www:/var/www/certbot/:rw
+      - ./nginx/ssl:/etc/nginx/ssl/:rw
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h; done'"
+
+# ==================== Networks ====================
+networks:
+  vanguard-network:
+    driver: bridge
+
+# ==================== Volumes ====================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  nginx_logs:
+    driver: local
