@@ -122,6 +122,7 @@ sessions/
 tmp/
 temp/
 *.tmp
+*.bak
 telegram-config.md
 nginx-config.md
 telegram-config.md
