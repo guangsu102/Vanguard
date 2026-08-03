@@ -29,11 +29,17 @@ describe('Users view', () => {
     const wrapper = mount(Users, {
       global: {
         stubs: {
+          'el-avatar': { template: '<span><slot /></span>' },
           'el-button': { template: '<button><slot /></button>' },
+          'el-card': { template: '<div><slot /></div>' },
+          'el-drawer': { template: '<div><slot /></div>' },
+          'el-empty': { template: '<div />' },
           'el-icon': { template: '<span><slot /></span>' },
           'el-tag': { template: '<span><slot /></span>' },
           'el-table': { template: '<table><slot /></table>' },
           'el-table-column': { template: '<div />' },
+          'el-timeline': { template: '<div><slot /></div>' },
+          'el-timeline-item': { template: '<div><slot /></div>' },
         },
       },
     })

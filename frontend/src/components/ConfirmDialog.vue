@@ -28,7 +28,7 @@ const confirm = async () => {
     await ElMessageBox.confirm(props.message, props.title, {
       confirmButtonText: props.confirmText,
       cancelButtonText: props.cancelText,
-      type: props.confirmType === 'danger' ? 'error' : props.confType === 'warning' ? 'warning' : 'info',
+      type: props.confirmType === 'danger' ? 'error' : props.confirmType === 'warning' ? 'warning' : 'info',
       confirmButtonClass: `el-button--${props.confirmType}`,
     })
     emit('confirm')

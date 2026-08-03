@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, computed, watch } from 'vue'
-import { ElButton, ElIcon, ElCard, ElRow, ElCol, ElDatePicker, ElTable, ElSelect, ElOption, ElEmpty } from 'element-plus'
-import { Download, Refresh, Calendar } from '@element-plus/icons-vue'
+import { ref, onMounted, computed, watch } from 'vue'
+import { ElButton, ElIcon, ElCard, ElRow, ElCol, ElDatePicker, ElTable, ElSelect, ElOption, ElEmpty, ElMessage } from 'element-plus'
+import { Download, Refresh } from '@element-plus/icons-vue'
 import { useStatsStore } from '@/stores/stats'
+import { statsApi } from '@/api/stats'
+import { downloadBlob } from '@/utils/download'
 import ECharts from '@/components/ECharts.vue'
 import dayjs from 'dayjs'
 
@@ -11,6 +13,10 @@ const statsStore = useStatsStore()
 const loading = ref(false)
 const dateType = ref('week')
 const customDateRange = ref<[string, string] | null>(null)
+const weeklyGrowth = computed(() => statsStore.overview?.weeklyGrowth || 0)
+const trendData = computed(() => statsStore.trendData || [])
+const funnelData = computed(() => statsStore.funnelData || [])
+const sourceData = computed(() => statsStore.sourceData || [])
 
 const dateRange = computed(() => {
   const now = dayjs()
@@ -29,7 +35,7 @@ const dateRange = computed(() => {
 })
 
 const trendChartOption = computed(() => {
-  const data = statsStore.trendData || []
+  const data = trendData.value
   return {
     tooltip: {
       trigger: 'axis',
@@ -79,7 +85,7 @@ const trendChartOption = computed(() => {
 })
 
 const funnelChartOption = computed(() => {
-  const data = statsStore.funnelData || []
+  const data = funnelData.value
   return {
     tooltip: {
       trigger: 'item',
@@ -124,7 +130,7 @@ const funnelChartOption = computed(() => {
 })
 
 const sourceChartOption = computed(() => {
-  const data = statsStore.sourceData || []
+  const data = sourceData.value
   return {
     tooltip: {
       trigger: 'item',
@@ -197,9 +203,15 @@ const fetchAllStats = async () => {
   }
 }
 
-const handleExport = (type: string) => {
+const handleExport = async (type: string) => {
   const [startDate, endDate] = dateRange.value
-  window.open(`/api/stats/export?type=${type}&startDate=${startDate}&endDate=${endDate}`, '_blank')
+  try {
+    const response = await statsApi.export({ type, startDate, endDate })
+    downloadBlob(response.data, `vanguard-${type}.csv`)
+  } catch (error) {
+    console.error('Failed to export stats:', error)
+    ElMessage.error('导出失败')
+  }
 }
 
 const handleDateTypeChange = () => {
@@ -270,8 +282,8 @@ onMounted(() => {
         <el-card shadow="hover" class="overview-card">
           <div class="overview-item">
             <span class="label">周增长率</span>
-            <span class="value" :class="{ positive: (statsStore.overview?.weeklyGrowth || 0) > 0 }">
-              {{ statsStore.overview?.weeklyGrowth > 0 ? '+' : '' }}{{ statsStore.overview?.weeklyGrowth || 0 }}%
+            <span class="value" :class="{ positive: weeklyGrowth > 0 }">
+              {{ weeklyGrowth > 0 ? '+' : '' }}{{ weeklyGrowth }}%
             </span>
           </div>
         </el-card>
@@ -291,7 +303,7 @@ onMounted(() => {
             </div>
           </template>
           <ECharts
-            v-if="statsStore.trendData.length"
+            v-if="trendData.length"
             :option="trendChartOption"
             height="350px"
           />
@@ -307,7 +319,7 @@ onMounted(() => {
             </div>
           </template>
           <ECharts
-            v-if="statsStore.funnelData.length"
+            v-if="funnelData.length"
             :option="funnelChartOption"
             height="350px"
           />
@@ -380,7 +392,7 @@ onMounted(() => {
             </div>
           </template>
           <ECharts
-            v-if="statsStore.sourceData.length"
+            v-if="sourceData.length"
             :option="sourceChartOption"
             height="300px"
           />

@@ -71,12 +71,14 @@ export interface KeywordTrigger {
   trigger_type: KeywordTriggerType
   action: KeywordTriggerAction
   template_id?: number
+  template_name?: string
   reply_content?: string
   use_ai_reply: boolean
   cooldown_seconds: number
   max_triggers_per_user: number
   max_triggers_per_group: number
   priority: number
+  requires_review: boolean
   enabled: boolean
   created_at: string
 }
@@ -93,7 +95,45 @@ export interface KeywordTriggerFormData {
   max_triggers_per_user: number
   max_triggers_per_group: number
   priority: number
+  requires_review?: boolean
   enabled: boolean
+}
+
+export interface MessageTemplate {
+  id: number
+  name: string
+  content: string
+  template_variables?: string
+  message_type: string
+  cooldown_seconds: number
+  max_uses_per_day: number
+  enabled: boolean
+  usage_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface MessageTemplateFormData {
+  name: string
+  content: string
+  template_variables?: string
+  message_type?: string
+  cooldown_seconds?: number
+  max_uses_per_day?: number
+  enabled: boolean
+}
+
+export interface GenerateKeywordTriggersResult {
+  requested: number
+  generated: number
+  created: number
+  skipped_existing: number
+  skipped_duplicate: number
+  skipped_invalid: number
+  candidate_exhausted: boolean
+  llm_configured: boolean
+  requires_review: boolean
+  keywords: KeywordTrigger[]
 }
 
 export const acquisitionApi = {
@@ -145,8 +185,22 @@ export const acquisitionApi = {
     keyword?: string
     action?: KeywordTriggerAction | ''
     enabled?: boolean
+    requires_review?: boolean
   }) => {
     return apiClient.get<{ data: KeywordTrigger[]; total: number }>('/acquisition/keyword-triggers', { params })
+  },
+
+  generateKeywordTriggers: (data: {
+    category: string
+    count: number
+    action: KeywordTriggerAction
+    use_ai_reply?: boolean
+    cooldown_seconds?: number
+    max_triggers_per_user?: number
+    max_triggers_per_group?: number
+    priority?: number
+  }) => {
+    return apiClient.post<{ data: GenerateKeywordTriggersResult }>('/acquisition/keyword-triggers/generate', data)
   },
 
   createKeywordTrigger: (data: KeywordTriggerFormData) => {
@@ -159,6 +213,34 @@ export const acquisitionApi = {
 
   deleteKeywordTrigger: (id: number) => {
     return apiClient.delete(`/acquisition/keyword-triggers/${id}`)
+  },
+
+  getMessageTemplates: (params?: { message_type?: string; enabled?: boolean; include_inline?: boolean }) => {
+    return apiClient.get<{ data: MessageTemplate[] }>('/acquisition/message-templates', { params })
+  },
+
+  createMessageTemplate: (data: MessageTemplateFormData) => {
+    return apiClient.post<{ data: MessageTemplate }>('/acquisition/message-templates', data)
+  },
+
+  updateMessageTemplate: (id: number, data: Partial<MessageTemplateFormData>) => {
+    return apiClient.put<{ data: MessageTemplate }>(`/acquisition/message-templates/${id}`, data)
+  },
+
+  deleteMessageTemplate: (id: number) => {
+    return apiClient.delete(`/acquisition/message-templates/${id}`)
+  },
+
+  batchBindKeywordTriggerTemplate: (data: {
+    trigger_ids: number[]
+    template_id: number
+    reply_target: 'private' | 'group'
+    enabled?: boolean
+  }) => {
+    return apiClient.post<{ data: { updated: number; missing_ids: number[]; template: MessageTemplate; triggers: KeywordTrigger[] } }>(
+      '/acquisition/keyword-triggers/batch-template',
+      data,
+    )
   },
 
   // Guide Flow

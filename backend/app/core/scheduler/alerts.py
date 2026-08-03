@@ -5,6 +5,8 @@ Telegram-based alerting for task failures and monitoring.
 """
 
 import asyncio
+import inspect
+from contextlib import AsyncExitStack
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -12,7 +14,10 @@ from typing import Optional
 import structlog
 
 from app.core.config import settings
-
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.system_identity import bot_risk_identity
+from app.core import database as db_module
+from app.integrations.telegram.client import TelegramClient, TelegramConfig
 
 logger = structlog.get_logger()
 
@@ -72,18 +77,30 @@ class AlertManager:
             return False
 
         try:
-            if not settings.BOT_TOKEN:
-                logger.debug("alert_bot_token_missing")
-                return False
-
-            from app.integrations.telegram.client import TelegramClient, TelegramConfig
-
             async def _send() -> None:
-                client = TelegramClient(TelegramConfig(bot_token=settings.BOT_TOKEN))
-                try:
-                    await client.send_message(self._alert_chat_id, message, parse_mode="Markdown")
-                finally:
-                    await client.close()
+                async with AsyncExitStack() as stack:
+                    risk_guard = None
+                    risk_account = None
+                    try:
+                        if db_module.async_session_factory is None:
+                            await db_module.init_db(create_tables=False)
+                        db = await stack.enter_async_context(db_module.get_db_session())
+                        risk_guard = AccountRiskGuard(db)
+                        risk_account = bot_risk_identity("scheduler_alerts")
+                    except Exception as exc:
+                        logger.warning("telegram_alert_risk_guard_unavailable", error=str(exc))
+
+                    client = TelegramClient(
+                        TelegramConfig(bot_token=settings.BOT_TOKEN),
+                        risk_guard=risk_guard,
+                        risk_account=risk_account,
+                    )
+                    try:
+                        await client.send_message(self._alert_chat_id, message, parse_mode="Markdown")
+                    finally:
+                        close_result = client.close()
+                        if inspect.isawaitable(close_result):
+                            await close_result
 
             asyncio.run(_send())
             logger.info("alert_sent_to_telegram", chat_id=self._alert_chat_id)
@@ -278,3 +295,5 @@ def TaskAlertManager() -> AlertManager:
     if _alert_manager is None:
         _alert_manager = AlertManager()
     return _alert_manager
+
+

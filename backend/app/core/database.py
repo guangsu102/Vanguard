@@ -4,6 +4,7 @@ Database Connection and Session Management
 SQLAlchemy 2.0 async support with connection pooling.
 """
 
+import importlib
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -17,7 +18,6 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
-
 
 # Naming convention for database constraints
 convention = {
@@ -61,45 +61,23 @@ async def init_db(create_tables: bool = True) -> None:
         autoflush=False,
     )
     
-    # Import models to register them with Base
-    from app.core.account.models import TelegramAccount, AccountOperationConfig, GuardianBotProfile
-    from app.core.group.models import Group, GroupAccountMembership, GroupLevelConfig
-    from app.core.keyword.models import Keyword
-    from app.core.user.models import User
-    from app.core.campaign.models import Campaign, CampaignTracking
-    from app.core.worker_status import TelegramWorkerStatus
-    from app.api.broadcasts import BroadcastRecord
-    from app.modules.guardian.models import (
-        Violation,
-        ModerationRule,
-        Whitelist,
-        GroupVerificationConfig,
-        VerificationSession,
-        KeywordSuggestion,
-        ModerationSensitiveKeyword,
-        ManagedGroupBinding,
-        GroupModerationPolicy,
-        GroupPunishmentPolicy,
-        CouponDistribution,
-    )
-    from app.modules.acquisition.models import (
-        GroupSearchRecord,
-        GroupSearchKeyword,
-        AutoJoinAttempt,
-        AcquisitionTracking,
-        AcquisitionMessage,
-        KeywordTrigger,
-        TriggerRecord,
-        MessageTemplate,
-        GuideFlow,
-        ConversationContext,
-        AdCreative,
-        AdCampaign,
-        AccountAdBinding,
-        AdDeliveryLog,
-    )
-    from app.integrations.xboard.models import XBoardEvent, XBoardCallback
-    
+    # Import model modules so SQLAlchemy registers every table with Base.metadata.
+    for model_module in (
+        "app.core.account.models",
+        "app.core.group.models",
+        "app.core.keyword.models",
+        "app.core.user.models",
+        "app.core.campaign.models",
+        "app.core.worker_status",
+        "app.core.settings_models",
+        "app.api.broadcasts",
+        "app.modules.guardian.models",
+        "app.modules.acquisition.models",
+        "app.modules.qq.models",
+        "app.integrations.xboard.models",
+    ):
+        importlib.import_module(model_module)
+
     if create_tables:
         # Create tables (use curated SQL migrations for production schema changes)
         async with engine.begin() as conn:

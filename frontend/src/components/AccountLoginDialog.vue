@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue'
-import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload } from 'element-plus'
-import type { FormInstance, FormRules, UploadFile } from 'element-plus'
+import { ref, reactive, computed, watch } from 'vue'
+import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload, ElAlert } from 'element-plus'
+import type { FormInstance, FormRules, UploadRawFile } from 'element-plus'
+import { proxiesApi, type Proxy } from '@/api/proxies'
 
 interface Props {
   visible: boolean
@@ -57,6 +58,7 @@ const countryOptions = countryCodes.map((code) => {
 // Dialog state
 const currentStep = ref(0)
 const loginMethod = ref<'code' | 'session'>('code')
+const proxyOptions = ref<Proxy[]>([])
 
 // Form data
 const formData = reactive({
@@ -64,11 +66,14 @@ const formData = reactive({
   apiConfigName: 'default',
   countryCode: 'US',
   countryName: '美国',
+  profileBio: '',
   code: '',
   password: '',
   sessionId: '',
   requires2FA: false,
   sessionString: '',
+  proxyMode: 'dynamic' as 'dynamic' | 'static' | 'none',
+  staticProxyId: undefined as number | undefined,
 })
 
 // Session import data
@@ -77,13 +82,24 @@ const sessionImportData = reactive({
   apiConfigName: 'default',
   countryCode: 'US',
   countryName: '美国',
+  profileBio: '',
   sessionFile: null as File | null,
+  proxyMode: 'dynamic' as 'dynamic' | 'static' | 'none',
+  staticProxyId: undefined as number | undefined,
 })
 
 const formRef = ref<FormInstance>()
 const sessionFormRef = ref<FormInstance>()
 
 const loading = ref(false)
+
+const formatProxyOption = (proxy: Proxy) => {
+  const bound = proxy.bindAccountCount || 0
+  const suffix = bound > 0 ? ` (${bound}/3)` : ' (0/3)'
+  return `${proxy.protocol}://${proxy.address}:${proxy.port}${suffix}`
+}
+
+const isProxyFull = (proxy: Proxy) => (proxy.remainingBindSlots ?? Math.max(3 - (proxy.bindAccountCount || 0), 0)) <= 0
 
 // Form rules
 const phoneRules: FormRules = {
@@ -93,6 +109,18 @@ const phoneRules: FormRules = {
   ],
   apiConfigName: [{ required: true, message: '请选择API配置', trigger: 'change' }],
   countryCode: [{ required: true, message: '请选择国家代码', trigger: 'change' }],
+  staticProxyId: [
+    {
+      validator: (_rule, value, callback) => {
+        if (formData.proxyMode === 'static' && !value) {
+          callback(new Error('请选择静态代理'))
+          return
+        }
+        callback()
+      },
+      trigger: 'change',
+    },
+  ],
 }
 
 const codeRules: FormRules = {
@@ -113,6 +141,18 @@ const sessionImportRules: FormRules = {
   ],
   apiConfigName: [{ required: true, message: '请选择API配置', trigger: 'change' }],
   countryCode: [{ required: true, message: '请选择国家代码', trigger: 'change' }],
+  staticProxyId: [
+    {
+      validator: (_rule, value, callback) => {
+        if (sessionImportData.proxyMode === 'static' && !value) {
+          callback(new Error('请选择静态代理'))
+          return
+        }
+        callback()
+      },
+      trigger: 'change',
+    },
+  ],
 }
 
 // Computed
@@ -144,6 +184,21 @@ const handleClose = () => {
   dialogVisible.value = false
 }
 
+const loadProxyOptions = async () => {
+  try {
+    const response = await proxiesApi.list({ page: 1, pageSize: 200, status: 'active' })
+    proxyOptions.value = response.data.data.list || []
+  } catch (error) {
+    console.error('Load proxies error:', error)
+  }
+}
+
+watch(dialogVisible, (visible) => {
+  if (visible) {
+    loadProxyOptions()
+  }
+})
+
 const resetForm = () => {
   currentStep.value = 0
   loginMethod.value = 'code'
@@ -152,18 +207,24 @@ const resetForm = () => {
     apiConfigName: 'default',
     countryCode: 'US',
     countryName: '美国',
+    profileBio: '',
     code: '',
     password: '',
     sessionId: '',
     requires2FA: false,
     sessionString: '',
+    proxyMode: 'dynamic',
+    staticProxyId: undefined,
   })
   Object.assign(sessionImportData, {
     phone: '',
     apiConfigName: 'default',
     countryCode: 'US',
     countryName: '美国',
+    profileBio: '',
     sessionFile: null,
+    proxyMode: 'dynamic',
+    staticProxyId: undefined,
   })
   formRef.value?.clearValidate()
   sessionFormRef.value?.clearValidate()
@@ -199,7 +260,7 @@ const handleSendCode = async () => {
   if (!formRef.value) return
 
   try {
-    await formRef.value.validateField(['phone', 'apiConfigName', 'countryCode'])
+    await formRef.value.validateField(['phone', 'apiConfigName', 'countryCode', 'staticProxyId'])
   } catch {
     return
   }
@@ -216,6 +277,8 @@ const handleSendCode = async () => {
         phone: formData.phone,
         api_config_name: formData.apiConfigName,
         country_code: formData.countryCode,
+        proxy_mode: formData.proxyMode,
+        static_proxy_id: formData.proxyMode === 'static' ? formData.staticProxyId : undefined,
       }),
     })
 
@@ -338,7 +401,10 @@ const completeLogin = async () => {
         api_config_name: formData.apiConfigName,
         country_code: formData.countryCode,
         country_name: formData.countryName,
+        profile_bio: formData.profileBio.trim() || undefined,
         session_string: formData.sessionString,
+        proxy_mode: formData.proxyMode,
+        static_proxy_id: formData.proxyMode === 'static' ? formData.staticProxyId : undefined,
       }),
     })
 
@@ -360,10 +426,8 @@ const completeLogin = async () => {
 }
 
 // Import session file
-const handleSessionFileChange = (file: UploadFile) => {
-  if (file.raw) {
-    sessionImportData.sessionFile = file.raw
-  }
+const handleSessionFileChange = (file: UploadRawFile) => {
+  sessionImportData.sessionFile = file
   return false // Prevent auto upload
 }
 
@@ -386,6 +450,13 @@ const handleImportSession = async () => {
       formDataToSend.append('country_code', sessionImportData.countryCode)
       if (sessionImportData.countryName) {
         formDataToSend.append('country_name', sessionImportData.countryName)
+      }
+      if (sessionImportData.profileBio.trim()) {
+        formDataToSend.append('profile_bio', sessionImportData.profileBio.trim())
+      }
+      formDataToSend.append('proxy_mode', sessionImportData.proxyMode)
+      if (sessionImportData.proxyMode === 'static' && sessionImportData.staticProxyId) {
+        formDataToSend.append('static_proxy_id', String(sessionImportData.staticProxyId))
       }
       formDataToSend.append('session_file', sessionImportData.sessionFile)
 
@@ -494,6 +565,52 @@ const handleNext = () => {
           <el-form-item label="国家名称" prop="countryName">
             <el-input v-model="formData.countryName" placeholder="自动填充，可手动调整" />
           </el-form-item>
+          <el-form-item label="账号简介" prop="profileBio">
+            <el-input
+              v-model="formData.profileBio"
+              type="textarea"
+              :rows="3"
+              maxlength="70"
+              show-word-limit
+              placeholder="用户点开账号资料时看到的简介"
+            />
+          </el-form-item>
+          <el-form-item label="代理模式" prop="proxyMode">
+            <el-select v-model="formData.proxyMode" style="width: 100%">
+              <el-option label="动态住宅代理" value="dynamic" />
+              <el-option label="静态绑定代理" value="static" />
+              <el-option label="不使用代理" value="none" />
+            </el-select>
+          </el-form-item>
+          <el-form-item
+            v-if="formData.proxyMode === 'static'"
+            label="静态代理"
+            prop="staticProxyId"
+            :rules="phoneRules.staticProxyId"
+          >
+            <el-alert
+              v-if="proxyOptions.length === 0"
+              type="warning"
+              show-icon
+              :closable="false"
+              title="暂无可用静态代理IP，请先到增长中心的静态代理IP页面添加。"
+              class="proxy-empty-alert"
+            />
+            <el-select
+              v-model="formData.staticProxyId"
+              filterable
+              placeholder="请选择静态代理"
+              style="width: 100%"
+            >
+              <el-option
+                v-for="proxy in proxyOptions"
+                :key="proxy.id"
+                :label="formatProxyOption(proxy)"
+                :value="proxy.id"
+                :disabled="isProxyFull(proxy)"
+              />
+            </el-select>
+          </el-form-item>
         </div>
 
         <!-- Step 1: Verification code or 2FA -->
@@ -562,6 +679,52 @@ const handleNext = () => {
         </el-form-item>
         <el-form-item label="国家名称" prop="countryName">
           <el-input v-model="sessionImportData.countryName" placeholder="自动填充，可手动调整" />
+        </el-form-item>
+        <el-form-item label="账号简介" prop="profileBio">
+          <el-input
+            v-model="sessionImportData.profileBio"
+            type="textarea"
+            :rows="3"
+            maxlength="70"
+            show-word-limit
+            placeholder="用户点开账号资料时看到的简介"
+          />
+        </el-form-item>
+        <el-form-item label="代理模式" prop="proxyMode">
+          <el-select v-model="sessionImportData.proxyMode" style="width: 100%">
+            <el-option label="动态住宅代理" value="dynamic" />
+            <el-option label="静态绑定代理" value="static" />
+            <el-option label="不使用代理" value="none" />
+          </el-select>
+        </el-form-item>
+        <el-form-item
+          v-if="sessionImportData.proxyMode === 'static'"
+          label="静态代理"
+          prop="staticProxyId"
+          :rules="sessionImportRules.staticProxyId"
+        >
+          <el-alert
+            v-if="proxyOptions.length === 0"
+            type="warning"
+            show-icon
+            :closable="false"
+            title="暂无可用静态代理IP，请先到增长中心的静态代理IP页面添加。"
+            class="proxy-empty-alert"
+          />
+          <el-select
+            v-model="sessionImportData.staticProxyId"
+            filterable
+            placeholder="请选择静态代理"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="proxy in proxyOptions"
+              :key="proxy.id"
+              :label="formatProxyOption(proxy)"
+              :value="proxy.id"
+              :disabled="isProxyFull(proxy)"
+            />
+          </el-select>
         </el-form-item>
         <el-form-item label="Session文件" required>
           <el-upload

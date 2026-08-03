@@ -4,12 +4,15 @@ WebSocket API Router
 Real-time communication with WebSocket connections.
 """
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from typing import Dict, List, Set
-import json
 import asyncio
+import contextlib
+import json
 from collections import defaultdict
 
+import structlog
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+
+from app.core.security import verify_access_token
 
 router = APIRouter()
 
@@ -22,8 +25,8 @@ class ConnectionManager:
     """
 
     def __init__(self):
-        self._connections: Dict[int, WebSocket] = {}
-        self._subscriptions: Dict[int, Set[str]] = defaultdict(set)
+        self._connections: dict[int, WebSocket] = {}
+        self._subscriptions: dict[int, set[str]] = defaultdict(set)
         self._lock = asyncio.Lock()
 
     async def connect(self, websocket: WebSocket, client_id: int):
@@ -104,7 +107,7 @@ class ConnectionManager:
         async with self._lock:
             return len(self._connections)
 
-    async def get_subscribed_clients(self, channel: str) -> List[int]:
+    async def get_subscribed_clients(self, channel: str) -> list[int]:
         """Get list of clients subscribed to a channel."""
         async with self._lock:
             return [
@@ -114,14 +117,83 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+logger = structlog.get_logger()
+_redis_bridge_task: asyncio.Task | None = None
+
+
+async def _redis_bridge_loop() -> None:
+    """Fan Redis events into the WebSocket connections owned by this API process."""
+    from app.core.redis import get_redis
+    from app.modules.qq.service import QQ_WS_CHANNEL
+
+    while True:
+        pubsub = None
+        try:
+            client = await get_redis()
+            pubsub = client.pubsub()
+            await pubsub.subscribe(QQ_WS_CHANNEL)
+            async for item in pubsub.listen():
+                if item.get("type") != "message":
+                    continue
+                try:
+                    payload = json.loads(item.get("data") or "{}")
+                    channel = str(payload.get("channel") or "")
+                    message = payload.get("message")
+                    if channel and isinstance(message, dict):
+                        await manager.broadcast_to_channel(message, channel)
+                except (TypeError, json.JSONDecodeError):
+                    logger.warning("websocket_redis_bridge_invalid_payload")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("websocket_redis_bridge_failed", error=str(exc))
+            await asyncio.sleep(5)
+        finally:
+            if pubsub is not None:
+                with contextlib.suppress(Exception):
+                    await pubsub.aclose()
+
+
+async def start_redis_bridge() -> None:
+    global _redis_bridge_task
+    if _redis_bridge_task is None or _redis_bridge_task.done():
+        _redis_bridge_task = asyncio.create_task(
+            _redis_bridge_loop(),
+            name="websocket-redis-bridge",
+        )
+
+
+async def stop_redis_bridge() -> None:
+    global _redis_bridge_task
+    if _redis_bridge_task is None:
+        return
+    _redis_bridge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await _redis_bridge_task
+    _redis_bridge_task = None
 
 
 @router.websocket("/connect")
 async def websocket_endpoint(
     websocket: WebSocket,
     client_id: int = Query(...),
+    token: str | None = Query(None),
 ):
-    """WebSocket connection endpoint."""
+    """WebSocket connection endpoint with token authentication."""
+    # Authenticate via token query parameter
+    if not token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Missing authentication token")
+        return
+
+    try:
+        user = verify_access_token(token)
+        if not user:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
+            return
+    except Exception:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication failed")
+        return
+
     await manager.connect(websocket, client_id)
 
     try:
@@ -193,3 +265,5 @@ class Channels:
     PROXY_HEALTH = "proxy:health"
     CAMPAIGN_UPDATE = "campaign:update"
     USER_ACTIVITY = "user:activity"
+    QQ_MESSAGES = "qq:messages"
+    QQ_GROUPS = "qq:groups"

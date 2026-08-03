@@ -12,11 +12,13 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
-    Enum as SQLEnum,
     ForeignKey,
     Index,
     Integer,
     String,
+)
+from sqlalchemy import (
+    Enum as SQLEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -56,6 +58,16 @@ class CampaignDistributionMode(str, Enum):
     SCHEDULED = "scheduled"
     MANUAL = "manual"
     PERIODIC = "periodic"
+
+
+class CampaignExecutionStatus(str, Enum):
+    """Execution state for campaign delivery and scheduling."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
 
 
 def _enum_values(enum_cls: type[Enum]) -> list[str]:
@@ -156,4 +168,59 @@ class CampaignTracking(Base):
         Index("idx_source", "source"),
         Index("idx_campaign", "campaign_name"),
         Index("idx_registered_at", "registered_at"),
+    )
+
+
+class CampaignExecution(Base):
+    """Campaign execution and schedule state."""
+
+    __tablename__ = "campaign_execution"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("campaign.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="活动ID",
+    )
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=True,
+        comment="目标用户ID",
+    )
+    group_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, comment="目标群组ID")
+    status: Mapped[CampaignExecutionStatus] = mapped_column(
+        SQLEnum(CampaignExecutionStatus, values_callable=_enum_values, native_enum=False),
+        default=CampaignExecutionStatus.PENDING,
+        nullable=False,
+        comment="执行状态",
+    )
+    trigger_timing: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, comment="触发时机")
+    trigger_event: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, comment="触发事件")
+    distribution_mode: Mapped[Optional[CampaignDistributionMode]] = mapped_column(
+        SQLEnum(CampaignDistributionMode, values_callable=_enum_values, native_enum=False),
+        nullable=True,
+        comment="分发模式",
+    )
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="计划执行时间")
+    executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="实际执行时间")
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="活动最近运行时间")
+    delivered: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否发送消息")
+    reward_granted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否发放奖励")
+    error: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True, comment="错误信息")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    campaign = relationship("Campaign", backref="executions")
+    user = relationship("User", backref="campaign_executions")
+
+    __table_args__ = (
+        Index("idx_campaign_execution_campaign", "campaign_id"),
+        Index("idx_campaign_execution_user", "user_id"),
+        Index("idx_campaign_execution_status_scheduled", "status", "scheduled_at"),
+        Index("idx_campaign_execution_last_run", "campaign_id", "last_run_at"),
     )

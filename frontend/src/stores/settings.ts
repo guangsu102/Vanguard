@@ -2,10 +2,6 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import {
   settingsApi,
-  type SystemSettings,
-  type NotificationSettings,
-  type SecuritySettings,
-  type XBoardSettings,
   type SettingsFormData,
   type SystemInfo,
   type OperationLog,

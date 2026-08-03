@@ -16,8 +16,10 @@ export type MessageHandler = (data: unknown) => void
 
 class WebSocketClient {
   private ws: WebSocket | null = null
+  private baseUrl: string = ''
   private url: string = ''
   private clientId: number = 0
+  private token: string = ''
   private handlers: Map<string, Set<MessageHandler>> = new Map()
   private reconnectAttempts: number = 0
   private maxReconnectAttempts: number = 5
@@ -35,10 +37,21 @@ class WebSocketClient {
     this.handlers.set('*', new Set())
   }
 
-  connect(baseUrl: string, clientId: number): Promise<void> {
+  connect(baseUrl: string, clientId: number, token: string): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.url = `${baseUrl.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/connect?client_id=${clientId}`
+      if (!token) {
+        reject(new Error('Missing authentication token'))
+        return
+      }
+
+      this.baseUrl = baseUrl
       this.clientId = clientId
+      this.token = token
+      const params = new URLSearchParams({
+        client_id: String(clientId),
+        token,
+      })
+      this.url = `${this.toWebSocketBaseUrl(baseUrl)}/ws/connect?${params.toString()}`
       this._status.value = 'connecting'
 
       try {
@@ -186,10 +199,20 @@ class WebSocketClient {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectAttempts++
-      this.connect(this.url.replace('/ws/connect', '').replace('ws://', 'http://').replace('wss://', 'https://'), this.clientId).catch(() => {
+      this.connect(this.baseUrl, this.clientId, this.token).catch(() => {
         this.scheduleReconnect()
       })
     }, delay)
+  }
+
+  private toWebSocketBaseUrl(baseUrl: string): string {
+    if (baseUrl.startsWith('http://') || baseUrl.startsWith('https://')) {
+      return baseUrl.replace('http://', 'ws://').replace('https://', 'wss://').replace(/\/$/, '')
+    }
+
+    const normalizedBaseUrl = baseUrl.startsWith('/') ? baseUrl : `/${baseUrl}`
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${protocol}//${window.location.host}${normalizedBaseUrl}`.replace(/\/$/, '')
   }
 
   isConnected(): boolean {

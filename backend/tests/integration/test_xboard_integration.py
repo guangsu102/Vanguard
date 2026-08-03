@@ -13,11 +13,20 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
+from app.core.campaign.models import (
+    Campaign,
+    CampaignDistributionMode,
+    CampaignExecution,
+    CampaignScope,
+    CampaignTracking,
+    CampaignTriggerTiming,
+    CampaignType,
+)
 from app.core.config import settings
-from app.core.campaign.models import CampaignTracking
 from app.core.user.models import User, UserState
 from app.integrations.xboard.models import XBoardCallback, XBoardEvent
 from app.modules.acquisition.models import AcquisitionTracking
+from app.modules.guardian.models import CouponDistribution
 
 
 def _build_signature(method: str, path: str, query_string: str, timestamp: str, request_id: str, raw_body: str, secret: str | None = None) -> str:
@@ -455,6 +464,57 @@ async def test_user_registered_updates_user_and_tracking(client, test_db):
     assert tracking is not None
     assert tracking.registered_at is not None
     assert tracking.user_id == user.id
+
+
+@pytest.mark.asyncio
+async def test_user_registered_triggers_after_register_campaign(client, test_db):
+    campaign = Campaign(
+        name="xboard-after-register",
+        campaign_type=CampaignType.DISCOUNT,
+        campaign_scope=CampaignScope.GLOBAL,
+        trigger_timing=CampaignTriggerTiming.AFTER_REGISTER,
+        distribution_mode=CampaignDistributionMode.WELCOME,
+        enabled=True,
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+    await test_db.refresh(campaign)
+
+    payload = {
+        "event_id": "evt_user_registered_campaign_1",
+        "trace_id": "trace_user_registered_campaign_1",
+        "event_type": "user.registered",
+        "tracking_code": "ref_registered_campaign_1",
+        "tg_user_id": 456789123,
+        "external_user_id": "8899",
+        "occurred_at": "2026-05-23T10:12:00Z",
+        "payload": {
+            "source": "telegram",
+            "campaign_name": "spring_launch",
+            "keyword": "ref_registered_campaign_1",
+            "bot_id": "bot_001",
+        },
+    }
+    headers = _xboard_headers("POST", "/api/v1/events/ingest", payload)
+
+    resp = await client.post("/api/v1/events/ingest", json=payload, headers=headers)
+
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["campaign_results"][0]["campaign_id"] == campaign.id
+    assert data["campaign_results"][0]["reward_granted"] is True
+
+    user = (await test_db.execute(select(User).where(User.telegram_id == 456789123))).scalar_one()
+    execution = (
+        await test_db.execute(select(CampaignExecution).where(CampaignExecution.campaign_id == campaign.id))
+    ).scalar_one()
+    assert execution.user_id == user.id
+    assert execution.reward_granted is True
+
+    distribution = (
+        await test_db.execute(select(CouponDistribution).where(CouponDistribution.campaign_id == campaign.id))
+    ).scalar_one()
+    assert distribution.user_id == user.id
 
 
 @pytest.mark.asyncio

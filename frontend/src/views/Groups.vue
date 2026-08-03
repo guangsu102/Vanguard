@@ -9,7 +9,7 @@ import SearchBar from '@/components/SearchBar.vue'
 import FormDrawer from '@/components/FormDrawer.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import dayjs from 'dayjs'
-import type { Group, GroupMember } from '@/api/groups'
+import type { Group, GroupFormData, GroupMember } from '@/api/groups'
 
 const groupStore = useGroupStore()
 const accountStore = useAccountStore()
@@ -76,7 +76,12 @@ const searchFilters = [
     width: '120px',
     options: [
       { label: '全部', value: '' },
-      { label: '可用', value: 'active' },
+      { label: '正常', value: 'active' },
+      { label: '待入群', value: 'pending_join' },
+      { label: '等待审核', value: 'pending' },
+      { label: '入群失败', value: 'join_failed' },
+      { label: '冷却中', value: 'cooling_down' },
+      { label: '已拒绝', value: 'rejected' },
       { label: '停用', value: 'inactive' },
       { label: '已离开', value: 'left' },
       { label: '封禁', value: 'banned' },
@@ -125,7 +130,12 @@ const drawerFields = computed(() => [
     label: '状态',
     type: 'select' as const,
     options: [
-      { label: '可用', value: 'active' },
+      { label: '正常', value: 'active' },
+      { label: '待入群', value: 'pending_join' },
+      { label: '等待审核', value: 'pending' },
+      { label: '入群失败', value: 'join_failed' },
+      { label: '冷却中', value: 'cooling_down' },
+      { label: '已拒绝', value: 'rejected' },
       { label: '停用', value: 'inactive' },
       { label: '已离开', value: 'left' },
       { label: '封禁', value: 'banned' },
@@ -138,6 +148,7 @@ const drawerFields = computed(() => [
     options: [
       { label: '手动录入', value: 'manual' },
       { label: '关键词搜索', value: 'keyword_search' },
+      { label: '自动搜群', value: 'auto_keyword_search' },
       { label: '相关群发现', value: 'related_group' },
       { label: '批量导入', value: 'import' },
     ],
@@ -255,12 +266,13 @@ const openEditDrawer = (row: Group) => {
 }
 
 const handleSubmit = async () => {
+  const payload = { ...formData } as GroupFormData
   try {
     if (editingId.value) {
-      await groupStore.update(editingId.value, formData)
+      await groupStore.update(editingId.value, payload)
       ElMessage.success('群池条目已更新')
     } else {
-      await groupStore.create(formData)
+      await groupStore.create(payload)
       ElMessage.success('群池条目已添加')
     }
     drawerVisible.value = false
@@ -307,6 +319,7 @@ const sourceLabel = (source: string) => {
   const map: Record<string, string> = {
     manual: '手动',
     keyword_search: '关键词',
+    auto_keyword_search: '自动搜群',
     related_group: '相关群',
     import: '导入',
     keyword_auto_join: '关键词自动加群',

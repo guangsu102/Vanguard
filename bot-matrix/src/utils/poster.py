@@ -1,5 +1,7 @@
 """海报生成器 - 生成推广裂变海报"""
+import hashlib
 import os
+import re
 import qrcode
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +30,14 @@ class PosterGenerator:
         self.height = height
         self.qr_size = qr_size
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _safe_filename_token(value: str, max_prefix_length: int = 24) -> str:
+        """Build a filesystem-safe, stable token for user-provided values."""
+        safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-")
+        safe_prefix = safe_prefix[:max_prefix_length].strip("._-") or "link"
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+        return f"{safe_prefix}_{digest}"
 
     def generate_qr_code(self, data: str, size: int = None) -> Image.Image:
         """生成二维码"""
@@ -118,7 +128,7 @@ class PosterGenerator:
             self._draw_qr_hint(draw, qr_position)
 
             # 保存海报
-            filename = f"poster_{user_id}_{aff_link[:20]}.png"
+            filename = f"poster_{user_id}_{self._safe_filename_token(aff_link)}.png"
             filepath = self.output_dir / filename
             poster.save(filepath, "PNG", quality=95)
 

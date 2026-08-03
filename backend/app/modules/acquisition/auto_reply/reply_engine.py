@@ -14,10 +14,11 @@ import structlog
 from app.core.keyword.engine import KeywordEngine, CompiledKeyword
 from app.core.ai.intent_classifier import IntentClassifier, IntentType
 from app.core.ai.llm_client import LLMClient
-from app.core.runtime_settings import is_ai_reply_enabled
+from app.core.automation_settings import get_group_ai_interaction_settings
+from app.core.runtime_settings import DEFAULT_GROUP_AI_INTERACTION_SETTINGS
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
+from app.modules.acquisition.auto_reply.safety import sanitize_natural_group_reply
 from app.modules.acquisition.constants import ResponseMode, INTENT_RESPONSE_MAP
-from app.modules.acquisition.exceptions import TemplateNotFoundError
 
 logger = structlog.get_logger()
 
@@ -77,8 +78,25 @@ class ReplyEngine:
         self.logger = logger.bind(module="reply_engine")
         self._reply_lock = asyncio.Lock()
 
-    def _ai_enabled(self) -> bool:
-        return is_ai_reply_enabled()
+    async def _group_ai_settings(self) -> dict:
+        from app.core import database as db_module
+
+        try:
+            if db_module.async_session_factory is None:
+                await db_module.init_db(create_tables=False)
+            async with db_module.get_db_session() as db:
+                return await get_group_ai_interaction_settings(db)
+        except Exception as exc:
+            self.logger.warning("group_ai_interaction_setting_unavailable", error=str(exc))
+            return dict(DEFAULT_GROUP_AI_INTERACTION_SETTINGS)
+
+    async def _ai_enabled(self) -> bool:
+        settings = await self._group_ai_settings()
+        return bool(
+            settings.get("enabled")
+            and settings.get("aiEnabled")
+            and settings.get("allowKeywordTriggeredReply", True)
+        )
 
     async def should_reply(self, message_text: str) -> bool:
         """
@@ -121,18 +139,25 @@ class ReplyEngine:
             if not matched_keywords:
                 return ReplyResult(content="", mode=ResponseMode.IGNORE, should_send=False)
 
+            ai_settings = await self._group_ai_settings()
+            ai_enabled = bool(
+                ai_settings.get("enabled")
+                and ai_settings.get("aiEnabled")
+                and ai_settings.get("allowKeywordTriggeredReply", True)
+            )
+
             # 意图分类。AI开关关闭时只走本地规则，避免分类阶段消耗 token。
-            if self.intent_classifier and self._ai_enabled():
+            if self.intent_classifier and ai_enabled:
                 intent_result = await self.intent_classifier.classify(message_text)
                 context.intent = intent_result.intent
             else:
                 context.intent = self._rule_based_intent(message_text)
 
             # 选择回复模式
-            mode = self._select_reply_mode(context)
+            mode = self._select_reply_mode(context, ai_enabled=ai_enabled)
 
             # 生成回复内容
-            content = await self._generate_content(message_text, context, mode)
+            content = await self._generate_content(message_text, context, mode, ai_enabled=ai_enabled, ai_settings=ai_settings)
 
             return ReplyResult(
                 content=content,
@@ -140,7 +165,7 @@ class ReplyEngine:
                 should_send=mode != ResponseMode.IGNORE,
             )
 
-    def _select_reply_mode(self, context: ReplyContext) -> ResponseMode:
+    def _select_reply_mode(self, context: ReplyContext, *, ai_enabled: bool) -> ResponseMode:
         """
         Select reply mode based on context.
 
@@ -153,11 +178,11 @@ class ReplyEngine:
         if context.intent:
             intent_key = context.intent.value
             mode = INTENT_RESPONSE_MAP.get(intent_key, ResponseMode.TEMPLATE)
-            if mode == ResponseMode.AI and (self.llm_client is None or not self._ai_enabled()):
+            if mode == ResponseMode.AI and (self.llm_client is None or not ai_enabled):
                 return ResponseMode.TEMPLATE
             return mode
 
-        if self.llm_client is not None and self._ai_enabled():
+        if self.llm_client is not None and ai_enabled:
             return ResponseMode.AI
 
         return ResponseMode.TEMPLATE
@@ -167,6 +192,9 @@ class ReplyEngine:
         message_text: str,
         context: ReplyContext,
         mode: ResponseMode,
+        *,
+        ai_enabled: bool,
+        ai_settings: dict,
     ) -> str:
         """
         Generate reply content based on mode.
@@ -183,7 +211,10 @@ class ReplyEngine:
             return ""
 
         if mode == ResponseMode.AI:
-            return await self._generate_ai_reply(message_text, context)
+            return await self._generate_ai_reply(message_text, context, ai_enabled=ai_enabled, ai_settings=ai_settings)
+
+        if mode in {ResponseMode.PRIVATE, ResponseMode.GROUP} and ai_enabled and self.llm_client is not None:
+            return await self._generate_ai_reply(message_text, context, ai_enabled=ai_enabled, ai_settings=ai_settings)
 
         if mode == ResponseMode.TEMPLATE:
             return await self._generate_template_reply(context)
@@ -201,9 +232,12 @@ class ReplyEngine:
         self,
         message_text: str,
         context: ReplyContext,
+        *,
+        ai_enabled: bool,
+        ai_settings: dict,
     ) -> str:
         """Generate AI-powered reply."""
-        if not self._ai_enabled():
+        if not ai_enabled:
             self.logger.info("ai_reply_disabled_by_settings")
             return await self._generate_template_reply(context)
 
@@ -211,17 +245,21 @@ class ReplyEngine:
         llm_client = self.llm_client
         if llm_client is not None:
             try:
-                return await llm_client.generate(
+                generated = await llm_client.generate(
                     prompt=prompt,
-                    model="gpt-4o-mini",
-                    temperature=0.6,
-                    max_tokens=180,
-                    system_prompt="你是一个中文Telegram社群客服助手，回复要简洁、自然、友好，不要提及你是AI。",
+                    model=llm_client.model_for("fast"),
+                    temperature=float(ai_settings.get("temperature", DEFAULT_GROUP_AI_INTERACTION_SETTINGS["temperature"])),
+                    max_tokens=int(ai_settings.get("maxTokens", DEFAULT_GROUP_AI_INTERACTION_SETTINGS["maxTokens"])),
+                    system_prompt=str(ai_settings.get("systemPrompt") or DEFAULT_GROUP_AI_INTERACTION_SETTINGS["systemPrompt"]),
                 )
+                return sanitize_natural_group_reply(generated, ai_settings)
             except Exception as exc:
                 self.logger.warning("ai_reply_failed", error=str(exc))
 
-        return "感谢您的提问！有需要可以私信了解更多~"
+        return sanitize_natural_group_reply(
+            "\u8fd9\u4e2a\u95ee\u9898\u633a\u5b9e\u9645\u7684\uff0c\u53ef\u4ee5\u518d\u770b\u770b\u5927\u5bb6\u7684\u53cd\u9988\u3002",
+            ai_settings,
+        )
 
     async def _generate_template_reply(self, context: ReplyContext) -> str:
         """Generate template-based reply."""
@@ -280,12 +318,18 @@ class ReplyEngine:
         history = context.conversation_history or []
         history_text = "\n".join(f"{item.get('role')}: {item.get('content')}" for item in history[-6:])
         return (
-            f"你是一个中文客服助手。\n"
-            f"当前消息: {message_text}\n"
-            f"匹配关键词: {keywords}\n"
-            f"用户意图: {context.intent.value if context.intent else 'unknown'}\n"
-            f"最近对话:\n{history_text}\n"
-            f"请给出简洁自然的回复。"
+            "You are writing one short natural Chinese reply for a Telegram group chat.\n"
+            f"User message: {message_text}\n"
+            f"Matched keywords: {keywords}\n"
+            f"Intent: {context.intent.value if context.intent else 'unknown'}\n"
+            f"Recent context:\n{history_text}\n"
+            "Rules:\n"
+            "1. Reply in Chinese, one message only, usually 20-80 Chinese characters.\n"
+            "2. Sound like a normal group participant, practical and low-pressure.\n"
+            "3. Do not mention AI, bot, language model, automation, prompt, system, OpenAI, or GPT.\n"
+            "4. Do not claim to be a specific human, admin, official support, or employee.\n"
+            "5. Avoid markdown, numbered lists, role prefixes, and obvious sales copy.\n"
+            "Return only the message text."
         )
 
     def _rule_based_intent(self, text: str) -> IntentType:

@@ -3,6 +3,29 @@ import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig, AxiosResp
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
+export const getApiErrorMessage = (data: unknown): string => {
+  if (!data || typeof data !== 'object') return 'Request failed'
+
+  const payload = data as { message?: unknown; detail?: unknown }
+  if (typeof payload.message === 'string' && payload.message.trim()) {
+    return payload.message
+  }
+  if (typeof payload.detail === 'string' && payload.detail.trim()) {
+    return payload.detail
+  }
+  if (Array.isArray(payload.detail)) {
+    const messages = payload.detail
+      .map((item) => {
+        if (!item || typeof item !== 'object' || !('msg' in item)) return null
+        const message = (item as { msg?: unknown }).msg
+        return typeof message === 'string' && message.trim() ? message : null
+      })
+      .filter((item): item is string => item !== null)
+    if (messages.length > 0) return messages.join('; ')
+  }
+  return 'Request failed'
+}
+
 const apiClient: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
   timeout: 30000,
@@ -54,7 +77,7 @@ apiClient.interceptors.response.use(
           ElMessage.error('Server error')
           break
         default:
-          ElMessage.error((error.response.data as any)?.message || 'Request failed')
+          ElMessage.error(getApiErrorMessage(error.response.data))
       }
     } else if (error.request) {
       ElMessage.error('Network error, please try again')

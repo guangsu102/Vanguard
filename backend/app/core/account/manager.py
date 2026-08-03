@@ -19,6 +19,7 @@ from typing import Optional
 import structlog
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.account.exceptions import (
     AccountAlreadyExistsError,
@@ -26,8 +27,9 @@ from app.core.account.exceptions import (
     AccountSessionError,
     InvalidAPIConfigError,
 )
-from app.core.account.models import AccountStatus, AccountType, TelegramAccount, TelegramAPIConfig
+from app.core.account.models import AccountAssetTier, AccountStatus, AccountType, ProxyMode, TelegramAccount, TelegramAPIConfig
 from app.core.config import get_settings
+from app.core.network.fingerprint import FingerprintManager
 
 logger = structlog.get_logger()
 
@@ -152,7 +154,16 @@ class AccountManager:
         *,
         identifier: Optional[str] = None,
         display_name: Optional[str] = None,
+        profile_bio: Optional[str] = None,
+        asset_tier: str = AccountAssetTier.UNKNOWN.value,
+        registered_at: Optional[datetime] = None,
+        asset_note: Optional[str] = None,
+        managed_started_at: Optional[datetime] = None,
+        warmup_hold_until: Optional[datetime] = None,
+        warmup_note: Optional[str] = None,
         account_type: AccountType = AccountType.PROMOTER,
+        proxy_mode: ProxyMode = ProxyMode.DYNAMIC,
+        static_proxy_id: Optional[int] = None,
     ) -> TelegramAccount:
         """
         Create a new Telegram account.
@@ -188,15 +199,32 @@ class AccountManager:
             session_seed = resolved_identifier.replace("+", "").replace("@", "").replace(" ", "_")
             session_name = f"session_{session_seed}"
 
+        device_profile = FingerprintManager().generate_telegram_device_profile(resolved_identifier or session_name)
+
         account = TelegramAccount(
             phone=phone,
             account_type=account_type,
             identifier=resolved_identifier,
             display_name=display_name,
+            profile_bio=profile_bio,
+            asset_tier=asset_tier,
+            registered_at=registered_at,
+            asset_verified_at=datetime.utcnow() if asset_tier != AccountAssetTier.UNKNOWN.value else None,
+            asset_note=asset_note,
+            managed_started_at=managed_started_at or datetime.utcnow(),
+            warmup_stage_updated_at=datetime.utcnow(),
+            warmup_hold_until=warmup_hold_until,
+            warmup_note=warmup_note,
             api_config_name=api_config_name,
             country_code=country_code.upper()[:2],
             country_name=country_name,
             session_name=session_name,
+            proxy_mode=proxy_mode,
+            static_proxy_id=static_proxy_id,
+            fingerprint_id=device_profile["fingerprint_id"],
+            device_model=device_profile["device_model"],
+            system_version=device_profile["system_version"],
+            app_version=device_profile["app_version"],
             status=AccountStatus.OFFLINE,
         )
 
@@ -229,7 +257,9 @@ class AccountManager:
             TelegramAccount if found, None otherwise
         """
         result = await self.db.execute(
-            select(TelegramAccount).where(TelegramAccount.id == account_id)
+            select(TelegramAccount)
+            .options(selectinload(TelegramAccount.static_proxy))
+            .where(TelegramAccount.id == account_id)
         )
         return result.scalar_one_or_none()
 
@@ -285,7 +315,7 @@ class AccountManager:
         Returns:
             List of TelegramAccount instances
         """
-        query = select(TelegramAccount)
+        query = select(TelegramAccount).options(selectinload(TelegramAccount.static_proxy))
 
         if status:
             query = query.where(TelegramAccount.status == status)
@@ -364,9 +394,19 @@ class AccountManager:
     async def update_account(
         self,
         account_id: int,
+        display_name: Optional[str] = None,
+        profile_bio: Optional[str] = None,
+        asset_tier: Optional[str] = None,
+        registered_at: Optional[datetime] = None,
+        asset_note: Optional[str] = None,
+        managed_started_at: Optional[datetime] = None,
+        warmup_hold_until: Optional[datetime] = None,
+        warmup_note: Optional[str] = None,
         country_code: Optional[str] = None,
         fingerprint_id: Optional[str] = None,
         is_active: Optional[bool] = None,
+        proxy_mode: Optional[ProxyMode] = None,
+        static_proxy_id: Optional[int] = None,
     ) -> TelegramAccount:
         """
         Update account settings.
@@ -389,10 +429,34 @@ class AccountManager:
 
         if country_code is not None:
             account.country_code = country_code.upper()[:2]
+        if display_name is not None:
+            account.display_name = display_name
+        if profile_bio is not None:
+            account.profile_bio = profile_bio
+            account.profile_bio_synced_at = None
+        if asset_tier is not None:
+            if account.asset_tier != asset_tier:
+                account.asset_verified_at = datetime.utcnow()
+            account.asset_tier = asset_tier
+        if registered_at is not None:
+            account.registered_at = registered_at
+        if asset_note is not None:
+            account.asset_note = asset_note
+        if managed_started_at is not None:
+            account.managed_started_at = managed_started_at
+            account.warmup_stage_updated_at = datetime.utcnow()
+        if warmup_hold_until is not None:
+            account.warmup_hold_until = warmup_hold_until
+        if warmup_note is not None:
+            account.warmup_note = warmup_note
         if fingerprint_id is not None:
             account.fingerprint_id = fingerprint_id
         if is_active is not None:
             account.is_active = is_active
+        if proxy_mode is not None:
+            account.proxy_mode = proxy_mode
+        if static_proxy_id is not None:
+            account.static_proxy_id = static_proxy_id
 
         await self.db.commit()
         await self.db.refresh(account)
@@ -560,5 +624,5 @@ class AccountManager:
                 func.count(TelegramAccount.id).label("count"),
             ).group_by(TelegramAccount.country_code)
         )
-        
+
         return {row[0]: row[1] for row in result.all()}

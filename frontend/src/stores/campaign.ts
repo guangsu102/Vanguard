@@ -105,6 +105,10 @@ export const useCampaignStore = defineStore('campaign', () => {
     }
   }
 
+  const trigger = async (id: number) => {
+    return campaignsApi.trigger(id)
+  }
+
   const setPage = (newPage: number) => {
     page.value = newPage
   }
@@ -130,6 +134,7 @@ export const useCampaignStore = defineStore('campaign', () => {
     remove,
     getById,
     toggle,
+    trigger,
     fetchStats,
     setPage,
     setPageSize,

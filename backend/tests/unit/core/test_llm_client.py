@@ -77,6 +77,18 @@ class TestModels:
         assert "fast" in models
         assert "balanced" in models
         assert "quality" in models
+        assert models["fast"] == "gpt-5.6-luna"
+
+    def test_openai_model_tiers_use_runtime_settings(self, monkeypatch):
+        """Test configurable OpenAI model tiers."""
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "LLM_FAST_MODEL", "fast-test-model")
+        monkeypatch.setattr(settings, "LLM_MODEL", "balanced-test-model")
+        client = LLMClient(provider=LLMProvider.OPENAI)
+
+        assert client.model_for("fast") == "fast-test-model"
+        assert client.model_for("balanced") == "balanced-test-model"
 
     def test_anthropic_models_defined(self):
         """Test Anthropic models are defined."""

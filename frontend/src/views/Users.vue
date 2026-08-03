@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
-import { ElButton, ElIcon, ElMessage, ElMessageBox, ElTag, ElDrawer, ElTable, ElEmpty, ElTimeline, ElTimelineItem } from 'element-plus'
-import { View, UserDelete, Mute, Unlock, RemoveFilled, CircleCheckFilled, CircleCloseFilled } from '@element-plus/icons-vue'
+import { ref, onMounted } from 'vue'
+import { ElButton, ElIcon, ElMessage, ElDrawer, ElEmpty, ElTimeline, ElTimelineItem } from 'element-plus'
+import { View, Mute, Unlock, RemoveFilled, CircleCheckFilled } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
@@ -139,23 +139,8 @@ const handleRemoveBlacklist = async (row: any) => {
   }
 }
 
-const formatDate = (date: string) => {
+const formatDate = (date?: string) => {
   return date ? dayjs(date).format('YYYY-MM-DD HH:mm') : '-'
-}
-
-const getActivityIcon = (type: string) => {
-  switch (type) {
-    case 'register':
-      return 'User'
-    case 'message':
-      return 'ChatLineSquare'
-    case 'campaign':
-      return 'Gift'
-    case 'punishment':
-      return 'Warning'
-    default:
-      return 'Document'
-  }
 }
 
 onMounted(() => {

@@ -43,7 +43,7 @@ DEFAULT_LEVEL_CONFIGS = {
     },
     GroupLevel.B: {
         "min_score": 50.0,
-        "can_send_ads": False,
+        "can_send_ads": True,
         "can_mention_users": False,
         "can_share_links": True,
         "can_initiate_private": True,

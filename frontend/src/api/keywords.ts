@@ -6,10 +6,10 @@ export type KeywordStatus = 'active' | 'inactive' | 'pending' | 'approved' | 'ex
 export type MatchMode = 'exact' | 'contains' | 'fuzzy' | 'regex'
 
 export const GROUP_SEARCH_KEYWORD_TYPE_OPTIONS = [
-  { label: '核心行业词', value: 'demand' as KeywordType, tag: 'success' as const },
-  { label: '场景搜索词', value: 'inquiry' as KeywordType, tag: 'info' as const },
-  { label: '产品形态词', value: 'price' as KeywordType, tag: 'warning' as const },
-  { label: '平台/地区词', value: 'competitor' as KeywordType, tag: 'danger' as const },
+  { label: '行业人群词', value: 'demand' as KeywordType, tag: 'success' as const },
+  { label: '平台生态词', value: 'inquiry' as KeywordType, tag: 'info' as const },
+  { label: '场景痛点词', value: 'price' as KeywordType, tag: 'warning' as const },
+  { label: '地区市场词', value: 'competitor' as KeywordType, tag: 'danger' as const },
 ]
 
 export const DEFAULT_GROUP_SEARCH_KEYWORD_TYPES: KeywordType[] = GROUP_SEARCH_KEYWORD_TYPE_OPTIONS.map((item) => item.value)

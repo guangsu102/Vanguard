@@ -362,7 +362,7 @@ class SensitiveKeywordGenerator:
         try:
             response = await self.llm.generate(
                 prompt,
-                model="gpt-4o-mini",  # Use cheaper model for keyword generation
+                model=self.llm.model_for("fast"),
                 temperature=0.7,
                 max_tokens=500,
             )

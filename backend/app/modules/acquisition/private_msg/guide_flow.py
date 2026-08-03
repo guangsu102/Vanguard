@@ -13,6 +13,8 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.redis import RedisCache
+from app.core.automation_settings import get_private_reply_template_settings
+from app.core.runtime_settings import render_runtime_template
 from app.modules.acquisition.constants import DEFAULT_GUIDE_MESSAGES, GUIDE_STEP_TIMEOUTS
 from app.modules.acquisition.tracking.url_builder import URLBuilder
 
@@ -65,6 +67,12 @@ GUIDE_FLOW_CONFIG = [
         is_final=True,
     ),
 ]
+GUIDE_STEP_TEMPLATE_KEYS = {
+    GuideStep.WELCOME: "guideWelcome",
+    GuideStep.INTRODUCE: "guideIntroduce",
+    GuideStep.INVITE_REGISTER: "guideInviteRegister",
+    GuideStep.CONFIRM: "guideConfirm",
+}
 
 
 class GuideFlowManager:
@@ -177,21 +185,25 @@ class GuideFlowManager:
         Returns:
             Step message
         """
+        try:
+            step = GuideStep(step)
+        except (TypeError, ValueError):
+            pass
+
         config = self._get_step_config(step)
         if not config:
             return "感谢您的关注！"
 
-        message = config.message
+        template_key = GUIDE_STEP_TEMPLATE_KEYS.get(step)
+        templates = await get_private_reply_template_settings(self.db)
+        message = templates.get(template_key, config.message) if template_key else config.message
 
         # 替换变量
         if "{register_link}" in message and "register_link" not in kwargs:
             user_id = kwargs.get("user_id", 0)
             kwargs["register_link"] = await self.url_builder.build_invite_url(user_id, "guide_flow")
 
-        for key, value in kwargs.items():
-            message = message.replace(f"{{{{{key}}}}}", str(value))
-
-        return message
+        return render_runtime_template(message, kwargs)
 
     async def advance_step(self, user_id: int) -> Optional[str]:
         """
@@ -215,7 +227,7 @@ class GuideFlowManager:
 
         # 移动到下一步
         await self._save_flow_state(user_id, config.next_step)
-        return await self.get_step_message(config.next_step)
+        return await self.get_step_message(config.next_step, user_id=user_id)
 
     async def skip_to_step(
         self,
@@ -253,15 +265,14 @@ class GuideFlowManager:
             if any(kw in text_lower for kw in ["了解", "看看", "好的", "继续", "怎么"]):
                 return await self.advance_step(user_id), None
             else:
-                return "没问题！有其他问题随时问我~", None
+                return await self._render_reply_template("guideFallback", user_id), None
 
         elif current_step == GuideStep.INVITE_REGISTER:
             # 检查用户是否要注册
             if any(kw in text_lower for kw in ["注册", "好", "试试", "link", "链接"]):
-                link = await self.url_builder.build_invite_url(user_id, "guide_flow")
-                return f"好的，点击这个链接注册：{link}", None
+                return await self._render_reply_template("guideRegisterReminder", user_id), None
             elif any(kw in text_lower for kw in ["不需要", "不了", "谢谢"]):
-                return "好的，没问题！有需要随时找我~", None
+                return await self._render_reply_template("guideNoNeed", user_id), None
             else:
                 return await self.advance_step(user_id), None
 
@@ -269,17 +280,15 @@ class GuideFlowManager:
             # 检查注册确认
             if any(kw in text_lower for kw in ["注册", "好了", "成功", "ok", "完成"]):
                 await self._confirm_registration(user_id)
-                return "太好了！恭喜注册成功，快去体验吧~ 有问题随时找我！", None
+                return await self._render_reply_template("guideConfirmSuccess", user_id), None
             else:
-                link = await self.url_builder.build_invite_url(user_id, "guide_flow")
-                return f"还没注册？点击链接完成注册：{link}", None
+                return await self._render_reply_template("guideRegisterReminder", user_id), None
 
-        return "好的~", None
+        return await self._render_reply_template("guideFallback", user_id), None
 
     async def _handle_timeout(self, user_id: int) -> dict:
         """Handle step timeout."""
-        link = await self.url_builder.build_invite_url(user_id, "guide_flow")
-        message = f"看起来您可能有事离开了~ 有需要随时回来找我！\n\n点击链接注册体验：{link}"
+        message = await self._render_reply_template("guideTimeout", user_id)
 
         return {
             "reply": message,
@@ -287,6 +296,20 @@ class GuideFlowManager:
             "completed": False,
             "reason": "timeout",
         }
+
+    async def _render_reply_template(self, template_key: str, user_id: int, **kwargs) -> str:
+        """Render a guide-flow reply template."""
+        templates = await get_private_reply_template_settings(self.db)
+        template = templates.get(template_key, "")
+        if "{register_link}" in template and "register_link" not in kwargs:
+            kwargs["register_link"] = await self.url_builder.build_invite_url(user_id, "guide_flow")
+        variables = {
+            "user_id": user_id,
+            "user_name": kwargs.pop("user_name", "朋友"),
+            "message_text": kwargs.pop("message_text", ""),
+            **kwargs,
+        }
+        return render_runtime_template(template, variables)
 
     async def _confirm_registration(self, user_id: int) -> None:
         """Confirm user registration."""

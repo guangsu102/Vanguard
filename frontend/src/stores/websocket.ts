@@ -6,7 +6,7 @@
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import wsClient, { type WebSocketStatus, type WebSocketMessage } from '@/utils/websocket'
+import wsClient, { type WebSocketStatus } from '@/utils/websocket'
 
 export interface RealtimeUpdate {
   type: string
@@ -74,9 +74,14 @@ export const useWebSocketStore = defineStore('websocket', () => {
   }
 
   async function connect(baseUrl: string): Promise<void> {
+    const token = localStorage.getItem('token')
+    if (!token) {
+      throw new Error('Missing authentication token')
+    }
+
     clientId.value = Date.now()
     setupHandlers()
-    await wsClient.connect(baseUrl, clientId.value)
+    await wsClient.connect(baseUrl, clientId.value, token)
     status.value = 'connected'
   }
 

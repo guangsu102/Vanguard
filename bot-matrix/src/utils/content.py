@@ -13,7 +13,7 @@ class ContentTemplates:
             "messages": [
                 "{name}，今日签到获得 <b>{bonus}MB</b> 流量！",
                 "运气不错，{name}！签到获得 <b>{bonus}MB</b>，已存入您的账户~",
-                "🎉 {name} 签到成功！获得 <b>{bonus}MB</b} 流量奖励！",
+                "🎉 {name} 签到成功！获得 <b>{bonus}MB</b> 流量奖励！",
             ],
             "suffix": "坚持签到，流量多多！"
         },
@@ -21,7 +21,7 @@ class ContentTemplates:
             "title": "签到成功",
             "messages": [
                 "Hey {name}，又来签到啦？不错不错！今日获得 <b>{bonus}MB</b>~",
-                "{name}，签到是一种习惯！今日收益 <b>{bonus}MB</b}，已到账！",
+                "{name}，签到是一种习惯！今日收益 <b>{bonus}MB</b>，已到账！",
             ],
             "suffix": "明天再来，更有好礼相送！"
         }

@@ -7,7 +7,7 @@ XBoard Telegram Bot Matrix - Main Application Module
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -20,7 +20,7 @@ from app.api import (
     campaigns,
     rules,
     stats,
-    websocket,
+    websocket as websocket_router,
     moderation,
     verification,
     punishments,
@@ -35,11 +35,20 @@ from app.api import (
     managed_groups,
     moderation_sensitive_keywords,
     workers,
+    qq,
+    sub2api_alerts,
 )
 from app.api.settings import router as settings_router
+from app.api.websocket import start_redis_bridge, stop_redis_bridge
 from app.core.config import settings
+from app.core.security import get_current_user
 from app.core.database import init_db, close_db
 from app.core.redis import init_redis, close_redis
+from app.core.account.proxy_policy_events import (
+    start_account_proxy_policy_listener,
+    stop_account_proxy_policy_listener,
+)
+from app.integrations.sub2api import close_all_sub2api_clients
 from app.integrations.xboard import close_all_xboard_clients
 
 
@@ -49,6 +58,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Startup
     await init_db(create_tables=not settings.is_production)
     await init_redis()
+    await start_account_proxy_policy_listener()
+    await start_redis_bridge()
 
     # Initialize Telegram client pools
     from app.core.account import AccountPool
@@ -58,7 +69,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     
     # Shutdown
     await app.state.account_pool.close_all()
+    await close_all_sub2api_clients()
     await close_all_xboard_clients()
+    await stop_redis_bridge()
+    await stop_account_proxy_policy_listener()
     await close_redis()
     await close_db()
 
@@ -106,29 +120,31 @@ async def health_check() -> dict:
 
 # Include API routers
 app.include_router(auth, prefix="/api", tags=["Authentication"])
-app.include_router(accounts, prefix="/api/accounts", tags=["Accounts"])
-app.include_router(proxies, prefix="/api/proxies", tags=["Proxies"])
-app.include_router(groups, prefix="/api/groups", tags=["Groups"])
-app.include_router(keywords, prefix="/api/keywords", tags=["Keywords"])
-app.include_router(users, prefix="/api/users", tags=["Users"])
-app.include_router(campaigns, prefix="/api/campaigns", tags=["Campaigns"])
-app.include_router(rules, prefix="/api/rules", tags=["Rules"])
-app.include_router(moderation, prefix="/api/moderation", tags=["审核管理"])
-app.include_router(stats, prefix="/api/stats", tags=["Stats"])
-app.include_router(settings_router, prefix="/api/settings", tags=["Settings"])
-app.include_router(websocket, prefix="/api/ws", tags=["WebSocket"])
-app.include_router(verification, prefix="/api/verification", tags=["Verification"])
-app.include_router(punishments, prefix="/api/punishments", tags=["Punishments"])
-app.include_router(acquisition, prefix="/api/acquisition", tags=["Acquisition"])
-app.include_router(broadcasts, prefix="/api/broadcasts", tags=["Broadcasts"])
+app.include_router(accounts, prefix="/api/accounts", tags=["Accounts"], dependencies=[Depends(get_current_user)])
+app.include_router(proxies, prefix="/api/proxies", tags=["Proxies"], dependencies=[Depends(get_current_user)])
+app.include_router(groups, prefix="/api/groups", tags=["Groups"], dependencies=[Depends(get_current_user)])
+app.include_router(keywords, prefix="/api/keywords", tags=["Keywords"], dependencies=[Depends(get_current_user)])
+app.include_router(users, prefix="/api/users", tags=["Users"], dependencies=[Depends(get_current_user)])
+app.include_router(campaigns, prefix="/api/campaigns", tags=["Campaigns"], dependencies=[Depends(get_current_user)])
+app.include_router(rules, prefix="/api/rules", tags=["Rules"], dependencies=[Depends(get_current_user)])
+app.include_router(moderation, prefix="/api/moderation", tags=["审核管理"], dependencies=[Depends(get_current_user)])
+app.include_router(stats, prefix="/api/stats", tags=["Stats"], dependencies=[Depends(get_current_user)])
+app.include_router(settings_router, prefix="/api/settings", tags=["Settings"], dependencies=[Depends(get_current_user)])
+app.include_router(websocket_router, prefix="/api/ws", tags=["WebSocket"])
+app.include_router(verification, prefix="/api/verification", tags=["Verification"], dependencies=[Depends(get_current_user)])
+app.include_router(punishments, prefix="/api/punishments", tags=["Punishments"], dependencies=[Depends(get_current_user)])
+app.include_router(acquisition, prefix="/api/acquisition", tags=["Acquisition"], dependencies=[Depends(get_current_user)])
+app.include_router(broadcasts, prefix="/api/broadcasts", tags=["Broadcasts"], dependencies=[Depends(get_current_user)])
 app.include_router(xboard, prefix="/api/v1", tags=["XBoard"])
-app.include_router(automation, prefix="/api/automation", tags=["Automation"])
-app.include_router(group_search_keywords, prefix="/api/group-search-keywords", tags=["Group Search Keywords"])
-app.include_router(guardian_bots, prefix="/api/guardian-bots", tags=["Guardian Bots"])
-app.include_router(managed_groups, prefix="/api/managed-groups", tags=["Managed Groups"])
-app.include_router(group_governance, prefix="/api/group-governance", tags=["Group Governance"])
-app.include_router(moderation_sensitive_keywords, prefix="/api/moderation-sensitive-keywords", tags=["Moderation Sensitive Keywords"])
-app.include_router(workers, prefix="/api/workers", tags=["Telegram Workers"])
+app.include_router(automation, prefix="/api/automation", tags=["Automation"], dependencies=[Depends(get_current_user)])
+app.include_router(group_search_keywords, prefix="/api/group-search-keywords", tags=["Group Search Keywords"], dependencies=[Depends(get_current_user)])
+app.include_router(guardian_bots, prefix="/api/guardian-bots", tags=["Guardian Bots"], dependencies=[Depends(get_current_user)])
+app.include_router(managed_groups, prefix="/api/managed-groups", tags=["Managed Groups"], dependencies=[Depends(get_current_user)])
+app.include_router(group_governance, prefix="/api/group-governance", tags=["Group Governance"], dependencies=[Depends(get_current_user)])
+app.include_router(moderation_sensitive_keywords, prefix="/api/moderation-sensitive-keywords", tags=["Moderation Sensitive Keywords"], dependencies=[Depends(get_current_user)])
+app.include_router(workers, prefix="/api/workers", tags=["Execution Workers"])
+app.include_router(qq, prefix="/api/qq", tags=["NapCat OneBot"], dependencies=[Depends(get_current_user)])
+app.include_router(sub2api_alerts, prefix="/api/integrations/sub2api", tags=["Sub2API Alerts"])
 
 
 if __name__ == "__main__":

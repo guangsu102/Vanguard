@@ -400,9 +400,10 @@ class Tracker:
         if user is not None:
             return user.id
 
-        existing = await self.db.get(User, telegram_user_id)
-        if existing is not None:
-            return existing.id
+        if -(2**31) <= telegram_user_id <= 2**31 - 1:
+            existing = await self.db.get(User, telegram_user_id)
+            if existing is not None:
+                return existing.id
 
         user = User(telegram_id=telegram_user_id, state=UserState.NEW)
         self.db.add(user)

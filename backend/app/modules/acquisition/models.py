@@ -13,7 +13,6 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
-    Enum as SQLEnum,
     ForeignKey,
     Index,
     Integer,
@@ -21,10 +20,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import (
+    Enum as SQLEnum,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
-
 
 # =============================================================================
 # Enums
@@ -58,6 +59,7 @@ class GuideState(str, Enum):
 class MessageType(str, Enum):
     """Message type for auto发言."""
     INTERACTION = "interaction"   # 互动型
+    AI_WARMUP = "ai_warmup"       # AI主动暖场
     SHARE = "share"              # 分享型
     GUIDE = "guide"              # 引导型
     QA = "qa"                    # 问答型
@@ -83,6 +85,38 @@ class DeliveryStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+class AdSurvivalStatus(str, Enum):
+    """Post-delivery message survival check status."""
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    SURVIVED = "survived"
+    DELETED = "deleted"
+    CHECK_FAILED = "check_failed"
+
+
+class GroupAdTier(str, Enum):
+    """Per-group soft-ad capacity tier."""
+    BLOCKED = "blocked"
+    OBSERVING = "observing"
+    TRIAL = "trial"
+    VALIDATED = "validated"
+    STABLE = "stable"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    PREMIUM = "premium"
+
+
+class GroupAdPolicyMode(str, Enum):
+    """Evidence-backed group advertising permission."""
+    FORBIDDEN = "forbidden"
+    UNKNOWN = "unknown"
+    APPROVAL_REQUIRED = "approval_required"
+    SOFT_AD_TRIAL = "soft_ad_trial"
+    SOFT_AD_ALLOWED = "soft_ad_allowed"
+    HIGH_VOLUME_AD_ALLOWED = "high_volume_ad_allowed"
 
 
 class SearchKeywordStatus(str, Enum):
@@ -129,6 +163,13 @@ class GroupSearchKeyword(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     text: Mapped[str] = mapped_column(String(255), nullable=False, comment="搜群关键词")
+    normalized_text: Mapped[str] = mapped_column(
+        String(255),
+        default="",
+        server_default="",
+        nullable=False,
+        comment="规范化搜群关键词，用于快速判重",
+    )
     keyword_type: Mapped[str] = mapped_column(String(50), nullable=False, comment="关键词类型")
     status: Mapped[SearchKeywordStatus] = mapped_column(
         SQLEnum(SearchKeywordStatus),
@@ -144,7 +185,9 @@ class GroupSearchKeyword(Base):
     )
     match_mode: Mapped[str] = mapped_column(String(20), default="fuzzy", nullable=False, comment="匹配模式")
     trigger_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="命中次数")
-    requires_review: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="是否需要审核")
+    use_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="搜群使用次数")
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="首次用于搜群时间")
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否需要审核")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="是否启用")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -158,6 +201,10 @@ class GroupSearchKeyword(Base):
         UniqueConstraint("text", "keyword_type", name="uq_group_search_keyword_text_type"),
         Index("idx_group_search_keyword_status", "status"),
         Index("idx_group_search_keyword_type", "keyword_type"),
+        Index("idx_group_search_keyword_used", "used_at"),
+        Index("idx_group_search_keyword_normalized", "keyword_type", "normalized_text"),
+        Index("idx_group_search_keyword_list", "updated_at", "id"),
+        Index("idx_group_search_keyword_searchable", "keyword_type", "status", "enabled", "used_at"),
     )
 
 
@@ -313,6 +360,7 @@ class KeywordTrigger(Base):
 
     # Priority & Status
     priority: Mapped[int] = mapped_column(Integer, default=0, comment="优先级")
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否需要人工审核")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, comment="是否启用")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
@@ -322,6 +370,7 @@ class KeywordTrigger(Base):
     __table_args__ = (
         Index("idx_trigger_keyword", "keyword_id"),
         Index("idx_trigger_enabled", "enabled"),
+        Index("idx_trigger_requires_review", "requires_review"),
     )
 
 
@@ -673,13 +722,18 @@ class AdCampaign(Base):
         nullable=True,
         comment="目标群等级JSON数组，如[A,B]",
     )
+    target_group_ids: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="指定目标群数据库ID JSON数组；为空时按群等级投放",
+    )
     start_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="开始时间")
     end_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="结束时间")
     min_wait_after_join_minutes: Mapped[int] = mapped_column(Integer, default=60, nullable=False, comment="入群后等待分钟")
     interval_minutes: Mapped[int] = mapped_column(Integer, default=1440, nullable=False, comment="间隔发送分钟")
     scheduled_times: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="每日定时点JSON数组 HH:MM")
     max_sends_per_group_per_day: Mapped[int] = mapped_column(Integer, default=1, nullable=False, comment="单群每日上限")
-    max_sends_per_account_per_day: Mapped[int] = mapped_column(Integer, default=20, nullable=False, comment="单账号每日上限")
+    max_sends_per_account_per_day: Mapped[int] = mapped_column(Integer, default=3, nullable=False, comment="单账号每日上限")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -704,6 +758,25 @@ class AdCampaign(Base):
             return [str(level) for level in levels if str(level)]
         except (json.JSONDecodeError, TypeError):
             return ["A"]
+
+    def get_target_group_ids(self) -> list[int]:
+        """Return explicitly targeted group database IDs."""
+        if not self.target_group_ids:
+            return []
+        try:
+            values = json.loads(self.target_group_ids)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+        result: list[int] = []
+        for value in values if isinstance(values, list) else []:
+            try:
+                group_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if group_id > 0 and group_id not in result:
+                result.append(group_id)
+        return result
 
     def get_scheduled_times(self) -> list[str]:
         """Return configured daily send times."""
@@ -759,6 +832,88 @@ class AccountAdBinding(Base):
     )
 
 
+class GroupAdProfile(Base):
+    """Per-group soft advertisement capacity and survival profile."""
+
+    __tablename__ = "group_ad_profile"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="群组表ID",
+    )
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False, comment="Telegram群组ID")
+    ad_policy_mode: Mapped[str] = mapped_column(
+        String(40),
+        default=GroupAdPolicyMode.UNKNOWN.value,
+        nullable=False,
+        comment="广告许可: forbidden/unknown/approval_required/soft_ad_trial/soft_ad_allowed/high_volume_ad_allowed",
+    )
+    ad_policy_confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="广告许可置信度0-100")
+    ad_policy_source: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, comment="广告许可证据来源")
+    ad_policy_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告许可确认时间")
+    ad_policy_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告许可失效时间")
+    ad_tier: Mapped[str] = mapped_column(
+        String(30),
+        default=GroupAdTier.OBSERVING.value,
+        nullable=False,
+        comment="软广承载等级: blocked/observing/trial/validated/stable/high/premium",
+    )
+    daily_capacity: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="群每日软广承载上限")
+    score: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="软广承载评分")
+    survival_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="广告存活次数")
+    deleted_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="广告删除次数")
+    consecutive_survivals: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="连续存活次数")
+    consecutive_deletions: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="连续删除次数")
+    tier_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告档位最近变更时间")
+    paused_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="群广告暂停截止时间")
+    last_probe_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近探测时间")
+    last_survived_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近广告存活时间")
+    last_deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近广告删除时间")
+    blocked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="软广阻断时间")
+    blocked_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, comment="软广阻断原因")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    group = relationship("Group", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("group_id", name="uq_group_ad_profile_group"),
+        Index("idx_group_ad_profile_tg_group", "telegram_group_id"),
+        Index("idx_group_ad_profile_tier", "ad_tier"),
+        Index("idx_group_ad_profile_blocked", "blocked_at"),
+    )
+
+
+class GroupAdPolicyEvent(Base):
+    """Immutable audit trail for automated and manual group ad-policy changes."""
+
+    __tablename__ = "group_ad_policy_event"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(ForeignKey("group.id", ondelete="CASCADE"), nullable=False)
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    previous_mode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    new_mode: Mapped[str] = mapped_column(String(40), nullable=False)
+    confidence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    evidence: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    changed_by_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("idx_group_ad_policy_event_group", "group_id", "created_at"),
+        Index("idx_group_ad_policy_event_mode", "new_mode", "created_at"),
+    )
+
+
 class AdDeliveryLog(Base):
     """Record advertisement delivery attempts."""
 
@@ -793,6 +948,26 @@ class AdDeliveryLog(Base):
         comment="发送状态",
     )
     telegram_message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, comment="Telegram消息ID")
+    survival_status: Mapped[str] = mapped_column(
+        String(30),
+        default=AdSurvivalStatus.NOT_REQUIRED.value,
+        nullable=False,
+        comment="广告2分钟存活检测状态",
+    )
+    survival_stage: Mapped[str] = mapped_column(
+        String(30),
+        default="two_minute",
+        nullable=False,
+        comment="下一存活检测阶段: two_minute/one_hour/twenty_four_hour/complete",
+    )
+    survival_check_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告存活检测时间")
+    survival_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告存活实际检测时间")
+    survived_two_minute_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告2分钟存活时间")
+    survived_one_hour_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告1小时存活时间")
+    survived_twenty_four_hour_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="广告24小时存活时间")
+    survival_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="广告存活检测错误")
+    survival_retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="存活检测重试次数")
+    reservation_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, comment="广告发送预留幂等标识")
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="错误详情")
     sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="发送时间")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
@@ -807,4 +982,6 @@ class AdDeliveryLog(Base):
         Index("idx_ad_delivery_group_sent", "telegram_group_id", "sent_at"),
         Index("idx_ad_delivery_campaign", "ad_campaign_id"),
         Index("idx_ad_delivery_status", "status"),
+        Index("idx_ad_delivery_survival_due", "survival_status", "survival_check_due_at"),
+        Index("idx_ad_delivery_reservation", "reservation_token", unique=True),
     )

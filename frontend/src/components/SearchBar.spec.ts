@@ -15,7 +15,10 @@ describe('SearchBar', () => {
         stubs: {
           'el-card': { template: '<div><slot /></div>' },
           'el-form': { template: '<form><slot /></form>' },
-          'el-form-item': { template: '<div><slot /></div>' },
+          'el-form-item': {
+            props: ['label'],
+            template: '<div><span>{{ label }}</span><slot /></div>',
+          },
           'el-input': { template: '<input />' },
           'el-select': { template: '<select><slot /></select>' },
           'el-option': { template: '<option />' },

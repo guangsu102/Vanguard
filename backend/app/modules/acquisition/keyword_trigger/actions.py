@@ -4,7 +4,6 @@ Trigger Actions Module
 Action executors for trigger responses.
 """
 
-import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -12,6 +11,10 @@ from typing import Optional
 import structlog
 
 from app.core.account.pool import AccountPool
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.telegram_execution import TelegramExecutionService
+from app.core.automation_settings import get_group_ai_interaction_settings, is_private_messaging_enabled
+from app.modules.acquisition.rate_limit import AcquisitionRateLimitService
 
 logger = structlog.get_logger()
 
@@ -45,7 +48,7 @@ class ActionExecutor:
     like sending messages, reactions, etc.
     """
 
-    def __init__(self, account_pool: AccountPool):
+    def __init__(self, account_pool: AccountPool, risk_guard: Optional[AccountRiskGuard] = None):
         """
         Initialize ActionExecutor.
 
@@ -53,7 +56,76 @@ class ActionExecutor:
             account_pool: Account pool for operations
         """
         self.account_pool = account_pool
+        self.risk_guard = risk_guard
+        self.telegram_execution = TelegramExecutionService(risk_guard)
         self.logger = logger.bind(module="action_executor")
+        self.group_ai_rate_limit = AcquisitionRateLimitService(key_prefix="acquisition:group_ai_reply:")
+
+    async def _private_messaging_enabled(self) -> bool:
+        db = getattr(self.risk_guard, "db", None)
+        if db is not None:
+            return await is_private_messaging_enabled(db, initiated_by_user=False)
+
+        from app.core import database as db_module
+
+        if db_module.async_session_factory is None:
+            await db_module.init_db(create_tables=False)
+        async with db_module.get_db_session() as session:
+            return await is_private_messaging_enabled(session, initiated_by_user=False)
+
+    async def _group_ai_settings(self) -> dict:
+        db = getattr(self.risk_guard, "db", None)
+        if db is not None:
+            return await get_group_ai_interaction_settings(db)
+
+        from app.core import database as db_module
+
+        if db_module.async_session_factory is None:
+            await db_module.init_db(create_tables=False)
+        async with db_module.get_db_session() as session:
+            return await get_group_ai_interaction_settings(session)
+
+    async def _group_ai_reply_allowed(self, account_id: int, group_id: int) -> bool:
+        settings = await self._group_ai_settings()
+        if not settings.get("enabled"):
+            return True
+
+        group_limit = int(settings.get("maxRepliesPerGroupPerDay", 0) or 0)
+        account_limit = int(settings.get("maxRepliesPerAccountPerDay", 0) or 0)
+        cooldown_seconds = int(settings.get("cooldownSeconds", 0) or 0)
+        if group_limit <= 0 or account_limit <= 0:
+            self.logger.info("group_ai_reply_blocked_by_zero_limit", account_id=account_id, group_id=group_id)
+            return False
+
+        account_key = self.group_ai_rate_limit.build_key("daily", "account", account_id)
+        group_key = self.group_ai_rate_limit.build_key("daily", "group", group_id)
+        cooldown_key = self.group_ai_rate_limit.build_key("cooldown", "account", account_id, "group", group_id)
+
+        if not await self.group_ai_rate_limit.allow_daily(account_key, rate=account_limit):
+            self.logger.info(
+                "group_ai_account_daily_limit_reached",
+                account_id=account_id,
+                group_id=group_id,
+                limit=account_limit,
+            )
+            return False
+
+        if not await self.group_ai_rate_limit.check_daily_and_cooldown(
+            daily_key=group_key,
+            cooldown_key=cooldown_key,
+            daily_rate=group_limit,
+            cooldown_seconds=cooldown_seconds,
+        ):
+            self.logger.info(
+                "group_ai_group_limit_or_cooldown_reached",
+                account_id=account_id,
+                group_id=group_id,
+                group_limit=group_limit,
+                cooldown_seconds=cooldown_seconds,
+            )
+            return False
+
+        return True
 
     async def send_group_reply(
         self,
@@ -65,16 +137,18 @@ class ActionExecutor:
         """Send a reply in a group via Telethon client."""
         self.logger.info("send_group_reply", group_id=group_id, message_length=len(message))
 
-        client = getattr(account, "client", None)
-        if client is None and hasattr(account, "get_client"):
-            client = account.get_client()
-        if client is None:
-            self.logger.warning("send_group_reply_no_client", group_id=group_id)
-            return None
-
         try:
-            result = await client.send_message(group_id, message, reply_to=reply_to)
-            return getattr(result, "id", getattr(result, "message_id", None))
+            account_id = getattr(account, "id", None) or getattr(account, "account_id", 0)
+            if account_id and not await self._group_ai_reply_allowed(account_id, group_id):
+                return None
+
+            return await self.telegram_execution.send_group_message(
+                account,
+                group_id,
+                message,
+                reply_to=reply_to,
+                source="keyword_trigger",
+            )
         except Exception as e:
             self.logger.error("send_group_reply_failed", group_id=group_id, error=str(e))
             raise
@@ -86,18 +160,24 @@ class ActionExecutor:
         message: str,
     ) -> bool:
         """Send a private message to a user via Telethon client."""
-        self.logger.info("send_private_message", user_id=user_id, message_length=len(message))
-
-        client = getattr(account, "client", None)
-        if client is None and hasattr(account, "get_client"):
-            client = account.get_client()
-        if client is None:
-            self.logger.warning("send_private_message_no_client", user_id=user_id)
+        if not await self._private_messaging_enabled():
+            self.logger.info(
+                "private_messaging_paused",
+                user_id=user_id,
+                initiated_by_user=False,
+                message_length=len(message),
+            )
             return False
 
+        self.logger.info("send_private_message", user_id=user_id, message_length=len(message))
+
         try:
-            await client.send_message(user_id, message)
-            return True
+            return await self.telegram_execution.send_private_message(
+                account,
+                user_id,
+                message,
+                source="keyword_trigger",
+            )
         except Exception as e:
             self.logger.error("send_private_message_failed", user_id=user_id, error=str(e))
             return False
@@ -112,22 +192,14 @@ class ActionExecutor:
         """Send a reaction to a message via Telethon client."""
         self.logger.info("send_reaction", group_id=group_id, message_id=message_id, emoji=emoji)
 
-        client = getattr(account, "client", None)
-        if client is None and hasattr(account, "get_client"):
-            client = account.get_client()
-        if client is None:
-            self.logger.warning("send_reaction_no_client")
-            return False
-
         try:
-            if hasattr(client, "send_reaction"):
-                await client.send_reaction(group_id, message_id, emoji)
-                return True
-            if hasattr(client, "send_reaction_request"):
-                await client.send_reaction_request(group_id, message_id, emoji)
-                return True
-            self.logger.warning("send_reaction_not_supported")
-            return False
+            return await self.telegram_execution.send_reaction(
+                account,
+                group_id,
+                message_id,
+                emoji,
+                source="keyword_trigger",
+            )
         except Exception as e:
             self.logger.error("send_reaction_failed", error=str(e))
             return False
@@ -141,19 +213,13 @@ class ActionExecutor:
         """Pin a message in a group via Telethon client."""
         self.logger.info("pin_message", group_id=group_id, message_id=message_id)
 
-        client = getattr(account, "client", None)
-        if client is None and hasattr(account, "get_client"):
-            client = account.get_client()
-        if client is None:
-            self.logger.warning("pin_message_no_client")
-            return False
-
         try:
-            if hasattr(client, "pin_message"):
-                await client.pin_message(group_id, message_id)
-                return True
-            self.logger.warning("pin_message_not_supported")
-            return False
+            return await self.telegram_execution.pin_message(
+                account,
+                group_id,
+                message_id,
+                source="keyword_trigger",
+            )
         except Exception as e:
             self.logger.error("pin_message_failed", error=str(e))
             return False
@@ -173,16 +239,14 @@ class ActionExecutor:
             message_id=message_id,
         )
 
-        client = getattr(account, "client", None)
-        if client is None and hasattr(account, "get_client"):
-            client = account.get_client()
-        if client is None:
-            self.logger.warning("forward_message_no_client")
-            return None
-
         try:
-            result = await client.forward_messages(to_chat_id, message_id, from_chat_id)
-            return getattr(result, "id", getattr(result, "message_id", None))
+            return await self.telegram_execution.forward_message(
+                account,
+                from_chat_id,
+                to_chat_id,
+                message_id,
+                source="keyword_trigger",
+            )
         except Exception as e:
             self.logger.error("forward_message_failed", error=str(e))
             return None

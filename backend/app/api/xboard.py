@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -426,7 +427,33 @@ async def ingest_event(
     _apply_acquisition_event(acquisition_tracking, payload)
     _apply_campaign_event(campaign_tracking, payload)
 
-    return _response({"accepted": True, "idempotent": False, "xboard_event_id": payload.event_id}, trace_id=payload.trace_id)
+    campaign_results = []
+    if payload.event_type == "user.registered" and user is not None:
+        from app.core.campaign.runner import CampaignRunner
+
+        runner = CampaignRunner(db)
+        executions = await runner.trigger_for_registration(
+            user,
+            occurred_at=_utc_naive(payload.occurred_at),
+            metadata={
+                "source": _source_from_payload(payload.payload) or "xboard:user.registered",
+                "tracking_code": payload.tracking_code,
+                "keyword": payload.payload.get("keyword"),
+                "bot_id": payload.payload.get("bot_id"),
+                "external_user_id": payload.external_user_id,
+            },
+        )
+        campaign_results = [asdict(item) for item in executions]
+
+    return _response(
+        {
+            "accepted": True,
+            "idempotent": False,
+            "xboard_event_id": payload.event_id,
+            "campaign_results": campaign_results,
+        },
+        trace_id=payload.trace_id,
+    )
 
 
 @router.get("/users/status")

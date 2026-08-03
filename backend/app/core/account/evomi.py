@@ -15,10 +15,23 @@ from urllib.parse import unquote, urlparse
 import httpx
 import structlog
 
+try:
+    import phonenumbers
+except ImportError:  # pragma: no cover - production installs this dependency.
+    phonenumbers = None
+
 from app.core.account.exceptions import ProxyProviderError
 from app.core.config import get_settings
 
 logger = structlog.get_logger()
+
+
+EVOMI_PASSWORD_PARAM_MARKERS: tuple[str, ...] = (
+    "_country-",
+    "_session-",
+    "_hardsession-",
+    "_lifetime-",
+)
 
 
 @dataclass
@@ -112,10 +125,23 @@ class EvomiClient:
     def __init__(self, api_key: str | None = None):
         settings = get_settings()
         self.api_key = api_key or getattr(settings, "EVOMI_API_KEY", None)
-        if not self.api_key:
+        self.proxy_host = getattr(settings, "EVOMI_PROXY_HOST", None)
+        self.proxy_port = getattr(settings, "EVOMI_PROXY_PORT", None)
+        self.proxy_username = getattr(settings, "EVOMI_PROXY_USERNAME", None)
+        self.proxy_password = getattr(settings, "EVOMI_PROXY_PASSWORD", None)
+        self._has_static_proxy = all(
+            [
+                self.proxy_host,
+                self.proxy_port,
+                self.proxy_username,
+                self.proxy_password,
+            ]
+        )
+        if not self.api_key and not self._has_static_proxy:
             raise ProxyProviderError(
                 "Evomi",
-                "API key not configured. Set EVOMI_API_KEY in environment.",
+                "Proxy credentials not configured. Set EVOMI_API_KEY or "
+                "EVOMI_PROXY_HOST/EVOMI_PROXY_PORT/EVOMI_PROXY_USERNAME/EVOMI_PROXY_PASSWORD.",
             )
 
         self.product_code = getattr(settings, "EVOMI_PRODUCT_CODE", "rp")
@@ -124,6 +150,14 @@ class EvomiClient:
         self.session_lifetime = getattr(settings, "EVOMI_SESSION_LIFETIME_MINUTES", 30)
         self.session_namespace = getattr(settings, "EVOMI_SESSION_NAMESPACE", "vanguard")
         self.adblock = getattr(settings, "EVOMI_ADBLOCK", False)
+        self.country_verify_enabled = bool(getattr(settings, "EVOMI_COUNTRY_VERIFY_ENABLED", False))
+        self.country_verify_attempts = max(1, int(getattr(settings, "EVOMI_COUNTRY_VERIFY_ATTEMPTS", 5)))
+        self.country_verify_timeout = max(1, int(getattr(settings, "EVOMI_COUNTRY_VERIFY_TIMEOUT_SECONDS", 8)))
+        self.country_verify_url = getattr(
+            settings,
+            "EVOMI_COUNTRY_VERIFY_URL",
+            "http://ip-api.com/json/?fields=status,countryCode,query",
+        )
         self._client: httpx.AsyncClient | None = None
         self._proxy_data: dict | None = None
         self.logger = logger.bind(module="evomi_client")
@@ -217,11 +251,115 @@ class EvomiClient:
 
         return proxies
 
-    def sticky_session_id(self, account_key: str) -> str:
+    def sticky_session_id(self, account_key: str, attempt: int = 0, country_code: str | None = None) -> str:
         """Build a deterministic Evomi session id for one Vanguard account."""
         normalized = (account_key or "default").strip().lower()
-        seed = f"{self.session_namespace}:{normalized}".encode()
+        retry_key = "" if attempt <= 0 else f":{(country_code or '').upper()}:{attempt}"
+        seed = f"{self.session_namespace}:{normalized}{retry_key}".encode()
         return hashlib.sha256(seed).hexdigest()[:8]
+
+    def resolve_country_code(self, country_code: str, account_key: str | None = None) -> str:
+        """Resolve proxy country from the phone/account key first, then the country field."""
+        phone_country = self.country_code_from_phone(account_key)
+        if phone_country:
+            return phone_country
+
+        return (country_code or "").upper()[:2]
+
+    def country_code_from_phone(self, phone: str | None) -> str | None:
+        """Infer ISO alpha-2 country code from an E.164 phone number."""
+        if not phone or phonenumbers is None:
+            return None
+
+        normalized = phone.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        candidates = [normalized]
+        if normalized.startswith("00"):
+            candidates.append(f"+{normalized[2:]}")
+        elif normalized.startswith("+"):
+            candidates.append(normalized)
+
+        for candidate in dict.fromkeys(candidates):
+            if not candidate.startswith("+"):
+                continue
+            try:
+                parsed = phonenumbers.parse(candidate, None)
+            except phonenumbers.NumberParseException:
+                continue
+            country = phonenumbers.region_code_for_number(parsed)
+            if not country:
+                country = phonenumbers.region_code_for_country_code(parsed.country_code)
+            if country and country != "001":
+                return country.upper()
+
+        return None
+
+    def _static_base_password(self) -> str:
+        """Return the configured Evomi password without existing routing modifiers."""
+        password = str(self.proxy_password)
+        marker_positions = [
+            position
+            for marker in EVOMI_PASSWORD_PARAM_MARKERS
+            if (position := password.find(marker)) >= 0
+        ]
+        if not marker_positions:
+            return password
+        return password[:min(marker_positions)]
+
+    def build_routed_password(
+        self,
+        *,
+        base_password: str,
+        account_key: str,
+        country_code: str,
+        lifetime: int | None = None,
+        session_attempt: int = 0,
+    ) -> tuple[str, str, float | None]:
+        """Build an Evomi password with country routing and account-scoped sticky session."""
+        resolved_country = self.resolve_country_code(country_code, account_key)
+        session_id = self.sticky_session_id(account_key, attempt=session_attempt, country_code=resolved_country)
+        configured_session_type = (self.session_type or "sticky").lower()
+        session_mode = "hardsession" if configured_session_type in {"hard", "hardsession"} else "session"
+        resolved_lifetime = max(1, min(int(lifetime or self.session_lifetime), 120))
+
+        password_parts = [base_password]
+        if resolved_country:
+            password_parts.append(f"country-{resolved_country}")
+        password_parts.append(f"{session_mode}-{session_id}")
+        if session_mode != "hardsession":
+            password_parts.append(f"lifetime-{resolved_lifetime}")
+
+        expires_at = None if session_mode == "hardsession" else time.time() + resolved_lifetime * 60
+        return "_".join(password_parts), session_id, expires_at
+
+    def build_static_account_proxy(
+        self,
+        *,
+        account_key: str,
+        country_code: str,
+        protocol: str | None = None,
+        lifetime: int | None = None,
+        session_attempt: int = 0,
+    ) -> ProxyInfo:
+        """Build a proxy from static Evomi gateway credentials."""
+        if not self._has_static_proxy:
+            raise ProxyProviderError("Evomi", "Static proxy credentials are incomplete")
+        password, session_id, expires_at = self.build_routed_password(
+            base_password=self._static_base_password(),
+            account_key=account_key,
+            country_code=country_code,
+            lifetime=lifetime,
+            session_attempt=session_attempt,
+        )
+
+        return ProxyInfo(
+            protocol=protocol or self.protocol,
+            host=str(self.proxy_host),
+            port=int(self.proxy_port),
+            username=str(self.proxy_username),
+            password=password,
+            session_id=session_id,
+            expires_at=expires_at,
+        )
 
     async def build_account_proxy(
         self,
@@ -233,6 +371,14 @@ class EvomiClient:
         lifetime: int | None = None,
     ) -> ProxyInfo:
         """Construct a stable sticky Evomi proxy for one Telegram account."""
+        if self._has_static_proxy:
+            return await self.build_verified_static_account_proxy(
+                account_key=account_key,
+                country_code=country_code,
+                protocol=protocol,
+                lifetime=lifetime,
+            )
+
         resolved_product = product or self.product_code
         resolved_protocol = protocol or self.protocol
         data = await self.get_proxy_data()
@@ -248,27 +394,78 @@ class EvomiClient:
         if not username or not base_password or not endpoint or not port:
             raise ProxyProviderError("Evomi", f"Proxy product '{resolved_product}' has incomplete credentials")
 
-        session_id = self.sticky_session_id(account_key)
-        configured_session_type = (self.session_type or "sticky").lower()
-        session_mode = "hardsession" if configured_session_type in {"hard", "hardsession"} else "session"
-        resolved_lifetime = max(1, min(int(lifetime or self.session_lifetime), 120))
-        password_parts = [str(base_password)]
-        country = (country_code or "").upper()[:2]
-        if country:
-            password_parts.append(f"country-{country}")
-        password_parts.append(f"{session_mode}-{session_id}")
-        if session_mode != "hardsession":
-            password_parts.append(f"lifetime-{resolved_lifetime}")
+        password, session_id, expires_at = self.build_routed_password(
+            base_password=str(base_password),
+            account_key=account_key,
+            country_code=country_code,
+            lifetime=lifetime,
+        )
 
         return ProxyInfo(
             protocol=resolved_protocol,
             host=str(endpoint),
             port=int(port),
             username=str(username),
-            password="_".join(password_parts),
+            password=password,
             session_id=session_id,
-            expires_at=None if session_mode == "hardsession" else time.time() + resolved_lifetime * 60,
+            expires_at=expires_at,
         )
+
+    async def build_verified_static_account_proxy(
+        self,
+        *,
+        account_key: str,
+        country_code: str,
+        protocol: str | None = None,
+        lifetime: int | None = None,
+    ) -> ProxyInfo:
+        """Build a static proxy and optionally verify its real exit country."""
+        target_country = self.resolve_country_code(country_code, account_key)
+        for attempt in range(self.country_verify_attempts):
+            proxy = self.build_static_account_proxy(
+                account_key=account_key,
+                country_code=country_code,
+                protocol=protocol,
+                lifetime=lifetime,
+                session_attempt=attempt,
+            )
+            if not self.country_verify_enabled or not target_country:
+                return proxy
+            if await self.proxy_matches_country(proxy, target_country):
+                return proxy
+
+        raise ProxyProviderError(
+            "Evomi",
+            f"Unable to acquire proxy for country {target_country} after "
+            f"{self.country_verify_attempts} attempts",
+        )
+
+    async def proxy_matches_country(self, proxy: ProxyInfo, target_country: str) -> bool:
+        """Return whether the proxy exits from the requested country."""
+        try:
+            async with httpx.AsyncClient(proxy=proxy.url, timeout=float(self.country_verify_timeout)) as client:
+                response = await client.get(self.country_verify_url)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            self.logger.warning(
+                "evomi_country_verify_failed",
+                target_country=target_country,
+                proxy_host=proxy.host,
+                error=str(exc),
+            )
+            return False
+
+        actual_country = str(data.get("countryCode") or "").upper()
+        matched = actual_country == target_country.upper()
+        if not matched:
+            self.logger.warning(
+                "evomi_country_mismatch",
+                target_country=target_country,
+                actual_country=actual_country or None,
+                proxy_host=proxy.host,
+            )
+        return matched
 
     async def get_proxy_for_account(
         self,
@@ -279,6 +476,15 @@ class EvomiClient:
         """Get a required proxy for a Telegram account country."""
         if account_key:
             return [await self.build_account_proxy(account_key=account_key, country_code=country_code)]
+
+        if self._has_static_proxy:
+            return [
+                self.build_static_account_proxy(
+                    account_key=f"{country_code or 'default'}:{index}",
+                    country_code=country_code,
+                )
+                for index in range(max(1, count))
+            ]
 
         country = (country_code or "").upper()[:2] or None
         proxies = await self.generate_proxies(

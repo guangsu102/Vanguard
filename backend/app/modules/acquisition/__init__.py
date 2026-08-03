@@ -21,6 +21,8 @@ from app.modules.acquisition.models import (
     AdCreativeType,
     AdSendMode,
     DeliveryStatus,
+    AdSurvivalStatus,
+    GroupAdTier,
     # Search & Tracking
     GroupSearchRecord,
     AutoJoinAttempt,
@@ -39,6 +41,7 @@ from app.modules.acquisition.models import (
     AdCreative,
     AdCampaign,
     AccountAdBinding,
+    GroupAdProfile,
     AdDeliveryLog,
 )
 
@@ -153,6 +156,8 @@ __all__ = [
     "AdCreativeType",
     "AdSendMode",
     "DeliveryStatus",
+    "AdSurvivalStatus",
+    "GroupAdTier",
 
     # Models - Search & Tracking
     "GroupSearchRecord",
@@ -176,6 +181,7 @@ __all__ = [
     "AdCreative",
     "AdCampaign",
     "AccountAdBinding",
+    "GroupAdProfile",
     "AdDeliveryLog",
 
     # Config

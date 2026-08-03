@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElButton, ElIcon, ElMessage, ElMessageBox, ElTag, ElProgress } from 'element-plus'
-import { Plus, Refresh, Upload, Download, Delete, Edit, Connection, DeleteSolid } from '@element-plus/icons-vue'
+import { Plus, Refresh, Download, Delete, Edit, Connection } from '@element-plus/icons-vue'
 import { useProxyStore } from '@/stores/proxy'
+import { proxiesApi, type ProxyFormData } from '@/api/proxies'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
 import FormDrawer from '@/components/FormDrawer.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import { downloadBlob } from '@/utils/download'
 import dayjs from 'dayjs'
 
 const proxyStore = useProxyStore()
@@ -22,12 +24,17 @@ const formData = reactive({
   protocol: 'http' as 'http' | 'https' | 'socks5',
   username: '',
   password: '',
+  proxy_type: 'datacenter' as 'residential' | 'datacenter' | 'mobile',
+  country: 'US',
+  country_name: '',
 })
 
 const formRules = {
   address: [{ required: true, message: '请输入代理地址', trigger: 'blur' }],
   port: [{ required: true, message: '请输入端口', trigger: 'blur' }],
   protocol: [{ required: true, message: '请选择协议', trigger: 'change' }],
+  proxy_type: [{ required: true, message: '请选择代理类型', trigger: 'change' }],
+  country: [{ required: true, message: '请输入国家代码', trigger: 'blur' }],
 }
 
 const searchFilters = [
@@ -71,9 +78,11 @@ const columns = [
   { prop: 'address', label: '地址', minWidth: '150' },
   { prop: 'port', label: '端口', width: '100' },
   { prop: 'protocol', label: '协议', width: '100', slot: 'protocol' },
+  { prop: 'proxy_type', label: '类型', width: '110', slot: 'proxyType' },
+  { prop: 'country', label: '国家', width: '100', slot: 'country' },
   { prop: 'latency', label: '延迟', width: '150', slot: 'latency' },
   { prop: 'status', label: '状态', width: '100', slot: 'status' },
-  { prop: 'bindAccountPhone', label: '绑定账号', width: '130', slot: 'bindAccount' },
+  { prop: 'bindAccountCount', label: '绑定容量', width: '180', slot: 'bindAccount' },
   { prop: 'lastCheckedAt', label: '最后检测', width: '180', slot: 'lastChecked' },
   { prop: 'createdAt', label: '创建时间', width: '180', slot: 'createdAt' },
   { prop: 'actions', label: '操作', width: '160', fixed: 'right', slot: 'actions' },
@@ -112,7 +121,16 @@ const handlePageSizeChange = (pageSize: number) => {
 
 const openAddDrawer = () => {
   editingId.value = null
-  Object.assign(formData, { address: '', port: 8080, protocol: 'http', username: '', password: '' })
+  Object.assign(formData, {
+    address: '',
+    port: 8080,
+    protocol: 'http',
+    username: '',
+    password: '',
+    proxy_type: 'datacenter',
+    country: 'US',
+    country_name: '',
+  })
   drawerVisible.value = true
 }
 
@@ -124,17 +142,36 @@ const openEditDrawer = (row: any) => {
     protocol: row.protocol,
     username: row.username || '',
     password: '',
+    proxy_type: row.proxy_type || 'datacenter',
+    country: row.country || 'US',
+    country_name: row.countryName || '',
   })
   drawerVisible.value = true
+}
+
+const buildSubmitData = (): ProxyFormData => {
+  const data: ProxyFormData = {
+    ...formData,
+    country: formData.country.trim().toUpperCase(),
+    country_name: formData.country_name.trim() || undefined,
+  }
+
+  // Passwords are intentionally omitted from API responses. Keep the stored
+  // password when an edit form is submitted without a replacement password.
+  if (editingId.value && !String(data.password || '').trim()) {
+    delete data.password
+  }
+
+  return data
 }
 
 const handleSubmit = async () => {
   try {
     if (editingId.value) {
-      await proxyStore.update(editingId.value, formData)
+      await proxyStore.update(editingId.value, buildSubmitData())
       ElMessage.success('更新成功')
     } else {
-      await proxyStore.create(formData)
+      await proxyStore.create(buildSubmitData())
       ElMessage.success('添加成功')
     }
     drawerVisible.value = false
@@ -183,8 +220,14 @@ const handleRefreshStatus = async () => {
   }
 }
 
-const handleExport = () => {
-  window.open('/api/proxies/export', '_blank')
+const handleExport = async () => {
+  try {
+    const response = await proxiesApi.export()
+    downloadBlob(response.data, 'vanguard-proxies.csv')
+  } catch (error) {
+    console.error('Failed to export proxies:', error)
+    ElMessage.error('导出失败')
+  }
 }
 
 const formatDate = (date: string) => {
@@ -252,6 +295,16 @@ onMounted(() => {
         </el-tag>
       </template>
 
+      <template #proxyType="{ row }">
+        <el-tag effect="plain">
+          {{ row.proxy_type === 'residential' ? '住宅' : row.proxy_type === 'mobile' ? '移动' : '机房' }}
+        </el-tag>
+      </template>
+
+      <template #country="{ row }">
+        <span>{{ row.country }}{{ row.countryName ? ` / ${row.countryName}` : '' }}</span>
+      </template>
+
       <template #latency="{ row }">
         <div class="latency-cell">
           <span :style="{ color: getLatencyColor(row.latency) }">
@@ -273,8 +326,18 @@ onMounted(() => {
       </template>
 
       <template #bindAccount="{ row }">
-        <span v-if="row.bindAccountPhone">{{ row.bindAccountPhone }}</span>
-        <span v-else class="text-muted">未绑定</span>
+        <div class="binding-cell">
+          <el-tag
+            :type="row.bindAccountCount >= 3 ? 'danger' : row.bindAccountCount > 0 ? 'warning' : 'success'"
+            effect="plain"
+          >
+            {{ row.bindAccountCount || 0 }}/3
+          </el-tag>
+          <span v-if="row.bindAccounts?.length" class="binding-accounts">
+            {{ row.bindAccounts.map((item: any) => item.phone || item.identifier).join('，') }}
+          </span>
+          <span v-else class="text-muted">可绑定</span>
+        </div>
       </template>
 
       <template #lastChecked="{ row }">
@@ -309,7 +372,7 @@ onMounted(() => {
 
     <FormDrawer
       v-model:visible="drawerVisible"
-      :title="editingId ? '编辑代理' : '添加代理'"
+      :title="editingId ? '编辑静态代理IP' : '添加静态代理IP'"
       :fields="[
         { prop: 'address', label: '地址', type: 'input', placeholder: '例如: 192.168.1.1' },
         { prop: 'port', label: '端口', type: 'number', placeholder: '例如: 8080', props: { min: 1, max: 65535 } },
@@ -323,6 +386,18 @@ onMounted(() => {
             { label: 'SOCKS5', value: 'socks5' },
           ]
         },
+        {
+          prop: 'proxy_type',
+          label: '类型',
+          type: 'select',
+          options: [
+            { label: '住宅', value: 'residential' },
+            { label: '机房', value: 'datacenter' },
+            { label: '移动', value: 'mobile' },
+          ]
+        },
+        { prop: 'country', label: '国家代码', type: 'input', placeholder: '如 US / SG / HK' },
+        { prop: 'country_name', label: '国家名称', type: 'input', placeholder: '可选' },
         { prop: 'username', label: '用户名', type: 'input', placeholder: '可选' },
         { prop: 'password', label: '密码', type: 'input', placeholder: '可选' },
       ]"
@@ -360,6 +435,20 @@ onMounted(() => {
 .latency-cell {
   display: flex;
   align-items: center;
+}
+
+.binding-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.binding-accounts {
+  color: #606266;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .text-muted {

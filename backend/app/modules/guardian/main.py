@@ -5,27 +5,26 @@ Main entry point for the Telegram guardian bot.
 Integrates all guardian modules for group moderation.
 """
 
-import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.guardian.campaign_runner import ManagedGroupCampaignRunner
 from app.core.keyword.engine import KeywordEngine
-from app.modules.guardian.config import get_guardian_config
-from app.modules.guardian.moderation.rule_engine import GuardianRuleEngine, EvaluationResult
-from app.modules.guardian.moderation.action_executor import ActionExecutor
-from app.modules.guardian.anti_spam.spam_detector import SpamDetector
 from app.modules.guardian.anti_spam.competitor_block import CompetitorBlocker
+from app.modules.guardian.anti_spam.spam_detector import SpamDetector
+from app.modules.guardian.broadcast.broadcaster import GuardianBroadcaster
+from app.modules.guardian.campaign_runner import ManagedGroupCampaignRunner
+from app.modules.guardian.config import get_guardian_config
+from app.modules.guardian.coupon.coupon_distributor import CouponDistributor
+from app.modules.guardian.models import GroupCampaignTriggerEvent, ViolationAction
+from app.modules.guardian.moderation.action_executor import ActionExecutor
+from app.modules.guardian.moderation.rule_engine import EvaluationResult, GuardianRuleEngine
 from app.modules.guardian.punishment.punishment_mgr import PunishmentManager
 from app.modules.guardian.punishment.warn_system import WarnSystem
-from app.modules.guardian.verification.verification_mgr import VerificationManager
 from app.modules.guardian.verification.captcha_gen import CaptchaGenerator
-from app.modules.guardian.broadcast.broadcaster import GuardianBroadcaster
-from app.modules.guardian.coupon.coupon_distributor import CouponDistributor
-from app.modules.guardian.models import GroupCampaignTriggerEvent, ViolationAction, ViolationLevel
+from app.modules.guardian.verification.verification_mgr import VerificationManager
 
 logger = structlog.get_logger()
 
@@ -76,6 +75,7 @@ class GuardianBot:
             xboard_client: XBoard client for rewards
         """
         self._db = db
+        self._telegram_client = telegram_client
         self._config = get_guardian_config()
         
         keyword_engine = KeywordEngine(db)
@@ -126,6 +126,14 @@ class GuardianBot:
         try:
             if not text:
                 return False
+
+            if self._is_private_chat(chat_id, user_id):
+                return await self._handle_private_message(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=username,
+                    text=text,
+                )
             
             is_verified = await self._context.verification_manager.is_user_verified(user_id, chat_id)
             
@@ -173,6 +181,35 @@ class GuardianBot:
                 message_id=message_id
             )
             return False
+
+    async def _handle_private_message(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        username: Optional[str],
+        text: str,
+    ) -> bool:
+        if not text.strip().startswith("/start"):
+            return False
+
+        response = await self._context.campaign_runner.claim_group_coupon(
+            text,
+            user_telegram_id=user_id,
+            username=username,
+        )
+        if not response:
+            return False
+        if self._telegram_client is None:
+            self.logger.warning("private_claim_response_client_missing", user_id=user_id)
+            return True
+
+        await self._telegram_client.send_message(chat_id, response, parse_mode="")
+        return True
+
+    @staticmethod
+    def _is_private_chat(chat_id: int, user_id: int) -> bool:
+        return int(chat_id) == int(user_id)
     
     async def _handle_violation(
         self,
@@ -377,8 +414,9 @@ class GuardianBot:
         Returns:
             Broadcast result
         """
-        from app.modules.guardian.broadcast.templates import NodeStatus
         from datetime import datetime
+
+        from app.modules.guardian.broadcast.templates import NodeStatus
         
         node_status = NodeStatus(
             node_name=node_name,

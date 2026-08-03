@@ -28,7 +28,11 @@ const statusConfig: Record<string, { label: string; type: string }> = {
   error: { label: '异常', type: 'danger' },
 
   // Group status
+  pending_join: { label: '待入群', type: 'warning' },
+  join_failed: { label: '入群失败', type: 'danger' },
+  cooling_down: { label: '冷却中', type: 'warning' },
   left: { label: '已离开', type: 'warning' },
+  rejected: { label: '已拒绝', type: 'danger' },
   unrated: { label: '未评级', type: 'info' },
 
   // User status
@@ -56,6 +60,12 @@ const statusConfig: Record<string, { label: string; type: string }> = {
 }
 
 const config = computed(() => {
+  if (props.type === 'group' && props.status === 'pending') {
+    return { label: '等待审核', type: 'warning' }
+  }
+  if (props.type === 'keyword' && props.status === 'pending') {
+    return { label: '待审核', type: 'warning' }
+  }
   return statusConfig[props.status] || { label: props.status, type: 'info' }
 })
 </script>

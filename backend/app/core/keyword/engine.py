@@ -20,6 +20,7 @@ from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.keyword.models import Keyword, KeywordType, KeywordStatus, MatchMode
+from app.core.keyword.regex_guard import safe_compile, safe_search, RegexTimeoutError
 from app.core.exceptions import KeywordNotFoundError, ValidationError
 
 logger = structlog.get_logger()
@@ -113,8 +114,8 @@ class KeywordEngine:
                 # 模糊匹配：包含关键词即可（子串匹配）
                 pattern = re.compile(escaped, re.IGNORECASE)
             elif keyword.match_mode == MatchMode.REGEX:
-                # 正则模式：用户提供的正则表达式
-                pattern = re.compile(keyword.text, re.IGNORECASE)
+                # 正则模式：用户提供的正则表达式 —— 必须经过 ReDoS 安全检查
+                pattern = safe_compile(keyword.text, re.IGNORECASE)
             else:
                 # 默认使用模糊匹配
                 pattern = re.compile(escaped, re.IGNORECASE)
@@ -127,9 +128,9 @@ class KeywordEngine:
                 match_mode=keyword.match_mode,
                 keyword=keyword,
             )
-        except re.error as e:
+        except (re.error, ValueError) as e:
             self.logger.warning(
-                "invalid_keyword_regex",
+                "invalid_or_unsafe_keyword_regex",
                 keyword_id=keyword.id,
                 text=keyword.text,
                 error=str(e),
@@ -138,7 +139,7 @@ class KeywordEngine:
 
     async def match(self, text: str) -> list[CompiledKeyword]:
         """
-        Match text against all keywords.
+        Match text against all keywords with ReDoS-protected regex execution.
 
         Args:
             text: Text to match against
@@ -150,12 +151,21 @@ class KeywordEngine:
             return []
 
         matches = []
+        truncated = text[:10000] if len(text) > 10000 else text
 
         async with self._lock:
             for compiled in self._keywords.values():
                 try:
-                    if compiled.pattern.search(text):
+                    result = await safe_search(compiled.pattern, truncated, timeout=0.5)
+                    if result:
                         matches.append(compiled)
+                except RegexTimeoutError:
+                    self.logger.warning(
+                        "regex_timeout_skipped",
+                        keyword_id=compiled.id,
+                        text_preview=truncated[:50],
+                    )
+                    continue
                 except re.error:
                     continue
 

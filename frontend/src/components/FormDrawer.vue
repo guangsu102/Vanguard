@@ -9,7 +9,7 @@ interface FormField {
   label: string
   type: 'input' | 'textarea' | 'select' | 'number' | 'switch' | 'date' | 'datetime'
   placeholder?: string
-  options?: Array<{ label: string; value: any }>
+  options?: Array<{ label: string; value: any; disabled?: boolean }>
   rules?: FormRules
   props?: Record<string, any>
 }
@@ -149,6 +149,7 @@ const updateField = (prop: string, value: any) => {
             :key="option.value"
             :label="option.label"
             :value="option.value"
+            :disabled="option.disabled"
           />
         </el-select>
 

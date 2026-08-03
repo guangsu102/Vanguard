@@ -35,6 +35,18 @@ export interface ManagedGroupBinding {
   permissions_snapshot?: Record<string, any>
   bound_at: string
   last_synced_at?: string
+  chat_type: 'group' | 'supergroup' | 'channel'
+  all_members_muted: boolean
+}
+
+export interface ManagedGroupPinnedMessageConfig {
+  enabled: boolean
+  content: string
+  parse_mode: '' | 'Markdown' | 'HTML'
+  disable_web_page_preview: boolean
+  disable_notification: boolean
+  button_text?: string | null
+  button_url?: string | null
 }
 
 export interface ModerationSensitiveKeyword {
@@ -95,6 +107,77 @@ export const guardianApi = {
 
   updateManagedGroup: (id: number, data: Record<string, any>) =>
     apiClient.put<{ data: ManagedGroupBinding }>(`/managed-groups/${id}`, data),
+
+  syncConfirmedGroups: (data: { bot_account_id: number; statuses?: string[]; limit?: number }) =>
+    apiClient.post<{ data: { checked: number; synced: number; skipped: number; errors: Array<Record<string, any>> } }>(
+      '/managed-groups/sync-confirmed',
+      data
+    ),
+
+  getPinnedMessageConfig: (id: number) =>
+    apiClient.get<{ data: ManagedGroupPinnedMessageConfig }>(`/managed-groups/${id}/pinned-message-config`),
+
+  savePinnedMessageConfig: (id: number, data: ManagedGroupPinnedMessageConfig) =>
+    apiClient.put<{ data: ManagedGroupPinnedMessageConfig }>(`/managed-groups/${id}/pinned-message-config`, data),
+
+  sendPinnedMessage: (id: number, data: {
+    content: string
+    parse_mode?: 'Markdown' | 'HTML' | ''
+    disable_web_page_preview?: boolean
+    disable_notification?: boolean
+    button_text?: string | null
+    button_url?: string | null
+  }) => apiClient.post<{ data: { binding_id: number; telegram_group_id: number; message_id: number; pinned: boolean } }>(
+    `/managed-groups/${id}/pinned-message`,
+    data
+  ),
+
+  setMuteAll: (id: number, muted: boolean) =>
+    apiClient.post<{ data: { binding_id: number; telegram_group_id?: number; all_members_muted: boolean } }>(
+      `/managed-groups/${id}/mute-all`,
+      { muted }
+    ),
+
+  sendChannelMessage: (id: number, data: {
+    content: string
+    parse_mode?: 'Markdown' | 'HTML' | ''
+    disable_web_page_preview?: boolean
+    disable_notification?: boolean
+  }) => apiClient.post<{ data: { binding_id: number; telegram_channel_id: number; message_id: number } }>(
+    `/managed-groups/${id}/channel-message`,
+    data
+  ),
+
+  createChannel: (data: {
+    creator_account_id: number
+    bot_account_id: number
+    title: string
+    about?: string
+    is_public?: boolean
+    username?: string
+  }) => apiClient.post<{
+      data: {
+        binding: ManagedGroupBinding
+        warnings: string[]
+        bot_assignment_complete: boolean
+        public_username_complete: boolean
+      }
+  }>('/managed-groups/channels', data),
+
+  updateChannelUsername: (id: number, username: string) =>
+    apiClient.put<{
+      data: {
+        binding_id: number
+        telegram_channel_id: number
+        username?: string | null
+        channel_visibility: 'public' | 'private'
+      }
+    }>(`/managed-groups/${id}/channel-username`, { username }),
+
+  refreshChannelStatus: (id: number) =>
+    apiClient.post<{
+      data: { binding: ManagedGroupBinding; bot_assignment_complete: boolean }
+    }>(`/managed-groups/${id}/channel-status/refresh`),
 
   listSensitiveKeywords: (params?: { group_id?: number; category?: string; enabled?: boolean; search?: string; page?: number; page_size?: number }) =>
     apiClient.get<{ data: ModerationSensitiveKeyword[]; total: number }>('/moderation-sensitive-keywords', { params }),

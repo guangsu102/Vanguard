@@ -68,7 +68,10 @@ class KeywordMatcher:
 
         async with self._lock:
             result = await self.db.execute(
-                select(KeywordTrigger).where(KeywordTrigger.enabled == True)
+                select(KeywordTrigger).where(
+                    KeywordTrigger.enabled == True,
+                    KeywordTrigger.requires_review == False,
+                )
             )
             triggers = list(result.scalars().all())
 

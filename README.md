@@ -58,7 +58,7 @@ vanguard/
 ### Prerequisites
 
 - Docker & Docker Compose
-- Python 3.11+
+- Python 3.12+
 - Node.js 18+
 
 ### Development Setup

@@ -13,6 +13,9 @@ docs/
 # IDE
 .vscode/
 .idea/
+.codex*/
+.chrome*/
+.ruff_cache/
 
 # Environment
 .env
@@ -29,8 +32,11 @@ venv/
 node_modules/
 
 # Logs
+data/
 logs/
 *.log
+*.tar
+*.tar.gz
 
 # Sessions (should be mounted as volume)
 sessions/
@@ -41,9 +47,12 @@ Thumbs.db
 
 # Testing
 .pytest_cache/
+backend/.pytest_cache/
 .coverage
+backend/.coverage
 htmlcov/
 
 # Temporary
 tmp/
 temp/
+NUL

@@ -27,6 +27,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 
 from app.core.config import get_settings
+from app.core.network.fingerprint import FingerprintManager
 
 logger = structlog.get_logger()
 
@@ -42,6 +43,7 @@ class LoginSession:
     created_at: datetime
     expires_at: datetime
     requires_2fa: bool = False
+    device_profile: Optional[Dict[str, str]] = None
 
     def is_expired(self) -> bool:
         """Check if session is expired."""
@@ -70,6 +72,14 @@ class TelegramAuthHelper:
     def _get_session_path(self, session_name: str) -> Path:
         """Get session file path."""
         return self._session_dir / f"{session_name}.session"
+
+    @staticmethod
+    def _export_session_string(client: TelegramClient) -> str:
+        """Export a Telethon client session as a portable string session."""
+        session_string = StringSession.save(client.session)
+        if not session_string:
+            raise Exception("Failed to export Telegram session string")
+        return session_string
 
     async def _get_required_proxy(self, country_code: str, account_key: str) -> tuple:
         """Acquire a required provider proxy for Telegram authentication."""
@@ -103,6 +113,8 @@ class TelegramAuthHelper:
         country_code: str = "US",
         account_key: Optional[str] = None,
         proxy: Optional[Dict[str, Any]] = None,
+        proxy_required: Optional[bool] = None,
+        device_profile: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Send verification code to phone number.
@@ -124,16 +136,27 @@ class TelegramAuthHelper:
         """
         self.logger.info("sending_verification_code", phone=phone)
 
-        if proxy is None and getattr(self.settings, "PROMOTER_PROXY_REQUIRED", True):
+        should_require_proxy = (
+            getattr(self.settings, "PROMOTER_PROXY_REQUIRED", True)
+            if proxy_required is None
+            else proxy_required
+        )
+        if proxy is None and should_require_proxy:
             proxy = await self._get_required_proxy(country_code, account_key or phone)
 
-        # Create temporary client
-        session_name = f"temp_{phone}_{datetime.utcnow().timestamp()}"
+        profile = device_profile or FingerprintManager().generate_telegram_device_profile(account_key or phone)
+
+        # Create temporary in-memory client; the persisted account stores a StringSession.
         client = TelegramClient(
-            str(self._get_session_path(session_name)),
+            StringSession(),
             int(api_id),
             api_hash,
             proxy=proxy,
+            device_model=profile["device_model"],
+            system_version=profile["system_version"],
+            app_version=profile["app_version"],
+            lang_code=profile["lang_code"],
+            system_lang_code=profile["system_lang_code"],
         )
 
         try:
@@ -152,6 +175,7 @@ class TelegramAuthHelper:
                 client=client,
                 created_at=datetime.utcnow(),
                 expires_at=datetime.utcnow() + timedelta(minutes=5),
+                device_profile=profile,
             )
             self._login_sessions[session_id] = login_session
 
@@ -167,6 +191,7 @@ class TelegramAuthHelper:
                 "phone_code_hash": sent_code.phone_code_hash,
                 "code_type": sent_code.type.__class__.__name__,
                 "timeout": 300,  # 5 minutes
+                "device_profile": profile,
             }
 
         except FloodWaitError as e:
@@ -218,7 +243,7 @@ class TelegramAuthHelper:
             )
 
             # Success - save session
-            session_string = login_session.client.session.save()
+            session_string = self._export_session_string(login_session.client)
             user_id = user.id
             username = user.username
 
@@ -238,6 +263,7 @@ class TelegramAuthHelper:
                 "user_id": user_id,
                 "username": username,
                 "session_string": session_string,
+                "device_profile": login_session.device_profile,
             }
 
         except SessionPasswordNeededError:
@@ -249,6 +275,7 @@ class TelegramAuthHelper:
                 "status": "requires_2fa",
                 "requires_2fa": True,
                 "session_id": session_id,
+                "device_profile": login_session.device_profile,
             }
 
         except PhoneCodeInvalidError:
@@ -301,7 +328,7 @@ class TelegramAuthHelper:
             user = await login_session.client.sign_in(password=password)
 
             # Success - save session
-            session_string = login_session.client.session.save()
+            session_string = self._export_session_string(login_session.client)
             user_id = user.id
             username = user.username
 
@@ -320,6 +347,7 @@ class TelegramAuthHelper:
                 "user_id": user_id,
                 "username": username,
                 "session_string": session_string,
+                "device_profile": login_session.device_profile,
             }
 
         except PasswordHashInvalidError:
@@ -339,6 +367,8 @@ class TelegramAuthHelper:
         country_code: str = "US",
         account_key: Optional[str] = None,
         proxy: Optional[Dict[str, Any]] = None,
+        proxy_required: Optional[bool] = None,
+        device_profile: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Import existing session file.
@@ -363,8 +393,15 @@ class TelegramAuthHelper:
         if not os.path.exists(session_file_path):
             raise Exception("Session file not found")
 
-        if proxy is None and getattr(self.settings, "PROMOTER_PROXY_REQUIRED", True):
+        should_require_proxy = (
+            getattr(self.settings, "PROMOTER_PROXY_REQUIRED", True)
+            if proxy_required is None
+            else proxy_required
+        )
+        if proxy is None and should_require_proxy:
             proxy = await self._get_required_proxy(country_code, account_key or phone)
+
+        profile = device_profile or FingerprintManager().generate_telegram_device_profile(account_key or phone)
 
         # Create client with existing session
         client = TelegramClient(
@@ -372,6 +409,11 @@ class TelegramAuthHelper:
             int(api_id),
             api_hash,
             proxy=proxy,
+            device_model=profile["device_model"],
+            system_version=profile["system_version"],
+            app_version=profile["app_version"],
+            lang_code=profile["lang_code"],
+            system_lang_code=profile["system_lang_code"],
         )
 
         try:
@@ -397,7 +439,7 @@ class TelegramAuthHelper:
                 )
 
             # Export session string
-            session_string = client.session.save()
+            session_string = self._export_session_string(client)
 
             await client.disconnect()
 
@@ -414,6 +456,7 @@ class TelegramAuthHelper:
                 "username": username,
                 "phone": f"+{phone_from_session}" if phone_from_session else phone,
                 "session_string": session_string,
+                "device_profile": profile,
             }
 
         except Exception as e:

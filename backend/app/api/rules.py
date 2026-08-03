@@ -274,7 +274,7 @@ async def create_rule(
     return _rule_to_response(rule)
 
 
-@router.get("/{rule_id}", response_model=RuleResponse)
+@router.get("/{rule_id:int}", response_model=RuleResponse)
 async def get_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db),
@@ -289,7 +289,7 @@ async def get_rule(
     return _rule_to_response(rule)
 
 
-@router.put("/{rule_id}", response_model=RuleResponse)
+@router.put("/{rule_id:int}", response_model=RuleResponse)
 async def update_rule(
     rule_id: int,
     rule_data: RuleUpdate,
@@ -326,7 +326,7 @@ async def update_rule(
     return _rule_to_response(rule)
 
 
-@router.delete("/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{rule_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db),
@@ -342,7 +342,7 @@ async def delete_rule(
     await db.commit()
 
 
-@router.post("/{rule_id}/toggle")
+@router.post("/{rule_id:int}/toggle")
 async def toggle_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db),
@@ -509,7 +509,7 @@ async def create_whitelist(
     return _whitelist_to_response(entry)
 
 
-@router.get("/whitelist/{entry_id}", response_model=WhitelistResponse)
+@router.get("/whitelist/{entry_id:int}", response_model=WhitelistResponse)
 async def get_whitelist_entry(
     entry_id: int,
     db: AsyncSession = Depends(get_db),
@@ -524,7 +524,7 @@ async def get_whitelist_entry(
     return _whitelist_to_response(entry)
 
 
-@router.delete("/whitelist/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/whitelist/{entry_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_whitelist_entry(
     entry_id: int,
     db: AsyncSession = Depends(get_db),

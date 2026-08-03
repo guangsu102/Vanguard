@@ -15,6 +15,9 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    networks:
+      - default
+      - xboard_internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -32,6 +35,9 @@ services:
     command: ["python", "-m", "app.core.scheduler.worker", "multi"]
     depends_on:
       - backend
+    networks:
+      - default
+      - xboard_internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -51,6 +57,9 @@ services:
     command: ["python", "-m", "app.core.scheduler.worker", "beat"]
     depends_on:
       - backend
+    networks:
+      - default
+      - xboard_internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -78,6 +87,9 @@ services:
       ]
     depends_on:
       - backend
+    networks:
+      - default
+      - xboard_internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -106,9 +118,60 @@ services:
       ]
     depends_on:
       - backend
+    networks:
+      - default
+      - xboard_internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
+    healthcheck:
+      disable: true
+
+  # ==================== NapCatQQ OneBot 11 ====================
+  napcat:
+    image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+    container_name: vanguard-napcat
+    restart: unless-stopped
+    environment:
+      NAPCAT_UID: ${NAPCAT_UID:-1000}
+      NAPCAT_GID: ${NAPCAT_GID:-1000}
+    ports:
+      - "127.0.0.1:6099:6099"
+    expose:
+      - "3000"
+      - "3001"
+    networks:
+      - default
+    volumes:
+      - napcat_qq_data:/app/.config/QQ
+      - napcat_config:/app/napcat/config
+      - napcat_plugins:/app/napcat/plugins
+
+  # ==================== QQ OneBot Event Worker ====================
+  qq-onebot-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-qq-onebot-worker
+    env_file:
+      - .env.production
+    restart: on-failure:3
+    command:
+      [
+        "python",
+        "-m",
+        "app.workers.qq_onebot_worker",
+        "--worker-id",
+        "qq_onebot_worker:production",
+      ]
+    depends_on:
+      - backend
+      - napcat
+    networks:
+      - default
+      - xboard_internal
+    volumes:
+      - ./data/logs:/app/logs
     healthcheck:
       disable: true
 
@@ -140,3 +203,13 @@ services:
     network_mode: host
     depends_on:
       - backend
+
+networks:
+  xboard_internal:
+    external: true
+    name: xboard_xboard_internal
+
+volumes:
+  napcat_qq_data:
+  napcat_config:
+  napcat_plugins:

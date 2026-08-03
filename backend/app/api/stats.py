@@ -4,19 +4,21 @@ Stats API Router
 RESTful API for statistics and reporting with multiple time granularity support.
 """
 
+import csv
+import io
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func, desc, and_, or_, text
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.account.models import TelegramAccount, AccountStatus
 from app.core.group.models import Group, GroupLevel
 from app.core.user.models import User, UserState
-from app.core.keyword.models import Keyword, KeywordType, KeywordStatus
+from app.core.keyword.models import Keyword, KeywordType
 from app.core.campaign.models import Campaign, CampaignTracking
 from app.modules.acquisition.models import AcquisitionTracking
 from app.modules.guardian.models import Violation
@@ -44,14 +46,14 @@ class TimeGranularity(str, Enum):
 def get_date_trunc_expression(granularity: TimeGranularity, column: str) -> str:
     """Get SQL date truncation expression based on granularity."""
     if granularity == TimeGranularity.HOURLY:
-        return f"DATE_FORMAT({column}, '%Y-%m-%d %H:00:00')"
+        return f"date_trunc('hour', {column})"
     elif granularity == TimeGranularity.DAILY:
-        return f"DATE({column})"
+        return f"date_trunc('day', {column})"
     elif granularity == TimeGranularity.WEEKLY:
-        return f"DATE(DATE_SUB({column}, INTERVAL WEEKDAY({column}) DAY))"
+        return f"date_trunc('week', {column})"
     elif granularity == TimeGranularity.MONTHLY:
-        return f"DATE_FORMAT({column}, '%Y-%m-01')"
-    return f"DATE({column})"
+        return f"date_trunc('month', {column})"
+    return f"date_trunc('day', {column})"
 
 
 def parse_date(date_str: Optional[str]) -> Optional[datetime]:
@@ -65,6 +67,20 @@ def parse_date(date_str: Optional[str]) -> Optional[datetime]:
             return datetime.strptime(date_str, '%Y-%m-%d')
         except ValueError:
             return None
+
+
+def _csv_response(filename: str, rows: list[dict], fieldnames: list[str]) -> Response:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # =============================================================================
@@ -154,6 +170,69 @@ async def get_dashboard(
 
 
 # =============================================================================
+# Export Endpoint
+# =============================================================================
+
+@router.get("/export")
+async def export_stats(
+    export_type: str = Query(default="dashboard", alias="type"),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    start_date_compat: Optional[str] = Query(None, alias="startDate"),
+    end_date_compat: Optional[str] = Query(None, alias="endDate"),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    """Export statistics as CSV."""
+    start_date = start_date or start_date_compat
+    end_date = end_date or end_date_compat
+    export_type = export_type.lower()
+
+    if export_type == "dashboard":
+        result = await get_dashboard(db)
+        data = result["data"]
+        rows = [
+            {"metric": key, "value": value}
+            for key, value in data.items()
+            if isinstance(value, (int, float, str))
+        ]
+        return _csv_response("vanguard-dashboard.csv", rows, ["metric", "value"])
+
+    if export_type == "trend":
+        result = await get_stats_trend(start_date=start_date, end_date=end_date, db=db)
+        return _csv_response(
+            "vanguard-trend.csv",
+            result["data"],
+            ["date", "registered", "converted", "active"],
+        )
+
+    if export_type == "funnel":
+        result = await get_stats_funnel(start_date=start_date, end_date=end_date, db=db)
+        return _csv_response("vanguard-funnel.csv", result["data"], ["stage", "count", "rate"])
+
+    if export_type == "sources":
+        result = await get_stats_sources(start_date=start_date, end_date=end_date, db=db)
+        return _csv_response("vanguard-sources.csv", result["data"], ["source", "count", "percentage"])
+
+    if export_type == "groups":
+        result = await get_group_stats(db)
+        return _csv_response(
+            "vanguard-groups.csv",
+            result["data"]["top_groups"],
+            ["id", "group_id", "title", "level", "score", "member_count"],
+        )
+
+    if export_type == "keywords":
+        result = await get_keyword_stats(start_date=start_date, end_date=end_date, db=db)
+        return _csv_response(
+            "vanguard-keywords.csv",
+            result["data"]["top_keywords"],
+            ["id", "text", "type", "trigger_count"],
+        )
+
+    raise HTTPException(status_code=400, detail=f"Unsupported export type: {export_type}")
+
+
+# =============================================================================
 # Overview Endpoint
 # =============================================================================
 
@@ -166,9 +245,6 @@ async def get_stats_overview(
     """
     Get statistics overview.
     """
-    start = parse_date(start_date) or (datetime.utcnow() - timedelta(days=7))
-    end = parse_date(end_date) or datetime.utcnow()
-
     # Total users
     total_users_result = await db.execute(select(func.count(User.id)))
     total_users = total_users_result.scalar() or 0
@@ -1014,6 +1090,3 @@ async def get_campaign_stats(
         }
     }
 
-
-# Import HTTPException for error handling
-from fastapi import HTTPException

@@ -34,7 +34,7 @@ from app.modules.guardian.models import (
 )
 
 
-router = APIRouter(prefix="/moderation", tags=["审核管理"])
+router = APIRouter(tags=["审核管理"])
 
 
 # =============================================================================
@@ -343,6 +343,7 @@ async def list_suggestions(
     page_size: int = 20,
     status_filter: Optional[str] = None,
     category: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
 ) -> KeywordSuggestionListResponse:
     """
     获取敏感词候选列表

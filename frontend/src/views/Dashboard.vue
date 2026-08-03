@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue'
-import { ElCard, ElRow, ElCol, ElStatistic, ElButton, ElIcon, ElEmpty } from 'element-plus'
+import { ElCard, ElRow, ElCol, ElStatistic, ElButton, ElIcon, ElEmpty, ElMessage } from 'element-plus'
 import { Refresh, Download } from '@element-plus/icons-vue'
 import { useStatsStore } from '@/stores/stats'
+import { statsApi } from '@/api/stats'
+import { downloadBlob } from '@/utils/download'
 import ECharts from '@/components/ECharts.vue'
 import dayjs from 'dayjs'
 
@@ -130,8 +132,14 @@ const toggleAutoRefresh = () => {
   }
 }
 
-const exportData = () => {
-  window.open('/api/stats/export?type=dashboard', '_blank')
+const exportData = async () => {
+  try {
+    const response = await statsApi.export({ type: 'dashboard' })
+    downloadBlob(response.data, 'vanguard-dashboard.csv')
+  } catch (error) {
+    console.error('Failed to export dashboard:', error)
+    ElMessage.error('导出失败')
+  }
 }
 
 onMounted(() => {

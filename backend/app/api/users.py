@@ -7,9 +7,9 @@ RESTful API for user management with cursor pagination.
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc, and_, String
+from sqlalchemy import String, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -223,7 +223,7 @@ async def list_users(
     )
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get("/{user_id:int}", response_model=UserResponse)
 async def get_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),
@@ -238,7 +238,7 @@ async def get_user(
     return _user_to_response(user)
 
 
-@router.get("/telegram/{telegram_id}", response_model=UserResponse)
+@router.get("/telegram/{telegram_id:int}", response_model=UserResponse)
 async def get_user_by_telegram(
     telegram_id: int,
     db: AsyncSession = Depends(get_db),
@@ -257,7 +257,7 @@ async def get_user_by_telegram(
 # User Operations
 # =============================================================================
 
-@router.put("/{user_id}/state")
+@router.put("/{user_id:int}/state")
 async def update_user_state(
     user_id: int,
     update: UserStateUpdate,
@@ -289,7 +289,7 @@ async def update_user_state(
     }
 
 
-@router.post("/{user_id}/warn")
+@router.post("/{user_id:int}/warn")
 async def warn_user(
     user_id: int,
     request: UserWarnRequest,
@@ -323,7 +323,7 @@ async def warn_user(
     }
 
 
-@router.post("/{user_id}/mute")
+@router.post("/{user_id:int}/mute")
 async def mute_user(
     user_id: int,
     request: UserMuteRequest,
@@ -350,7 +350,7 @@ async def mute_user(
     }
 
 
-@router.post("/{user_id}/unmute")
+@router.post("/{user_id:int}/unmute")
 async def unmute_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),
@@ -378,7 +378,7 @@ async def unmute_user(
     }
 
 
-@router.post("/{user_id}/block")
+@router.post("/{user_id:int}/block")
 async def block_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),
@@ -402,7 +402,7 @@ async def block_user(
     }
 
 
-@router.post("/{user_id}/unblock")
+@router.post("/{user_id:int}/unblock")
 async def unblock_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),
@@ -432,7 +432,7 @@ async def unblock_user(
 # User History
 # =============================================================================
 
-@router.get("/{user_id}/violations", response_model=ViolationListResponse)
+@router.get("/{user_id:int}/violations", response_model=ViolationListResponse)
 async def get_user_violations(
     user_id: int,
     limit: int = 50,
@@ -466,7 +466,7 @@ async def get_user_violations(
     )
 
 
-@router.get("/{user_id}/actions")
+@router.get("/{user_id:int}/actions")
 async def get_user_actions(
     user_id: int,
     cursor: Optional[str] = None,

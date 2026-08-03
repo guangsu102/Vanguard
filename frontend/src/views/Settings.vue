@@ -3,11 +3,11 @@ import { ref, reactive, onMounted } from 'vue'
 import { ElButton, ElIcon, ElMessage, ElTabs, ElTabPane, ElForm, ElFormItem, ElInput, ElSwitch, ElSelect, ElOption, ElCard, ElTable, ElTag, ElDivider, ElAlert } from 'element-plus'
 import { Select, Download, Delete, FolderOpened } from '@element-plus/icons-vue'
 import { useSettingsStore } from '@/stores/settings'
-import { useAuthStore } from '@/stores/auth'
+import { settingsApi } from '@/api/settings'
+import { downloadBlob } from '@/utils/download'
 import dayjs from 'dayjs'
 
 const settingsStore = useSettingsStore()
-const authStore = useAuthStore()
 
 const loading = ref(false)
 const activeTab = ref('basic')
@@ -22,8 +22,17 @@ const basicForm = reactive({
 })
 
 const notificationForm = reactive({
+  sub2apiAlertsEnabled: false,
+  sub2apiNotifyResolved: true,
+  sub2apiAnnouncementsEnabled: false,
   telegramEnabled: false,
   telegramChatId: '',
+  telegramAnnouncementsEnabled: false,
+  telegramAnnouncementChatId: '',
+  telegramAnnouncementPin: true,
+  telegramAnnouncementPinSilent: true,
+  qqEnabled: false,
+  qqAnnouncementsEnabled: false,
   emailEnabled: false,
   emailRecipients: '',
   webhookEnabled: false,
@@ -54,6 +63,85 @@ const aiReplyForm = reactive({
   maxRepliesPerUserPerDay: 2,
   cooldownSeconds: 1800,
 })
+
+const keywordPrivateReplyForm = reactive({
+  enabled: false,
+})
+
+const privateMessagingForm = reactive({
+  inboundRepliesEnabled: true,
+  proactiveEnabled: false,
+})
+
+const privateReplyTemplatesForm = reactive<Record<string, string>>({
+  startWelcome: '',
+  help: '',
+  register: '',
+  statusFound: '',
+  statusPending: '',
+  unknownCommand: '',
+  thanks: '',
+  usageHelp: '',
+  registerIntent: '',
+  priceIntent: '',
+  nodeIntent: '',
+  default: '',
+  guideWelcome: '',
+  guideIntroduce: '',
+  guideInviteRegister: '',
+  guideConfirm: '',
+  guideTimeout: '',
+  guideNoNeed: '',
+  guideConfirmSuccess: '',
+  guideRegisterReminder: '',
+  guideFallback: '',
+  triggerInvite: '',
+})
+
+const privateReplyTemplateGroups = [
+  {
+    title: '命令回复',
+    fields: [
+      { key: 'startWelcome', label: '/start 欢迎', rows: 5 },
+      { key: 'help', label: '/help 帮助', rows: 6 },
+      { key: 'register', label: '/register 注册', rows: 4 },
+      { key: 'statusFound', label: '/status 已查询', rows: 2 },
+      { key: 'statusPending', label: '/status 查询中', rows: 2 },
+      { key: 'unknownCommand', label: '未知命令', rows: 2 },
+    ],
+  },
+  {
+    title: '意图回复',
+    fields: [
+      { key: 'thanks', label: '感谢确认', rows: 2 },
+      { key: 'usageHelp', label: '使用帮助', rows: 2 },
+      { key: 'registerIntent', label: '注册/试用', rows: 4 },
+      { key: 'priceIntent', label: '价格咨询', rows: 3 },
+      { key: 'nodeIntent', label: '线路/速度', rows: 3 },
+      { key: 'default', label: '默认回复', rows: 3 },
+    ],
+  },
+  {
+    title: '引导流程',
+    fields: [
+      { key: 'guideWelcome', label: '引导欢迎', rows: 2 },
+      { key: 'guideIntroduce', label: '服务介绍', rows: 3 },
+      { key: 'guideInviteRegister', label: '邀请注册', rows: 3 },
+      { key: 'guideConfirm', label: '注册确认', rows: 2 },
+      { key: 'guideTimeout', label: '流程超时', rows: 4 },
+      { key: 'guideNoNeed', label: '暂不需要', rows: 2 },
+      { key: 'guideConfirmSuccess', label: '确认成功', rows: 2 },
+      { key: 'guideRegisterReminder', label: '注册链接提醒', rows: 3 },
+      { key: 'guideFallback', label: '引导兜底', rows: 2 },
+    ],
+  },
+  {
+    title: '保留模板',
+    fields: [
+      { key: 'triggerInvite', label: '关键词私聊内容', rows: 4 },
+    ],
+  },
+]
 
 const logColumns = [
   { prop: 'id', label: 'ID', width: '80' },
@@ -91,6 +179,13 @@ const fetchSettings = async () => {
       })
       Object.assign(xboardForm, settingsStore.settings.xboard || {})
       Object.assign(aiReplyForm, settingsStore.settings.aiReply || {})
+      Object.assign(keywordPrivateReplyForm, settingsStore.settings.keywordPrivateReply || {})
+      const privateMessaging = settingsStore.settings.privateMessaging || {}
+      Object.assign(privateMessagingForm, {
+        inboundRepliesEnabled: privateMessaging.inboundRepliesEnabled ?? true,
+        proactiveEnabled: privateMessaging.proactiveEnabled ?? false,
+      })
+      Object.assign(privateReplyTemplatesForm, privateMessaging.templates || {})
     }
   } catch (error) {
     console.error('Failed to fetch settings:', error)
@@ -147,15 +242,28 @@ const handleSaveXBoard = async () => {
 
 const handleSaveAiReply = async () => {
   try {
-    await settingsStore.updateSettings({ aiReply: aiReplyForm })
+    await settingsStore.updateSettings({
+      aiReply: aiReplyForm,
+      keywordPrivateReply: keywordPrivateReplyForm,
+      privateMessaging: {
+        ...privateMessagingForm,
+        templates: privateReplyTemplatesForm,
+      },
+    })
     ElMessage.success('保存成功')
   } catch (error) {
     ElMessage.error('保存失败')
   }
 }
 
-const handleExportLogs = () => {
-  window.open('/api/settings/logs/export', '_blank')
+const handleExportLogs = async () => {
+  try {
+    const response = await settingsApi.exportLogs()
+    downloadBlob(response.data, 'vanguard-operation-logs.csv')
+  } catch (error) {
+    console.error('Failed to export logs:', error)
+    ElMessage.error('导出失败')
+  }
 }
 
 const handleClearLogs = async () => {
@@ -177,10 +285,6 @@ const handleBackup = async () => {
   } finally {
     loading.value = false
   }
-}
-
-const handleLogout = async () => {
-  await authStore.logout()
 }
 
 const formatDate = (date: string) => {
@@ -254,12 +358,55 @@ onMounted(() => {
       <el-tab-pane label="通知设置" name="notification">
         <el-card shadow="never">
           <el-form :model="notificationForm" label-width="140px">
+            <el-form-item label="Sub2API告警">
+              <el-switch v-model="notificationForm.sub2apiAlertsEnabled" />
+              <span class="form-tip">接收通过签名验证的 Sub2API 运维告警</span>
+            </el-form-item>
+
+            <el-form-item v-if="notificationForm.sub2apiAlertsEnabled" label="恢复通知">
+              <el-switch v-model="notificationForm.sub2apiNotifyResolved" />
+            </el-form-item>
+
+            <el-form-item label="Sub2API公告">
+              <el-switch v-model="notificationForm.sub2apiAnnouncementsEnabled" />
+              <span class="form-tip">接收并分发 Sub2API 的公开公告</span>
+            </el-form-item>
+
+            <el-divider />
+
             <el-form-item label="Telegram通知">
               <el-switch v-model="notificationForm.telegramEnabled" />
             </el-form-item>
 
             <el-form-item v-if="notificationForm.telegramEnabled" label="Telegram Chat ID">
-              <el-input v-model="notificationForm.telegramChatId" placeholder="Telegram Chat ID" style="width: 300px;" />
+              <el-input v-model="notificationForm.telegramChatId" placeholder="多个 Chat ID 用逗号分隔" style="width: 400px;" />
+            </el-form-item>
+
+            <template v-if="notificationForm.sub2apiAnnouncementsEnabled">
+              <el-form-item label="公告发到 Telegram">
+                <el-switch v-model="notificationForm.telegramAnnouncementsEnabled" />
+              </el-form-item>
+              <el-form-item v-if="notificationForm.telegramAnnouncementsEnabled" label="公告 Chat ID">
+                <el-input v-model="notificationForm.telegramAnnouncementChatId" placeholder="多个 Chat ID 用逗号分隔" style="width: 400px;" />
+              </el-form-item>
+              <el-form-item v-if="notificationForm.telegramAnnouncementsEnabled" label="自动置顶公告">
+                <el-switch v-model="notificationForm.telegramAnnouncementPin" />
+              </el-form-item>
+              <el-form-item v-if="notificationForm.telegramAnnouncementsEnabled && notificationForm.telegramAnnouncementPin" label="静默置顶">
+                <el-switch v-model="notificationForm.telegramAnnouncementPinSilent" />
+              </el-form-item>
+            </template>
+
+            <el-divider />
+
+            <el-form-item label="QQ 群通知">
+              <el-switch v-model="notificationForm.qqEnabled" />
+              <span class="form-tip">具体目标群由“QQ 群管理”中的“群通知”开关选择</span>
+            </el-form-item>
+
+            <el-form-item v-if="notificationForm.sub2apiAnnouncementsEnabled" label="公告发到 QQ 群">
+              <el-switch v-model="notificationForm.qqAnnouncementsEnabled" />
+              <span class="form-tip">目标群沿用“QQ 群管理”中的“群通知”开关</span>
             </el-form-item>
 
             <el-divider />
@@ -387,13 +534,28 @@ onMounted(() => {
       <el-tab-pane label="AI回复设置" name="aiReply">
         <el-card shadow="never">
           <el-alert
-            title="关闭后，自动回复关键词、私聊追问和意图识别都不会调用 AI，仅使用规则和模板。"
+            title="推广账号不再主动私聊；只有用户先发私聊进来，系统才允许回复。"
             type="warning"
             :closable="false"
             style="margin-bottom: 20px;"
           />
 
           <el-form :model="aiReplyForm" label-width="160px">
+            <el-form-item label="用户私聊后回复">
+              <el-switch v-model="privateMessagingForm.inboundRepliesEnabled" />
+              <span class="form-tip">开启后，仅当用户主动私聊推广账号时才允许回复</span>
+            </el-form-item>
+
+            <el-form-item label="主动私聊触达">
+              <el-switch v-model="privateMessagingForm.proactiveEnabled" />
+              <span class="form-tip">开启后允许系统按策略主动发起私聊触达</span>
+            </el-form-item>
+
+            <el-form-item label="关键词私聊回复">
+              <el-switch v-model="keywordPrivateReplyForm.enabled" />
+              <span class="form-tip">保留配置项；当前主动私聊策略关闭时不会发出</span>
+            </el-form-item>
+
             <el-form-item label="启用AI自动回复">
               <el-switch v-model="aiReplyForm.enabled" />
               <span class="form-tip">默认关闭，只有开启后才允许调用模型</span>
@@ -415,6 +577,34 @@ onMounted(() => {
             <el-form-item label="同用户冷却(秒)">
               <el-input-number v-model="aiReplyForm.cooldownSeconds" :min="0" :max="86400" :step="60" />
             </el-form-item>
+
+            <el-divider content-position="left">用户主动私聊模板</el-divider>
+
+            <div class="template-vars">
+              可用变量：{user_name}、{user_id}、{register_link}、{status}、{message_text}、{command}、{keyword}
+            </div>
+
+            <div
+              v-for="group in privateReplyTemplateGroups"
+              :key="group.title"
+              class="template-group"
+            >
+              <div class="template-group-title">{{ group.title }}</div>
+              <el-form-item
+                v-for="field in group.fields"
+                :key="field.key"
+                :label="field.label"
+              >
+                <el-input
+                  v-model="privateReplyTemplatesForm[field.key]"
+                  type="textarea"
+                  :rows="field.rows"
+                  maxlength="2000"
+                  show-word-limit
+                  class="template-input"
+                />
+              </el-form-item>
+            </div>
 
             <el-form-item>
               <el-button type="primary" @click="handleSaveAiReply">
@@ -503,6 +693,28 @@ onMounted(() => {
   margin-left: 12px;
   color: #909399;
   font-size: 12px;
+}
+
+.template-vars {
+  margin: -4px 0 18px 160px;
+  color: #606266;
+  font-size: 12px;
+}
+
+.template-group {
+  max-width: 920px;
+  margin-bottom: 18px;
+}
+
+.template-group-title {
+  margin: 0 0 12px 160px;
+  color: #303133;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.template-input {
+  width: min(680px, 100%);
 }
 
 .log-actions {

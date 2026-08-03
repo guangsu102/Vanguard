@@ -31,6 +31,18 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '推广账号', icon: 'User' },
       },
       {
+        path: 'growth-dashboard',
+        name: 'GrowthDashboard',
+        component: () => import('@/views/GrowthDashboard.vue'),
+        meta: { title: '增长驾驶舱', icon: 'Promotion' },
+      },
+      {
+        path: 'proxies',
+        name: 'Proxies',
+        component: () => import('@/views/Proxies.vue'),
+        meta: { title: '静态代理IP', icon: 'Connection' },
+      },
+      {
         path: 'groups',
         name: 'Groups',
         component: () => import('@/views/Groups.vue'),
@@ -77,6 +89,12 @@ const routes: RouteRecordRaw[] = [
         name: 'ManagedGroups',
         component: () => import('@/views/ManagedGroups.vue'),
         meta: { title: 'Bot管理群', icon: 'ChatDotRound' },
+      },
+      {
+        path: 'guardian/qq',
+        name: 'QQGroups',
+        component: () => import('@/views/QQGroups.vue'),
+        meta: { title: 'NapCat QQ群', icon: 'ChatLineSquare' },
       },
       {
         path: 'guardian/keywords',

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import { mount } from '@vue/test-utils'
 import TableCard from './TableCard.vue'
 
@@ -17,6 +17,9 @@ describe('TableCard', () => {
           'el-table-column': { template: '<div />' },
           'el-empty': { template: '<div>暂无数据</div>' },
           'el-pagination': { template: '<div />' },
+        },
+        directives: {
+          loading: { mounted: () => undefined },
         },
       },
     })
@@ -38,6 +41,9 @@ describe('TableCard', () => {
           'el-table-column': { template: '<div />' },
           'el-empty': { template: '<div />' },
           'el-pagination': { template: '<div />' },
+        },
+        directives: {
+          loading: { mounted: () => undefined },
         },
       },
     })

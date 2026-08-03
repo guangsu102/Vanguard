@@ -5,6 +5,7 @@ Configuration settings for the Telegram acquisition bot.
 """
 
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -12,7 +13,7 @@ class SearchConfig(BaseModel):
     """群组搜索配置"""
 
     max_results_per_keyword: int = Field(default=50, description="每个关键词最大搜索结果数")
-    min_group_members: int = Field(default=100, description="最小群组成员数")
+    min_group_members: int = Field(default=50, description="最小群组成员数")
     max_group_members: int = Field(default=50000, description="最大群组成员数")
     search_interval_seconds: int = Field(default=300, description="搜索间隔(秒)")
     auto_join_enabled: bool = Field(default=True, description="是否自动加入搜索到的群组")

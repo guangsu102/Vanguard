@@ -1,0 +1,2253 @@
+<script setup lang="ts">
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Check, Refresh, VideoPause } from '@element-plus/icons-vue'
+import { useRoute } from 'vue-router'
+import {
+  automationApi,
+  type AccountAssetPolicySettings,
+  type AccountRiskGuardSettings,
+  type AccountWarmupPolicySettings,
+  type AdCapacitySettings,
+  type AdDeliveryExecutionSettings,
+  type AdDeliveryThrottleSettings,
+  type AdDynamicStatus,
+  type AdFailurePolicy,
+  type GroupAdProfile,
+  type AutoJoinSchedulerConfig,
+  type AutoJoinVerificationLog,
+} from '@/api/automation'
+import { settingsApi, type GroupAiInteractionSettings } from '@/api/settings'
+
+const loading = ref(false)
+const saving = ref('')
+const activeConfigTab = ref('join')
+const activeEventTab = ref('attempts')
+const route = useRoute()
+
+const configTabNames = ['join', 'warmup', 'asset', 'risk', 'ads', 'group-ai'] as const
+type ConfigTabName = (typeof configTabNames)[number]
+
+const applyConfigQuery = (config: unknown) => {
+  const value = Array.isArray(config) ? config[0] : config
+  if (typeof value === 'string' && configTabNames.includes(value as ConfigTabName)) {
+    activeConfigTab.value = value
+  }
+}
+
+const dynamicStatuses = ref<AdDynamicStatus[]>([])
+const autoJoinAttempts = ref<any[]>([])
+const verificationLogs = ref<AutoJoinVerificationLog[]>([])
+const deliveryLogs = ref<any[]>([])
+const groupAdProfiles = ref<GroupAdProfile[]>([])
+
+const riskActionOptions = [
+  { label: '搜群', value: 'search' },
+  { label: '加群', value: 'join' },
+  { label: '私聊', value: 'private_message' },
+  { label: '群消息', value: 'group_message' },
+  { label: '广告探针', value: 'ad_probe' },
+  { label: 'AI暖群', value: 'ai_warmup' },
+  { label: '审核', value: 'moderation' },
+  { label: '广告', value: 'ad_delivery' },
+  { label: '资料', value: 'profile_update' },
+  { label: '回应', value: 'reaction' },
+  { label: '转发', value: 'forward' },
+  { label: '置顶', value: 'pin' },
+  { label: 'Bot消息', value: 'bot_message' },
+  { label: 'Bot置顶', value: 'bot_pin' },
+  { label: '创建频道', value: 'channel_create' },
+]
+
+const riskLevelPolicyOptions = [
+  { label: '正常', value: 'normal' },
+  { label: '观察', value: 'watch' },
+  { label: '限流', value: 'limited' },
+  { label: '冻结', value: 'frozen' },
+  { label: '隔离', value: 'quarantined' },
+]
+
+const riskScoreDeltaOptions = [
+  { label: '群禁言', value: 'group_write_forbidden' },
+  { label: '平台群禁言', value: 'platform_group_write_forbidden' },
+  { label: 'Flood Wait', value: 'flood_wait' },
+  { label: 'Peer Flood', value: 'peer_flood' },
+  { label: '账号封禁', value: 'account_banned' },
+  { label: '账号受限', value: 'account_restricted' },
+  { label: '普通失败', value: 'generic_failure' },
+  { label: '拦截加分', value: 'block' },
+]
+
+const assetTierOptions = [
+  { label: '未知', value: 'unknown' },
+  { label: '1个月', value: 'month_1' },
+  { label: '3-6个月', value: 'month_3_6' },
+  { label: '1年', value: 'year_1' },
+  { label: '2年', value: 'year_2' },
+  { label: '3年以上', value: 'year_3_plus' },
+]
+
+const warmupStageOptions = [
+  { label: '观察', value: 'observe' },
+  { label: '起步', value: 'seed' },
+  { label: '低频', value: 'soft' },
+  { label: '提量', value: 'ramp' },
+  { label: '正常', value: 'normal' },
+  { label: '冷却', value: 'cooldown' },
+]
+
+const groupLevelOptions = [
+  { label: 'A', value: 'A' },
+  { label: 'B', value: 'B' },
+  { label: 'C', value: 'C' },
+  { label: '未评级', value: 'UNRATED' },
+]
+
+const adCapacityTierOptions = [
+  { label: '封禁', value: 'blocked' },
+  { label: '观察', value: 'observing' },
+  { label: '试投', value: 'trial' },
+  { label: '已验证', value: 'validated' },
+  { label: '稳定', value: 'stable' },
+  { label: '低', value: 'low' },
+  { label: '中', value: 'medium' },
+  { label: '高', value: 'high' },
+  { label: '优质', value: 'premium' },
+]
+
+const adPolicyModeOptions = [
+  { label: '禁止广告', value: 'forbidden' },
+  { label: '许可未知', value: 'unknown' },
+  { label: '需管理员审批', value: 'approval_required' },
+  { label: '允许软广告', value: 'soft_ad_allowed' },
+  { label: '允许高容量广告', value: 'high_volume_ad_allowed' },
+]
+
+const adHourlyWeightOptions = Array.from({ length: 24 }, (_, hour) => ({
+  label: `${hour}:00`,
+  value: String(hour),
+}))
+
+const unknownChallengeActionOptions = [
+  { label: '退出', value: 'leave' },
+  { label: '人工', value: 'manual' },
+  { label: '等待', value: 'wait' },
+  { label: '跳过', value: 'skip' },
+]
+
+const groupAiModeOptions = [
+  { label: '辅助回复', value: 'assistive' },
+  { label: '暖号互动', value: 'warmup' },
+  { label: '转化引导', value: 'conversion' },
+  { label: '关闭', value: 'off' },
+]
+
+const groupAiToneOptions = [
+  { label: '自然', value: 'natural' },
+  { label: '友好', value: 'friendly' },
+  { label: '专业', value: 'professional' },
+  { label: '柔和', value: 'soft' },
+]
+
+const defaultRiskActions = (): AccountRiskGuardSettings['actions'] => ({
+  search: { daily_limit: 100, cooldown_seconds: 30 },
+  join: { daily_limit: 100, cooldown_seconds: 60 },
+  private_message: { daily_limit: 20, cooldown_seconds: 300 },
+  group_message: { daily_limit: 1000, cooldown_seconds: 60 },
+  moderation: { daily_limit: 60, cooldown_seconds: 15 },
+  ad_delivery: { daily_limit: 40000, cooldown_seconds: 90 },
+  profile_update: { daily_limit: 5, cooldown_seconds: 3600 },
+  reaction: { daily_limit: 120, cooldown_seconds: 10 },
+  forward: { daily_limit: 25, cooldown_seconds: 120 },
+  pin: { daily_limit: 20, cooldown_seconds: 120 },
+  bot_message: { daily_limit: 500, cooldown_seconds: 1 },
+  bot_pin: { daily_limit: 100, cooldown_seconds: 5 },
+  channel_create: { daily_limit: 1, cooldown_seconds: 86400 },
+})
+
+const defaultRiskLevelThresholds = (): Record<string, number> => ({
+  watch: 20,
+  limited: 45,
+  frozen: 70,
+  quarantined: 90,
+})
+
+const defaultRiskLevelMultipliers = (): Record<string, number> => ({
+  normal: 1,
+  watch: 0.7,
+  limited: 0.45,
+  frozen: 0,
+  quarantined: 0,
+})
+
+const defaultRiskScoreDeltas = (): Record<string, number> => ({
+  group_write_forbidden: 4,
+  platform_group_write_forbidden: 12,
+  flood_wait: 15,
+  peer_flood: 35,
+  account_banned: 50,
+  account_restricted: 50,
+  generic_failure: 5,
+  block: 1,
+})
+
+const defaultRiskLifecycle = (): Record<string, number> => ({
+  default_freeze_seconds: 3600,
+  flood_wait_buffer_seconds: 60,
+  peer_flood_freeze_seconds: 86400,
+  account_restricted_freeze_seconds: 86400,
+  group_write_forbidden_freeze_seconds: 43200,
+  recovery_seconds: 86400,
+  post_freeze_score_cap: 69,
+  manual_clear_score_cap: 44,
+  decay_interval_hours: 24,
+  decay_points_per_interval: 8,
+  new_account_days: 3,
+  new_account_multiplier: 0.3,
+  recovery_multiplier: 0.5,
+  healthy_account_days: 14,
+  healthy_account_multiplier: 1,
+  max_budget_multiplier: 1,
+})
+
+const defaultGroupWriteForbiddenPolicy = (): Record<string, number> => ({
+  freeze_window_hours: 2,
+  freeze_distinct_groups: 5,
+  quarantine_window_hours: 24,
+  quarantine_distinct_groups: 10,
+})
+
+const defaultRiskRetention = (): Record<string, number> => ({
+  low_value_detail_retention_days: 14,
+  high_value_detail_retention_days: 90,
+  daily_stat_retention_days: 370,
+})
+
+const defaultAssetTiers = (): AccountAssetPolicySettings['tiers'] => ({
+  unknown: { join_multiplier: 0.6, ad_multiplier: 0.5, run_multiplier: 0.5, probe_multiplier: 0.7, warmup_days: 18, age_floor_days: 0 },
+  month_1: { join_multiplier: 0.4, ad_multiplier: 0.25, run_multiplier: 0.25, probe_multiplier: 0.45, warmup_days: 25, age_floor_days: 30 },
+  month_3_6: { join_multiplier: 0.7, ad_multiplier: 0.6, run_multiplier: 0.6, probe_multiplier: 0.75, warmup_days: 18, age_floor_days: 120 },
+  year_1: { join_multiplier: 1, ad_multiplier: 1, run_multiplier: 1, probe_multiplier: 1, warmup_days: 12, age_floor_days: 365 },
+  year_2: { join_multiplier: 1.15, ad_multiplier: 1.2, run_multiplier: 1.15, probe_multiplier: 1.1, warmup_days: 9, age_floor_days: 730 },
+  year_3_plus: { join_multiplier: 1.3, ad_multiplier: 1.35, run_multiplier: 1.25, probe_multiplier: 1.15, warmup_days: 7, age_floor_days: 1095 },
+})
+
+const defaultWarmupTiers = (): AccountWarmupPolicySettings['tiers'] => ({
+  unknown: { warmup_days: 15 },
+  month_1: { warmup_days: 18 },
+  month_3_6: { warmup_days: 12 },
+  year_1: { warmup_days: 9 },
+  year_2: { warmup_days: 7 },
+  year_3_plus: { warmup_days: 7 },
+})
+
+const defaultWarmupStages = (): AccountWarmupPolicySettings['stages'] => ({
+  observe: {
+    limit_multiplier: 0.08,
+    join_multiplier: 0,
+    ad_multiplier: 0,
+    run_multiplier: 0,
+    probe_multiplier: 0.1,
+    private_message_multiplier: 0,
+    group_message_multiplier: 0.05,
+    profile_update_multiplier: 0.2,
+    allow_proactive_private_message: false,
+  },
+  seed: {
+    limit_multiplier: 0.15,
+    join_multiplier: 0.15,
+    ad_multiplier: 0,
+    run_multiplier: 0,
+    probe_multiplier: 0.25,
+    private_message_multiplier: 0,
+    group_message_multiplier: 0.15,
+    profile_update_multiplier: 0.5,
+    allow_proactive_private_message: false,
+  },
+  soft: {
+    limit_multiplier: 0.35,
+    join_multiplier: 0.35,
+    ad_multiplier: 0.25,
+    run_multiplier: 0.25,
+    probe_multiplier: 0.45,
+    private_message_multiplier: 0.1,
+    group_message_multiplier: 0.35,
+    profile_update_multiplier: 0.75,
+    allow_proactive_private_message: false,
+  },
+  ramp: {
+    limit_multiplier: 0.65,
+    join_multiplier: 0.65,
+    ad_multiplier: 0.65,
+    run_multiplier: 0.65,
+    probe_multiplier: 0.75,
+    private_message_multiplier: 0.25,
+    group_message_multiplier: 0.65,
+    profile_update_multiplier: 1,
+    allow_proactive_private_message: false,
+  },
+  normal: {
+    limit_multiplier: 1,
+    join_multiplier: 1,
+    ad_multiplier: 1,
+    run_multiplier: 1,
+    probe_multiplier: 1,
+    private_message_multiplier: 1,
+    group_message_multiplier: 1,
+    profile_update_multiplier: 1,
+    allow_proactive_private_message: true,
+  },
+  cooldown: {
+    limit_multiplier: 0,
+    join_multiplier: 0,
+    ad_multiplier: 0,
+    run_multiplier: 0,
+    probe_multiplier: 0,
+    private_message_multiplier: 0,
+    group_message_multiplier: 0,
+    profile_update_multiplier: 0,
+    allow_proactive_private_message: false,
+  },
+})
+
+const schedulerForm = reactive<AutoJoinSchedulerConfig>({
+  enabled: true,
+  scan_interval_minutes: 5,
+  search_filter: {
+    title_blacklist_enabled: true,
+    title_blacklist: [],
+  },
+  join_verification: {
+    enabled: true,
+    ai_enabled: true,
+    confidence_threshold: 0.72,
+    post_action_wait_seconds: 8,
+    post_action_recheck_attempts: 3,
+    post_action_extra_wait_seconds: 12,
+    message_limit: 20,
+    ai_timeout_seconds: 45,
+    action_timeout_seconds: 5,
+    pending_sync_min_age_seconds: 120,
+    pending_sync_limit: 5,
+    unknown_challenge_action: 'leave',
+    allow_button_clicks: true,
+    allow_text_answers: true,
+    answer_profile: '中文用户，主要为了学习交流、找资料、行业沟通。',
+  },
+  group_capacity_cleanup: {
+    enabled: false,
+    no_conversion_days: 30,
+    min_join_age_days: 30,
+    max_cleanup_per_run: 15,
+  },
+})
+
+const riskGuardForm = reactive<AccountRiskGuardSettings>({
+  enabled: true,
+  global_daily_limit: 200,
+  redis_fail_closed: null,
+  actions: defaultRiskActions(),
+  level_thresholds: defaultRiskLevelThresholds(),
+  level_budget_multipliers: defaultRiskLevelMultipliers(),
+  risk_score_deltas: defaultRiskScoreDeltas(),
+  lifecycle: defaultRiskLifecycle(),
+  group_write_forbidden: defaultGroupWriteForbiddenPolicy(),
+  retention: defaultRiskRetention(),
+})
+
+const assetPolicyForm = reactive<AccountAssetPolicySettings>({
+  enabled: true,
+  tiers: defaultAssetTiers(),
+})
+
+const warmupPolicyForm = reactive<AccountWarmupPolicySettings>({
+  enabled: true,
+  default_warmup_days: 15,
+  minimum_warmup_days: 5,
+  user_initiated_private_message_multiplier: 1,
+  tiers: defaultWarmupTiers(),
+  stages: defaultWarmupStages(),
+})
+
+const adExecutionForm = reactive<AdDeliveryExecutionSettings>({
+  enabled: true,
+  dispatcher_interval_seconds: 60,
+  max_deliveries_per_run: 1,
+  max_deliveries_per_account_per_run: 1,
+  group_campaign_cooldown_minutes: 1440,
+  stop_account_after_success: true,
+  stop_account_after_failure: true,
+})
+
+const adThrottleForm = reactive<AdDeliveryThrottleSettings>({
+  enabled: true,
+  delivery_interval_seconds: 3600,
+  batch_window_seconds: 3600,
+  batch_size_min: 1,
+  batch_size_max: 1,
+  cooldown_min_seconds: 3600,
+  cooldown_max_seconds: 10800,
+})
+
+const adCapacityForm = reactive<AdCapacitySettings>({
+  enabled: true,
+  timezone_offset_hours: 8,
+  window_start_hour: 9,
+  window_end_hour: 2,
+  survival_check_delay_seconds: 120,
+  survival_one_hour_seconds: 3600,
+  survival_twenty_four_hour_seconds: 86400,
+  survival_check_batch_size: 50,
+  survival_retry_max_attempts: 3,
+  survival_retry_base_seconds: 300,
+  account_ad_daily_hard_cap: 5,
+  account_group_daily_cap_default: 3,
+  group_global_daily_hard_cap: 400,
+  group_min_interval_seconds: 3600,
+  max_groups_per_account: 400,
+  max_new_ad_groups_per_day: 3,
+  leave_on_deleted_ad: true,
+  block_group_on_probe_failure: true,
+  ad_policy_ai_enabled: true,
+  ad_policy_ai_model: 'gpt-5.6-luna',
+  ad_policy_ai_timeout_seconds: 45,
+  ad_policy_ai_min_confidence: 95,
+  ad_policy_ai_require_second_pass: true,
+  ad_policy_auto_ttl_days: 7,
+  ad_policy_manual_ttl_days: 30,
+  premium_min_samples: 20,
+  premium_min_conversions: 1,
+  premium_survival_rate_percent: 95,
+  premium_clean_days_auto: 5,
+  premium_clean_days_verified: 3,
+  premium_growth_samples: 100,
+  premium_full_capacity_samples: 1000,
+  premium_entry_capacity: 20,
+  premium_growth_capacity: 50,
+  premium_conversion_capacity_step: 20,
+  deleted_ad_pause_hours: 72,
+  membership_delete_block_count: 2,
+  warmup_days_before_ads: 15,
+  warmup_daily_interactions_min: 0,
+  warmup_daily_interactions_max: 1,
+  mature_daily_interactions_min: 0,
+  mature_daily_interactions_max: 1,
+  tier_daily_capacities: { blocked: 0, observing: 0, trial: 1, validated: 3, stable: 10, low: 3, medium: 10, high: 20, premium: 400 },
+  hourly_weights: {},
+})
+
+const adFailurePolicyForm = reactive<AdFailurePolicy>({
+  enabled: true,
+  leave_on_group_control_failure: true,
+  group_control_failure_limit: 1,
+  group_control_failure_window_hours: 720,
+  levels: ['A', 'B', 'C', 'UNRATED'],
+})
+
+const groupAiForm = reactive<GroupAiInteractionSettings>({
+  enabled: false,
+  aiEnabled: false,
+  dailyTokenBudget: 0,
+  maxRepliesPerGroupPerDay: 3,
+  maxRepliesPerAccountPerDay: 20,
+  cooldownSeconds: 900,
+  replyMaxChars: 120,
+  blockAiSelfDisclosure: true,
+  mode: 'assistive',
+  tone: 'natural',
+  temperature: 0.6,
+  maxTokens: 180,
+  allowKeywordTriggeredReply: false,
+  allowSemanticTriggeredReply: true,
+  semanticScanWindowMessages: 100,
+  semanticEvaluateEveryMessages: 100,
+  semanticMinConfidence: 0.78,
+  semanticMinTextChars: 4,
+  semanticAllowedIntents: ['question', 'buying_interest', 'problem', 'recommendation_request', 'experience_request'],
+  semanticBlockedIntents: ['smalltalk', 'thanks', 'emoji', 'command', 'spam', 'ad', 'sensitive'],
+  semanticDecisionPrompt: '你需要从最近的Telegram群聊消息中，选择最值得自然回复的一条真实用户消息。只有当消息明确表达问题、需求、使用障碍、推荐请求或可自然接话的经验讨论时才回复；闲聊、表情、感谢、广告、命令、敏感内容、低质量短句都不要回复。',
+  allowProactiveWarmup: false,
+  proactiveWarmupIntervalMinutes: 30,
+  proactiveWarmupMaxGroupsPerRun: 5,
+  proactiveWarmupMaxPerGroupPerDay: 2,
+  proactiveWarmupMaxPerAccountPerDay: 20,
+  proactiveWarmupCooldownSeconds: 3600,
+  proactiveWarmupWindowStartHour: 9,
+  proactiveWarmupWindowEndHour: 2,
+  proactiveWarmupTopics: ['节点稳定性', '工具使用体验', '账号风控经验', '自动化效率', '群内常见问题'],
+  proactiveWarmupTemplates: [
+    '最近大家用节点稳定吗？有没有哪种线路体验比较好？',
+    '你们平时会怎么判断一个工具到底稳不稳定？',
+    '群里有人最近遇到账号风控吗？一般怎么处理比较稳？',
+    '感觉自动化最麻烦的还是细节限制，大家一般怎么控频率？',
+    '这个问题我也挺关心的，想听听群里有没有实际经验。',
+  ],
+  proactiveWarmupGroupOverrides: {},
+  systemPrompt: '你是一个中文Telegram社群客服助手，回复要简洁、自然、友好，不要提及你是AI。',
+})
+
+const semanticAllowedIntentsText = ref(groupAiForm.semanticAllowedIntents.join('\n'))
+const semanticBlockedIntentsText = ref(groupAiForm.semanticBlockedIntents.join('\n'))
+const proactiveWarmupTopicsText = ref(groupAiForm.proactiveWarmupTopics.join('\n'))
+const proactiveWarmupTemplatesText = ref(groupAiForm.proactiveWarmupTemplates.join('\n'))
+const proactiveWarmupGroupOverridesText = ref(JSON.stringify(groupAiForm.proactiveWarmupGroupOverrides, null, 2))
+
+const linesToList = (value: string) => value
+  .split(/\r?\n/)
+  .map((item) => item.trim())
+  .filter(Boolean)
+
+const syncGroupAiTextFields = () => {
+  semanticAllowedIntentsText.value = (groupAiForm.semanticAllowedIntents || []).join('\n')
+  semanticBlockedIntentsText.value = (groupAiForm.semanticBlockedIntents || []).join('\n')
+  proactiveWarmupTopicsText.value = (groupAiForm.proactiveWarmupTopics || []).join('\n')
+  proactiveWarmupTemplatesText.value = (groupAiForm.proactiveWarmupTemplates || []).join('\n')
+  proactiveWarmupGroupOverridesText.value = JSON.stringify(groupAiForm.proactiveWarmupGroupOverrides || {}, null, 2)
+}
+
+const buildGroupAiPayload = (): GroupAiInteractionSettings | null => {
+  let groupOverrides: GroupAiInteractionSettings['proactiveWarmupGroupOverrides'] = {}
+  try {
+    const parsed = JSON.parse(proactiveWarmupGroupOverridesText.value || '{}')
+    groupOverrides = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    ElMessage.error('按群暖场覆盖不是合法 JSON')
+    return null
+  }
+
+  return {
+    ...groupAiForm,
+    semanticAllowedIntents: linesToList(semanticAllowedIntentsText.value),
+    semanticBlockedIntents: linesToList(semanticBlockedIntentsText.value),
+    proactiveWarmupTopics: linesToList(proactiveWarmupTopicsText.value),
+    proactiveWarmupTemplates: linesToList(proactiveWarmupTemplatesText.value),
+    proactiveWarmupGroupOverrides: groupOverrides,
+  }
+}
+
+const metrics = computed(() => {
+  const rows = dynamicStatuses.value
+  const total = rows.length
+  const activeAds = rows.filter((row) => row.auto_ads_enabled).length
+  const activeJoin = rows.filter((row) => row.auto_join_enabled).length
+  const paused = rows.filter((row) => ['frozen', 'quarantined', 'limited'].includes(row.risk_level)).length
+  const eligibleGroups = rows.reduce((sum, row) => sum + Number(row.ad_eligible_groups || 0), 0)
+  const avgWritable = total
+    ? rows.reduce((sum, row) => sum + Number(row.writable_rate || 0), 0) / total
+    : 0
+  const avgAdSuccess = total
+    ? rows.reduce((sum, row) => sum + Number(row.ad_success_rate_24h || 0), 0) / total
+    : 0
+
+  return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess }
+})
+
+const redisFailClosedValue = computed({
+  get: () => {
+    if (riskGuardForm.redis_fail_closed === null) return 'system'
+    return riskGuardForm.redis_fail_closed ? 'closed' : 'open'
+  },
+  set: (value: string) => {
+    riskGuardForm.redis_fail_closed = value === 'system' ? null : value === 'closed'
+  },
+})
+
+const titleBlacklistText = computed({
+  get: () => (schedulerForm.search_filter?.title_blacklist || []).join('\n'),
+  set: (value: string) => {
+    if (!schedulerForm.search_filter) {
+      schedulerForm.search_filter = { title_blacklist_enabled: true, title_blacklist: [] }
+    }
+    schedulerForm.search_filter.title_blacklist = value
+      .split(/[\n,，]+/)
+      .map((item) => item.trim())
+      .filter(Boolean)
+  },
+})
+
+const flowSteps = computed(() => [
+  {
+    key: 'search',
+    title: '搜群',
+    enabled: schedulerForm.enabled,
+    status: schedulerForm.enabled ? `${schedulerForm.scan_interval_minutes} 分钟/轮` : '关闭',
+    detail: schedulerForm.search_filter?.title_blacklist_enabled
+      ? `标题黑名单 ${schedulerForm.search_filter?.title_blacklist?.length || 0} 条`
+      : '标题黑名单关闭',
+  },
+  {
+    key: 'verify',
+    title: '群检测',
+    enabled: Boolean(schedulerForm.join_verification?.enabled),
+    status: schedulerForm.join_verification?.ai_enabled ? 'AI 辅助' : '本地规则',
+    detail: `未知验证：${challengeActionLabel(schedulerForm.join_verification?.unknown_challenge_action)}`,
+  },
+  {
+    key: 'join',
+    title: '入群',
+    enabled: Boolean(riskGuardForm.enabled && riskGuardForm.actions.join?.daily_limit),
+    status: `${riskGuardForm.actions.join?.daily_limit || 0}/天`,
+    detail: `冷却 ${formatDuration(riskGuardForm.actions.join?.cooldown_seconds || 0)}`,
+  },
+  {
+    key: 'warmup',
+    title: '暖号',
+    enabled: warmupPolicyForm.enabled,
+    status: `${warmupPolicyForm.default_warmup_days} 天`,
+    detail: `最低 ${warmupPolicyForm.minimum_warmup_days} 天，广告等待 ${adCapacityForm.warmup_days_before_ads} 天`,
+  },
+  {
+    key: 'interaction',
+    title: '群AI互动',
+    enabled: Boolean(groupAiForm.enabled && groupAiForm.aiEnabled),
+    status: groupAiForm.enabled ? groupAiModeLabel(groupAiForm.mode) : '关闭',
+    detail: `${groupAiForm.maxRepliesPerGroupPerDay}/群/天，冷却 ${formatDuration(groupAiForm.cooldownSeconds)}`,
+  },
+  {
+    key: 'ad',
+    title: '广告',
+    enabled: adExecutionForm.enabled,
+    status: `${adExecutionForm.max_deliveries_per_run}/轮`,
+    detail: `账号 ${adExecutionForm.max_deliveries_per_account_per_run}/轮，删帖检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
+  },
+  {
+    key: 'risk',
+    title: '账号风控',
+    enabled: riskGuardForm.enabled,
+    status: `${riskGuardForm.global_daily_limit}/天`,
+    detail: adFailurePolicyForm.leave_on_group_control_failure ? '群控失败自动退群' : '群控失败仅记录',
+  },
+])
+
+const fillSchedulerForm = (config: AutoJoinSchedulerConfig) => {
+  Object.assign(schedulerForm, {
+    ...config,
+    search_filter: {
+      ...schedulerForm.search_filter,
+      ...(config.search_filter || {}),
+      title_blacklist: config.search_filter?.title_blacklist || [],
+    },
+    join_verification: {
+      ...schedulerForm.join_verification,
+      ...(config.join_verification || {}),
+    },
+    group_capacity_cleanup: {
+      ...schedulerForm.group_capacity_cleanup,
+      ...(config.group_capacity_cleanup || {}),
+    },
+  })
+}
+
+const fillRiskGuardForm = (config: AccountRiskGuardSettings) => {
+  riskGuardForm.enabled = config.enabled
+  riskGuardForm.global_daily_limit = config.global_daily_limit
+  riskGuardForm.redis_fail_closed = config.redis_fail_closed
+  const actions = defaultRiskActions()
+  for (const item of riskActionOptions) {
+    actions[item.value] = {
+      ...actions[item.value],
+      ...(config.actions?.[item.value] || {}),
+    }
+  }
+  riskGuardForm.actions = actions
+  riskGuardForm.level_thresholds = {
+    ...defaultRiskLevelThresholds(),
+    ...(config.level_thresholds || {}),
+  }
+  riskGuardForm.level_budget_multipliers = {
+    ...defaultRiskLevelMultipliers(),
+    ...(config.level_budget_multipliers || {}),
+  }
+  riskGuardForm.risk_score_deltas = {
+    ...defaultRiskScoreDeltas(),
+    ...(config.risk_score_deltas || {}),
+  }
+  riskGuardForm.lifecycle = {
+    ...defaultRiskLifecycle(),
+    ...(config.lifecycle || {}),
+  }
+  riskGuardForm.group_write_forbidden = {
+    ...defaultGroupWriteForbiddenPolicy(),
+    ...(config.group_write_forbidden || {}),
+  }
+  riskGuardForm.retention = {
+    ...defaultRiskRetention(),
+    ...(config.retention || {}),
+  }
+}
+
+const fillAssetPolicyForm = (config: AccountAssetPolicySettings) => {
+  assetPolicyForm.enabled = config.enabled
+  const tiers = defaultAssetTiers()
+  for (const item of assetTierOptions) {
+    tiers[item.value] = {
+      ...tiers[item.value],
+      ...(config.tiers?.[item.value] || {}),
+    }
+  }
+  assetPolicyForm.tiers = tiers
+}
+
+const fillWarmupPolicyForm = (config: AccountWarmupPolicySettings) => {
+  warmupPolicyForm.enabled = config.enabled
+  warmupPolicyForm.default_warmup_days = config.default_warmup_days
+  warmupPolicyForm.minimum_warmup_days = config.minimum_warmup_days
+  warmupPolicyForm.user_initiated_private_message_multiplier = config.user_initiated_private_message_multiplier
+  const tiers = defaultWarmupTiers()
+  for (const item of assetTierOptions) {
+    tiers[item.value] = {
+      ...tiers[item.value],
+      ...(config.tiers?.[item.value] || {}),
+    }
+  }
+  warmupPolicyForm.tiers = tiers
+  const stages = defaultWarmupStages()
+  for (const item of warmupStageOptions) {
+    stages[item.value] = {
+      ...stages[item.value],
+      ...(config.stages?.[item.value] || {}),
+    }
+  }
+  warmupPolicyForm.stages = stages
+}
+
+const loadAll = async () => {
+  loading.value = true
+  try {
+    const [
+      dynamicRes,
+      schedulerRes,
+      riskRes,
+      assetRes,
+      warmupRes,
+      executionRes,
+      throttleRes,
+      capacityRes,
+      failureRes,
+      settingsRes,
+      attemptsRes,
+      verificationRes,
+      deliveryRes,
+      groupProfilesRes,
+    ] = await Promise.all([
+      automationApi.getAdDynamicStatus(),
+      automationApi.getAutoJoinSchedulerConfig(),
+      automationApi.getAccountRiskGuard(),
+      automationApi.getAccountAssetPolicy(),
+      automationApi.getAccountWarmupPolicy(),
+      automationApi.getAdDeliveryExecution(),
+      automationApi.getAdDeliveryThrottle(),
+      automationApi.getAdCapacity(),
+      automationApi.getAdFailurePolicy(),
+      settingsApi.get(),
+      automationApi.getAutoJoinAttempts({ limit: 20 }),
+      automationApi.getAutoJoinVerificationLogs({ limit: 20 }),
+      automationApi.getDeliveryLogs({ limit: 20 }),
+      automationApi.getGroupAdProfiles(),
+    ])
+
+    dynamicStatuses.value = dynamicRes.data.data
+    fillSchedulerForm(schedulerRes.data.data)
+    fillRiskGuardForm(riskRes.data.data)
+    fillAssetPolicyForm(assetRes.data.data)
+    fillWarmupPolicyForm(warmupRes.data.data)
+    Object.assign(adExecutionForm, executionRes.data.data)
+    Object.assign(adThrottleForm, throttleRes.data.data)
+    Object.assign(adCapacityForm, capacityRes.data.data)
+    Object.assign(adFailurePolicyForm, failureRes.data.data)
+    Object.assign(groupAiForm, settingsRes.data.data.groupAiInteraction || {})
+    syncGroupAiTextFields()
+    autoJoinAttempts.value = attemptsRes.data.data
+    verificationLogs.value = verificationRes.data.data
+    deliveryLogs.value = deliveryRes.data.data
+    groupAdProfiles.value = groupProfilesRes.data.data
+  } finally {
+    loading.value = false
+  }
+}
+
+const saveScheduler = async () => {
+  saving.value = 'scheduler'
+  try {
+    const res = await automationApi.updateAutoJoinSchedulerConfig(schedulerForm)
+    fillSchedulerForm(res.data.data)
+    ElMessage.success('已保存入群与群检测配置')
+  } finally {
+    saving.value = ''
+  }
+}
+
+const saveRiskGuard = async () => {
+  saving.value = 'risk'
+  try {
+    const res = await automationApi.updateAccountRiskGuard(riskGuardForm)
+    fillRiskGuardForm(res.data.data)
+    ElMessage.success('已保存账号风控配置')
+  } finally {
+    saving.value = ''
+  }
+}
+
+const saveAssetPolicy = async () => {
+  saving.value = 'asset'
+  try {
+    const res = await automationApi.updateAccountAssetPolicy(assetPolicyForm)
+    fillAssetPolicyForm(res.data.data)
+    ElMessage.success('已保存账号等级策略')
+  } finally {
+    saving.value = ''
+  }
+}
+
+const saveWarmupPolicy = async () => {
+  saving.value = 'warmup'
+  try {
+    const res = await automationApi.updateAccountWarmupPolicy(warmupPolicyForm)
+    fillWarmupPolicyForm(res.data.data)
+    ElMessage.success('已保存暖号配置')
+  } finally {
+    saving.value = ''
+  }
+}
+
+const saveAdsPolicy = async () => {
+  saving.value = 'ads'
+  try {
+    const [executionRes, throttleRes, capacityRes, failureRes] = await Promise.all([
+      automationApi.updateAdDeliveryExecution(adExecutionForm),
+      automationApi.updateAdDeliveryThrottle(adThrottleForm),
+      automationApi.updateAdCapacity(adCapacityForm),
+      automationApi.updateAdFailurePolicy(adFailurePolicyForm),
+    ])
+    Object.assign(adExecutionForm, executionRes.data.data)
+    Object.assign(adThrottleForm, throttleRes.data.data)
+    Object.assign(adCapacityForm, capacityRes.data.data)
+    Object.assign(adFailurePolicyForm, failureRes.data.data)
+    ElMessage.success('已保存广告投放配置')
+  } finally {
+    saving.value = ''
+  }
+}
+
+const saveGroupAi = async () => {
+  saving.value = 'groupAi'
+  try {
+    const payload = buildGroupAiPayload()
+    if (!payload) return
+    const res = await settingsApi.update({ groupAiInteraction: payload })
+    Object.assign(groupAiForm, (res as any).data?.data?.groupAiInteraction || groupAiForm)
+    syncGroupAiTextFields()
+    ElMessage.success('已保存群AI互动配置')
+  } finally {
+    saving.value = ''
+  }
+}
+
+function pct(value: number | undefined) {
+  return `${Math.round(Number(value || 0) * 100)}%`
+}
+
+function formatDuration(seconds: number) {
+  if (!seconds) return '0 秒'
+  if (seconds < 60) return `${seconds} 秒`
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`
+  return `${Math.round(seconds / 3600)} 小时`
+}
+
+function riskTagType(level: string) {
+  if (['frozen', 'quarantined'].includes(level)) return 'danger'
+  if (['limited', 'watch'].includes(level)) return 'warning'
+  return 'success'
+}
+
+function statusTagType(status: string) {
+  if (['success', 'joined', 'active'].includes(status)) return 'success'
+  if (['failed', 'error', 'frozen', 'quarantined'].includes(status)) return 'danger'
+  if (['pending', 'scheduled', 'limited', 'watch'].includes(status)) return 'warning'
+  return 'info'
+}
+
+function challengeActionLabel(value?: string) {
+  return unknownChallengeActionOptions.find((item) => item.value === value)?.label || value || '-'
+}
+
+function groupAiModeLabel(value: string) {
+  return groupAiModeOptions.find((item) => item.value === value)?.label || value
+}
+
+function accountLabel(row: AdDynamicStatus) {
+  return row.account_label || `#${row.account_id}`
+}
+
+function compactError(row: AdDynamicStatus) {
+  const error = row.recent_errors?.[0]
+  return error ? `${error.error || '-'} (${error.count})` : '-'
+}
+
+const saveGroupAdPolicy = async (row: GroupAdProfile) => {
+  let note = ''
+  try {
+    const result = await ElMessageBox.prompt('请填写许可依据、管理员确认或禁止原因', '确认群广告策略', {
+      confirmButtonText: '确认保存',
+      cancelButtonText: '取消',
+      inputPattern: /\S{2,}/,
+      inputErrorMessage: '至少填写 2 个字符',
+    })
+    note = result.value
+  } catch {
+    return
+  }
+  saving.value = `group-policy-${row.group_id}`
+  try {
+    const res = await automationApi.updateGroupAdPolicy(row.group_id, {
+      mode: row.ad_policy_mode,
+      confidence: row.ad_policy_mode === 'unknown' ? 0 : 100,
+      note,
+    })
+    Object.assign(row, res.data.data)
+    ElMessage.success('群广告许可已更新')
+  } finally {
+    saving.value = ''
+  }
+}
+
+function severityTagType(severity?: string) {
+  if (severity === 'danger') return 'danger'
+  if (severity === 'warning') return 'warning'
+  if (severity === 'success') return 'success'
+  return 'info'
+}
+
+function diagnosticTagType(row: AdDynamicStatus) {
+  return severityTagType(row.delivery_diagnostic?.primary_block_severity)
+}
+
+function diagnosticLabel(row: AdDynamicStatus) {
+  return row.delivery_diagnostic?.primary_block_label || '-'
+}
+
+function dynamicHealthTagType(row: AdDynamicStatus) {
+  return severityTagType(row.dynamic_health_diagnostic?.primary_severity)
+}
+
+function dynamicHealthText(row: AdDynamicStatus) {
+  const diagnostic = row.dynamic_health_diagnostic
+  if (!diagnostic) return '-'
+  const main = diagnostic.primary_label
+  const top = diagnostic.negative_adjustments?.[0]
+  return top ? `${main} · ${top.label} ${top.delta}` : main
+}
+
+function nextActionText(row: AdDynamicStatus) {
+  const diagnostic = row.delivery_diagnostic
+  if (!diagnostic) return '-'
+  return diagnostic.next_action_at
+    ? `${diagnostic.next_action_label} · ${diagnostic.next_action_at.slice(5, 16).replace('T', ' ')}`
+    : diagnostic.next_action_label
+}
+
+function groupDiagnosticText(row: AdDynamicStatus) {
+  const item = row.delivery_diagnostic?.group_diagnostics
+  if (!item) return '-'
+  const probeState = row.delivery_diagnostic?.probe_execution_allowed ? '探针可运行' : '探针阻断'
+  const adState = row.delivery_diagnostic?.ad_delivery_allowed ? '广告可发送' : '广告暂停'
+  return `${probeState} · ${adState} · 就绪 ${item.ready} · Premium ${item.premium || 0} · 待许可 ${(item.ad_permission_unknown || 0) + (item.ad_policy_expired || 0)} · 待探针 ${item.pending_probe} · 阻断 ${item.probe_failed + item.blocked + (item.ad_permission_forbidden || 0)}`
+}
+
+watch(
+  () => route.query.config,
+  (config) => applyConfigQuery(config),
+)
+
+onMounted(() => {
+  applyConfigQuery(route.query.config)
+  loadAll()
+})
+</script>
+
+<template>
+  <div class="growth-dashboard" v-loading="loading">
+    <div class="page-toolbar">
+      <div>
+        <h2>增长驾驶舱</h2>
+        <div class="toolbar-meta">
+          账号 {{ metrics.total }} 个 · 加群 {{ metrics.activeJoin }} 个 · 广告 {{ metrics.activeAds }} 个 · 风控 {{ metrics.paused }} 个
+        </div>
+      </div>
+      <el-button :icon="Refresh" :loading="loading" @click="loadAll">刷新</el-button>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric-cell">
+        <span>可投放群</span>
+        <strong>{{ metrics.eligibleGroups }}</strong>
+      </div>
+      <div class="metric-cell">
+        <span>群可发言率</span>
+        <strong>{{ pct(metrics.avgWritable) }}</strong>
+      </div>
+      <div class="metric-cell">
+        <span>广告成功率</span>
+        <strong>{{ pct(metrics.avgAdSuccess) }}</strong>
+      </div>
+      <div class="metric-cell">
+            <span>账号风控</span>
+        <strong>{{ riskGuardForm.enabled ? '运行' : '关闭' }}</strong>
+      </div>
+    </div>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>流程总览</h3>
+      </div>
+      <div class="flow-grid">
+        <div v-for="step in flowSteps" :key="step.key" class="flow-item" :class="{ disabled: !step.enabled }">
+          <div class="flow-icon">
+            <el-icon>
+              <component :is="step.enabled ? Check : VideoPause" />
+            </el-icon>
+          </div>
+          <div class="flow-body">
+            <div class="flow-title">{{ step.title }}</div>
+            <div class="flow-status">{{ step.status }}</div>
+            <div class="flow-detail">{{ step.detail }}</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>账号运营态</h3>
+        <el-tag type="info" effect="plain">{{ dynamicStatuses.length }} 个账号</el-tag>
+      </div>
+      <el-table :data="dynamicStatuses" height="360" size="small" border>
+        <el-table-column label="账号" min-width="150">
+          <template #default="{ row }">
+            <div class="account-cell">
+              <span>{{ accountLabel(row) }}</span>
+              <small>#{{ row.account_id }}</small>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="开关" width="130">
+          <template #default="{ row }">
+            <el-tag :type="row.auto_join_enabled ? 'success' : 'info'" size="small">加群</el-tag>
+            <el-tag :type="row.auto_ads_enabled ? 'success' : 'info'" size="small">广告</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="风控" min-width="130">
+          <template #default="{ row }">
+            <el-tag :type="riskTagType(row.risk_level)" size="small">{{ row.risk_level }}</el-tag>
+            <span class="inline-score">{{ row.risk_score }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="健康诊断" min-width="210" show-overflow-tooltip>
+          <template #default="{ row }">
+            <el-tag :type="dynamicHealthTagType(row)" size="small">{{ row.dynamic_health_diagnostic?.primary_label || '-' }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="暖号" min-width="150">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.warmup_stage }}</el-tag>
+            <span class="muted-text">{{ row.warmup_remaining_days }} 天</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="探针/发言" min-width="150">
+          <template #default="{ row }">
+            <div>{{ pct(row.probe_success_rate_24h) }} / {{ pct(row.writable_rate) }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column prop="ad_eligible_groups" label="可投放群" width="100" />
+        <el-table-column label="额度" min-width="130">
+          <template #default="{ row }">
+            {{ row.dynamic_daily_limit }} / {{ row.dynamic_run_limit }}
+          </template>
+        </el-table-column>
+        <el-table-column label="投放阻塞" min-width="170">
+          <template #default="{ row }">
+            <el-tag :type="diagnosticTagType(row)" size="small">{{ diagnosticLabel(row) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="下一步" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">{{ nextActionText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="群状态" min-width="240" show-overflow-tooltip>
+          <template #default="{ row }">{{ groupDiagnosticText(row) }}</template>
+        </el-table-column>
+        <el-table-column label="近期错误" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">{{ compactError(row) }}</template>
+        </el-table-column>
+      </el-table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>群广告许可与档位</h3>
+        <el-tag type="info" effect="plain">群级上限 400/天</el-tag>
+      </div>
+      <el-table :data="groupAdProfiles" size="small" border height="360">
+        <el-table-column label="群" min-width="180" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.group_title || row.telegram_group_id }}</template>
+        </el-table-column>
+        <el-table-column label="广告许可" min-width="180">
+          <template #default="{ row }">
+            <el-select v-model="row.ad_policy_mode" size="small">
+              <el-option v-for="item in adPolicyModeOptions" :key="item.value" :label="item.label" :value="item.value" />
+            </el-select>
+          </template>
+        </el-table-column>
+        <el-table-column label="档位" width="100">
+          <template #default="{ row }"><el-tag size="small">{{ row.ad_tier }}</el-tag></template>
+        </el-table-column>
+        <el-table-column prop="daily_capacity" label="日容量" width="90" />
+        <el-table-column label="24h样本" width="100">
+          <template #default="{ row }">{{ row.metrics?.completed_samples || 0 }}</template>
+        </el-table-column>
+        <el-table-column label="24h存活" width="100">
+          <template #default="{ row }">{{ pct(row.metrics?.survival_rate_24h || 0) }}</template>
+        </el-table-column>
+        <el-table-column label="转化" width="80">
+          <template #default="{ row }">{{ row.metrics?.conversions || 0 }}</template>
+        </el-table-column>
+        <el-table-column label="无删除" width="90">
+          <template #default="{ row }">{{ row.metrics?.clean_days || 0 }}天</template>
+        </el-table-column>
+        <el-table-column label="操作" width="100" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              :icon="Check"
+              type="primary"
+              size="small"
+              :loading="saving === `group-policy-${row.group_id}`"
+              @click="saveGroupAdPolicy(row)"
+            >保存</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>投放阻塞明细</h3>
+        <el-tag type="info" effect="plain">只读诊断</el-tag>
+      </div>
+      <div class="diagnostic-grid">
+        <div v-for="row in dynamicStatuses" :key="row.account_id" class="diagnostic-card">
+          <div class="diagnostic-card__head">
+            <div>
+              <strong>{{ accountLabel(row) }}</strong>
+              <small>#{{ row.account_id }}</small>
+            </div>
+            <el-tag :type="diagnosticTagType(row)" size="small">{{ diagnosticLabel(row) }}</el-tag>
+          </div>
+          <div class="diagnostic-next">{{ nextActionText(row) }}</div>
+          <div class="diagnostic-next">健康：{{ dynamicHealthText(row) }}</div>
+          <div class="diagnostic-counts">{{ groupDiagnosticText(row) }}</div>
+          <div class="diagnostic-tags">
+            <el-tag
+              v-for="item in row.dynamic_health_diagnostic?.negative_adjustments || []"
+              :key="item.reason"
+              :type="severityTagType(item.severity)"
+              size="small"
+              effect="plain"
+            >
+              {{ item.label }} {{ item.delta }}
+            </el-tag>
+          </div>
+          <div class="diagnostic-tags">
+            <el-tag
+              v-for="reason in row.delivery_diagnostic?.block_reasons || []"
+              :key="reason.reason"
+              :type="severityTagType(reason.severity)"
+              size="small"
+              effect="plain"
+            >
+              {{ reason.label }}{{ reason.detail ? `：${reason.detail}` : '' }}
+            </el-tag>
+          </div>
+          <el-table
+            v-if="row.delivery_diagnostic?.blocked_group_samples?.length"
+            :data="row.delivery_diagnostic.blocked_group_samples"
+            size="small"
+            border
+            height="180"
+          >
+            <el-table-column label="群" min-width="150" show-overflow-tooltip>
+              <template #default="{ row: group }">{{ group.title || group.telegram_group_id }}</template>
+            </el-table-column>
+            <el-table-column label="原因" min-width="140">
+              <template #default="{ row: group }">
+                <el-tag :type="severityTagType(group.severity)" size="small">
+                  {{ group.label }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="状态" min-width="180" show-overflow-tooltip>
+              <template #default="{ row: group }">
+                {{ group.warmup_status }} / {{ group.probe_status }} / {{ group.ad_status }}
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>配置中心</h3>
+      </div>
+      <el-tabs v-model="activeConfigTab" class="config-tabs">
+        <el-tab-pane label="入群与群检测" name="join">
+          <div class="form-grid">
+            <el-form label-width="160px" size="small">
+              <el-form-item label="自动入群">
+                <el-switch v-model="schedulerForm.enabled" />
+              </el-form-item>
+              <el-form-item label="扫描间隔">
+                <el-input-number v-model="schedulerForm.scan_interval_minutes" :min="1" :max="1440" />
+              </el-form-item>
+              <el-form-item label="标题黑名单">
+                <el-switch v-model="schedulerForm.search_filter!.title_blacklist_enabled" />
+              </el-form-item>
+              <el-form-item label="黑名单词表">
+                <el-input
+                  v-model="titleBlacklistText"
+                  type="textarea"
+                  :rows="8"
+                  maxlength="4000"
+                  show-word-limit
+                />
+              </el-form-item>
+            </el-form>
+            <el-form label-width="160px" size="small">
+              <el-form-item label="群检测">
+                <el-switch v-model="schedulerForm.join_verification!.enabled" />
+              </el-form-item>
+              <el-form-item label="检测AI">
+                <el-switch v-model="schedulerForm.join_verification!.ai_enabled" />
+              </el-form-item>
+              <el-form-item label="可信阈值">
+                <el-input-number v-model="schedulerForm.join_verification!.confidence_threshold" :min="0" :max="1" :step="0.01" />
+              </el-form-item>
+              <el-form-item label="消息采样">
+                <el-input-number v-model="schedulerForm.join_verification!.message_limit" :min="5" :max="50" />
+              </el-form-item>
+              <el-form-item label="未知验证">
+                <el-select v-model="schedulerForm.join_verification!.unknown_challenge_action">
+                  <el-option v-for="item in unknownChallengeActionOptions" :key="item.value" :label="item.label" :value="item.value" />
+                </el-select>
+              </el-form-item>
+            </el-form>
+            <el-form label-width="160px" size="small">
+              <el-form-item label="验证后等待">
+                <el-input-number v-model="schedulerForm.join_verification!.post_action_wait_seconds" :min="0" :max="120" />
+              </el-form-item>
+              <el-form-item label="额外等待">
+                <el-input-number v-model="schedulerForm.join_verification!.post_action_extra_wait_seconds" :min="0" :max="30" :step="1" />
+              </el-form-item>
+              <el-form-item label="复查次数">
+                <el-input-number v-model="schedulerForm.join_verification!.post_action_recheck_attempts" :min="1" :max="10" />
+              </el-form-item>
+              <el-form-item label="AI超时">
+                <el-input-number v-model="schedulerForm.join_verification!.ai_timeout_seconds" :min="1" :max="45" :step="1" />
+              </el-form-item>
+              <el-form-item label="操作超时">
+                <el-input-number v-model="schedulerForm.join_verification!.action_timeout_seconds" :min="1" :max="20" :step="1" />
+              </el-form-item>
+              <el-form-item label="待同步最小时间">
+                <el-input-number v-model="schedulerForm.join_verification!.pending_sync_min_age_seconds" :min="30" :max="3600" :step="10" />
+              </el-form-item>
+              <el-form-item label="待同步批量">
+                <el-input-number v-model="schedulerForm.join_verification!.pending_sync_limit" :min="1" :max="20" />
+              </el-form-item>
+            </el-form>
+            <el-form label-width="160px" size="small">
+              <el-form-item label="允许点按钮">
+                <el-switch v-model="schedulerForm.join_verification!.allow_button_clicks" />
+              </el-form-item>
+              <el-form-item label="允许文本回答">
+                <el-switch v-model="schedulerForm.join_verification!.allow_text_answers" />
+              </el-form-item>
+              <el-form-item label="回答身份描述">
+                <el-input
+                  v-model="schedulerForm.join_verification!.answer_profile"
+                  type="textarea"
+                  :rows="3"
+                  maxlength="500"
+                  show-word-limit
+                />
+              </el-form-item>
+              <el-form-item label="清理无转化群">
+                <el-switch v-model="schedulerForm.group_capacity_cleanup!.enabled" />
+              </el-form-item>
+              <el-form-item label="无转化天数">
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.no_conversion_days" :min="1" :max="365" />
+              </el-form-item>
+              <el-form-item label="最小入群天数">
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.min_join_age_days" :min="1" :max="365" />
+              </el-form-item>
+              <el-form-item label="单轮清理上限">
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.max_cleanup_per_run" :min="1" :max="15" />
+              </el-form-item>
+              <el-form-item>
+                <el-button type="primary" :icon="Check" :loading="saving === 'scheduler'" @click="saveScheduler">保存</el-button>
+              </el-form-item>
+            </el-form>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="暖号期" name="warmup">
+          <div class="form-grid">
+            <el-form label-width="150px" size="small">
+              <el-form-item label="暖号策略">
+                <el-switch v-model="warmupPolicyForm.enabled" />
+              </el-form-item>
+              <el-form-item label="默认天数">
+                <el-input-number v-model="warmupPolicyForm.default_warmup_days" :min="0" :max="120" />
+              </el-form-item>
+              <el-form-item label="最低天数">
+                <el-input-number v-model="warmupPolicyForm.minimum_warmup_days" :min="0" :max="120" />
+              </el-form-item>
+              <el-form-item label="用户私聊倍率">
+                <el-input-number v-model="warmupPolicyForm.user_initiated_private_message_multiplier" :min="0" :max="2" :step="0.05" />
+              </el-form-item>
+            </el-form>
+            <el-table :data="assetTierOptions" size="small" border>
+              <el-table-column label="账号等级" width="110">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="暖号天数" min-width="140">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.tiers[row.value].warmup_days" :min="0" :max="120" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-table :data="warmupStageOptions" size="small" border class="wide-config-table">
+              <el-table-column label="阶段" width="90" fixed>
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="总额度" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].limit_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="加群" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].join_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="广告" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].ad_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="运行" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].run_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="探针" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].probe_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="私聊" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].private_message_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="群消息" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].group_message_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="资料" min-width="130">
+                <template #default="{ row }">
+                  <el-input-number v-model="warmupPolicyForm.stages[row.value].profile_update_multiplier" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="主动私聊" min-width="110">
+                <template #default="{ row }">
+                  <el-switch v-model="warmupPolicyForm.stages[row.value].allow_proactive_private_message" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+          <div class="form-actions">
+            <el-button type="primary" :icon="Check" :loading="saving === 'warmup'" @click="saveWarmupPolicy">保存</el-button>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="账号等级" name="asset">
+          <el-form label-width="150px" size="small">
+            <el-form-item label="等级策略">
+              <el-switch v-model="assetPolicyForm.enabled" />
+            </el-form-item>
+          </el-form>
+          <el-table :data="assetTierOptions" size="small" border>
+            <el-table-column label="等级" width="110">
+              <template #default="{ row }">{{ row.label }}</template>
+            </el-table-column>
+            <el-table-column label="加群倍率">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].join_multiplier" :min="0" :max="3" :step="0.05" size="small" />
+              </template>
+            </el-table-column>
+            <el-table-column label="广告倍率">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].ad_multiplier" :min="0" :max="3" :step="0.05" size="small" />
+              </template>
+            </el-table-column>
+            <el-table-column label="运行倍率">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].run_multiplier" :min="0" :max="3" :step="0.05" size="small" />
+              </template>
+            </el-table-column>
+            <el-table-column label="探针倍率">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].probe_multiplier" :min="0" :max="3" :step="0.05" size="small" />
+              </template>
+            </el-table-column>
+            <el-table-column label="暖号天数">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].warmup_days" :min="0" :max="120" size="small" />
+              </template>
+            </el-table-column>
+            <el-table-column label="年龄门槛天">
+              <template #default="{ row }">
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].age_floor_days" :min="0" :max="3650" size="small" />
+              </template>
+            </el-table-column>
+          </el-table>
+          <div class="form-actions">
+            <el-button type="primary" :icon="Check" :loading="saving === 'asset'" @click="saveAssetPolicy">保存</el-button>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="账号风控" name="risk">
+          <div class="single-entry-note">
+            配置全局生效到所有账号，额度按单账号独立累计，不是全部账号共享总额度。
+          </div>
+          <div class="form-grid">
+            <el-form label-width="150px" size="small">
+              <el-form-item label="风控开关">
+                <el-switch v-model="riskGuardForm.enabled" />
+              </el-form-item>
+              <el-form-item label="单号总日额度">
+                <el-input-number v-model="riskGuardForm.global_daily_limit" :min="1" :max="200" />
+              </el-form-item>
+              <el-form-item label="Redis失败关闭">
+                <el-select v-model="redisFailClosedValue">
+                  <el-option label="跟随系统" value="system" />
+                  <el-option label="失败即关闭" value="closed" />
+                  <el-option label="失败放行" value="open" />
+                </el-select>
+              </el-form-item>
+            </el-form>
+            <el-table :data="riskActionOptions" size="small" border>
+              <el-table-column label="动作" width="100">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="单号日额度">
+                <template #default="{ row }">
+                  <el-input-number v-model="riskGuardForm.actions[row.value].daily_limit" :min="1" :max="100000" size="small" />
+                </template>
+              </el-table-column>
+              <el-table-column label="冷却秒">
+                <template #default="{ row }">
+                  <el-input-number v-model="riskGuardForm.actions[row.value].cooldown_seconds" :min="0" :max="86400" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+          <div class="form-grid secondary-grid">
+            <el-table :data="riskLevelPolicyOptions" size="small" border>
+              <el-table-column label="风险等级" width="100">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="分数阈值">
+                <template #default="{ row }">
+                  <span v-if="row.value === 'normal'" class="muted-text">-</span>
+                  <el-input-number
+                    v-else
+                    v-model="riskGuardForm.level_thresholds[row.value]"
+                    :min="0"
+                    :max="100"
+                    :step="1"
+                    size="small"
+                  />
+                </template>
+              </el-table-column>
+              <el-table-column label="频率倍率">
+                <template #default="{ row }">
+                  <el-input-number v-model="riskGuardForm.level_budget_multipliers[row.value]" :min="0" :max="2" :step="0.05" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-table :data="riskScoreDeltaOptions" size="small" border>
+              <el-table-column label="风险事件" width="130">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="风险分增量">
+                <template #default="{ row }">
+                  <el-input-number v-model="riskGuardForm.risk_score_deltas[row.value]" :min="0" :max="100" :step="0.5" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+          <div class="form-grid secondary-grid">
+            <el-form label-width="170px" size="small">
+              <el-form-item label="默认冻结秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.default_freeze_seconds" :min="60" :max="604800" :step="60" />
+              </el-form-item>
+              <el-form-item label="Flood缓冲秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.flood_wait_buffer_seconds" :min="0" :max="3600" :step="10" />
+              </el-form-item>
+              <el-form-item label="PeerFlood冻结秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.peer_flood_freeze_seconds" :min="60" :max="604800" :step="60" />
+              </el-form-item>
+              <el-form-item label="账号受限冻结秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.account_restricted_freeze_seconds" :min="60" :max="604800" :step="60" />
+              </el-form-item>
+              <el-form-item label="群禁言冻结秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.group_write_forbidden_freeze_seconds" :min="60" :max="604800" :step="60" />
+              </el-form-item>
+              <el-form-item label="恢复期秒">
+                <el-input-number v-model="riskGuardForm.lifecycle.recovery_seconds" :min="60" :max="604800" :step="60" />
+              </el-form-item>
+              <el-form-item label="冻结恢复分数上限">
+                <el-input-number v-model="riskGuardForm.lifecycle.post_freeze_score_cap" :min="0" :max="100" :step="1" />
+              </el-form-item>
+              <el-form-item label="手动清除分数上限">
+                <el-input-number v-model="riskGuardForm.lifecycle.manual_clear_score_cap" :min="0" :max="100" :step="1" />
+              </el-form-item>
+              <el-form-item label="衰减周期小时">
+                <el-input-number v-model="riskGuardForm.lifecycle.decay_interval_hours" :min="1" :max="720" />
+              </el-form-item>
+              <el-form-item label="每周期降低分">
+                <el-input-number v-model="riskGuardForm.lifecycle.decay_points_per_interval" :min="0" :max="100" :step="0.5" />
+              </el-form-item>
+            </el-form>
+            <el-form label-width="170px" size="small">
+              <el-form-item label="新号天数">
+                <el-input-number v-model="riskGuardForm.lifecycle.new_account_days" :min="0" :max="120" />
+              </el-form-item>
+              <el-form-item label="新号倍率">
+                <el-input-number v-model="riskGuardForm.lifecycle.new_account_multiplier" :min="0" :max="2" :step="0.05" />
+              </el-form-item>
+              <el-form-item label="恢复期倍率">
+                <el-input-number v-model="riskGuardForm.lifecycle.recovery_multiplier" :min="0" :max="2" :step="0.05" />
+              </el-form-item>
+              <el-form-item label="稳定账号天数">
+                <el-input-number v-model="riskGuardForm.lifecycle.healthy_account_days" :min="0" :max="365" />
+              </el-form-item>
+              <el-form-item label="稳定账号倍率">
+                <el-input-number v-model="riskGuardForm.lifecycle.healthy_account_multiplier" :min="0" :max="2" :step="0.05" />
+              </el-form-item>
+              <el-form-item label="最大频率倍率">
+                <el-input-number v-model="riskGuardForm.lifecycle.max_budget_multiplier" :min="0" :max="2" :step="0.05" />
+              </el-form-item>
+              <el-form-item label="冻结窗口小时">
+                <el-input-number v-model="riskGuardForm.group_write_forbidden.freeze_window_hours" :min="1" :max="168" />
+              </el-form-item>
+              <el-form-item label="冻结命中群数">
+                <el-input-number v-model="riskGuardForm.group_write_forbidden.freeze_distinct_groups" :min="1" :max="100" />
+              </el-form-item>
+              <el-form-item label="隔离窗口小时">
+                <el-input-number v-model="riskGuardForm.group_write_forbidden.quarantine_window_hours" :min="1" :max="720" />
+              </el-form-item>
+              <el-form-item label="隔离命中群数">
+                <el-input-number v-model="riskGuardForm.group_write_forbidden.quarantine_distinct_groups" :min="1" :max="200" />
+              </el-form-item>
+              <el-form-item label="低价值日志保留天">
+                <el-input-number v-model="riskGuardForm.retention.low_value_detail_retention_days" :min="1" :max="3650" />
+              </el-form-item>
+              <el-form-item label="高价值日志保留天">
+                <el-input-number v-model="riskGuardForm.retention.high_value_detail_retention_days" :min="1" :max="3650" />
+              </el-form-item>
+              <el-form-item label="日统计保留天">
+                <el-input-number v-model="riskGuardForm.retention.daily_stat_retention_days" :min="1" :max="3650" />
+              </el-form-item>
+            </el-form>
+          </div>
+          <div class="form-actions">
+            <el-button type="primary" :icon="Check" :loading="saving === 'risk'" @click="saveRiskGuard">保存</el-button>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="广告投放" name="ads">
+          <div class="form-grid">
+            <el-form label-width="150px" size="small">
+              <el-form-item label="投放执行">
+                <el-switch v-model="adExecutionForm.enabled" />
+              </el-form-item>
+              <el-form-item label="执行间隔">
+                <el-input-number v-model="adExecutionForm.dispatcher_interval_seconds" :min="1" :max="86400" />
+              </el-form-item>
+              <el-form-item label="单轮上限">
+                <el-input-number v-model="adExecutionForm.max_deliveries_per_run" :min="1" :max="20" />
+              </el-form-item>
+              <el-form-item label="单号单轮上限">
+                <el-input-number v-model="adExecutionForm.max_deliveries_per_account_per_run" :min="1" :max="5" />
+              </el-form-item>
+              <el-form-item label="群广告冷却">
+                <el-input-number v-model="adExecutionForm.group_campaign_cooldown_minutes" :min="0" :max="10080" />
+              </el-form-item>
+              <el-form-item label="成功后停号">
+                <el-switch v-model="adExecutionForm.stop_account_after_success" />
+              </el-form-item>
+              <el-form-item label="失败后停号">
+                <el-switch v-model="adExecutionForm.stop_account_after_failure" />
+              </el-form-item>
+              <el-form-item label="节流策略">
+                <el-switch v-model="adThrottleForm.enabled" />
+              </el-form-item>
+              <el-form-item label="投放间隔">
+                <el-input-number v-model="adThrottleForm.delivery_interval_seconds" :min="0" :max="3600" />
+              </el-form-item>
+              <el-form-item label="批次窗口">
+                <el-input-number v-model="adThrottleForm.batch_window_seconds" :min="1" :max="3600" />
+              </el-form-item>
+              <el-form-item label="批次最小量">
+                <el-input-number v-model="adThrottleForm.batch_size_min" :min="1" :max="10000" />
+              </el-form-item>
+              <el-form-item label="批次最大量">
+                <el-input-number v-model="adThrottleForm.batch_size_max" :min="1" :max="10000" />
+              </el-form-item>
+              <el-form-item label="冷却最小秒">
+                <el-input-number v-model="adThrottleForm.cooldown_min_seconds" :min="0" :max="86400" />
+              </el-form-item>
+              <el-form-item label="冷却最大秒">
+                <el-input-number v-model="adThrottleForm.cooldown_max_seconds" :min="0" :max="86400" />
+              </el-form-item>
+            </el-form>
+            <el-form label-width="150px" size="small">
+              <el-form-item label="动态容量">
+                <el-switch v-model="adCapacityForm.enabled" />
+              </el-form-item>
+              <el-form-item label="时区偏移">
+                <el-input-number v-model="adCapacityForm.timezone_offset_hours" :min="-12" :max="14" />
+              </el-form-item>
+              <el-form-item label="窗口开始小时">
+                <el-input-number v-model="adCapacityForm.window_start_hour" :min="0" :max="23" />
+              </el-form-item>
+              <el-form-item label="窗口结束小时">
+                <el-input-number v-model="adCapacityForm.window_end_hour" :min="0" :max="23" />
+              </el-form-item>
+              <el-form-item label="账号广告日硬上限">
+                <el-input-number v-model="adCapacityForm.account_ad_daily_hard_cap" :min="1" :max="500" />
+              </el-form-item>
+              <el-form-item label="账号群日容量">
+                <el-input-number v-model="adCapacityForm.account_group_daily_cap_default" :min="1" :max="500" />
+              </el-form-item>
+              <el-form-item label="群全局日硬上限">
+                <el-input-number v-model="adCapacityForm.group_global_daily_hard_cap" :min="1" :max="400" />
+              </el-form-item>
+              <el-form-item label="群广告最小间隔秒">
+                <el-input-number v-model="adCapacityForm.group_min_interval_seconds" :min="60" :max="3600" />
+              </el-form-item>
+              <el-form-item label="单号最大群数">
+                <el-input-number v-model="adCapacityForm.max_groups_per_account" :min="1" :max="1000" />
+              </el-form-item>
+              <el-form-item label="新广告群/天">
+                <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="500" />
+              </el-form-item>
+              <el-form-item label="删帖检测延迟">
+                <el-input-number v-model="adCapacityForm.survival_check_delay_seconds" :min="30" :max="3600" :step="10" />
+              </el-form-item>
+              <el-form-item label="1小时检测点">
+                <el-input-number v-model="adCapacityForm.survival_one_hour_seconds" :min="300" :max="7200" :step="300" />
+              </el-form-item>
+              <el-form-item label="24小时检测点">
+                <el-input-number v-model="adCapacityForm.survival_twenty_four_hour_seconds" :min="3600" :max="172800" :step="3600" />
+              </el-form-item>
+              <el-form-item label="检测批量">
+                <el-input-number v-model="adCapacityForm.survival_check_batch_size" :min="1" :max="500" />
+              </el-form-item>
+              <el-form-item label="检测重试次数">
+                <el-input-number v-model="adCapacityForm.survival_retry_max_attempts" :min="1" :max="10" />
+              </el-form-item>
+              <el-form-item label="重试基础秒数">
+                <el-input-number v-model="adCapacityForm.survival_retry_base_seconds" :min="60" :max="3600" />
+              </el-form-item>
+              <el-form-item label="删帖退群">
+                <el-switch v-model="adCapacityForm.leave_on_deleted_ad" />
+              </el-form-item>
+              <el-form-item label="探针失败封群">
+                <el-switch v-model="adCapacityForm.block_group_on_probe_failure" />
+              </el-form-item>
+              <el-form-item label="AI许可复核">
+                <el-switch v-model="adCapacityForm.ad_policy_ai_enabled" />
+              </el-form-item>
+              <el-form-item label="许可识别模型">
+                <el-input v-model="adCapacityForm.ad_policy_ai_model" maxlength="100" />
+              </el-form-item>
+              <el-form-item label="许可识别超时">
+                <el-input-number v-model="adCapacityForm.ad_policy_ai_timeout_seconds" :min="5" :max="120" />
+              </el-form-item>
+              <el-form-item label="许可最低置信度">
+                <el-input-number v-model="adCapacityForm.ad_policy_ai_min_confidence" :min="90" :max="100" />
+              </el-form-item>
+              <el-form-item label="双阶段复核">
+                <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
+              </el-form-item>
+              <el-form-item label="Premium最小样本">
+                <el-input-number v-model="adCapacityForm.premium_min_samples" :min="1" :max="1000" />
+              </el-form-item>
+              <el-form-item label="Premium最小转化">
+                <el-input-number v-model="adCapacityForm.premium_min_conversions" :min="1" :max="1000" />
+              </el-form-item>
+              <el-form-item label="Premium存活率%">
+                <el-input-number v-model="adCapacityForm.premium_survival_rate_percent" :min="50" :max="100" />
+              </el-form-item>
+              <el-form-item label="自动许可清洁天数">
+                <el-input-number v-model="adCapacityForm.premium_clean_days_auto" :min="3" :max="30" />
+              </el-form-item>
+              <el-form-item label="人工许可清洁天数">
+                <el-input-number v-model="adCapacityForm.premium_clean_days_verified" :min="3" :max="30" />
+              </el-form-item>
+              <el-form-item label="Premium增长样本">
+                <el-input-number v-model="adCapacityForm.premium_growth_samples" :min="20" :max="1000" />
+              </el-form-item>
+              <el-form-item label="Premium满额样本">
+                <el-input-number v-model="adCapacityForm.premium_full_capacity_samples" :min="20" :max="5000" />
+              </el-form-item>
+              <el-form-item label="Premium入场容量">
+                <el-input-number v-model="adCapacityForm.premium_entry_capacity" :min="1" :max="400" />
+              </el-form-item>
+              <el-form-item label="Premium增长容量">
+                <el-input-number v-model="adCapacityForm.premium_growth_capacity" :min="1" :max="400" />
+              </el-form-item>
+              <el-form-item label="广告前暖群天数">
+                <el-input-number v-model="adCapacityForm.warmup_days_before_ads" :min="0" :max="90" />
+              </el-form-item>
+              <el-form-item label="暖群互动最小">
+                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_min" :min="0" :max="100" />
+              </el-form-item>
+              <el-form-item label="暖群互动最大">
+                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_max" :min="0" :max="100" />
+              </el-form-item>
+              <el-form-item label="成熟互动最小">
+                <el-input-number v-model="adCapacityForm.mature_daily_interactions_min" :min="0" :max="100" />
+              </el-form-item>
+              <el-form-item label="成熟互动最大">
+                <el-input-number v-model="adCapacityForm.mature_daily_interactions_max" :min="0" :max="100" />
+              </el-form-item>
+              <el-form-item label="失败策略">
+                <el-switch v-model="adFailurePolicyForm.enabled" />
+              </el-form-item>
+              <el-form-item label="群控失败退群">
+                <el-switch v-model="adFailurePolicyForm.leave_on_group_control_failure" />
+              </el-form-item>
+              <el-form-item label="失败次数阈值">
+                <el-input-number v-model="adFailurePolicyForm.group_control_failure_limit" :min="1" :max="20" />
+              </el-form-item>
+              <el-form-item label="失败统计窗口">
+                <el-input-number v-model="adFailurePolicyForm.group_control_failure_window_hours" :min="1" :max="720" />
+              </el-form-item>
+              <el-form-item label="失败适用等级">
+                <el-select v-model="adFailurePolicyForm.levels" multiple>
+                  <el-option v-for="item in groupLevelOptions" :key="item.value" :label="item.label" :value="item.value" />
+                </el-select>
+              </el-form-item>
+            </el-form>
+          </div>
+          <div class="form-grid secondary-grid">
+            <el-table :data="adCapacityTierOptions" size="small" border>
+              <el-table-column label="群等级" width="100">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="日容量">
+                <template #default="{ row }">
+                  <el-input-number v-model="adCapacityForm.tier_daily_capacities[row.value]" :min="0" :max="10000" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-table :data="adHourlyWeightOptions" size="small" border height="360">
+              <el-table-column label="小时" width="100">
+                <template #default="{ row }">{{ row.label }}</template>
+              </el-table-column>
+              <el-table-column label="权重">
+                <template #default="{ row }">
+                  <el-input-number v-model="adCapacityForm.hourly_weights[row.value]" :min="0" :max="10000" size="small" />
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+          <div class="form-actions">
+            <el-button type="primary" :icon="Check" :loading="saving === 'ads'" @click="saveAdsPolicy">保存</el-button>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="群AI互动" name="group-ai">
+          <div class="form-grid">
+            <el-form label-width="160px" size="small">
+              <el-form-item label="互动模块">
+                <el-switch v-model="groupAiForm.enabled" />
+              </el-form-item>
+              <el-form-item label="AI生成">
+                <el-switch v-model="groupAiForm.aiEnabled" />
+              </el-form-item>
+              <el-form-item label="模式">
+                <el-select v-model="groupAiForm.mode">
+                  <el-option v-for="item in groupAiModeOptions" :key="item.value" :label="item.label" :value="item.value" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="语气">
+                <el-select v-model="groupAiForm.tone">
+                  <el-option v-for="item in groupAiToneOptions" :key="item.value" :label="item.label" :value="item.value" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="关键词群回复">
+                <el-switch v-model="groupAiForm.allowKeywordTriggeredReply" />
+              </el-form-item>
+              <el-form-item label="语义回复">
+                <el-switch v-model="groupAiForm.allowSemanticTriggeredReply" />
+              </el-form-item>
+              <el-form-item label="主动暖号">
+                <el-switch v-model="groupAiForm.allowProactiveWarmup" />
+              </el-form-item>
+            </el-form>
+            <el-form label-width="160px" size="small">
+              <el-form-item label="每日Token预算">
+                <el-input-number v-model="groupAiForm.dailyTokenBudget" :min="0" :max="10000000" :step="1000" />
+              </el-form-item>
+              <el-form-item label="单群回复/天">
+                <el-input-number v-model="groupAiForm.maxRepliesPerGroupPerDay" :min="0" :max="10000" />
+              </el-form-item>
+              <el-form-item label="单号回复/天">
+                <el-input-number v-model="groupAiForm.maxRepliesPerAccountPerDay" :min="0" :max="100000" />
+              </el-form-item>
+              <el-form-item label="回复冷却">
+                <el-input-number v-model="groupAiForm.cooldownSeconds" :min="0" :max="86400" :step="60" />
+              </el-form-item>
+              <el-form-item label="安全过滤">
+                <el-switch v-model="groupAiForm.blockAiSelfDisclosure" />
+              </el-form-item>
+              <el-form-item label="单条字数">
+                <el-input-number v-model="groupAiForm.replyMaxChars" :min="20" :max="500" :step="10" />
+              </el-form-item>
+              <el-form-item label="语义窗口消息">
+                <el-input-number v-model="groupAiForm.semanticScanWindowMessages" :min="5" :max="100" />
+              </el-form-item>
+              <el-form-item label="语义评估间隔">
+                <el-input-number v-model="groupAiForm.semanticEvaluateEveryMessages" :min="1" :max="100" />
+              </el-form-item>
+              <el-form-item label="语义最低置信度">
+                <el-input-number v-model="groupAiForm.semanticMinConfidence" :min="0" :max="1" :step="0.01" />
+              </el-form-item>
+              <el-form-item label="最短文本长度">
+                <el-input-number v-model="groupAiForm.semanticMinTextChars" :min="1" :max="80" />
+              </el-form-item>
+              <el-form-item label="暖场间隔">
+                <el-input-number v-model="groupAiForm.proactiveWarmupIntervalMinutes" :min="1" :max="1440" />
+              </el-form-item>
+              <el-form-item label="单轮群数">
+                <el-input-number v-model="groupAiForm.proactiveWarmupMaxGroupsPerRun" :min="1" :max="100" />
+              </el-form-item>
+              <el-form-item label="暖场单群/天">
+                <el-input-number v-model="groupAiForm.proactiveWarmupMaxPerGroupPerDay" :min="0" :max="1000" />
+              </el-form-item>
+              <el-form-item label="暖场单号/天">
+                <el-input-number v-model="groupAiForm.proactiveWarmupMaxPerAccountPerDay" :min="0" :max="10000" />
+              </el-form-item>
+              <el-form-item label="暖场冷却">
+                <el-input-number v-model="groupAiForm.proactiveWarmupCooldownSeconds" :min="60" :max="86400" :step="60" />
+              </el-form-item>
+              <el-form-item label="暖场开始小时">
+                <el-input-number v-model="groupAiForm.proactiveWarmupWindowStartHour" :min="0" :max="23" />
+              </el-form-item>
+              <el-form-item label="暖场结束小时">
+                <el-input-number v-model="groupAiForm.proactiveWarmupWindowEndHour" :min="0" :max="23" />
+              </el-form-item>
+              <el-form-item label="温度">
+                <el-input-number v-model="groupAiForm.temperature" :min="0" :max="2" :step="0.1" />
+              </el-form-item>
+              <el-form-item label="最大Token">
+                <el-input-number v-model="groupAiForm.maxTokens" :min="20" :max="1000" />
+              </el-form-item>
+            </el-form>
+          </div>
+          <el-form label-width="160px" size="small">
+            <el-form-item label="系统提示词">
+              <el-input v-model="groupAiForm.systemPrompt" type="textarea" :rows="4" maxlength="2000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="语义决策提示词">
+              <el-input v-model="groupAiForm.semanticDecisionPrompt" type="textarea" :rows="4" maxlength="2000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="允许意图">
+              <el-input v-model="semanticAllowedIntentsText" type="textarea" :rows="5" maxlength="2000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="排除意图">
+              <el-input v-model="semanticBlockedIntentsText" type="textarea" :rows="5" maxlength="2000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="暖场主题">
+              <el-input v-model="proactiveWarmupTopicsText" type="textarea" :rows="5" maxlength="4000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="暖场模板">
+              <el-input v-model="proactiveWarmupTemplatesText" type="textarea" :rows="8" maxlength="8000" show-word-limit />
+            </el-form-item>
+            <el-form-item label="按群暖场覆盖">
+              <el-input v-model="proactiveWarmupGroupOverridesText" type="textarea" :rows="8" maxlength="12000" show-word-limit />
+            </el-form-item>
+          </el-form>
+          <div class="form-actions">
+            <el-button type="primary" :icon="Check" :loading="saving === 'groupAi'" @click="saveGroupAi">保存</el-button>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <h3>事件流水</h3>
+      </div>
+      <el-tabs v-model="activeEventTab">
+        <el-tab-pane label="入群" name="attempts">
+          <el-table :data="autoJoinAttempts" size="small" border height="260">
+            <el-table-column prop="id" label="ID" width="80" />
+            <el-table-column prop="account_id" label="账号" width="90" />
+            <el-table-column label="群" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.group_title || row.group_username || row.keyword || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="110">
+              <template #default="{ row }">
+                <el-tag :type="statusTagType(row.status)" size="small">{{ row.status || '-' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
+            <el-table-column prop="attempted_at" label="时间" min-width="170" />
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="群检测" name="verification">
+          <el-table :data="verificationLogs" size="small" border height="260">
+            <el-table-column prop="account_id" label="账号" width="90" />
+            <el-table-column prop="group_title" label="群" min-width="180" show-overflow-tooltip />
+            <el-table-column label="动作" width="110">
+              <template #default="{ row }">{{ row.action }}</template>
+            </el-table-column>
+            <el-table-column label="结果" width="110">
+              <template #default="{ row }">
+                <el-tag :type="row.success ? 'success' : 'warning'" size="small">{{ row.success === false ? '失败' : '成功' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
+            <el-table-column prop="updated_at" label="时间" min-width="170" />
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="广告" name="delivery">
+          <el-table :data="deliveryLogs" size="small" border height="260">
+            <el-table-column prop="account_id" label="账号" width="90" />
+            <el-table-column prop="group_title" label="群" min-width="180" show-overflow-tooltip />
+            <el-table-column label="状态" width="110">
+              <template #default="{ row }">
+                <el-tag :type="statusTagType(row.status)" size="small">{{ row.status || '-' }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="survival_status" label="存活" width="110" />
+            <el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip />
+            <el-table-column prop="created_at" label="时间" min-width="170" />
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+    </section>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.growth-dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+
+  h2 {
+    margin: 0 0 6px;
+    color: #1f2d3d;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+}
+
+.toolbar-meta,
+.muted-text {
+  color: #6b7280;
+  font-size: 13px;
+}
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.metric-cell {
+  min-height: 76px;
+  padding: 14px 16px;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+
+  span {
+    color: #6b7280;
+    font-size: 13px;
+  }
+
+  strong {
+    color: #111827;
+    font-size: 24px;
+    line-height: 1;
+    letter-spacing: 0;
+  }
+}
+
+.panel {
+  padding: 16px;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+
+  h3 {
+    margin: 0;
+    color: #1f2d3d;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+}
+
+.flow-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.flow-item {
+  min-height: 114px;
+  padding: 12px;
+  border: 1px solid #cfd8e3;
+  border-radius: 8px;
+  background: #fbfcfe;
+  display: flex;
+  gap: 10px;
+  overflow: hidden;
+
+  &.disabled {
+    background: #f7f7f8;
+    color: #7b8494;
+  }
+}
+
+.flow-icon {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  color: #1f7a5b;
+  background: #e8f5ef;
+
+  .disabled & {
+    color: #909399;
+    background: #ebeef5;
+  }
+}
+
+.flow-body {
+  min-width: 0;
+}
+
+.flow-title {
+  color: #111827;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.flow-status {
+  margin-top: 8px;
+  color: #1f5f99;
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.flow-detail {
+  margin-top: 6px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.account-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  small {
+    color: #8b95a5;
+  }
+}
+
+.inline-score {
+  margin-left: 8px;
+  color: #606266;
+  font-size: 12px;
+}
+
+.config-tabs {
+  :deep(.el-tabs__content) {
+    padding-top: 10px;
+  }
+}
+
+.single-entry-note {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.6;
+  background: #f5f7fa;
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.secondary-grid,
+.wide-config-table {
+  margin-top: 16px;
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+:deep(.el-input-number) {
+  width: 150px;
+}
+
+:deep(.el-select) {
+  width: 220px;
+}
+
+:deep(.el-tag + .el-tag) {
+  margin-left: 6px;
+}
+
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.diagnostic-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #d8dee9;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+
+.diagnostic-card__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+
+  > div {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  strong {
+    color: #111827;
+    font-size: 14px;
+    line-height: 1.3;
+  }
+
+  small {
+    color: #8b95a5;
+  }
+}
+
+.diagnostic-next,
+.diagnostic-counts {
+  margin-top: 8px;
+  color: #4b5563;
+  font-size: 13px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.diagnostic-counts {
+  color: #6b7280;
+}
+
+.diagnostic-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 12px;
+
+  :deep(.el-tag) {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 1280px) {
+  .flow-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .metric-grid,
+  .diagnostic-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 860px) {
+  .page-toolbar,
+  .form-grid {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .flow-grid,
+  .metric-grid,
+  .diagnostic-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

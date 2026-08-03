@@ -6,12 +6,11 @@ Provides the lightweight settings contract used by the Vue settings page.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-import json
 import platform
 import time
-import asyncio
 from copy import deepcopy
 from datetime import datetime
 from typing import Any
@@ -22,11 +21,14 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.automation_settings import get_app_runtime_settings, save_app_runtime_settings
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.redis import get_redis
-from app.core.runtime_settings import SETTINGS_FILE
-
+from app.core.runtime_settings import (
+    DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
+    DEFAULT_PRIVATE_REPLY_TEMPLATES,
+)
 
 router = APIRouter()
 STARTED_AT = time.time()
@@ -40,8 +42,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "maintenanceMessage": "",
     },
     "notification": {
+        "sub2apiAlertsEnabled": False,
+        "sub2apiNotifyResolved": True,
+        "sub2apiAnnouncementsEnabled": False,
         "telegramEnabled": bool(settings.ALERT_CHAT_ID),
         "telegramChatId": settings.ALERT_CHAT_ID or "",
+        "telegramAnnouncementsEnabled": False,
+        "telegramAnnouncementChatId": "",
+        "telegramAnnouncementPin": True,
+        "telegramAnnouncementPinSilent": True,
+        "qqEnabled": False,
+        "qqAnnouncementsEnabled": False,
         "emailEnabled": False,
         "emailRecipients": [],
         "webhookEnabled": False,
@@ -69,6 +80,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "maxRepliesPerUserPerDay": 2,
         "cooldownSeconds": 1800,
     },
+    "groupAiInteraction": DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
+    "keywordPrivateReply": {
+        "enabled": False,
+    },
+    "privateMessaging": {
+        "inboundRepliesEnabled": True,
+        "proactiveEnabled": False,
+        "templates": DEFAULT_PRIVATE_REPLY_TEMPLATES,
+    },
 }
 
 
@@ -82,6 +102,9 @@ class SettingsUpdate(BaseModel):
     security: dict[str, Any] | None = None
     xboard: dict[str, Any] | None = None
     aiReply: dict[str, Any] | None = None
+    groupAiInteraction: dict[str, Any] | None = None
+    keywordPrivateReply: dict[str, Any] | None = None
+    privateMessaging: dict[str, Any] | None = None
 
 
 def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
@@ -93,29 +116,11 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
-def _load_raw_settings() -> dict[str, Any]:
-    if not SETTINGS_FILE.exists():
-        return {}
-
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
-
 def _public_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_SETTINGS)
-    _deep_merge(merged, raw or _load_raw_settings())
+    _deep_merge(merged, raw or {})
     merged.pop("_meta", None)
     return merged
-
-
-def _save_raw_settings(payload: dict[str, Any]) -> None:
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
 
 def _format_uptime(seconds: float) -> str:
@@ -132,31 +137,32 @@ def _format_uptime(seconds: float) -> str:
 
 
 @router.get("")
-async def get_settings() -> dict:
+async def get_settings(db: AsyncSession = Depends(get_db)) -> dict:
     """Return persisted settings with defaults filled in."""
+    raw = await get_app_runtime_settings(db)
     return {
         "code": 0,
         "message": "success",
-        "data": _public_settings(),
+        "data": _public_settings(raw),
     }
 
 
 @router.put("")
-async def update_settings(update: SettingsUpdate) -> dict:
+async def update_settings(update: SettingsUpdate, db: AsyncSession = Depends(get_db)) -> dict:
     """Persist partial settings changes."""
-    raw = _load_raw_settings()
+    raw = await get_app_runtime_settings(db)
     public = _public_settings(raw)
     patch = update.model_dump(exclude_none=True)
     _deep_merge(public, patch)
 
     if raw.get("_meta"):
         public["_meta"] = raw["_meta"]
-    _save_raw_settings(public)
+    saved = await save_app_runtime_settings(db, public)
 
     return {
         "code": 0,
         "message": "保存成功",
-        "data": _public_settings(public),
+        "data": _public_settings(saved),
     }
 
 
@@ -177,7 +183,7 @@ async def get_system_info(db: AsyncSession = Depends(get_db)) -> dict:
     except Exception:
         redis_status = "error"
 
-    raw = _load_raw_settings()
+    raw = await get_app_runtime_settings(db)
 
     return {
         "code": 0,
@@ -236,16 +242,16 @@ async def clear_logs() -> dict:
 
 
 @router.post("/backup")
-async def backup_database() -> dict:
+async def backup_database(db: AsyncSession = Depends(get_db)) -> dict:
     """Record a backup request and return a generated filename."""
     filename = f"vanguard-backup-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.sql"
-    raw = _load_raw_settings()
+    raw = await get_app_runtime_settings(db)
     raw["_meta"] = {
         **raw.get("_meta", {}),
         "lastBackup": datetime.utcnow().isoformat(),
         "lastBackupFile": filename,
     }
-    _save_raw_settings(raw)
+    await save_app_runtime_settings(db, raw)
 
     return {
         "code": 0,

@@ -17,7 +17,7 @@ logger = structlog.get_logger()
 @dataclass
 class GroupFilterCriteria:
     """Criteria for filtering groups."""
-    min_members: int = 100
+    min_members: int = 50
     max_members: int = 50000
     exclude_private: bool = False
     require_username: bool = False

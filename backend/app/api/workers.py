@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.worker_status import TelegramWorkerRole, TelegramWorkerStatus, TelegramWorkerStatusValue
+from app.core.security import get_current_user
 
 router = APIRouter()
 
@@ -101,6 +102,7 @@ async def list_workers(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ) -> WorkerStatusListResponse:
     query = select(TelegramWorkerStatus)
     count_query = select(func.count(TelegramWorkerStatus.id))
@@ -125,7 +127,11 @@ async def list_workers(
 
 
 @router.post("/heartbeat", response_model=WorkerStatusResponse, status_code=status.HTTP_200_OK)
-async def worker_heartbeat(request: WorkerHeartbeatRequest, db: AsyncSession = Depends(get_db)) -> WorkerStatusResponse:
+async def worker_heartbeat(
+    request: WorkerHeartbeatRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> WorkerStatusResponse:
     result = await db.execute(select(TelegramWorkerStatus).where(TelegramWorkerStatus.worker_id == request.worker_id))
     worker = result.scalar_one_or_none()
     now = datetime.utcnow()

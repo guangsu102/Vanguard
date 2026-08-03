@@ -1,17 +1,16 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { ElTable, ElTableColumn, ElPagination, ElButton, ElEmpty, ElCard } from 'element-plus'
-import type { TableColumnCtx } from 'element-plus'
+import { ElTable, ElTableColumn, ElPagination, ElEmpty, ElCard } from 'element-plus'
 
 interface Column<T = any> {
   prop?: string
   label: string
   width?: string | number
   minWidth?: string | number
-  align?: 'left' | 'center' | 'right'
-  fixed?: 'left' | 'right' | boolean
+  align?: string
+  fixed?: string | boolean
   sortable?: boolean
-  formatter?: (row: T, column: TableColumnCtx<T>, cellValue: any, $index: number) => string
+  formatter?: (row: T, column: any, cellValue: any, $index: number) => string
   slot?: string
 }
 

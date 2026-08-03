@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
-import { ElForm, ElFormItem, ElInput, ElButton, ElCheckbox, ElIcon } from 'element-plus'
 import { User, Lock, View, Hide } from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -64,7 +63,7 @@ const handleLogin = async () => {
           <el-input
             v-model="loginForm.username"
             placeholder="用户名"
-            prefix-icon="User"
+            :prefix-icon="User"
             clearable
             autocomplete="username"
           />
@@ -75,12 +74,12 @@ const handleLogin = async () => {
             v-model="loginForm.password"
             :type="showPassword ? 'text' : 'password'"
             placeholder="密码"
-            prefix-icon="Lock"
+            :prefix-icon="Lock"
             autocomplete="current-password"
           >
             <template #suffix>
               <el-icon class="password-toggle" @click="showPassword = !showPassword">
-                <component :is="showPassword ? 'Hide' : 'View'" />
+                <component :is="showPassword ? Hide : View" />
               </el-icon>
             </template>
           </el-input>

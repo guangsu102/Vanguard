@@ -81,6 +81,9 @@ data/logs/
 # Database backups
 backups/
 *.sql
+!scripts/init-db.sql
+!backend/migrations/026_add_ad_campaign_target_groups.sql
+!backend/migrations/027_add_qq_official.sql
 *.dump
 
 # SSL certificates
@@ -106,6 +109,7 @@ secrets.yml
 
 # Bot data
 bot-matrix/data/
+data/napcat/
 sessions/
 *.session
 *.session-journal
@@ -122,3 +126,5 @@ telegram-config.md
 nginx-config.md
 telegram-config.md
 DEPLOYMENT.md
+.codex*
+NUL

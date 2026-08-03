@@ -11,6 +11,7 @@ interface FilterItem {
   options?: Array<{ label: string; value: any }>
   width?: string | number
   clearable?: boolean
+  defaultValue?: any
 }
 
 interface Props {

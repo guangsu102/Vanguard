@@ -188,6 +188,14 @@ class TestCeleryConfig:
         # Check for 30-second task
         assert "campaign-check-every-30s" in beat_schedule
         assert beat_schedule["campaign-check-every-30s"]["schedule"] == 30.0
+        assert "auto-join-groups-dispatcher-every-minute" in beat_schedule
+        auto_join_schedule = beat_schedule["auto-join-groups-dispatcher-every-minute"]
+        assert auto_join_schedule["schedule"] == 60.0
+        assert auto_join_schedule["kwargs"] == {
+            "scheduled": True,
+            "keywords_per_account": 10,
+            "max_groups_per_keyword": 20,
+        }
 
     def test_beat_schedule_has_minute_level_tasks(self):
         """Test beat schedule includes minute-level tasks."""

@@ -33,19 +33,38 @@ class TestReplyEngine:
 
     @pytest.fixture
     def engine_with_ai(self, keyword_engine, template_engine, llm_client):
-        return ReplyEngine(
+        engine = ReplyEngine(
             keyword_engine=keyword_engine,
             template_engine=template_engine,
             llm_client=llm_client,
         )
+        engine._group_ai_settings = AsyncMock(
+            return_value={
+                "enabled": True,
+                "aiEnabled": True,
+                "allowKeywordTriggeredReply": True,
+                "temperature": 0.6,
+                "maxTokens": 180,
+                "systemPrompt": "system",
+            }
+        )
+        return engine
 
     @pytest.fixture
     def engine_without_ai(self, keyword_engine, template_engine):
-        return ReplyEngine(
+        engine = ReplyEngine(
             keyword_engine=keyword_engine,
             template_engine=template_engine,
             llm_client=None,
         )
+        engine._group_ai_settings = AsyncMock(
+            return_value={
+                "enabled": False,
+                "aiEnabled": False,
+                "allowKeywordTriggeredReply": False,
+            }
+        )
+        return engine
 
     @pytest.mark.asyncio
     async def test_generate_reply_uses_ai_mode(self, engine_with_ai, keyword_engine):
@@ -83,6 +102,16 @@ class TestReplyEngine:
         llm_client = MagicMock()
         llm_client.generate = AsyncMock(side_effect=RuntimeError("boom"))
         engine = ReplyEngine(keyword_engine=keyword_engine, template_engine=template_engine, llm_client=llm_client)
+        engine._group_ai_settings = AsyncMock(
+            return_value={
+                "enabled": True,
+                "aiEnabled": True,
+                "allowKeywordTriggeredReply": True,
+                "temperature": 0.6,
+                "maxTokens": 180,
+                "systemPrompt": "system",
+            }
+        )
 
         keyword_engine.match.return_value = [MagicMock(id=1, text="买", keyword_type=MagicMock(value="demand"))]
         context = ReplyContext(user_id=1, group_id=2, intent=IntentType.DEMAND)

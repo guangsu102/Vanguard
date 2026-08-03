@@ -15,16 +15,28 @@ import structlog
 logger = structlog.get_logger()
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(1, parsed)
+
+
 # Queue configurations based on TASK_CONCURRENCY from celery.py
 QUEUE_CONFIGS = {
-    "default": {"concurrency": 4, "prefetch_multiplier": 4},
-    "health_check": {"concurrency": 5, "prefetch_multiplier": 2},
-    "send_messages": {"concurrency": 10, "prefetch_multiplier": 1},
-    "proxy_validation": {"concurrency": 3, "prefetch_multiplier": 2},
-    "campaign_check": {"concurrency": 2, "prefetch_multiplier": 1},
-    "bulk_import": {"concurrency": 2, "prefetch_multiplier": 1},
-    "broadcast": {"concurrency": 3, "prefetch_multiplier": 1},
-    "automation": {"concurrency": 3, "prefetch_multiplier": 1},
+    "default": {"concurrency": _env_int("CELERY_DEFAULT_CONCURRENCY", 4), "prefetch_multiplier": 1},
+    "health_check": {"concurrency": _env_int("CELERY_HEALTH_CHECK_CONCURRENCY", 5), "prefetch_multiplier": 1},
+    "send_messages": {"concurrency": _env_int("CELERY_SEND_MESSAGES_CONCURRENCY", 10), "prefetch_multiplier": 1},
+    "proxy_validation": {"concurrency": _env_int("CELERY_PROXY_VALIDATION_CONCURRENCY", 3), "prefetch_multiplier": 1},
+    "campaign_check": {"concurrency": _env_int("CELERY_CAMPAIGN_CHECK_CONCURRENCY", 2), "prefetch_multiplier": 1},
+    "bulk_import": {"concurrency": _env_int("CELERY_BULK_IMPORT_CONCURRENCY", 2), "prefetch_multiplier": 1},
+    "broadcast": {"concurrency": _env_int("CELERY_BROADCAST_CONCURRENCY", 3), "prefetch_multiplier": 1},
+    "automation": {"concurrency": _env_int("CELERY_AUTOMATION_CONCURRENCY", 3), "prefetch_multiplier": 1},
+    "qq_commands": {"concurrency": _env_int("CELERY_QQ_COMMANDS_CONCURRENCY", 2), "prefetch_multiplier": 1},
 }
 
 
@@ -65,10 +77,10 @@ def start_worker(
         hostname: Custom hostname for this worker
         loglevel: Logging level
     """
-    from app.celery import celery_app
-
     queues_arg = ",".join(queues) if queues else get_queues_arg()
-    concurrency = 20  # Total concurrency across all queues
+    concurrency = _env_int("CELERY_WORKER_CONCURRENCY", 2)
+    max_tasks_per_child = _env_int("CELERY_WORKER_MAX_TASKS_PER_CHILD", 100)
+    prefetch_multiplier = _env_int("CELERY_WORKER_PREFETCH_MULTIPLIER", 1)
 
     cmd_parts = [
         "celery",
@@ -77,9 +89,8 @@ def start_worker(
         f"--loglevel={loglevel}",
         f"-Q {queues_arg}",
         f"--concurrency={concurrency}",
-        "--max-tasks-per-child=1000",
-        "--task-acks-late=True",
-        "--prefetch-multiplier=4",
+        f"--max-tasks-per-child={max_tasks_per_child}",
+        f"--prefetch-multiplier={prefetch_multiplier}",
     ]
 
     if hostname:
@@ -103,23 +114,31 @@ def start_multi_workers() -> None:
         ("worker-messages", ["send_messages", "broadcast"], "msg-worker@%h"),
         ("worker-default", ["default", "bulk_import", "proxy_validation"], "default-worker@%h"),
         ("worker-automation", ["automation"], "automation-worker@%h"),
+        ("worker-qq", ["qq_commands"], "qq-worker@%h"),
     ]
 
     processes = []
 
     for name, queues, hostname in workers:
         queues_arg = ",".join(queues)
-        concurrency = sum(QUEUE_CONFIGS[q]["concurrency"] for q in queues)
+        concurrency = min(
+            sum(QUEUE_CONFIGS[q]["concurrency"] for q in queues),
+            _env_int("CELERY_MULTI_WORKER_MAX_CONCURRENCY", 32),
+        )
+        max_tasks_per_child = _env_int("CELERY_WORKER_MAX_TASKS_PER_CHILD", 100)
+        prefetch_multiplier = _env_int("CELERY_WORKER_PREFETCH_MULTIPLIER", 1)
 
         cmd = [
             "celery",
             "-A", "app.celery",
             "worker",
             "--loglevel=info",
-            f"-Q {queues_arg}",
+            "-Q",
+            queues_arg,
             f"--concurrency={concurrency}",
             f"--hostname={hostname}",
-            "--max-tasks-per-child=1000",
+            f"--max-tasks-per-child={max_tasks_per_child}",
+            f"--prefetch-multiplier={prefetch_multiplier}",
         ]
 
         logger.info(f"starting_{name}", queues=queues, concurrency=concurrency)

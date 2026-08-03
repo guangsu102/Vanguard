@@ -14,6 +14,8 @@ Features:
 
 import asyncio
 import time
+import weakref
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
@@ -24,12 +26,37 @@ from telethon.sessions import StringSession
 
 from app.core.account.decodo import DecodoClient, get_decodo_client
 from app.core.account.evomi import EvomiClient, ProxyInfo, get_evomi_client
-from app.core.account.models import AccountStatus, AccountType
+from app.core.account.models import AccountStatus, AccountType, ProxyMode
+from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
+from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
+from app.core.account.session_crypto import decrypt_session_string, encrypt_session_string
+from app.core.account.environment_guard import AccountEnvironmentGuard
+from app.core.network.fingerprint import FingerprintManager
 
 if TYPE_CHECKING:
     from app.core.account.models import TelegramAccount
 
+StaticProxyResolver = Callable[[int], Awaitable[ResolvedProxy]]
+
 logger = structlog.get_logger()
+_ACCOUNT_POOLS = weakref.WeakSet()
+
+
+def _resolve_account_api_credentials(account: "TelegramAccount") -> tuple[str, str]:
+    """Resolve account API credentials from DB config, falling back to env defaults."""
+    api_config = getattr(account, "api_config", None)
+    api_id = getattr(api_config, "api_id", None) if api_config else None
+    api_hash = getattr(api_config, "api_hash", None) if api_config else None
+
+    if api_id and api_hash:
+        return str(api_id), str(api_hash)
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    return str(getattr(settings, "TELEGRAM_API_ID", None) or ""), str(
+        getattr(settings, "TELEGRAM_API_HASH", None) or ""
+    )
 
 
 @dataclass
@@ -62,6 +89,10 @@ class TelegramAccountWrapper:
     status: AccountStatus = AccountStatus.OFFLINE
     api_config_name: str = "default"
     fingerprint_id: Optional[str] = None
+    proxy_mode: ProxyMode = ProxyMode.DYNAMIC
+    static_proxy_id: Optional[int] = None
+    static_proxy: Optional[ResolvedProxy] = field(default=None, repr=False)
+    proxy_policy_version: int = field(default=0, repr=False)
     device_model: Optional[str] = None
     system_version: Optional[str] = None
     app_version: Optional[str] = None
@@ -143,7 +174,11 @@ class AccountPool:
         await pool.release(account)
     """
 
-    def __init__(self, strategy: str = "least_used"):
+    def __init__(
+        self,
+        strategy: str = "least_used",
+        static_proxy_resolver: Optional[StaticProxyResolver] = None,
+    ):
         """
         Initialize AccountPool.
 
@@ -157,7 +192,76 @@ class AccountPool:
         self._evomi_client: Optional[EvomiClient] = None
         self._decodo_client: Optional[DecodoClient] = None
         self._session_dir: Optional[Path] = None
+        self._static_proxy_resolver = static_proxy_resolver
         self.logger = logger.bind(module="account_pool")
+        _ACCOUNT_POOLS.add(self)
+
+    def set_static_proxy_resolver(self, resolver: Optional[StaticProxyResolver]) -> None:
+        """Set a fallback resolver for static proxies not preloaded from DB."""
+        self._static_proxy_resolver = resolver
+
+    @staticmethod
+    def _policy_matches(account: TelegramAccountWrapper, state: ProxyPolicyState) -> bool:
+        return (
+            account.proxy_mode.value == state.proxy_mode
+            and account.static_proxy_id == state.static_proxy_id
+            and account.proxy_policy_version == state.version
+        )
+
+    async def _disconnect_account_client(
+        self,
+        account: TelegramAccountWrapper,
+        *,
+        reason: str,
+    ) -> None:
+        client = account.client
+        account.client = None
+        account.current_proxy = None
+        account.current_proxy_country = None
+        account.static_proxy = None
+        account.keep_connected = False
+        account.status = AccountStatus.OFFLINE
+        if client is not None:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception as exc:
+                self.logger.warning(
+                    "account_policy_disconnect_failed",
+                    account_id=account.account_id,
+                    reason=reason,
+                    error=str(exc),
+                )
+
+    async def _assert_proxy_policy_current(self, account: TelegramAccountWrapper) -> None:
+        state = await get_account_proxy_policy_state(account.account_id)
+        if state is None or self._policy_matches(account, state):
+            return
+
+        await self._disconnect_account_client(account, reason="proxy_policy_generation_mismatch")
+        self._accounts.pop(account.session_name, None)
+        raise RuntimeError(
+            f"Proxy policy changed for account {account.account_id}; reload the account before reconnecting"
+        )
+
+    async def invalidate_account(self, account_id: int, *, reason: str) -> bool:
+        """Disconnect and evict one account so stale proxy settings cannot be reused."""
+        async with self._lock:
+            account = next(
+                (item for item in self._accounts.values() if item.account_id == account_id),
+                None,
+            )
+            if account is None:
+                return False
+            await self._disconnect_account_client(account, reason=reason)
+            self._accounts.pop(account.session_name, None)
+            self.logger.info(
+                "account_invalidated",
+                account_id=account_id,
+                session_name=account.session_name,
+                reason=reason,
+            )
+            return True
 
     def _ensure_session_dir(self) -> Path:
         """Ensure session directory exists."""
@@ -200,6 +304,10 @@ class AccountPool:
         account_type: AccountType = AccountType.PROMOTER,
         api_config_name: str = "default",
         fingerprint_id: Optional[str] = None,
+        proxy_mode: ProxyMode = ProxyMode.DYNAMIC,
+        static_proxy_id: Optional[int] = None,
+        static_proxy: Optional[ResolvedProxy] = None,
+        proxy_policy_version: int = 0,
         device_model: Optional[str] = None,
         system_version: Optional[str] = None,
         app_version: Optional[str] = None,
@@ -239,6 +347,10 @@ class AccountPool:
                 account_type=account_type,
                 api_config_name=api_config_name,
                 fingerprint_id=fingerprint_id,
+                proxy_mode=proxy_mode,
+                static_proxy_id=static_proxy_id,
+                static_proxy=static_proxy,
+                proxy_policy_version=proxy_policy_version,
                 device_model=device_model,
                 system_version=system_version,
                 app_version=app_version,
@@ -265,17 +377,52 @@ class AccountPool:
         Returns:
             TelegramAccountWrapper
         """
+        proxy_mode = normalize_proxy_mode(getattr(account, "proxy_mode", ProxyMode.DYNAMIC))
+        static_proxy_id = getattr(account, "static_proxy_id", None)
+        policy_state = await get_account_proxy_policy_state(account.id)
+        if policy_state is not None and (
+            policy_state.proxy_mode != proxy_mode.value
+            or policy_state.static_proxy_id != static_proxy_id
+        ):
+            raise RuntimeError(
+                f"Database proxy policy is stale for account {account.id}; retry with a fresh account record"
+            )
+
+        if account.session_name in self._accounts:
+            await self.sync_from_db([account])
+            existing = self._accounts.get(account.session_name)
+            if existing is None:
+                raise RuntimeError(f"Account {account.id} was invalidated while refreshing proxy policy")
+            return existing
+
+        api_id, api_hash = _resolve_account_api_credentials(account)
+        static_proxy = None
+        db_proxy = getattr(account, "__dict__", {}).get("static_proxy")
+        if db_proxy is not None:
+            static_proxy = ResolvedProxy(
+                protocol=db_proxy.protocol,
+                host=db_proxy.host,
+                port=db_proxy.port,
+                username=db_proxy.username,
+                password=db_proxy.password,
+                source="static",
+                proxy_id=db_proxy.id,
+            )
         return await self.add_account(
             account_id=account.id,
             phone=account.phone,
             session_name=account.session_name,
             country_code=account.country_code,
-            api_id=account.api_config.api_id if account.api_config else "",
-            api_hash=account.api_config.api_hash if account.api_config else "",
-            session_string=account.session_string,
+            api_id=api_id,
+            api_hash=api_hash,
+            session_string=decrypt_session_string(account.session_string),
             account_type=getattr(account, "account_type", AccountType.PROMOTER),
             api_config_name=account.api_config_name,
             fingerprint_id=account.fingerprint_id,
+            proxy_mode=proxy_mode,
+            static_proxy_id=static_proxy_id,
+            static_proxy=static_proxy,
+            proxy_policy_version=policy_state.version if policy_state else 0,
             device_model=account.device_model,
             system_version=account.system_version,
             app_version=account.app_version,
@@ -372,6 +519,7 @@ class AccountPool:
             selected.status = AccountStatus.WORKING
 
             try:
+                await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
                     selected.client = await self._create_client(selected)
@@ -446,6 +594,7 @@ class AccountPool:
             selected.status = AccountStatus.WORKING
 
             try:
+                await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
                     selected.client = await self._create_client(selected)
@@ -506,6 +655,7 @@ class AccountPool:
                 return None
 
             try:
+                await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
                     selected.client = await self._create_client(selected)
@@ -532,6 +682,20 @@ class AccountPool:
 
     async def _create_client(self, account: TelegramAccountWrapper) -> TelegramClient:
         """Create a Telethon client bound to the account session."""
+        api_id = str(account.api_id or "").strip()
+        api_hash = str(account.api_hash or "").strip()
+        if not api_id or not api_hash:
+            raise RuntimeError(
+                f"Telegram API credentials missing for account {account.account_id}. "
+                "Bind a telegram_api_config or set TELEGRAM_API_ID/TELEGRAM_API_HASH."
+            )
+        try:
+            api_id_int = int(api_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Telegram API ID for account {account.account_id} must be numeric."
+            ) from exc
+
         session_path = account.session_file_path
         session_path.parent.mkdir(parents=True, exist_ok=True)
         proxy = account.current_proxy
@@ -550,14 +714,32 @@ class AccountPool:
             str(session_path) if session_path.exists() else StringSession()
         )
 
-        client = TelegramClient(
-            session,
-            int(account.api_id),
-            account.api_hash,
-            proxy=proxy_config,
+        profile_key = account.fingerprint_id or account.phone or account.session_name or str(account.account_id)
+        telegram_profile = FingerprintManager().generate_telegram_device_profile(
+            profile_key,
             device_model=account.device_model,
             system_version=account.system_version,
             app_version=account.app_version,
+        )
+        account.fingerprint_id = account.fingerprint_id or telegram_profile["fingerprint_id"]
+        account.device_model = telegram_profile["device_model"]
+        account.system_version = telegram_profile["system_version"]
+        account.app_version = telegram_profile["app_version"]
+        self._validate_runtime_environment(account)
+        device_model = telegram_profile["device_model"]
+        system_version = telegram_profile["system_version"]
+        app_version = telegram_profile["app_version"]
+        lang_code = telegram_profile["lang_code"]
+        client = TelegramClient(
+            session,
+            api_id_int,
+            api_hash,
+            proxy=proxy_config,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=lang_code,
         )
         await client.connect()
         if not await client.is_user_authorized():
@@ -565,8 +747,17 @@ class AccountPool:
             raise RuntimeError(f"account {account.session_name} is not authorized")
         return client
 
+    def _validate_runtime_environment(self, account: TelegramAccountWrapper) -> None:
+        ok, reason = AccountEnvironmentGuard.validate_account_environment(account)
+        if ok:
+            return
+        raise RuntimeError(f"account runtime environment blocked: {reason}")
     def _proxy_required_for_account(self, account: TelegramAccountWrapper) -> bool:
         """Return whether this account must use a proxy."""
+        if account.proxy_mode == ProxyMode.NONE:
+            return False
+        if account.proxy_mode == ProxyMode.STATIC:
+            return True
         if account.account_type != AccountType.PROMOTER:
             return False
 
@@ -638,6 +829,15 @@ class AccountPool:
         provider = getattr(settings, "PROXY_PROVIDER", "evomi").lower()
 
         try:
+            if account.proxy_mode == ProxyMode.STATIC:
+                if account.static_proxy is None:
+                    if account.static_proxy_id is None or self._static_proxy_resolver is None:
+                        raise RuntimeError(
+                            f"Static proxy {account.static_proxy_id} is not loaded for account {account.account_id}"
+                        )
+                    account.static_proxy = await self._static_proxy_resolver(account.static_proxy_id)
+                return account.static_proxy.to_proxy_info()
+
             if provider == "decodo":
                 if self._decodo_client is None:
                     self._decodo_client = get_decodo_client()
@@ -915,23 +1115,91 @@ class AccountPool:
         """
         synced = 0
         for account in accounts:
+            new_proxy_mode = normalize_proxy_mode(
+                getattr(account, "proxy_mode", ProxyMode.DYNAMIC)
+            )
+            new_static_proxy_id = getattr(account, "static_proxy_id", None)
+            policy_state = await get_account_proxy_policy_state(account.id)
+            if policy_state is not None and (
+                policy_state.proxy_mode != new_proxy_mode.value
+                or policy_state.static_proxy_id != new_static_proxy_id
+            ):
+                await self.invalidate_account(
+                    account.id,
+                    reason="database_proxy_policy_snapshot_stale",
+                )
+                self.logger.warning(
+                    "database_proxy_policy_snapshot_stale",
+                    account_id=account.id,
+                    database_mode=new_proxy_mode.value,
+                    database_static_proxy_id=new_static_proxy_id,
+                    published_mode=policy_state.proxy_mode,
+                    published_static_proxy_id=policy_state.static_proxy_id,
+                )
+                continue
+
             existing = self._accounts.get(account.session_name)
             
             if existing:
+                api_id, api_hash = _resolve_account_api_credentials(account)
                 keep_runtime_status = (
-                    existing.keep_connected
-                    and existing.client is not None
-                    and existing.client.is_connected()
-                    and account.status not in [AccountStatus.ERROR, AccountStatus.BANNED]
+                    account.status not in [AccountStatus.ERROR, AccountStatus.BANNED]
+                    and (
+                        existing.status == AccountStatus.WORKING
+                        or (
+                            existing.keep_connected
+                            and existing.client is not None
+                            and existing.client.is_connected()
+                        )
+                    )
                 )
                 if not keep_runtime_status:
                     existing.status = account.status
                 existing.fingerprint_id = account.fingerprint_id
-                existing.session_string = account.session_string
-                existing.api_id = account.api_config.api_id if account.api_config else existing.api_id
-                existing.api_hash = account.api_config.api_hash if account.api_config else existing.api_hash
+                existing.session_string = decrypt_session_string(account.session_string)
+                existing.api_id = api_id or existing.api_id
+                existing.api_hash = api_hash or existing.api_hash
                 existing.account_type = getattr(account, "account_type", existing.account_type)
                 existing.country_code = account.country_code
+                static_proxy = None
+                db_proxy = getattr(account, "__dict__", {}).get("static_proxy")
+                if db_proxy is not None:
+                    static_proxy = ResolvedProxy(
+                        protocol=db_proxy.protocol,
+                        host=db_proxy.host,
+                        port=db_proxy.port,
+                        username=db_proxy.username,
+                        password=db_proxy.password,
+                        source="static",
+                        proxy_id=db_proxy.id,
+                    )
+                proxy_policy_changed = (
+                    existing.proxy_mode != new_proxy_mode
+                    or existing.static_proxy_id != new_static_proxy_id
+                    or (
+                        policy_state is not None
+                        and existing.proxy_policy_version != policy_state.version
+                    )
+                )
+                existing.proxy_mode = new_proxy_mode
+                existing.static_proxy_id = new_static_proxy_id
+                existing.static_proxy = static_proxy
+                existing.proxy_policy_version = policy_state.version if policy_state else 0
+                if proxy_policy_changed:
+                    existing.current_proxy = None
+                    existing.current_proxy_country = None
+                    if existing.client is not None:
+                        try:
+                            if existing.client.is_connected():
+                                await existing.client.disconnect()
+                        except Exception as e:
+                            self.logger.warning(
+                                "proxy_policy_refresh_disconnect_failed",
+                                session_name=existing.session_name,
+                                error=str(e),
+                            )
+                        finally:
+                            existing.client = None
                 existing.device_model = account.device_model
                 existing.system_version = account.system_version
                 existing.app_version = account.app_version
@@ -1005,6 +1273,15 @@ class AccountPool:
 
 
 # Global account pool instance
+async def invalidate_account_in_all_pools(account_id: int, *, reason: str) -> int:
+    """Invalidate an account in every AccountPool owned by this process."""
+    invalidated = 0
+    for pool in list(_ACCOUNT_POOLS):
+        if await pool.invalidate_account(account_id, reason=reason):
+            invalidated += 1
+    return invalidated
+
+
 _account_pool: Optional[AccountPool] = None
 
 

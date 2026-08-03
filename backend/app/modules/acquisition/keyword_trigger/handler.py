@@ -7,14 +7,19 @@ Handles keyword trigger events and executes appropriate actions.
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.pool import AccountPool
 from app.core.keyword.engine import CompiledKeyword
-from app.core.runtime_settings import is_ai_reply_enabled
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.automation_settings import (
+    get_group_ai_interaction_settings,
+    is_ai_reply_enabled,
+    is_keyword_private_reply_enabled,
+)
 from app.modules.acquisition.keyword_trigger.matcher import KeywordMatcher, TriggerMatch
 from app.modules.acquisition.keyword_trigger.actions import ActionExecutor, TriggerActionType
 from app.modules.acquisition.auto_reply.reply_engine import ReplyContext, ReplyEngine
@@ -75,7 +80,8 @@ class TriggerHandler:
         self.private_handler = private_handler
         self.tracker = tracker
         self.config = config or AcquisitionConfig()
-        self.action_executor = ActionExecutor(account_pool)
+        self.risk_guard = AccountRiskGuard(db)
+        self.action_executor = ActionExecutor(account_pool, risk_guard=self.risk_guard)
         self.logger = logger.bind(module="trigger_handler")
         self._handler_lock = asyncio.Lock()
         self.rate_limit_service = AcquisitionRateLimitService(
@@ -90,6 +96,7 @@ class TriggerHandler:
         group_id: int,
         message_id: int,
         context: Optional[dict] = None,
+        context_resolver: Optional[Callable[[], Awaitable[dict]]] = None,
     ) -> list[TriggerResult]:
         """
         Handle a message and execute triggers.
@@ -107,13 +114,28 @@ class TriggerHandler:
         async with self._handler_lock:
             results = []
 
-            # 检查限流
+            # 匹配关键词
+            matches = await self.keyword_matcher.match(message_text, group_id)
+            if not matches:
+                return results
+
+            # 仅对真实关键词命中消耗限流额度。
             if not await self._check_rate_limit(user_id, group_id):
                 self.logger.debug("rate_limit_exceeded", user_id=user_id, group_id=group_id)
                 return results
 
-            # 匹配关键词
-            matches = await self.keyword_matcher.match(message_text, group_id)
+            if matches and context_resolver is not None:
+                try:
+                    resolved_context = await context_resolver()
+                    if resolved_context is not None:
+                        context = resolved_context
+                except Exception as exc:
+                    self.logger.debug(
+                        "trigger_context_resolve_failed",
+                        user_id=user_id,
+                        group_id=group_id,
+                        error=str(exc),
+                    )
 
             for match in matches:
                 try:
@@ -216,6 +238,20 @@ class TriggerHandler:
         context: Optional[dict],
     ) -> TriggerResult:
         """Execute reply action."""
+        group_ai_settings = await get_group_ai_interaction_settings(self.db)
+        if not group_ai_settings.get("allowKeywordTriggeredReply", False):
+            self.logger.info(
+                "keyword_group_reply_paused",
+                trigger_id=getattr(trigger, "id", None),
+                keyword=match.keyword_text,
+                group_id=group_id,
+            )
+            return TriggerResult(
+                success=True,
+                action_taken=TriggerActionType.NONE,
+                matched_keyword=match.keyword_text,
+            )
+
         # 生成回复
         reply_content = await self._generate_reply(
             trigger=trigger,
@@ -287,6 +323,20 @@ class TriggerHandler:
         context: Optional[dict],
     ) -> TriggerResult:
         """Execute private message action."""
+        if not await is_keyword_private_reply_enabled(self.db):
+            self.logger.info(
+                "keyword_private_reply_paused",
+                trigger_id=getattr(trigger, "id", None),
+                keyword=match.keyword_text,
+                user_id=user_id,
+                group_id=group_id,
+            )
+            return TriggerResult(
+                success=True,
+                action_taken=TriggerActionType.NONE,
+                matched_keyword=match.keyword_text,
+            )
+
         # 先按触发器配置生成私聊内容；未配置时退回默认注册链接引导。
         message = await self._generate_private_message(
             trigger=trigger,
@@ -407,7 +457,7 @@ class TriggerHandler:
                     keyword=match.keyword_text,
                 )
 
-        if trigger.use_ai_reply and is_ai_reply_enabled():
+        if trigger.use_ai_reply and await is_ai_reply_enabled(self.db):
             prompt = (
                 f"触发关键词：{match.keyword_text}\n"
                 f"来源群：{context.get('group_name') if context else ''}\n"
@@ -420,7 +470,7 @@ class TriggerHandler:
                 try:
                     return await llm_client.generate(
                         prompt=prompt,
-                        model="gpt-4o-mini",
+                        model=llm_client.model_for("fast"),
                         temperature=0.6,
                         max_tokens=180,
                         system_prompt=(

@@ -7,7 +7,7 @@ Main event handler for Telegram messages in the acquisition bot.
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +20,7 @@ from app.core.ai.llm_client import LLMClient, LLMProvider
 
 from app.modules.acquisition.config import AcquisitionConfig
 from app.modules.acquisition.search import Searcher, GroupFinder
-from app.modules.acquisition.auto_reply import Speaker, ReplyEngine, TemplateEngine
+from app.modules.acquisition.auto_reply import Speaker, ReplyEngine, SemanticGroupReplyEngine, TemplateEngine
 from app.modules.acquisition.keyword_trigger import KeywordMatcher, TriggerHandler
 from app.modules.acquisition.private_msg import PrivateHandler, DialogManager, WelcomeGenerator, GuideFlowManager
 from app.modules.acquisition.tracking import Tracker, URLBuilder
@@ -39,6 +39,8 @@ class MessageEvent:
     content: str
     is_group: bool
     timestamp: datetime
+    account_id: Optional[int] = None
+    sender_name_resolver: Optional[Callable[[], Awaitable[str]]] = None
 
 
 @dataclass
@@ -119,6 +121,11 @@ class AcquisitionEventHandler:
             keyword_engine=self.keyword_engine,
             intent_classifier=self.intent_classifier,
             template_engine=self.template_engine,
+            llm_client=self.llm_client,
+        )
+        self.semantic_reply_engine = SemanticGroupReplyEngine(
+            db=self.db,
+            account_pool=self.account_pool,
             llm_client=self.llm_client,
         )
 
@@ -207,16 +214,47 @@ class AcquisitionEventHandler:
 
     async def _handle_group_message(self, event: MessageEvent) -> None:
         """Handle group message."""
+        context = {
+            "user_name": event.sender_name,
+            "group_id": event.chat_id,
+        }
+
+        async def resolve_context_on_match() -> dict:
+            if event.sender_name_resolver is None:
+                return context
+
+            try:
+                sender_name = await event.sender_name_resolver()
+            except Exception as exc:
+                self.logger.debug(
+                    "sender_name_resolve_failed",
+                    sender_id=event.sender_id,
+                    chat_id=event.chat_id,
+                    error=str(exc),
+                )
+                return context
+
+            if sender_name:
+                event.sender_name = sender_name
+                context["user_name"] = sender_name
+                await self.context_manager.set_user_context(
+                    user_id=event.sender_id,
+                    group_id=event.chat_id,
+                    metadata={
+                        "sender_name": sender_name,
+                        "last_message_id": event.message_id,
+                    },
+                )
+            return context
+
         # 1. 关键词触发检测
         trigger_results = await self.trigger_handler.handle_message(
             message_text=event.content,
             user_id=event.sender_id,
             group_id=event.chat_id,
             message_id=event.message_id,
-            context={
-                "user_name": event.sender_name,
-                "group_id": event.chat_id,
-            },
+            context=context,
+            context_resolver=resolve_context_on_match,
         )
 
         if trigger_results:
@@ -232,6 +270,25 @@ class AcquisitionEventHandler:
             role="user",
             content=event.content,
         )
+
+        # 3. 语义识别真实群聊消息，必要时只回复一条最合适的消息。
+        semantic_result = await self.semantic_reply_engine.process_message(
+            account_id=event.account_id,
+            group_id=event.chat_id,
+            message_id=event.message_id,
+            user_id=event.sender_id,
+            user_name=event.sender_name,
+            text=event.content,
+            timestamp=event.timestamp,
+        )
+        if semantic_result.sent:
+            self.logger.info(
+                "semantic_group_reply_sent",
+                message_id=event.message_id,
+                target_message_id=semantic_result.target_message_id,
+                intent=semantic_result.intent,
+                confidence=semantic_result.confidence,
+            )
 
     async def _handle_private_message(self, event: MessageEvent) -> None:
         """Handle private message."""

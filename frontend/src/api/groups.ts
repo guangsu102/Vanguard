@@ -1,8 +1,17 @@
 import apiClient from './client'
 
-export type GroupStatus = 'active' | 'inactive' | 'banned' | 'left'
+export type GroupStatus =
+  | 'active'
+  | 'inactive'
+  | 'banned'
+  | 'left'
+  | 'pending'
+  | 'pending_join'
+  | 'join_failed'
+  | 'cooling_down'
+  | 'rejected'
 export type GroupLevel = 'A' | 'B' | 'C' | 'unrated'
-export type DiscoverySource = 'manual' | 'keyword_search' | 'related_group' | 'import'
+export type DiscoverySource = 'manual' | 'keyword_search' | 'auto_keyword_search' | 'related_group' | 'import'
 
 export interface GroupMetrics {
   adsSent: number
@@ -197,6 +206,14 @@ export const groupsApi = {
 
   create: async (data: GroupFormData) => {
     const res = await apiClient.post<{ data: Group }>('/groups', clean(toServerGroup(data)))
+    return mapGroupResponse(res)
+  },
+
+  joinByLink: async (data: { accountId: number; groupLink: string }) => {
+    const res = await apiClient.post<{ data: Group }>('/groups/join-by-link', {
+      account_id: data.accountId,
+      group_link: data.groupLink.trim(),
+    })
     return mapGroupResponse(res)
   },
 

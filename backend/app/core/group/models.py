@@ -181,6 +181,36 @@ class GroupAccountMembership(Base):
     joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, nullable=True, comment="加入时间")
     left_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="离开时间")
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最后检查时间")
+    warmup_status: Mapped[str] = mapped_column(
+        String(40),
+        default="joined_pending_test",
+        nullable=False,
+        comment="广告预热状态: joined_pending_test/probe_scheduled/writable_verified/ad_eligible/blocked/ad_delivered",
+    )
+    probe_status: Mapped[str] = mapped_column(
+        String(40),
+        default="not_started",
+        nullable=False,
+        comment="软广探测状态: not_started/scheduled/success/failed/skipped",
+    )
+    probe_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="探测消息计划时间")
+    last_probe_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近探测时间")
+    ad_eligible_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="允许软广时间")
+    last_probe_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="最近探测失败原因")
+    ad_status: Mapped[str] = mapped_column(
+        String(40),
+        default="warming",
+        nullable=False,
+        comment="账号-群软广状态: warming/probing/active/paused/blocked",
+    )
+    account_group_daily_cap: Mapped[int] = mapped_column(Integer, default=50, nullable=False, comment="单账号单群每日软广上限")
+    ad_pause_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="账号-群广告暂停截止时间")
+    ad_failure_streak: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="账号-群连续广告失败次数")
+    interaction_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="互动预热开始时间")
+    interaction_sent_today: Mapped[int] = mapped_column(Integer, default=0, nullable=False, comment="今日互动消息数")
+    first_ad_allowed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="首次允许软广时间")
+    last_ad_survived_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近广告存活时间")
+    last_ad_deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近广告删除时间")
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="备注")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -199,4 +229,7 @@ class GroupAccountMembership(Base):
         Index("idx_group_membership_account", "account_id"),
         Index("idx_group_membership_tg_group", "telegram_group_id"),
         Index("idx_group_membership_status", "status"),
+        Index("idx_group_membership_warmup", "account_id", "warmup_status", "probe_status"),
+        Index("idx_group_membership_ad_eligible", "account_id", "ad_eligible_after"),
+        Index("idx_group_membership_ad_status", "account_id", "ad_status"),
     )

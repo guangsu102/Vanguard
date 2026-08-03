@@ -2,12 +2,11 @@
 Tests for Auto Reply Module
 """
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime
 
 from app.modules.acquisition.auto_reply.templates import TemplateEngine, MessageTemplateStore
 from app.modules.acquisition.auto_reply.scheduler import SpeakScheduler, SpeakTask, SpeakSchedule
+from app.modules.acquisition.auto_reply.safety import has_ai_self_disclosure, sanitize_natural_group_reply
 from app.modules.acquisition.models import MessageType
 
 
@@ -44,7 +43,7 @@ class TestMessageTemplateStore:
         template = self.store.get_random(MessageType.QA)
 
         assert isinstance(template, str)
-        assert "?" in template or "怎么" in template
+        assert any(marker in template for marker in ("?", "？", "怎么", "问"))
 
     def test_get_all_by_type(self):
         """Test getting all templates of a type."""
@@ -133,6 +132,31 @@ class TestTemplateEngine:
 
         assert "Bob" in rendered
         assert "Tech Group" in rendered
+
+
+class TestReplySafety:
+    """Tests for group reply safety filters."""
+
+    def test_detects_ai_self_disclosure(self):
+        assert has_ai_self_disclosure("我是AI助手，可以帮你分析")
+        assert has_ai_self_disclosure("As an AI language model, I can help")
+
+    def test_sanitize_replaces_ai_self_disclosure(self):
+        result = sanitize_natural_group_reply(
+            "我是AI助手，可以帮你分析",
+            {"blockAiSelfDisclosure": True, "replyMaxChars": 120},
+            fallback="这个点可以再看看大家怎么说。",
+        )
+
+        assert result == "这个点可以再看看大家怎么说。"
+
+    def test_sanitize_enforces_reply_length(self):
+        result = sanitize_natural_group_reply(
+            "这个问题挺实际的" * 20,
+            {"blockAiSelfDisclosure": True, "replyMaxChars": 30},
+        )
+
+        assert len(result) <= 30
 
 
 class TestSpeakScheduler:

@@ -509,6 +509,12 @@ class CouponDistribution(Base):
         nullable=True,
         comment="优惠码"
     )
+    batch_key: Mapped[str] = mapped_column(
+        String(100),
+        default="default",
+        nullable=False,
+        comment="发券批次标识"
+    )
     
     # 奖励详情
     trial_hours: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, comment="试用时长(小时)")
@@ -522,4 +528,6 @@ class CouponDistribution(Base):
     __table_args__ = (
         Index("idx_coupon_user", "user_id"),
         Index("idx_coupon_campaign", "campaign_id"),
+        Index("idx_coupon_batch", "campaign_id", "batch_key"),
+        UniqueConstraint("user_id", "campaign_id", "batch_key", name="uq_coupon_user_campaign_batch"),
     )

@@ -4,6 +4,7 @@ Acquisition API Router
 RESTful API for acquisition tracking, messages, triggers, and guide flows.
 """
 
+import re
 from datetime import datetime
 from typing import Optional
 import uuid
@@ -14,6 +15,9 @@ from sqlalchemy import select, func, desc, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.ai.keyword_generator import normalize_keyword_text
+from app.core.ai.llm_client import LLMClient, LLMProvider
+from app.core.config import settings
 from app.core.database import get_db
 from app.modules.acquisition.models import (
     GroupSearchRecord,
@@ -108,6 +112,7 @@ class KeywordTriggerCreate(BaseModel):
     max_triggers_per_user: int = Field(default=5, ge=1, description="Max triggers per user")
     max_triggers_per_group: int = Field(default=10, ge=1, description="Max triggers per group")
     priority: int = Field(default=0, ge=0, le=999, description="Priority")
+    requires_review: bool = Field(default=False, description="Require manual review before execution")
     enabled: bool = Field(default=True)
 
 
@@ -124,6 +129,56 @@ class KeywordTriggerUpdate(BaseModel):
     max_triggers_per_user: Optional[int] = Field(None, ge=1)
     max_triggers_per_group: Optional[int] = Field(None, ge=1)
     priority: Optional[int] = Field(None, ge=0, le=999)
+    requires_review: Optional[bool] = None
+    enabled: Optional[bool] = None
+
+
+class KeywordTriggerGenerateRequest(BaseModel):
+    """AI-generate marketing trigger keywords into the review queue."""
+
+    category: str = Field(default="demand", max_length=50, description="Generation category")
+    count: int = Field(default=20, ge=1, le=50)
+    action: str = Field(default="send_private", description="Default action for generated triggers")
+    use_ai_reply: bool = Field(default=False)
+    cooldown_seconds: int = Field(default=300, ge=0)
+    max_triggers_per_user: int = Field(default=5, ge=1)
+    max_triggers_per_group: int = Field(default=10, ge=1)
+    priority: int = Field(default=100, ge=0, le=999)
+
+
+class MessageTemplateCreate(BaseModel):
+    """Reusable marketing reply template creation request."""
+
+    name: str = Field(..., min_length=1, max_length=100)
+    content: str = Field(..., min_length=1, max_length=5000)
+    message_type: str = Field(default=MessageType.GUIDE.value, max_length=50)
+    template_variables: Optional[str] = Field(
+        default="user_name,group_name,bot_name,register_link,keyword",
+        max_length=500,
+    )
+    cooldown_seconds: int = Field(default=300, ge=0)
+    max_uses_per_day: int = Field(default=100, ge=1)
+    enabled: bool = True
+
+
+class MessageTemplateUpdate(BaseModel):
+    """Reusable marketing reply template update request."""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    content: Optional[str] = Field(None, min_length=1, max_length=5000)
+    message_type: Optional[str] = Field(None, max_length=50)
+    template_variables: Optional[str] = Field(None, max_length=500)
+    cooldown_seconds: Optional[int] = Field(None, ge=0)
+    max_uses_per_day: Optional[int] = Field(None, ge=1)
+    enabled: Optional[bool] = None
+
+
+class KeywordTriggerBatchTemplateRequest(BaseModel):
+    """Bind one reusable template to many keyword triggers."""
+
+    trigger_ids: list[int] = Field(..., min_length=1, max_length=200)
+    template_id: int = Field(..., ge=1)
+    reply_target: str = Field(default="private", pattern="^(private|group)$")
     enabled: Optional[bool] = None
 
 
@@ -137,14 +192,34 @@ def _trigger_to_response(trigger: KeywordTrigger) -> dict:
         "trigger_type": trigger.trigger_type.value,
         "action": trigger.action.value,
         "template_id": trigger.template_id,
+        "template_name": template.name if template else None,
         "reply_content": template.content if template else None,
         "use_ai_reply": trigger.use_ai_reply,
         "cooldown_seconds": trigger.cooldown_seconds,
         "max_triggers_per_user": trigger.max_triggers_per_user,
         "max_triggers_per_group": trigger.max_triggers_per_group,
         "priority": trigger.priority,
+        "requires_review": getattr(trigger, "requires_review", False),
         "enabled": trigger.enabled,
         "created_at": trigger.created_at.isoformat() if trigger.created_at else "",
+    }
+
+
+def _template_to_response(template: MessageTemplate, usage_count: int | None = None) -> dict:
+    """Serialize a reusable message template for API responses."""
+    message_type = template.message_type.value if hasattr(template.message_type, "value") else template.message_type
+    return {
+        "id": template.id,
+        "name": template.name,
+        "content": template.content,
+        "template_variables": template.template_variables,
+        "message_type": message_type,
+        "cooldown_seconds": template.cooldown_seconds,
+        "max_uses_per_day": template.max_uses_per_day,
+        "enabled": template.enabled,
+        "usage_count": usage_count or 0,
+        "created_at": template.created_at.isoformat() if template.created_at else "",
+        "updated_at": template.updated_at.isoformat() if template.updated_at else "",
     }
 
 
@@ -190,6 +265,211 @@ async def _save_inline_reply_template(
         await db.flush()
 
     return template.id
+
+
+MARKETING_TRIGGER_PROMPTS = {
+    "intent": """生成 Telegram 群内“营销触发词”，用于识别用户表达购买、寻找服务、寻找解决方案的自然发言片段。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 必须是跨行业通用的用户意图，不要绑定VPN、代理、机场、节点或任何单一行业
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：求推荐、求方案、找服务、找资源、能定制、能开发、求链接、发我下、谁能做、靠谱吗""",
+    "question": """生成 Telegram 群内“营销触发词”，用于识别用户正在咨询开通、使用、配置、教程、客服、售后等问题。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 覆盖所有行业的咨询意图，不要生成VPN、机场、节点、代理IP相关词
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：怎么弄、怎么用、怎么开、怎么配、支持吗、求教程、求客服、有文档、能教吗、用不了""",
+    "price": """生成 Telegram 群内“营销触发词”，用于识别用户正在询价、试用、找优惠、下单、付款、售后。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 覆盖所有行业的价格/交易意图，不要生成VPN、机场、节点、代理IP相关词
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：多少钱、求报价、有优惠、能便宜、有折扣、能试用、有试用、怎么付、可退款、有套餐""",
+    "pain": """生成 Telegram 群内“营销触发词”，用于识别用户遇到问题、缺资源、不会操作、急需解决方案。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 覆盖所有行业的痛点/求助意图，不要生成VPN、机场、节点、代理IP相关词
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：搞不定、不会弄、没效果、卡住了、缺资源、缺人手、求解法、求帮忙、谁能做、急用""",
+    "cooperation": """生成 Telegram 群内“营销触发词”，用于识别用户寻找合作、外包、渠道、货源、定制、代办、资源对接。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 覆盖所有行业的合作/资源意图，不要生成VPN、机场、节点、代理IP相关词
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：找合作、求合作、接单吗、可外包、找外包、找渠道、求渠道、求货源、能代办、可对接""",
+    "broad": """生成 Telegram 群内“营销触发词”，用于识别泛需求、轻咨询、求资料、求推荐、求帮忙等弱意图。
+
+关键定义：
+1. 这是“群内消息触发词”，不是“搜群关键词”
+2. 只输出短触发词，每行一个
+3. 纯中文2到4字，英文或中英文混合不超过16位
+4. 覆盖所有行业的泛需求，不要生成VPN、机场、节点、代理IP相关词
+5. 不要输出行业词、平台词、地区词、群名、频道名、品牌名、竞品名
+6. 不要输出广告话术、完整句子、违法灰产色情赌博诈骗相关词
+
+方向示例：有吗、在吗、求一下、私聊我、帮看看、能搞吗、靠谱嘛、哪个好、求一个、发我下""",
+}
+
+MARKETING_TRIGGER_FALLBACKS = {
+    "intent": [
+        "求推荐", "求方案", "求资料", "求工具", "求链接", "找服务", "找资源", "找方案", "能定制", "能开发",
+        "谁能做", "有现成", "有案例", "有资源", "有渠道", "发我下", "推荐下", "靠谱吗", "能搞吗", "接单吗",
+    ],
+    "question": [
+        "怎么弄", "怎么用", "怎么开", "怎么配", "怎么接", "怎么买", "怎么付", "怎么试", "支持吗", "有文档",
+        "求教程", "有教程", "求客服", "能教吗", "用不了", "打不开", "登不上", "怎么设", "能绑定", "能对接",
+    ],
+    "price": [
+        "多少钱", "价格呢", "求报价", "有优惠", "能便宜", "有折扣", "能试用", "有试用", "月付吗", "年付吗",
+        "怎么付", "怎么下", "可退款", "有售后", "有套餐", "便宜点", "可月付", "可年付", "能砍价", "报价下",
+    ],
+    "pain": [
+        "搞不定", "不会弄", "没效果", "卡住了", "缺资源", "缺人手", "求解法", "求帮忙", "谁能做", "急用",
+        "出问题", "用不了", "太麻烦", "没头绪", "求救", "帮看看", "不会配", "报错了", "没权限", "太难了",
+    ],
+    "cooperation": [
+        "找合作", "求合作", "接单吗", "可外包", "找外包", "找渠道", "求渠道", "求货源", "能代办", "可对接",
+        "招代理", "可分销", "招兼职", "能定制", "能开发", "找团队", "找人做", "可合作", "求对接", "有货源",
+    ],
+    "broad": [
+        "有吗", "在吗", "求一下", "私聊我", "帮看看", "能搞吗", "靠谱嘛", "哪个好", "求一个", "发我下",
+        "有推荐", "有人吗", "来一个", "看一下", "了解下", "问一下", "能做吗", "好用吗", "哪家好", "推荐下",
+    ],
+}
+
+MARKETING_TRIGGER_CATEGORY_ALIASES = {
+    "demand": "broad",
+    "inquiry": "question",
+    "competitor": "cooperation",
+}
+
+FORBIDDEN_TRIGGER_TERMS = {
+    "博彩", "赌博", "彩票", "盘口", "菠菜", "诈骗", "洗钱", "跑分", "接码", "裸聊", "黄播", "色情", "约炮", "代实名",
+    "vpn", "机场", "节点", "翻墙", "梯子", "代理ip", "加速器", "群发", "社工", "频道", "群组", "群",
+}
+
+
+def _normalize_generation_category(category: str) -> str:
+    category = MARKETING_TRIGGER_CATEGORY_ALIASES.get(category, category)
+    return category if category in MARKETING_TRIGGER_PROMPTS else "broad"
+
+
+def _validate_trigger_keyword_text(text: str) -> tuple[bool, str | None]:
+    compact = re.sub(r"\s+", "", text.strip())
+    if not compact:
+        return False, "empty"
+    if len(compact) < 2:
+        return False, "too_short"
+    has_latin_or_digit = bool(re.search(r"[A-Za-z0-9]", compact))
+    max_length = 16 if has_latin_or_digit else 4
+    if len(compact) > max_length:
+        return False, "too_long"
+    compact_lower = compact.lower()
+    if any(term.lower() in compact_lower for term in FORBIDDEN_TRIGGER_TERMS):
+        return False, "forbidden"
+    if re.search(r"https?://|t\.me/|@", compact, re.IGNORECASE):
+        return False, "contact_or_link"
+    if re.search(r"[\r\n]", compact):
+        return False, "multiline"
+    return True, None
+
+
+def _clean_generated_trigger_line(line: str) -> str:
+    text = line.strip()
+    text = text.lstrip("0123456789.-*、)）(（ ")
+    text = text.strip("`'\"“”‘’，,;； ")
+    text = re.split(r"\s*[：:，,；;|]\s*", text, maxsplit=1)[0]
+    text = re.split(r"\s+[-–—]\s+", text, maxsplit=1)[0]
+    return re.sub(r"\s+", "", text).strip()
+
+
+def _parse_trigger_generation_response(response: str, existing: set[str], category: str, count: int) -> list[str]:
+    seen: set[str] = set()
+    results: list[str] = []
+    for line in response.splitlines():
+        text = _clean_generated_trigger_line(line)
+        ok, _reason = _validate_trigger_keyword_text(text)
+        if not ok:
+            continue
+        normalized = normalize_keyword_text(text)
+        if normalized in existing or normalized in seen:
+            continue
+        if text.startswith(("以下", "这里", "触发词", "关键词")) and len(text) > 8:
+            continue
+        seen.add(normalized)
+        results.append(text)
+        if len(results) >= count:
+            break
+    for text in MARKETING_TRIGGER_FALLBACKS[_normalize_generation_category(category)]:
+        if len(results) >= count:
+            break
+        normalized = normalize_keyword_text(text)
+        ok, _reason = _validate_trigger_keyword_text(text)
+        if ok and normalized not in existing and normalized not in seen:
+            seen.add(normalized)
+            results.append(text)
+    return results[:count]
+
+
+async def _generate_marketing_trigger_texts(
+    *,
+    category: str,
+    count: int,
+    existing_keywords: list[str],
+) -> tuple[list[str], bool]:
+    category = _normalize_generation_category(category)
+    existing = {normalize_keyword_text(item) for item in existing_keywords if item}
+
+    provider = (
+        LLMProvider(settings.LLM_PROVIDER)
+        if settings.LLM_PROVIDER in {p.value for p in LLMProvider}
+        else LLMProvider.OPENAI
+    )
+    api_key = settings.OPENAI_API_KEY if provider == LLMProvider.OPENAI else settings.ANTHROPIC_API_KEY
+    llm_configured = provider == LLMProvider.LOCAL or bool(api_key)
+    if not llm_configured:
+        return _parse_trigger_generation_response("", existing, category, count), False
+
+    avoid_lines = "\n".join(f"- {item}" for item in existing_keywords[:200])
+    prompt = f"""{MARKETING_TRIGGER_PROMPTS[category]}
+
+数据库已有营销触发词如下，禁止重复或生成近似重复：
+{avoid_lines or "- 暂无"}
+
+请生成 {count} 个全新的营销触发词，每行一个，只输出触发词。"""
+
+    try:
+        llm_client = LLMClient(provider=provider, api_key=api_key)
+        response = await llm_client.generate(prompt=prompt, temperature=0.6, max_tokens=500)
+        return _parse_trigger_generation_response(response, existing, category, count), True
+    except Exception:
+        return _parse_trigger_generation_response("", existing, category, count), False
 
 
 # =============================================================================
@@ -322,6 +602,134 @@ async def get_message_stats(
 # Keyword Trigger Config Endpoints
 # =============================================================================
 
+@router.get("/message-templates")
+async def list_message_templates(
+    message_type: Optional[str] = Query(MessageType.GUIDE.value, description="Filter by template type"),
+    enabled: Optional[bool] = Query(None, description="Filter by enabled status"),
+    include_inline: bool = Query(False, description="Include per-keyword inline templates"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """List reusable marketing reply templates."""
+    query = select(MessageTemplate)
+
+    if message_type:
+        try:
+            message_type_enum = MessageType(message_type)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid message type")
+        query = query.where(MessageTemplate.message_type == message_type_enum)
+
+    if enabled is not None:
+        query = query.where(MessageTemplate.enabled == enabled)
+
+    if not include_inline:
+        query = query.where(~MessageTemplate.name.like("关键词回复 - %"))
+
+    query = query.order_by(desc(MessageTemplate.updated_at), desc(MessageTemplate.id))
+    result = await db.execute(query)
+    templates = list(result.scalars().all())
+
+    usage_result = await db.execute(
+        select(KeywordTrigger.template_id, func.count(KeywordTrigger.id))
+        .where(KeywordTrigger.template_id.is_not(None))
+        .group_by(KeywordTrigger.template_id)
+    )
+    usage_counts = {template_id: count for template_id, count in usage_result.all()}
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_template_to_response(item, usage_counts.get(item.id, 0)) for item in templates],
+    }
+
+
+@router.post("/message-templates", status_code=status.HTTP_201_CREATED)
+async def create_message_template(
+    request: MessageTemplateCreate,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Create a reusable marketing reply template."""
+    try:
+        message_type = MessageType(request.message_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid message type")
+
+    template = MessageTemplate(
+        name=request.name.strip(),
+        content=request.content.strip(),
+        template_variables=(request.template_variables or "").strip() or None,
+        message_type=message_type,
+        cooldown_seconds=request.cooldown_seconds,
+        max_uses_per_day=request.max_uses_per_day,
+        enabled=request.enabled,
+    )
+    db.add(template)
+    await db.commit()
+    await db.refresh(template)
+
+    return {
+        "code": 0,
+        "message": "Message template created",
+        "data": _template_to_response(template),
+    }
+
+
+@router.put("/message-templates/{template_id}")
+async def update_message_template(
+    template_id: int,
+    request: MessageTemplateUpdate,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Update a reusable marketing reply template."""
+    result = await db.execute(select(MessageTemplate).where(MessageTemplate.id == template_id))
+    template = result.scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail="Message template not found")
+
+    update_data = request.model_dump(exclude_none=True)
+    if "message_type" in update_data:
+        try:
+            update_data["message_type"] = MessageType(update_data["message_type"])
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid message type")
+
+    for field, value in update_data.items():
+        if isinstance(value, str):
+            value = value.strip()
+        setattr(template, field, value)
+    template.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(template)
+
+    usage_result = await db.execute(
+        select(func.count(KeywordTrigger.id)).where(KeywordTrigger.template_id == template.id)
+    )
+    return {
+        "code": 0,
+        "message": "Message template updated",
+        "data": _template_to_response(template, usage_result.scalar() or 0),
+    }
+
+
+@router.delete("/message-templates/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_message_template(
+    template_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Delete a reusable marketing reply template."""
+    result = await db.execute(select(MessageTemplate).where(MessageTemplate.id == template_id))
+    template = result.scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail="Message template not found")
+
+    trigger_rows = await db.execute(select(KeywordTrigger).where(KeywordTrigger.template_id == template_id))
+    for trigger in trigger_rows.scalars().all():
+        trigger.template_id = None
+    await db.delete(template)
+    await db.commit()
+
+
 @router.get("/keyword-triggers")
 async def list_keyword_triggers(
     page: int = Query(default=1, ge=1),
@@ -329,6 +737,7 @@ async def list_keyword_triggers(
     keyword: Optional[str] = Query(None, description="Filter by keyword text"),
     action: Optional[str] = Query(None, description="Filter by action"),
     enabled: Optional[bool] = Query(None, description="Filter by enabled status"),
+    requires_review: Optional[bool] = Query(None, description="Filter by review status"),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """List acquisition keyword reply/private-message triggers."""
@@ -352,6 +761,10 @@ async def list_keyword_triggers(
         query = query.where(KeywordTrigger.enabled == enabled)
         count_query = count_query.where(KeywordTrigger.enabled == enabled)
 
+    if requires_review is not None:
+        query = query.where(KeywordTrigger.requires_review == requires_review)
+        count_query = count_query.where(KeywordTrigger.requires_review == requires_review)
+
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
 
@@ -364,6 +777,139 @@ async def list_keyword_triggers(
         "message": "success",
         "data": [_trigger_to_response(trigger) for trigger in result.scalars().all()],
         "total": total,
+    }
+
+
+@router.post("/keyword-triggers/generate", status_code=status.HTTP_201_CREATED)
+async def generate_keyword_triggers(
+    request: KeywordTriggerGenerateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Generate marketing trigger keywords and place them into manual review."""
+    try:
+        action = TriggerAction(request.action)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid trigger action")
+
+    existing_result = await db.execute(select(KeywordTrigger.keyword_text))
+    existing_keywords = [item for item in existing_result.scalars().all() if item]
+    existing_normalized = {normalize_keyword_text(item) for item in existing_keywords}
+
+    candidate_count = min(50, max(request.count * 3, request.count))
+    candidates, llm_configured = await _generate_marketing_trigger_texts(
+        category=request.category,
+        count=candidate_count,
+        existing_keywords=existing_keywords,
+    )
+
+    created: list[KeywordTrigger] = []
+    skipped_existing: list[str] = []
+    skipped_duplicate: list[str] = []
+    skipped_invalid: list[str] = []
+    seen: set[str] = set()
+
+    for text in candidates:
+        if len(created) >= request.count:
+            break
+        ok, _reason = _validate_trigger_keyword_text(text)
+        if not ok:
+            skipped_invalid.append(text)
+            continue
+        normalized = normalize_keyword_text(text)
+        if normalized in existing_normalized:
+            skipped_existing.append(text)
+            continue
+        if normalized in seen:
+            skipped_duplicate.append(text)
+            continue
+        seen.add(normalized)
+        row = KeywordTrigger(
+            keyword_text=text,
+            trigger_type=TriggerType.KEYWORD,
+            action=action,
+            use_ai_reply=request.use_ai_reply or action == TriggerAction.REPLY_AI,
+            cooldown_seconds=request.cooldown_seconds,
+            max_triggers_per_user=request.max_triggers_per_user,
+            max_triggers_per_group=request.max_triggers_per_group,
+            priority=request.priority,
+            requires_review=True,
+            enabled=False,
+        )
+        db.add(row)
+        created.append(row)
+        existing_normalized.add(normalized)
+
+    await db.commit()
+    for row in created:
+        await db.refresh(row)
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "requested": request.count,
+            "generated": len(candidates),
+            "created": len(created),
+            "skipped_existing": len(skipped_existing),
+            "skipped_duplicate": len(skipped_duplicate),
+            "skipped_invalid": len(skipped_invalid),
+            "candidate_exhausted": len(created) < request.count,
+            "llm_configured": llm_configured,
+            "requires_review": True,
+            "keywords": [_trigger_to_response(item) for item in created],
+        },
+    }
+
+
+@router.post("/keyword-triggers/batch-template")
+async def batch_bind_keyword_trigger_template(
+    request: KeywordTriggerBatchTemplateRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Bind one reusable reply template to many marketing keyword triggers."""
+    template_result = await db.execute(
+        select(MessageTemplate).where(MessageTemplate.id == request.template_id)
+    )
+    template = template_result.scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail="Message template not found")
+
+    trigger_result = await db.execute(
+        select(KeywordTrigger)
+        .options(selectinload(KeywordTrigger.template))
+        .where(KeywordTrigger.id.in_(request.trigger_ids))
+    )
+    triggers = list(trigger_result.scalars().all())
+    found_ids = {trigger.id for trigger in triggers}
+    missing_ids = [trigger_id for trigger_id in request.trigger_ids if trigger_id not in found_ids]
+
+    action = TriggerAction.SEND_PRIVATE if request.reply_target == "private" else TriggerAction.REPLY_TEMPLATE
+    for trigger in triggers:
+        trigger.template_id = template.id
+        trigger.action = action
+        trigger.use_ai_reply = False
+        if request.enabled is not None:
+            trigger.enabled = request.enabled and not getattr(trigger, "requires_review", False)
+
+    await db.commit()
+
+    refreshed_result = await db.execute(
+        select(KeywordTrigger)
+        .options(selectinload(KeywordTrigger.template))
+        .where(KeywordTrigger.id.in_(found_ids))
+        .order_by(desc(KeywordTrigger.priority), desc(KeywordTrigger.id))
+    )
+    refreshed = list(refreshed_result.scalars().all())
+
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "updated": len(triggers),
+            "missing_ids": missing_ids,
+            "template": _template_to_response(template, len(triggers)),
+            "triggers": [_trigger_to_response(trigger) for trigger in refreshed],
+        },
     }
 
 
@@ -405,7 +951,8 @@ async def create_keyword_trigger(
         max_triggers_per_user=request.max_triggers_per_user,
         max_triggers_per_group=request.max_triggers_per_group,
         priority=request.priority,
-        enabled=request.enabled,
+        requires_review=request.requires_review,
+        enabled=request.enabled and not request.requires_review,
     )
 
     db.add(trigger)
@@ -468,6 +1015,9 @@ async def update_keyword_trigger(
             template_id=update_data.get("template_id", trigger.template_id),
             keyword_text=keyword_text,
         )
+
+    if update_data.get("requires_review") is True:
+        update_data["enabled"] = False
 
     for field, value in update_data.items():
         setattr(trigger, field, value)

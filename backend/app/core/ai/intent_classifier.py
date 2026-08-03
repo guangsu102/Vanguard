@@ -105,7 +105,7 @@ class IntentClassifier:
 
         try:
             prompt = self.CLASSIFIER_PROMPT.format(input=message)
-            response = await self.llm.generate(prompt, model="gpt-4o-mini")
+            response = await self.llm.generate(prompt, model=self.llm.model_for("fast"))
 
             import json
             result = json.loads(response)

@@ -21,7 +21,8 @@ export interface UserInfo {
   role: string
   email?: string
   avatar?: string
-  createdAt: string
+  createdAt?: string
+  created_at?: string
 }
 
 export const authApi = {

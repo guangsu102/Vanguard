@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import * as echarts from 'echarts'
 import type { EChartsOption } from 'echarts'
 
 interface Props {
-  option: EChartsOption
+  option: EChartsOption | Record<string, any>
   height?: string
   width?: string
   autoresize?: boolean
@@ -23,12 +23,12 @@ const initChart = () => {
   if (!chartRef.value) return
 
   chartInstance = echarts.init(chartRef.value)
-  chartInstance.setOption(props.option)
+  chartInstance.setOption(props.option as EChartsOption)
 }
 
 const updateChart = () => {
   if (chartInstance) {
-    chartInstance.setOption(props.option)
+    chartInstance.setOption(props.option as EChartsOption)
   }
 }
 
@@ -43,6 +43,8 @@ onMounted(() => {
     window.addEventListener('resize', resizeChart)
   }
 })
+
+watch(() => props.option, updateChart, { deep: true })
 
 onUnmounted(() => {
   if (props.autoresize) {

@@ -5,11 +5,23 @@ Task queue configuration with Celery.
 Supports second-level precision scheduling and configurable concurrency.
 """
 
+import os
+
 from celery import Celery
 from celery.schedules import crontab
 
 from app.core.config import settings
 
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(1, parsed)
 
 celery_app = Celery(
     "vanguard",
@@ -17,6 +29,7 @@ celery_app = Celery(
     backend=settings.CELERY_RESULT_BACKEND,
     include=[
         "app.core.scheduler.tasks",
+        "app.modules.qq.tasks",
     ],
 )
 
@@ -30,6 +43,7 @@ TASK_CONCURRENCY = {
     "campaign_check": 2,
     "bulk_import": 2,
     "automation": 3,
+    "qq_commands": 2,
 }
 
 # =============================================================================
@@ -44,8 +58,8 @@ celery_app.conf.update(
     task_track_started=True,
     task_time_limit=3600,  # 1 hour
     task_soft_time_limit=3000,  # 50 minutes
-    worker_prefetch_multiplier=4,
-    worker_max_tasks_per_child=1000,
+    worker_prefetch_multiplier=_env_int("CELERY_WORKER_PREFETCH_MULTIPLIER", 1),
+    worker_max_tasks_per_child=_env_int("CELERY_WORKER_MAX_TASKS_PER_CHILD", 100),
     task_acks_late=True,
     task_reject_on_worker_lost=True,
 )
@@ -91,15 +105,32 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/15"),
         "options": {"queue": "proxy_validation"},
     },
-    "auto-join-groups-every-30min": {
+    "auto-join-groups-dispatcher-every-minute": {
         "task": "app.core.scheduler.tasks.auto_join_groups_task",
-        "schedule": crontab(minute="*/30"),
-        "options": {"queue": "automation", "rate_limit": "2/h"},
+        "schedule": 60.0,
+        "kwargs": {"scheduled": True, "keywords_per_account": 10, "max_groups_per_keyword": 20},
+        "options": {"queue": "automation", "rate_limit": "60/h"},
     },
     "deliver-ads-every-10min": {
         "task": "app.core.scheduler.tasks.deliver_ads_task",
-        "schedule": crontab(minute="*/10"),
-        "options": {"queue": "automation", "rate_limit": "6/h"},
+        "schedule": 60.0,
+        "options": {"queue": "automation", "rate_limit": "60/h"},
+    },
+    "check-ad-survival-every-minute": {
+        "task": "app.core.scheduler.tasks.check_ad_survival_task",
+        "schedule": 60.0,
+        "options": {"queue": "automation", "rate_limit": "120/h"},
+    },
+    "audit-group-ad-policies-every-15min": {
+        "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
+        "schedule": crontab(minute="*/15"),
+        "kwargs": {"limit": 5},
+        "options": {"queue": "automation", "rate_limit": "4/h"},
+    },
+    "group-ai-warmup-dispatcher-every-minute": {
+        "task": "app.core.scheduler.tasks.group_ai_warmup_task",
+        "schedule": 60.0,
+        "options": {"queue": "automation", "rate_limit": "60/h"},
     },
 
     # -------------------------------------------------------------------------
@@ -115,12 +146,6 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute=30),  # Every hour at minute 30
         "options": {"queue": "default"},
     },
-    "replenish-keywords-every-6h": {
-        "task": "app.core.scheduler.tasks.replenish_keywords_task",
-        "schedule": crontab(minute=10, hour="*/6"),
-        "options": {"queue": "automation", "rate_limit": "1/h"},
-    },
-
     # -------------------------------------------------------------------------
     # Daily Tasks
     # -------------------------------------------------------------------------
@@ -132,6 +157,11 @@ celery_app.conf.beat_schedule = {
     "generate-daily-report-at-2am": {
         "task": "app.core.scheduler.tasks.generate_daily_report",
         "schedule": crontab(hour=2, minute=0),  # Daily at 2:00 AM
+        "options": {"queue": "default"},
+    },
+    "maintain-account-risk-daily": {
+        "task": "app.core.scheduler.tasks.maintain_account_risk",
+        "schedule": crontab(hour=2, minute=30),
         "options": {"queue": "default"},
     },
     "broadcast-node-status-at-830pm": {
@@ -147,6 +177,11 @@ celery_app.conf.beat_schedule = {
         "task": "app.core.scheduler.tasks.process_pending_campaigns",
         "schedule": crontab(minute="*/5"),
         "options": {"queue": "default"},
+    },
+    "cleanup-qq-messages-daily": {
+        "task": "app.modules.qq.tasks.cleanup_qq_messages",
+        "schedule": crontab(hour=3, minute=30),
+        "options": {"queue": "qq_commands"},
     },
 }
 
@@ -166,6 +201,10 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.replenish_keywords_task": {"queue": "automation"},
     "app.core.scheduler.tasks.auto_join_groups_task": {"queue": "automation"},
     "app.core.scheduler.tasks.deliver_ads_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.audit_group_ad_policies_task": {"queue": "automation"},
+    "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},
+    "app.modules.qq.tasks.cleanup_qq_messages": {"queue": "qq_commands"},
 }
 
 # =============================================================================
@@ -203,6 +242,10 @@ celery_app.conf.task_queues = {
     "automation": {
         "exchange": "automation",
         "routing_key": "automation",
+    },
+    "qq_commands": {
+        "exchange": "qq_commands",
+        "routing_key": "qq_commands",
     },
 }
 

@@ -10,6 +10,7 @@ Features:
 - TLS fingerprint simulation
 """
 
+import hashlib
 import random
 from dataclasses import dataclass, field
 from typing import Optional
@@ -128,8 +129,9 @@ class UA_Library:
     ]
 
     @classmethod
-    def get_random_ua(cls) -> str:
+    def get_random_ua(cls, rng: Optional[random.Random] = None) -> str:
         """Get a random User-Agent."""
+        chooser = rng or random
         all_ua = (
             cls.WINDOWS_CHROME_UA
             + cls.MACOS_CHROME_UA
@@ -139,20 +141,21 @@ class UA_Library:
             + cls.WINDOWS_FIREFOX_UA
             + cls.WINDOWS_EDGE_UA
         )
-        return random.choice(all_ua)
+        return chooser.choice(all_ua)
 
     @classmethod
-    def get_by_os(cls, os_type: str) -> str:
+    def get_by_os(cls, os_type: str, rng: Optional[random.Random] = None) -> str:
         """Get User-Agent by OS type."""
+        chooser = rng or random
         if os_type == "windows":
-            return random.choice(cls.WINDOWS_CHROME_UA)
+            return chooser.choice(cls.WINDOWS_CHROME_UA)
         elif os_type == "macos":
-            return random.choice(cls.MACOS_CHROME_UA + cls.MACOS_SAFARI_UA)
+            return chooser.choice(cls.MACOS_CHROME_UA + cls.MACOS_SAFARI_UA)
         elif os_type == "android":
-            return random.choice(cls.ANDROID_CHROME_UA)
+            return chooser.choice(cls.ANDROID_CHROME_UA)
         elif os_type == "ios":
-            return random.choice(cls.IOS_SAFARI_UA)
-        return random.choice(cls.WINDOWS_CHROME_UA)
+            return chooser.choice(cls.IOS_SAFARI_UA)
+        return chooser.choice(cls.WINDOWS_CHROME_UA)
 
 
 class FingerprintManager:
@@ -204,6 +207,20 @@ class FingerprintManager:
         "ios": ["Apple GPU"],
     }
 
+    TELEGRAM_APP_VERSIONS = {
+        "windows": ["5.0.1 x64", "5.1.3 x64", "5.2.2 x64"],
+        "macos": ["10.10.1", "10.11.2", "10.12.0"],
+        "android": ["10.14.5", "10.15.1", "10.15.2"],
+        "ios": ["10.14.5", "10.15.1", "10.15.2"],
+    }
+
+    TELEGRAM_DEVICE_MODELS = {
+        "windows": ["PC 64bit", "Desktop", "Windows PC"],
+        "macos": ["MacBook Pro", "MacBook Air", "iMac"],
+        "android": ["Pixel 8", "Samsung SM-G998B", "Xiaomi 13"],
+        "ios": ["iPhone 15", "iPhone 14 Pro", "iPhone 13"],
+    }
+
     def __init__(self):
         """Initialize FingerprintManager."""
         self._ua_library = UA_Library()
@@ -228,10 +245,11 @@ class FingerprintManager:
         if account_id and account_id in self._profiles:
             return self._profiles[account_id]
 
+        rng = self._rng_for_account(account_id)
         if os_type is None:
-            os_type = random.choice(["windows", "macos", "android", "ios"])
+            os_type = rng.choice(["windows", "macos", "android", "ios"])
 
-        ua = self._ua_library.get_by_os(os_type)
+        ua = self._ua_library.get_by_os(os_type, rng=rng)
 
         browser, browser_version = self._parse_browser(ua)
         os_version = self._get_os_version(os_type)
@@ -244,13 +262,13 @@ class FingerprintManager:
             os_version=os_version,
             browser=browser,
             browser_version=browser_version,
-            screen_resolution=random.choice(self.SCREEN_RESOLUTIONS.get(os_type, ["1920x1080"])),
+            screen_resolution=rng.choice(self.SCREEN_RESOLUTIONS.get(os_type, ["1920x1080"])),
             platform=platform,
-            device_memory=random.choice(self.DEVICE_MEMORY),
-            hardware_concurrency=random.choice(self.HARDWARE_CONCURRENCY),
-            canvas_seed=random.randint(100000, 999999),
-            webgl_vendor=random.choice(self.WEBGL_VENDORS.get(os_type, ["Intel Inc."])),
-            webgl_renderer=random.choice(self.WEBGL_RENDERERS.get(os_type, ["Intel Iris OpenGL Engine"])),
+            device_memory=rng.choice(self.DEVICE_MEMORY),
+            hardware_concurrency=rng.choice(self.HARDWARE_CONCURRENCY),
+            canvas_seed=rng.randint(100000, 999999),
+            webgl_vendor=rng.choice(self.WEBGL_VENDORS.get(os_type, ["Intel Inc."])),
+            webgl_renderer=rng.choice(self.WEBGL_RENDERERS.get(os_type, ["Intel Iris OpenGL Engine"])),
         )
 
         if account_id:
@@ -263,6 +281,33 @@ class FingerprintManager:
         )
 
         return fingerprint
+
+    def generate_telegram_device_profile(
+        self,
+        account_key: str,
+        *,
+        device_model: Optional[str] = None,
+        system_version: Optional[str] = None,
+        app_version: Optional[str] = None,
+        os_type: Optional[str] = None,
+    ) -> dict[str, str]:
+        """Generate stable Telethon client metadata for one account."""
+        fingerprint = self.generate_fingerprint(account_id=account_key, os_type=os_type)
+        rng = self._rng_for_account(f"telegram:{account_key}")
+        lang_code = fingerprint.language.replace("-", "_").lower()
+
+        return {
+            "fingerprint_id": fingerprint.fingerprint_id,
+            "device_model": device_model or rng.choice(
+                self.TELEGRAM_DEVICE_MODELS.get(fingerprint.os_type, ["Desktop"])
+            ),
+            "system_version": system_version or self._telegram_system_version(fingerprint),
+            "app_version": app_version or rng.choice(
+                self.TELEGRAM_APP_VERSIONS.get(fingerprint.os_type, ["10.15.1"])
+            ),
+            "lang_code": lang_code,
+            "system_lang_code": lang_code,
+        }
 
     def get_fingerprint(self, account_id: str) -> Optional[DeviceFingerprint]:
         """
@@ -293,12 +338,27 @@ class FingerprintManager:
 
     def _generate_id(self, account_id: Optional[str]) -> str:
         """Generate fingerprint ID."""
-        import hashlib
-        import time
-
-        base = f"{account_id}:{time.time()}" if account_id else str(time.time())
+        base = account_id or str(random.random())
         return hashlib.md5(base.encode()).hexdigest()[:16]
 
+    def _rng_for_account(self, account_id: Optional[str]) -> random.Random:
+        """Return a deterministic RNG when an account key is available."""
+        if not account_id:
+            return random.Random()
+        seed = int(hashlib.sha256(account_id.encode()).hexdigest()[:16], 16)
+        return random.Random(seed)
+
+    def _telegram_system_version(self, fingerprint: DeviceFingerprint) -> str:
+        """Map browser-style OS details to Telegram native client metadata."""
+        if fingerprint.os_type == "windows":
+            return f"Windows {fingerprint.os_version}"
+        if fingerprint.os_type == "macos":
+            return f"macOS {fingerprint.os_version}"
+        if fingerprint.os_type == "android":
+            return f"Android {fingerprint.os_version}"
+        if fingerprint.os_type == "ios":
+            return f"iOS {fingerprint.os_version}"
+        return fingerprint.os_version
     def _parse_browser(self, ua: str) -> tuple[str, str]:
         """Parse browser info from User-Agent."""
         if "Edg/" in ua:
@@ -345,8 +405,8 @@ class FingerprintManager:
         Returns:
             Noise bytes
         """
-        random.seed(seed)
-        return bytes([random.randint(0, 255) for _ in range(32)])
+        rng = random.Random(seed)
+        return bytes([rng.randint(0, 255) for _ in range(32)])
 
     def get_statistics(self) -> dict:
         """Get fingerprint statistics."""

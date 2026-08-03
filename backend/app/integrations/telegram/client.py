@@ -7,13 +7,17 @@ Supports both Bot Token and User Session authentication.
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, List, Dict, Any, Union
 from functools import wraps
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 import structlog
+
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.account.system_identity import bot_risk_identity
 
 logger = structlog.get_logger()
 
@@ -30,12 +34,14 @@ class TelegramAPIError(Exception):
 
 class RateLimitError(TelegramAPIError):
     """Rate limit exceeded."""
+
     pass
 
 
 @dataclass
 class TelegramConfig:
     """Telegram API configuration."""
+
     bot_token: Optional[str] = None
     api_id: Optional[int] = None
     api_hash: Optional[str] = None
@@ -47,6 +53,7 @@ class TelegramConfig:
 @dataclass
 class User:
     """Telegram user information."""
+
     user_id: int
     username: Optional[str] = None
     first_name: str = ""
@@ -84,6 +91,7 @@ class User:
 @dataclass
 class Chat:
     """Telegram chat (group/channel) information."""
+
     chat_id: int
     title: Optional[str] = None
     username: Optional[str] = None
@@ -108,6 +116,7 @@ class Chat:
 @dataclass
 class Message:
     """Telegram message."""
+
     message_id: int
     chat: Chat
     from_user: Optional[User] = None
@@ -134,6 +143,7 @@ class Message:
 @dataclass
 class SearchResult:
     """Telegram search result."""
+
     chat: Chat
     message_snippet: Optional[str] = None
     date: Optional[int] = None
@@ -153,7 +163,9 @@ class TelegramClient:
     MESSAGE_RATE_LIMIT = 30  # messages per second
     GROUP_LIMIT = 20  # groups per minute for new members
 
-    def __init__(self, config: TelegramConfig):
+    def __init__(
+        self, config: TelegramConfig, risk_guard: AccountRiskGuard | None = None, risk_account=None
+    ):
         """
         Initialize Telegram client.
 
@@ -163,7 +175,52 @@ class TelegramClient:
         self.config = config
         self._client: Optional[httpx.AsyncClient] = None
         self._rate_limiter = RateLimiter()
+        self.risk_guard = risk_guard
+        self.risk_account = risk_account or bot_risk_identity("bot_api")
         self.logger = logger.bind(module="telegram_client")
+
+    @asynccontextmanager
+    async def _risk_operation(
+        self,
+        action: AccountRiskAction,
+        *,
+        target_type: str,
+        target_id: Any,
+        details: Optional[dict[str, Any]] = None,
+    ):
+        if self.risk_guard is None:
+            yield
+            return
+
+        decision = await self.risk_guard.check_and_reserve(
+            self.risk_account,
+            action,
+            target_type=target_type,
+            target_id=target_id,
+            details=details,
+        )
+        if not decision.allowed:
+            raise RateLimitError(f"risk_guard_blocked:{decision.reason}")
+        try:
+            yield
+        except Exception as exc:
+            await self.risk_guard.record_failure(
+                self.risk_account,
+                action,
+                exc,
+                target_type=target_type,
+                target_id=target_id,
+                details=details,
+            )
+            raise
+        else:
+            await self.risk_guard.record_success(
+                self.risk_account,
+                action,
+                target_type=target_type,
+                target_id=target_id,
+                details=details,
+            )
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
@@ -337,10 +394,31 @@ class TelegramClient:
         Returns:
             Chat member information
         """
-        return await self._request(
-            "getChatMember",
-            {"chat_id": chat_id, "user_id": user_id}
+        return await self._request("getChatMember", {"chat_id": chat_id, "user_id": user_id})
+
+    async def get_chat_permissions(self, chat_id: int | str) -> dict[str, bool]:
+        """Return the current default member permissions for a chat."""
+        data = await self._request("getChat", {"chat_id": chat_id})
+        permissions = data.get("permissions") if isinstance(data, dict) else None
+        return dict(permissions) if isinstance(permissions, dict) else {}
+
+    async def set_chat_permissions(
+        self,
+        chat_id: int | str,
+        permissions: dict[str, bool],
+        *,
+        use_independent_chat_permissions: bool = True,
+    ) -> bool:
+        """Set default permissions applied to all non-administrator members."""
+        result = await self._request(
+            "setChatPermissions",
+            {
+                "chat_id": chat_id,
+                "permissions": permissions,
+                "use_independent_chat_permissions": use_independent_chat_permissions,
+            },
         )
+        return bool(result)
 
     # =============================================================================
     # Message Operations
@@ -350,7 +428,7 @@ class TelegramClient:
         self,
         chat_id: Union[int, str],
         text: str,
-        parse_mode: str = "Markdown",
+        parse_mode: Optional[str] = "Markdown",
         disable_web_page_preview: bool = False,
         disable_notification: bool = False,
         reply_to_message_id: int = None,
@@ -372,21 +450,27 @@ class TelegramClient:
             Sent message
         """
         await self._rate_limiter.acquire("message")
-
         params = {
             "chat_id": chat_id,
             "text": text,
-            "parse_mode": parse_mode,
             "disable_web_page_preview": disable_web_page_preview,
             "disable_notification": disable_notification,
         }
 
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         if reply_to_message_id:
             params["reply_to_message_id"] = reply_to_message_id
         if reply_markup:
             params["reply_markup"] = reply_markup
 
-        data = await self._request("sendMessage", params)
+        async with self._risk_operation(
+            AccountRiskAction.BOT_MESSAGE,
+            target_type="chat",
+            target_id=chat_id,
+            details={"source": "bot_api_send_message", "content": text},
+        ):
+            data = await self._request("sendMessage", params)
         return Message.from_dict(data)
 
     async def send_photo(
@@ -409,7 +493,6 @@ class TelegramClient:
             Sent message
         """
         await self._rate_limiter.acquire("message")
-
         params = {
             "chat_id": chat_id,
             "photo": photo,
@@ -419,7 +502,13 @@ class TelegramClient:
             params["caption"] = caption
             params["parse_mode"] = parse_mode
 
-        data = await self._request("sendPhoto", params)
+        async with self._risk_operation(
+            AccountRiskAction.BOT_MESSAGE,
+            target_type="chat",
+            target_id=chat_id,
+            details={"source": "bot_api_send_photo", "content": caption},
+        ):
+            data = await self._request("sendPhoto", params)
         return Message.from_dict(data)
 
     async def send_document(
@@ -440,7 +529,6 @@ class TelegramClient:
             Sent message
         """
         await self._rate_limiter.acquire("message")
-
         params = {
             "chat_id": chat_id,
             "document": document,
@@ -449,7 +537,13 @@ class TelegramClient:
         if caption:
             params["caption"] = caption
 
-        data = await self._request("sendDocument", params)
+        async with self._risk_operation(
+            AccountRiskAction.BOT_MESSAGE,
+            target_type="chat",
+            target_id=chat_id,
+            details={"source": "bot_api_send_document", "content": caption},
+        ):
+            data = await self._request("sendDocument", params)
         return Message.from_dict(data)
 
     async def delete_message(self, chat_id: Union[int, str], message_id: int) -> bool:
@@ -464,10 +558,66 @@ class TelegramClient:
             True if successful
         """
         result = await self._request(
-            "deleteMessage",
-            {"chat_id": chat_id, "message_id": message_id}
+            "deleteMessage", {"chat_id": chat_id, "message_id": message_id}
         )
         return bool(result)
+
+    async def pin_chat_message(
+        self,
+        chat_id: Union[int, str],
+        message_id: int,
+        disable_notification: bool = True,
+    ) -> bool:
+        """
+        Pin a message in a chat.
+
+        Args:
+            chat_id: Chat ID or username
+            message_id: Message ID to pin
+            disable_notification: Pin silently
+
+        Returns:
+            True if successful
+        """
+        if self.risk_guard is not None:
+            decision = await self.risk_guard.check_and_reserve(
+                self.risk_account,
+                AccountRiskAction.BOT_PIN,
+                target_type="message",
+                target_id=message_id,
+                details={"chat_id": chat_id, "source": "bot_api_pin"},
+            )
+            if not decision.allowed:
+                raise RateLimitError(f"risk_guard_blocked:{decision.reason}")
+        try:
+            result = await self._request(
+                "pinChatMessage",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "disable_notification": disable_notification,
+                },
+            )
+            if self.risk_guard is not None:
+                await self.risk_guard.record_success(
+                    self.risk_account,
+                    AccountRiskAction.BOT_PIN,
+                    target_type="message",
+                    target_id=message_id,
+                    details={"chat_id": chat_id, "source": "bot_api_pin"},
+                )
+            return bool(result)
+        except Exception as exc:
+            if self.risk_guard is not None:
+                await self.risk_guard.record_failure(
+                    self.risk_account,
+                    AccountRiskAction.BOT_PIN,
+                    exc,
+                    target_type="message",
+                    target_id=message_id,
+                    details={"chat_id": chat_id, "source": "bot_api_pin"},
+                )
+            raise
 
     async def edit_message_text(
         self,
@@ -495,7 +645,7 @@ class TelegramClient:
                 "message_id": message_id,
                 "text": text,
                 "parse_mode": parse_mode,
-            }
+            },
         )
         return Message.from_dict(data)
 
@@ -546,7 +696,7 @@ class TelegramClient:
         """
         result = await self._request(
             "unbanChatMember",
-            {"chat_id": chat_id, "user_id": user_id, "only_if_banned": only_if_banned}
+            {"chat_id": chat_id, "user_id": user_id, "only_if_banned": only_if_banned},
         )
         return bool(result)
 
@@ -640,7 +790,9 @@ class TelegramClient:
     # User Information
     # =============================================================================
 
-    async def get_user_profile_photos(self, user_id: int, offset: int = 0, limit: int = 100) -> List[Dict]:
+    async def get_user_profile_photos(
+        self, user_id: int, offset: int = 0, limit: int = 100
+    ) -> List[Dict]:
         """
         Get user profile photos.
 
@@ -653,8 +805,7 @@ class TelegramClient:
             List of photos
         """
         return await self._request(
-            "getUserProfilePhotos",
-            {"user_id": user_id, "offset": offset, "limit": limit}
+            "getUserProfilePhotos", {"user_id": user_id, "offset": offset, "limit": limit}
         )
 
     # =============================================================================
@@ -742,7 +893,7 @@ class TelegramClient:
                 "inline_query_id": inline_query_id,
                 "results": results,
                 "cache_time": cache_time,
-            }
+            },
         )
         return bool(result)
 
@@ -768,10 +919,7 @@ class RateLimiter:
             self._timestamps[key] = []
 
         # Remove old timestamps
-        self._timestamps[key] = [
-            ts for ts in self._timestamps[key]
-            if now - ts < window
-        ]
+        self._timestamps[key] = [ts for ts in self._timestamps[key] if now - ts < window]
 
         # Check limit
         if len(self._timestamps[key]) >= limit:
@@ -795,9 +943,10 @@ def get_telegram_client() -> TelegramClient:
     global _telegram_client
     if _telegram_client is None:
         from app.core.config import get_settings
+
         settings = get_settings()
         config = TelegramConfig(
-            bot_token=settings.BOT_TOKEN if hasattr(settings, 'BOT_TOKEN') else None,
+            bot_token=settings.BOT_TOKEN if hasattr(settings, "BOT_TOKEN") else None,
         )
         _telegram_client = TelegramClient(config)
     return _telegram_client

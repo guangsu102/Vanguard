@@ -8,6 +8,7 @@ const update = vi.fn().mockResolvedValue({})
 const remove = vi.fn().mockResolvedValue({})
 const getById = vi.fn().mockResolvedValue({})
 const toggle = vi.fn().mockResolvedValue({ enabled: true })
+const trigger = vi.fn().mockResolvedValue({ queued: true })
 const fetchStats = vi.fn().mockResolvedValue({})
 const setPage = vi.fn()
 const setPageSize = vi.fn()
@@ -58,6 +59,7 @@ vi.mock('@/stores/campaign', () => ({
     remove,
     getById,
     toggle,
+    trigger,
     fetchStats,
     setPage,
     setPageSize,
@@ -112,14 +114,22 @@ const stubs = {
   'el-dialog': { template: '<div><slot /></div>' },
   'el-form-item': { template: '<div><slot /></div>' },
   'el-input': { template: '<input />' },
+  'el-input-number': { template: '<input type="number" />' },
+  'el-select': { template: '<select><slot /></select>' },
+  'el-option': { template: '<option />' },
+  'el-checkbox': { template: '<label><slot /></label>' },
 }
 
 describe('Campaigns view', () => {
   beforeEach(() => {
     fetchList.mockClear()
+    create.mockClear()
+    update.mockClear()
+    remove.mockClear()
     toggle.mockClear()
     getById.mockClear()
     fetchStats.mockClear()
+    trigger.mockClear()
   })
 
   it('renders page and campaign row', () => {
@@ -142,6 +152,15 @@ describe('Campaigns view', () => {
     await vm.handleToggle({ id: 1, enabled: false })
 
     expect(toggle).toHaveBeenCalledWith(1)
+  })
+
+  it('calls trigger action for manual campaigns', async () => {
+    const wrapper = mount(Campaigns, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    await vm.handleTrigger({ id: 3, enabled: true, trigger_timing: 'manual' })
+
+    expect(trigger).toHaveBeenCalledWith(3)
   })
 
   it('opens details and fetches stats', async () => {
@@ -191,6 +210,7 @@ describe('Campaigns view', () => {
 
     vm.formData.campaign_scope = 'global'
     const triggerField = vm.drawerFields.find((field: any) => field.prop === 'trigger_timing')
+    const distributionField = vm.drawerFields.find((field: any) => field.prop === 'distribution_mode')
 
     expect(triggerField?.type).toBe('select')
     expect(triggerField?.options?.map((item: any) => item.value)).toEqual([
@@ -201,6 +221,7 @@ describe('Campaigns view', () => {
       'manual',
       'periodic',
     ])
+    expect(distributionField).toBeUndefined()
   })
 
   it('opens edit drawer with row data', async () => {
@@ -238,6 +259,15 @@ describe('Campaigns view', () => {
 
     expect(payload.target_group_ids).toBeUndefined()
     expect(payload.bot_account_id).toBeUndefined()
+    expect(payload.broadcast_message).toBe('')
+    expect(payload.once_per_user).toBe(true)
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.target_user_states).toEqual([])
+    expect(payload.target_limit).toBe(0)
+    expect(payload.min_account_age_minutes).toBe(0)
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
   })
 
   it('formats managed-group trigger event labels for display', () => {
@@ -256,13 +286,68 @@ describe('Campaigns view', () => {
     vm.formData.campaign_scope = 'managed_group'
     vm.formData.trigger_event = 'new_member_delay'
     vm.formData.delay_minutes = 15
+    vm.formData.verified_only = true
+    vm.formData.min_join_minutes = 5
     vm.formData.target_group_ids = [10001]
     vm.formData.bot_account_id = 99
 
     const payload = vm.buildPayload()
 
     expect(payload.trigger_timing).toBe('delayed')
-    expect(payload.broadcast_policy_json).toEqual({ delay_minutes: 15 })
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.delay_minutes).toBe(15)
+    expect(payload.verified_only).toBe(false)
+    expect(payload.min_join_minutes).toBe(5)
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
+  })
+
+  it('builds delayed global payload from trigger timing', () => {
+    const wrapper = mount(Campaigns, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    vm.formData.campaign_scope = 'global'
+    vm.formData.trigger_timing = 'delayed'
+    vm.formData.delay_minutes = 30
+    vm.formData.broadcast_message = 'welcome discount'
+
+    const payload = vm.buildPayload()
+
+    expect(payload.trigger_timing).toBe('delayed')
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.delay_minutes).toBe(30)
+    expect(payload.broadcast_message).toBe('welcome discount')
+    expect(payload.target_user_states).toEqual([])
+    expect(payload.target_limit).toBe(0)
+    expect(payload.min_account_age_minutes).toBe(0)
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
+  })
+
+  it('builds scheduled global payload with audience fields', () => {
+    const wrapper = mount(Campaigns, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    vm.formData.campaign_scope = 'global'
+    vm.formData.trigger_timing = 'scheduled'
+    vm.formData.schedule_times_text = '08:00, 18:30'
+    vm.formData.target_user_states = ['new', 'pending']
+    vm.formData.target_limit = 50
+    vm.formData.min_account_age_minutes = 30
+
+    const payload = vm.buildPayload()
+
+    expect(payload.trigger_timing).toBe('scheduled')
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.schedule_times).toEqual(['08:00', '18:30'])
+    expect(payload.target_user_states).toEqual(['new', 'pending'])
+    expect(payload.target_limit).toBe(50)
+    expect(payload.min_account_age_minutes).toBe(30)
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
   })
 
   it('builds scheduled managed-group broadcast policy from schedule text', () => {
@@ -278,6 +363,62 @@ describe('Campaigns view', () => {
     const payload = vm.buildPayload()
 
     expect(payload.trigger_timing).toBe('scheduled')
-    expect(payload.broadcast_policy_json).toEqual({ schedule_times: ['09:00', '14:30', '21:00'] })
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.schedule_times).toEqual(['09:00', '14:30', '21:00'])
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
+  })
+
+  it('builds periodic managed-group payload from interval field', () => {
+    const wrapper = mount(Campaigns, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    vm.formData.campaign_scope = 'managed_group'
+    vm.formData.trigger_event = 'periodic'
+    vm.formData.interval_minutes = 90
+    vm.formData.target_group_ids = [10001]
+    vm.formData.bot_account_id = 99
+
+    const payload = vm.buildPayload()
+
+    expect(payload.trigger_timing).toBe('periodic')
+    expect(payload.distribution_mode).toBeUndefined()
+    expect(payload.interval_minutes).toBe(90)
+    expect(payload.reward_policy_json).toBeUndefined()
+    expect(payload.broadcast_policy_json).toBeUndefined()
+    expect(payload.eligibility_policy_json).toBeUndefined()
+  })
+
+  it('fills structured fields from legacy policy JSON when editing', () => {
+    const wrapper = mount(Campaigns, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    vm.openEditDrawer({
+      id: 4,
+      name: 'Legacy Promo',
+      campaign_type: 'discount',
+      campaign_scope: 'global',
+      trigger_timing: 'scheduled',
+      distribution_mode: 'scheduled',
+      validity_hours: 48,
+      broadcast_policy_json: {
+        message: 'legacy message',
+        schedule_times: ['10:00'],
+      },
+      eligibility_policy_json: {
+        once_per_user: true,
+        target_user_states: ['active'],
+        target_limit: 20,
+        min_account_age_minutes: 60,
+      },
+      enabled: true,
+    })
+
+    expect(vm.formData.broadcast_message).toBe('legacy message')
+    expect(vm.formData.schedule_times_text).toBe('10:00')
+    expect(vm.formData.target_user_states).toEqual(['active'])
+    expect(vm.formData.target_limit).toBe(20)
+    expect(vm.formData.min_account_age_minutes).toBe(60)
   })
 })

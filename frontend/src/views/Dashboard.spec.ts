@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import Dashboard from './Dashboard.vue'
 
-const fetchDashboard = vi.fn().mockResolvedValue({})
-const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null)
+const mocks = vi.hoisted(() => ({
+  fetchDashboard: vi.fn().mockResolvedValue({}),
+  exportStats: vi.fn().mockResolvedValue({ data: 'metric,value' }),
+  downloadBlob: vi.fn(),
+}))
 
 vi.mock('@/stores/stats', () => ({
   useStatsStore: () => ({
@@ -18,7 +21,7 @@ vi.mock('@/stores/stats', () => ({
       accountDistribution: [],
       topGroups: [],
     },
-    fetchDashboard,
+    fetchDashboard: mocks.fetchDashboard,
   }),
 }))
 
@@ -29,10 +32,21 @@ vi.mock('@/components/ECharts.vue', () => ({
   },
 }))
 
+vi.mock('@/api/stats', () => ({
+  statsApi: {
+    export: mocks.exportStats,
+  },
+}))
+
+vi.mock('@/utils/download', () => ({
+  downloadBlob: mocks.downloadBlob,
+}))
+
 describe('Dashboard view', () => {
   beforeEach(() => {
-    fetchDashboard.mockClear()
-    openSpy.mockClear()
+    mocks.fetchDashboard.mockClear()
+    mocks.exportStats.mockClear()
+    mocks.downloadBlob.mockClear()
   })
 
   it('renders dashboard summary cards', () => {
@@ -75,10 +89,10 @@ describe('Dashboard view', () => {
       },
     })
 
-    expect(fetchDashboard).toHaveBeenCalledTimes(1)
+    expect(mocks.fetchDashboard).toHaveBeenCalledTimes(1)
   })
 
-  it('opens export URL when clicking export', () => {
+  it('downloads dashboard export through the API client', async () => {
     const wrapper = mount(Dashboard, {
       global: {
         stubs: {
@@ -97,7 +111,8 @@ describe('Dashboard view', () => {
     })
 
     const vm = wrapper.vm as any
-    vm.exportData()
-    expect(openSpy).toHaveBeenCalledWith('/api/stats/export?type=dashboard', '_blank')
+    await vm.exportData()
+    expect(mocks.exportStats).toHaveBeenCalledWith({ type: 'dashboard' })
+    expect(mocks.downloadBlob).toHaveBeenCalledWith('metric,value', 'vanguard-dashboard.csv')
   })
 })

@@ -10,8 +10,17 @@ export interface SystemSettings {
 }
 
 export interface NotificationSettings {
+  sub2apiAlertsEnabled: boolean
+  sub2apiNotifyResolved: boolean
+  sub2apiAnnouncementsEnabled: boolean
   telegramEnabled: boolean
   telegramChatId?: string
+  telegramAnnouncementsEnabled: boolean
+  telegramAnnouncementChatId?: string
+  telegramAnnouncementPin: boolean
+  telegramAnnouncementPinSilent: boolean
+  qqEnabled: boolean
+  qqAnnouncementsEnabled: boolean
   emailEnabled: boolean
   emailRecipients?: string[]
   webhookEnabled: boolean
@@ -43,12 +52,91 @@ export interface AiReplySettings {
   cooldownSeconds: number
 }
 
+export interface GroupAiInteractionSettings {
+  enabled: boolean
+  aiEnabled: boolean
+  dailyTokenBudget: number
+  maxRepliesPerGroupPerDay: number
+  maxRepliesPerAccountPerDay: number
+  cooldownSeconds: number
+  replyMaxChars: number
+  blockAiSelfDisclosure: boolean
+  mode: 'assistive' | 'warmup' | 'conversion' | 'off' | string
+  tone: 'natural' | 'friendly' | 'professional' | 'soft' | string
+  temperature: number
+  maxTokens: number
+  allowKeywordTriggeredReply: boolean
+  allowSemanticTriggeredReply: boolean
+  semanticScanWindowMessages: number
+  semanticEvaluateEveryMessages: number
+  semanticMinConfidence: number
+  semanticMinTextChars: number
+  semanticAllowedIntents: string[]
+  semanticBlockedIntents: string[]
+  semanticDecisionPrompt: string
+  allowProactiveWarmup: boolean
+  proactiveWarmupIntervalMinutes: number
+  proactiveWarmupMaxGroupsPerRun: number
+  proactiveWarmupMaxPerGroupPerDay: number
+  proactiveWarmupMaxPerAccountPerDay: number
+  proactiveWarmupCooldownSeconds: number
+  proactiveWarmupWindowStartHour: number
+  proactiveWarmupWindowEndHour: number
+  proactiveWarmupTopics: string[]
+  proactiveWarmupTemplates: string[]
+  proactiveWarmupGroupOverrides: Record<string, {
+    enabled?: boolean
+    topics?: string[]
+    templates?: string[]
+    prompt?: string
+  }>
+  systemPrompt: string
+}
+
+export interface KeywordPrivateReplySettings {
+  enabled: boolean
+}
+
+export interface PrivateReplyTemplatesSettings {
+  startWelcome: string
+  help: string
+  register: string
+  statusFound: string
+  statusPending: string
+  unknownCommand: string
+  thanks: string
+  usageHelp: string
+  registerIntent: string
+  priceIntent: string
+  nodeIntent: string
+  default: string
+  guideWelcome: string
+  guideIntroduce: string
+  guideInviteRegister: string
+  guideConfirm: string
+  guideTimeout: string
+  guideNoNeed: string
+  guideConfirmSuccess: string
+  guideRegisterReminder: string
+  guideFallback: string
+  triggerInvite: string
+}
+
+export interface PrivateMessagingSettings {
+  inboundRepliesEnabled: boolean
+  proactiveEnabled: boolean
+  templates?: Partial<PrivateReplyTemplatesSettings>
+}
+
 export interface SettingsFormData {
   site?: Partial<SystemSettings>
   notification?: Partial<NotificationSettings>
   security?: Partial<SecuritySettings>
   xboard?: Partial<XBoardSettings>
   aiReply?: Partial<AiReplySettings>
+  groupAiInteraction?: Partial<GroupAiInteractionSettings>
+  keywordPrivateReply?: Partial<KeywordPrivateReplySettings>
+  privateMessaging?: Partial<PrivateMessagingSettings>
 }
 
 export interface SystemInfo {

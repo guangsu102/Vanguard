@@ -10,16 +10,15 @@ Features:
 - Rate limiting
 """
 
-import asyncio
 import hashlib
-import json
-import time
+import inspect
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
 
 import structlog
 
+from app.core.config import settings
 from app.core.redis import RedisCache
 
 logger = structlog.get_logger()
@@ -64,7 +63,7 @@ class LLMClient:
     # Model configurations
     MODELS = {
         LLMProvider.OPENAI: {
-            "fast": "gpt-4o-mini",
+            "fast": "gpt-5.6-luna",
             "balanced": "gpt-4o",
             "quality": "gpt-4-turbo",
         },
@@ -93,6 +92,7 @@ class LLMClient:
         self,
         provider: LLMProvider = LLMProvider.OPENAI,
         api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
         cache_ttl: int = 3600,
     ):
         """
@@ -101,14 +101,37 @@ class LLMClient:
         Args:
             provider: LLM provider to use
             api_key: API key for the provider
+            base_url: Optional OpenAI-compatible API base URL
             cache_ttl: Cache TTL in seconds
         """
         self.provider = provider
-        self.api_key = api_key
+        self.api_key = api_key or (
+            settings.OPENAI_API_KEY if provider == LLMProvider.OPENAI else settings.ANTHROPIC_API_KEY
+        )
+        raw_base_url = base_url or (settings.OPENAI_BASE_URL if provider == LLMProvider.OPENAI else None)
+        self.base_url = self._normalize_openai_base_url(raw_base_url) if provider == LLMProvider.OPENAI else None
         self.cache = RedisCache()
         self.cache_ttl = cache_ttl
         self.stats = CostStats()
         self.logger = logger.bind(module="llm_client")
+
+    def model_for(self, tier: str) -> str:
+        """Resolve a model tier using runtime configuration where applicable."""
+        if self.provider == LLMProvider.OPENAI:
+            if tier == "fast":
+                return settings.LLM_FAST_MODEL
+            if tier == "balanced":
+                return settings.LLM_MODEL
+        return self.MODELS[self.provider][tier]
+
+    @staticmethod
+    def _normalize_openai_base_url(base_url: Optional[str]) -> Optional[str]:
+        if not base_url:
+            return None
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/v1") or "/v1/" in normalized:
+            return normalized
+        return f"{normalized}/v1"
 
     async def generate(
         self,
@@ -131,6 +154,9 @@ class LLMClient:
         Returns:
             Generated content
         """
+        if model is None:
+            model = self.model_for("balanced")
+
         cache_key = self._get_cache_key(prompt, model, temperature, system_prompt)
         cached = await self.cache.get(cache_key)
 
@@ -138,9 +164,6 @@ class LLMClient:
             self.stats.cache_hits += 1
             self.logger.debug("cache_hit", key=cache_key[:20])
             return cached
-
-        if model is None:
-            model = self.MODELS[self.provider]["balanced"]
 
         messages = []
         if system_prompt:
@@ -185,20 +208,74 @@ class LLMClient:
         try:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=self.api_key)
+            client_kwargs: dict[str, Any] = {"api_key": self.api_key}
+            if self.base_url:
+                client_kwargs["base_url"] = self.base_url
+            client = AsyncOpenAI(**client_kwargs)
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            finally:
+                close_result = client.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
 
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-
-            return response.choices[0].message.content or ""
+            return self._extract_openai_content(response)
 
         except ImportError:
             self.logger.warning("openai_not_installed")
             return await self._call_fallback("openai")
+
+    @staticmethod
+    def _extract_openai_content(response: Any) -> str:
+        """Extract text from OpenAI-compatible SDK or proxy responses."""
+        if isinstance(response, str):
+            return response
+
+        output_text = getattr(response, "output_text", None)
+        if isinstance(output_text, str):
+            return output_text
+
+        choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+
+        if not isinstance(response, dict) and not choices:
+            model_dump = getattr(response, "model_dump", None)
+            if callable(model_dump):
+                response = model_dump()
+
+        choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+        if choices:
+            choice = choices[0]
+            message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text") or item.get("content")
+                        if isinstance(text, str):
+                            parts.append(text)
+                return "\n".join(parts)
+
+            text = choice.get("text") if isinstance(choice, dict) else getattr(choice, "text", None)
+            if isinstance(text, str):
+                return text
+
+        if isinstance(response, dict):
+            for key in ("content", "text", "response"):
+                value = response.get(key)
+                if isinstance(value, str):
+                    return value
+
+        return ""
 
     async def _call_anthropic(
         self,

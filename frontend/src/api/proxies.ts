@@ -2,6 +2,7 @@ import apiClient from './client'
 
 export type ProxyProtocol = 'http' | 'https' | 'socks5'
 export type ProxyStatus = 'active' | 'inactive' | 'error'
+export type ProxyType = 'residential' | 'datacenter' | 'mobile'
 
 export interface Proxy {
   id: number
@@ -10,10 +11,21 @@ export interface Proxy {
   protocol: ProxyProtocol
   username?: string
   password?: string
+  proxy_type: ProxyType
+  country: string
+  countryName?: string
   latency?: number
   status: ProxyStatus
   bindAccountId?: number
   bindAccountPhone?: string
+  bindAccountCount: number
+  bindAccounts: Array<{
+    id: number
+    phone?: string
+    identifier: string
+    status: string
+  }>
+  remainingBindSlots: number
   lastCheckedAt?: string
   createdAt: string
   updatedAt: string
@@ -40,6 +52,9 @@ export interface ProxyFormData {
   protocol: ProxyProtocol
   username?: string
   password?: string
+  proxy_type?: ProxyType
+  country?: string
+  country_name?: string
 }
 
 export const proxiesApi = {
@@ -75,6 +90,10 @@ export const proxiesApi = {
 
   refreshStatus: () => {
     return apiClient.post('/proxies/refresh-status')
+  },
+
+  export: () => {
+    return apiClient.get('/proxies/export', { responseType: 'blob' })
   },
 
   batchValidate: (proxyIds?: number[]) => {

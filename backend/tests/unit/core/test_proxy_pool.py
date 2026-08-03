@@ -11,13 +11,12 @@ Tests cover:
 
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.network import proxy_pool as proxy_pool_module
 from app.core.network.proxy_pool import ProxyPool, ProxyConfig, ProxyHealth
-from app.core.account.models import Proxy, ProxyType, TelegramAccount
+from app.core.account.models import ProxyType, TelegramAccount
 
 
 class TestProxyConfig:
@@ -89,6 +88,62 @@ class TestProxyHealth:
         assert health.success_rate == 0.75
         assert health.avg_latency == 150
         assert health.consecutive_failures == 2
+
+
+class _FakeResponse:
+    def __init__(self, status: int):
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, status: int):
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def get(self, *args, **kwargs):
+        return _FakeResponse(self.status)
+
+
+class TestProxyHealthCheck:
+    def test_default_health_check_uses_ipify(self, test_db):
+        pool = ProxyPool(test_db)
+
+        assert pool.health_check_url == "https://api.ipify.org?format=json"
+
+    @pytest.mark.asyncio
+    async def test_non_200_response_is_reported_as_failure(self, test_db, monkeypatch):
+        pool = ProxyPool(test_db)
+        proxy = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "1.1.1.1",
+            8080,
+            "US",
+        )
+        monkeypatch.setattr(
+            proxy_pool_module.aiohttp,
+            "ClientSession",
+            lambda *args, **kwargs: _FakeSession(503),
+        )
+
+        result = await pool.health_check(proxy.id)
+        await test_db.refresh(proxy)
+
+        assert result[proxy.id]["success"] is False
+        assert result[proxy.id]["status"] == 503
+        assert proxy.is_active is False
+        assert proxy.consecutive_failures == 1
+        assert proxy.success_rate == pytest.approx(0.8)
 
 
 class TestProxyPoolAddRemove:
@@ -332,6 +387,8 @@ class TestAvailableProxy:
         # Create account with US country
         account = TelegramAccount(
             phone="+1234567890",
+            identifier="+1234567890",
+            api_config_name="default",
             session_name="test_session",
             country_code="US",
             country_match_enabled=True,

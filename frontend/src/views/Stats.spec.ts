@@ -4,18 +4,19 @@ import Stats from './Stats.vue'
 
 vi.mock('@/stores/stats', () => ({
   useStatsStore: () => ({
-    dashboardStats: {
-      totalAccounts: 10,
-      onlineAccounts: 6,
-      totalGroups: 4,
+    overview: {
       totalUsers: 30,
-      dailyRegistered: 5,
-      conversionRate: 12.5,
-      weeklyTrend: [],
-      accountDistribution: [],
-      topGroups: [],
+      todayRegistered: 5,
+      todayActive: 12,
+      weeklyGrowth: 8,
     },
-    fetchDashboard: vi.fn().mockResolvedValue({}),
+    trendData: [],
+    funnelData: [],
+    sourceData: [],
+    fetchTrend: vi.fn().mockResolvedValue([]),
+    fetchFunnel: vi.fn().mockResolvedValue([]),
+    fetchSources: vi.fn().mockResolvedValue([]),
+    fetchOverview: vi.fn().mockResolvedValue({}),
   }),
 }))
 
@@ -33,6 +34,7 @@ describe('Stats view', () => {
           'el-icon': { template: '<span><slot /></span>' },
           'el-table': { template: '<table><slot /></table>' },
           'el-table-column': { template: '<div />' },
+          'el-tag': { template: '<span><slot /></span>' },
           'el-progress': { template: '<div />' },
         },
       },

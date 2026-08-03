@@ -19,6 +19,14 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TELEGRAM_API_ID=${TELEGRAM_API_ID}
       - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - SUB2API_ENABLED=${SUB2API_ENABLED:-false}
+      - SUB2API_BASE_URL=${SUB2API_BASE_URL:-}
+      - SUB2API_ADMIN_API_KEY=${SUB2API_ADMIN_API_KEY:-}
+      - SUB2API_TIMEOUT=${SUB2API_TIMEOUT:-5}
+      - SUB2API_ALERT_WEBHOOK_SECRET=${SUB2API_ALERT_WEBHOOK_SECRET}
+      - SUB2API_ALERT_TIMESTAMP_TOLERANCE=${SUB2API_ALERT_TIMESTAMP_TOLERANCE:-300}
+      - SUB2API_ALERT_IDEMPOTENCY_TTL_SECONDS=${SUB2API_ALERT_IDEMPOTENCY_TTL_SECONDS:-2592000}
       - JWT_SECRET=${JWT_SECRET}
       - CORS_ORIGINS=${CORS_ORIGINS}
       - PROXY_PROVIDER=${PROXY_PROVIDER:-evomi}
@@ -31,6 +39,11 @@ services:
       - EVOMI_SESSION_NAMESPACE=${EVOMI_SESSION_NAMESPACE:-vanguard}
       - EVOMI_ADBLOCK=${EVOMI_ADBLOCK:-false}
       - DECODO_API_KEY=${DECODO_API_KEY}
+      - QQ_ONEBOT_ENABLED=${QQ_ONEBOT_ENABLED:-false}
+      - QQ_ONEBOT_ACCOUNT_ID=${QQ_ONEBOT_ACCOUNT_ID}
+      - QQ_ONEBOT_HTTP_URL=${QQ_ONEBOT_HTTP_URL:-http://napcat:3000}
+      - QQ_ONEBOT_WS_URL=${QQ_ONEBOT_WS_URL:-ws://napcat:3001}
+      - QQ_ONEBOT_ACCESS_TOKEN=${QQ_ONEBOT_ACCESS_TOKEN}
     depends_on:
       postgres:
         condition: service_healthy
@@ -50,6 +63,8 @@ services:
 
   # ==================== Bot Matrix ====================
   bot:
+    profiles:
+      - legacy-bot
     build:
       context: .
       dockerfile: Dockerfile.bot
@@ -62,6 +77,61 @@ services:
     depends_on:
       - backend
       - redis
+    networks:
+      - vanguard-network
+
+  napcat:
+    profiles:
+      - qq
+    image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
+    container_name: vanguard-napcat
+    restart: unless-stopped
+    environment:
+      - NAPCAT_UID=${NAPCAT_UID:-1000}
+      - NAPCAT_GID=${NAPCAT_GID:-1000}
+    ports:
+      - "127.0.0.1:6099:6099"
+    expose:
+      - "3000"
+      - "3001"
+    volumes:
+      - napcat_qq_data:/app/.config/QQ
+      - napcat_config:/app/napcat/config
+      - napcat_plugins:/app/napcat/plugins
+    networks:
+      - vanguard-network
+
+  qq-onebot-worker:
+    profiles:
+      - qq
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-qq-onebot-worker
+    restart: on-failure:3
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - QQ_ONEBOT_ENABLED=${QQ_ONEBOT_ENABLED:-false}
+      - QQ_ONEBOT_ACCOUNT_ID=${QQ_ONEBOT_ACCOUNT_ID}
+      - QQ_ONEBOT_HTTP_URL=${QQ_ONEBOT_HTTP_URL:-http://napcat:3000}
+      - QQ_ONEBOT_WS_URL=${QQ_ONEBOT_WS_URL:-ws://napcat:3001}
+      - QQ_ONEBOT_ACCESS_TOKEN=${QQ_ONEBOT_ACCESS_TOKEN}
+    command:
+      [
+        "python",
+        "-m",
+        "app.workers.qq_onebot_worker",
+        "--worker-id",
+        "qq_onebot_worker:development",
+      ]
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      napcat:
+        condition: service_started
     networks:
       - vanguard-network
 
@@ -150,3 +220,6 @@ volumes:
     driver: local
   nginx_logs:
     driver: local
+  napcat_qq_data:
+  napcat_config:
+  napcat_plugins:

@@ -4,17 +4,31 @@ Groups API Router
 RESTful API for group pool management, account membership, and group analytics.
 """
 
-from typing import Optional
+
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import case, distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.account.models import TelegramAccount
+from app.core.account.models import (
+    AccountRiskLevel,
+    AccountStatus,
+    AccountType,
+    TelegramAccount,
+)
+from app.core.account.pool import get_account_pool
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.telegram_execution import (
+    TelegramExecutionError,
+    TelegramExecutionService,
+    TelegramJoinRequestPendingError,
+)
 from app.core.campaign.models import CampaignTracking
 from app.core.database import get_db
-from app.core.group import GroupAccountMembership, GroupLevel, GroupManager
+from app.core.group import Group, GroupAccountMembership, GroupLevel, GroupManager
+from app.core.security import require_admin
 from app.exceptions import GroupNotFoundError, ValidationError
 from app.modules.acquisition.models import (
     AcquisitionMessage,
@@ -22,7 +36,7 @@ from app.modules.acquisition.models import (
     TriggerAction,
     TriggerRecord,
 )
-
+from app.modules.acquisition.search.group_finder import extract_flood_wait_seconds
 
 router = APIRouter()
 
@@ -40,6 +54,13 @@ class GroupCreate(BaseModel):
     account_id: int | None = Field(None, description="Account that joined this group")
     join_method: str = Field("manual", description="How the account joined this group")
     level: str | None = Field(None, description="Group level: A, B, C, unrated")
+
+
+class GroupJoinByLinkRequest(BaseModel):
+    """Join a Telegram group with a promoter account and persist the result."""
+
+    account_id: int = Field(..., gt=0, description="Promoter account database ID")
+    group_link: str = Field(..., min_length=4, max_length=512, description="Telegram group link")
 
 
 class GroupUpdate(BaseModel):
@@ -444,7 +465,10 @@ async def _get_group_account_summary(
             func.min(TelegramAccount.phone).label("primary_account_phone"),
         )
         .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
-        .where(GroupAccountMembership.group_id.in_(group_ids))
+        .where(
+            GroupAccountMembership.group_id.in_(group_ids),
+            GroupAccountMembership.status == "joined",
+        )
         .group_by(GroupAccountMembership.group_id)
     )
 
@@ -640,6 +664,141 @@ async def list_groups(
             for group in groups
         ],
         total=total,
+    )
+
+
+@router.post("/join-by-link", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
+async def join_group_by_link(
+    request: GroupJoinByLinkRequest,
+    db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_admin),
+) -> GroupResponse:
+    """Join by Telegram link, then persist the resolved group and membership."""
+    account_result = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == request.account_id)
+    )
+    account = account_result.scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Promoter account not found")
+    if account.account_type != AccountType.PROMOTER:
+        raise HTTPException(status_code=400, detail="Only promoter accounts can join ad groups")
+    if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+        raise HTTPException(status_code=400, detail="Promoter account is inactive or unavailable")
+    if account.risk_level in {
+        AccountRiskLevel.FROZEN.value,
+        AccountRiskLevel.QUARANTINED.value,
+    }:
+        raise HTTPException(status_code=400, detail="Promoter account is frozen or quarantined")
+
+    account_pool = get_account_pool()
+    await account_pool.add_account_from_db(account)
+    wrapper = None
+    try:
+        wrapper = await account_pool.acquire_by_id(
+            account.id,
+            purpose="manual_group_link_join",
+        )
+        if wrapper is None:
+            raise HTTPException(status_code=400, detail="Promoter account session is unavailable")
+        resolved = await TelegramExecutionService(AccountRiskGuard(db)).join_group_by_link(
+            wrapper,
+            request.group_link,
+        )
+    except HTTPException:
+        raise
+    except TelegramJoinRequestPendingError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TelegramExecutionError as exc:
+        detail = str(exc)
+        status_code = 429 if detail.startswith("risk_guard_blocked:") else 400
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    except Exception as exc:
+        flood_wait_seconds = extract_flood_wait_seconds(exc)
+        if flood_wait_seconds is not None:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Telegram rate limit: retry after {flood_wait_seconds} seconds",
+            ) from exc
+        error_name = exc.__class__.__name__
+        if error_name in {"InviteHashExpiredError", "InviteHashInvalidError"}:
+            detail = "Telegram invite link is invalid or expired"
+        elif error_name in {"UsernameInvalidError", "UsernameNotOccupiedError"}:
+            detail = "Telegram public group link does not exist"
+        elif error_name == "ChannelsTooMuchError":
+            detail = "This account has joined the maximum number of Telegram groups"
+        else:
+            detail = f"Telegram group join failed: {error_name}: {exc}"
+        raise HTTPException(status_code=400, detail=detail) from exc
+    finally:
+        if wrapper is not None:
+            await account_pool.release(wrapper)
+
+    telegram_group_id = int(resolved["id"])
+    title = str(resolved.get("title") or "").strip() or None
+    username = str(resolved.get("username") or "").strip().lstrip("@") or None
+    member_count = max(0, int(resolved.get("participants_count") or 0))
+    now = datetime.utcnow()
+
+    group_result = await db.execute(select(Group).where(Group.group_id == telegram_group_id))
+    group = group_result.scalar_one_or_none()
+    if group is None:
+        group = Group(
+            group_id=telegram_group_id,
+            title=title,
+            username=username,
+            member_count=member_count,
+            status="active",
+            discovery_source="manual_link_join",
+            level=GroupLevel.A,
+        )
+        db.add(group)
+        await db.flush()
+    else:
+        if title:
+            group.title = title
+        if username:
+            group.username = username
+        if member_count:
+            group.member_count = member_count
+        group.status = "active"
+        group.updated_at = now
+
+    membership_result = await db.execute(
+        select(GroupAccountMembership).where(
+            GroupAccountMembership.group_id == group.id,
+            GroupAccountMembership.account_id == account.id,
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        membership = GroupAccountMembership(
+            group_id=group.id,
+            telegram_group_id=telegram_group_id,
+            account_id=account.id,
+            status="joined",
+            join_method="manual_link_join",
+            joined_at=now,
+            last_checked_at=now,
+        )
+        db.add(membership)
+    else:
+        membership.telegram_group_id = telegram_group_id
+        membership.status = "joined"
+        membership.join_method = "manual_link_join"
+        membership.joined_at = membership.joined_at or now
+        membership.left_at = None
+        membership.last_checked_at = now
+        membership.updated_at = now
+
+    await db.commit()
+    await db.refresh(group)
+    metrics = await _get_group_metrics(db, [group.group_id])
+    account_summary = await _get_group_account_summary(db, [group.id])
+    return _group_to_response(
+        group,
+        metrics=metrics.get(group.group_id),
+        account_count=int(account_summary.get(group.id, {}).get("account_count", 0)),
+        primary_account_phone=account_summary.get(group.id, {}).get("primary_account_phone"),
     )
 
 

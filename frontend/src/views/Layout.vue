@@ -4,7 +4,7 @@ import { ElContainer, ElAside, ElMenu, ElMenuItem, ElSubMenu, ElIcon, ElScrollba
 import {
   Odometer, User, ChatDotRound,
   Key, UserFilled, Present, SetUp, DataLine, Setting,
-  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor
+  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor, Connection, ChatLineSquare
 } from '@element-plus/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -22,7 +22,9 @@ const menuItems = [
     title: '增长中心',
     icon: Promotion,
     children: [
+      { path: '/growth-dashboard', title: '增长驾驶舱', icon: Promotion },
       { path: '/accounts', title: '推广账号', icon: User },
+      { path: '/proxies', title: '静态代理IP', icon: Connection },
       { path: '/groups', title: '群池管理', icon: ChatDotRound },
       { path: '/keywords', title: '关键词管理', icon: Key },
       { path: '/campaigns', title: '活动管理', icon: Present },
@@ -37,6 +39,7 @@ const menuItems = [
     children: [
       { path: '/guardian/bots', title: 'Bot账号', icon: User },
       { path: '/guardian/groups', title: 'Bot管理群', icon: ChatDotRound },
+      { path: '/guardian/qq', title: 'NapCat QQ群', icon: ChatLineSquare },
       { path: '/guardian/policies', title: '群治理策略', icon: SetUp },
       { path: '/guardian/keywords', title: '群管敏感词', icon: Key },
     ],
@@ -109,7 +112,7 @@ const toggleCollapse = () => {
       <el-header class="header">
         <div class="header-left">
           <el-icon class="collapse-btn" @click="toggleCollapse">
-            <component :is="isCollapse ? 'Expand' : 'Fold'" />
+            <component :is="isCollapse ? Expand : Fold" />
           </el-icon>
           <el-breadcrumb separator="/">
             <el-breadcrumb-item :to="{ path: '/dashboard' }">首页</el-breadcrumb-item>
@@ -151,13 +154,6 @@ const toggleCollapse = () => {
     </el-container>
   </el-container>
 </template>
-
-<script lang="ts">
-import { Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation } from '@element-plus/icons-vue'
-export default {
-  components: { Fold, Expand, Bell, SwitchButton, UserIcon, Operation },
-}
-</script>
 
 <style scoped lang="scss">
 .layout-container {

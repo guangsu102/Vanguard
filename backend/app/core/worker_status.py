@@ -19,6 +19,7 @@ from app.core.database import Base
 class TelegramWorkerRole(str, Enum):
     GROWTH_USER = "growth_user_worker"
     GUARDIAN_BOT = "guardian_bot_worker"
+    QQ_ONEBOT = "qq_onebot_worker"
 
 
 class TelegramWorkerStatusValue(str, Enum):

@@ -106,6 +106,31 @@ export const useAccountStore = defineStore('account', () => {
     }
   }
 
+  const syncProfileBio = async (id: number, profileBio?: string) => {
+    const updated = await accountsApi.syncProfileBio(id, profileBio)
+    const index = list.value.findIndex((item) => item.id === id)
+    if (index !== -1) {
+      list.value[index] = updated
+    }
+    if (currentAccount.value?.id === id) {
+      currentAccount.value = updated
+    }
+    return updated
+  }
+
+  const updateProxyPolicy = async (
+    id: number,
+    data: { proxy_mode: 'dynamic' | 'static' | 'none'; static_proxy_id?: number },
+  ) => {
+    const result = await accountsApi.updateProxyPolicy(id, data)
+    const account = await getById(id)
+    const index = list.value.findIndex((item) => item.id === id)
+    if (index !== -1 && account) {
+      list.value[index] = account
+    }
+    return result
+  }
+
   const setPage = (newPage: number) => {
     page.value = newPage
   }
@@ -138,6 +163,8 @@ export const useAccountStore = defineStore('account', () => {
     getById,
     enable,
     disable,
+    syncProfileBio,
+    updateProxyPolicy,
     setPage,
     setPageSize,
     setAccountTypeFilter,

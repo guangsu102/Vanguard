@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import Proxy, ProxyType, TelegramAccount
 from app.core.exceptions import ProxyNotFoundError
+from app.core.network.ssrf_guard import get_safe_health_check_url, validate_url
 
 logger = structlog.get_logger()
 
@@ -115,10 +116,10 @@ class ProxyPool:
         self._account_bindings: dict[int, int] = {}
         self._lock = asyncio.Lock()
         self._health_check_task: Optional[asyncio.Task] = None
-        self.health_check_url = (
-            health_check_url
-            or os.getenv("HEALTH_CHECK_URL", "https://httpbin.org/ip")
+        raw_url = health_check_url or os.getenv(
+            "HEALTH_CHECK_URL", "https://api.ipify.org?format=json"
         )
+        self.health_check_url = get_safe_health_check_url(raw_url)
         self.logger = logger.bind(module="proxy_pool")
 
     async def sync_from_db(self, proxies: Optional[list[Proxy]] = None) -> int:
@@ -418,12 +419,26 @@ class ProxyPool:
             try:
                 start_time = time.time()
 
-                async with aiohttp.ClientSession() as session:
-                    timeout = aiohttp.ClientTimeout(total=10)
+                is_valid, error_msg = validate_url(self.health_check_url)
+                if not is_valid:
+                    raise ValueError(f"SSRF protection: {error_msg}")
+
+                timeout = aiohttp.ClientTimeout(total=10)
+                if proxy.protocol.lower().startswith("socks"):
+                    from aiohttp_socks import ProxyConnector
+
+                    connector = ProxyConnector.from_url(proxy.to_url())
+                    session_context = aiohttp.ClientSession(connector=connector)
+                    request_kwargs = {}
+                else:
+                    session_context = aiohttp.ClientSession()
+                    request_kwargs = {"proxy": proxy.to_url()}
+
+                async with session_context as session:
                     async with session.get(
                         self.health_check_url,
-                        proxy=proxy.to_url(),
                         timeout=timeout,
+                        **request_kwargs,
                     ) as resp:
                         latency = int((time.time() - start_time) * 1000)
                         is_active = resp.status == 200
@@ -437,9 +452,10 @@ class ProxyPool:
                             health.consecutive_failures = 0
                         else:
                             health.consecutive_failures += 1
+                            health.success_rate = max(0, health.success_rate - 0.2)
 
                         results[pid] = {
-                            "success": True,
+                            "success": is_active,
                             "latency": latency,
                             "status": resp.status,
                         }

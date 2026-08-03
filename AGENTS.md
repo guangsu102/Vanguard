@@ -236,7 +236,7 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `XBOARD_API_KEY` - XBoard API key
 
 **Frontend (.env.development, .env.production)**:
-- `VITE_API_BASE_URL` - Backend API base URL (e.g., `https://api.rensw.xyz/api`)
+- `VITE_API_BASE_URL` - Backend API base URL. Production should use same-origin `/api` so both `https://www.dh113.xyz` and `https://dh113.xyz` work.
 
 ### Configuration Files
 - `backend/alembic.ini` - Database migration configuration
@@ -299,11 +299,14 @@ If Telegram accounts fail to connect:
 ## Deployment
 
 ### Production Server
-- **Server**: 137.175.65.47 (SSH alias: `xd`)
-- **Backend**: https://api.rensw.xyz (port 8000)
-- **Frontend**: /var/www/vanguard/frontend (served by nginx)
-- **Database**: PostgreSQL 15 (system service)
-- **Cache**: Redis 7 (system service)
+- **Server**: 107.149.161.99 (SSH alias: `test001`; SSH port `28278`)
+- **Important**: Vanguard production deploys must target `ssh test001`. Do not deploy Vanguard to `xd`; `xd` is reserved for `new-api` and `sub2api` services.
+- **Public domains**: https://www.dh113.xyz and https://dh113.xyz
+- **Important**: `api.dh113.xyz` is deprecated and must not be used for Vanguard API checks, frontend configuration, or deployment verification.
+- **Backend**: served behind the same public domains under `/api` and `/health` (container port 8000)
+- **Frontend**: served by the Docker gateway in the `test001` deployment
+- **Database**: PostgreSQL service from `docker-compose.test001.yml`
+- **Cache**: Redis service from `docker-compose.test001.yml`
 
 ### Deployment Process
 
@@ -312,7 +315,7 @@ If Telegram accounts fail to connect:
 # On server
 cd /root/Vanguard
 git pull
-docker-compose -f docker-compose.production.yml up -d --build backend bot
+docker-compose -f docker-compose.test001.yml up -d --build
 ```
 
 **Frontend**:
@@ -323,17 +326,15 @@ npm run build
 tar -czf dist.tar.gz -C dist .
 
 # Deploy to server
-scp dist.tar.gz root@xd:/tmp/
-ssh root@xd
-cd /var/www/vanguard/frontend
-tar -xzf /tmp/dist.tar.gz
-chown -R www-data:www-data .
-systemctl reload nginx
+scp dist.tar.gz test001:/tmp/
+ssh test001
+cd /root/Vanguard
+docker-compose -f docker-compose.test001.yml up -d --build frontend gateway
 ```
 
 ### Health Checks
-- Backend: `curl https://api.rensw.xyz/health`
-- API Docs: `https://api.rensw.xyz/docs` (only in DEBUG mode)
+- Backend: `curl https://www.dh113.xyz/health` or `curl https://dh113.xyz/health`
+- API Docs: `https://www.dh113.xyz/docs` or `https://dh113.xyz/docs` (only in DEBUG mode)
 - Logs: `docker logs -f vanguard-backend`
 
 ## Code Style

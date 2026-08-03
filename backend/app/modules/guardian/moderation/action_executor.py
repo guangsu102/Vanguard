@@ -9,6 +9,7 @@ from typing import Optional
 
 import structlog
 
+from app.core.account.telegram_execution import TelegramExecutionService
 from app.modules.guardian.models import ViolationAction
 
 logger = structlog.get_logger()
@@ -30,7 +31,7 @@ class ActionExecutor:
     Provides methods for deleting messages, muting users, banning, etc.
     """
     
-    def __init__(self, telegram_client=None):
+    def __init__(self, telegram_client=None, telegram_execution: Optional[TelegramExecutionService] = None):
         """
         Initialize ActionExecutor.
         
@@ -38,6 +39,7 @@ class ActionExecutor:
             telegram_client: Telegram client instance for executing actions
         """
         self._client = telegram_client
+        self._execution = telegram_execution or TelegramExecutionService()
         self.logger = logger.bind(module="action_executor")
     
     def set_client(self, client) -> None:
@@ -137,7 +139,7 @@ class ActionExecutor:
             return False
         
         try:
-            await self._client.delete_message(chat_id, message_id)
+            await self._execution.delete_message(self._client, chat_id, message_id, source="guardian_moderation")
             self.logger.info(
                 "message_deleted",
                 chat_id=chat_id,
@@ -176,14 +178,12 @@ class ActionExecutor:
         try:
             until_date = duration if duration > 0 else 30 * 60
             
-            await self._client.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-                until_date=until_date,
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False,
-                can_add_web_page_previews=False
+            await self._execution.mute_user(
+                self._client,
+                chat_id,
+                user_id,
+                until_date,
+                source="guardian_moderation",
             )
             
             self.logger.info(
@@ -227,13 +227,11 @@ class ActionExecutor:
             return ActionResult(success=False, action=ViolationAction.MUTE, message="Client not set")
         
         try:
-            await self._client.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True
+            await self._execution.unmute_user(
+                self._client,
+                chat_id,
+                user_id,
+                source="guardian_moderation",
             )
             
             self.logger.info("user_unmuted", chat_id=chat_id, user_id=user_id)
@@ -271,9 +269,8 @@ class ActionExecutor:
             return ActionResult(success=False, action=ViolationAction.KICK, message="Client not set")
         
         try:
-            await self._client.ban_chat_member(chat_id, user_id)
-            
-            await self._client.unban_chat_member(chat_id, user_id)
+            await self._execution.ban_user(self._client, chat_id, user_id, source="guardian_moderation")
+            await self._execution.unban_user(self._client, chat_id, user_id, source="guardian_moderation")
             
             self.logger.info("user_kicked", chat_id=chat_id, user_id=user_id)
             
@@ -310,7 +307,7 @@ class ActionExecutor:
             return ActionResult(success=False, action=ViolationAction.BAN, message="Client not set")
         
         try:
-            await self._client.ban_chat_member(chat_id, user_id)
+            await self._execution.ban_user(self._client, chat_id, user_id, source="guardian_moderation")
             
             self.logger.info("user_banned", chat_id=chat_id, user_id=user_id)
             
@@ -347,7 +344,7 @@ class ActionExecutor:
             return ActionResult(success=False, action=ViolationAction.BAN, message="Client not set")
         
         try:
-            await self._client.unban_chat_member(chat_id, user_id)
+            await self._execution.unban_user(self._client, chat_id, user_id, source="guardian_moderation")
             
             self.logger.info("user_unbanned", chat_id=chat_id, user_id=user_id)
             
@@ -405,7 +402,13 @@ class ActionExecutor:
 多次违规将被禁言或踢出。"""
         
         try:
-            await self._client.send_message(chat_id, message, parse_mode="Markdown")
+            await self._execution.send_bot_message(
+                self._client,
+                chat_id,
+                message,
+                parse_mode="Markdown",
+                source="guardian_moderation",
+            )
             self.logger.info(
                 "warning_sent",
                 chat_id=chat_id,

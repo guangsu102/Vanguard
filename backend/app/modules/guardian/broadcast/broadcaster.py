@@ -12,6 +12,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.account.system_identity import bot_risk_identity
 from app.modules.guardian.broadcast.templates import BroadcastTemplate, NodeStatus, PromoData
 
 logger = structlog.get_logger()
@@ -23,6 +24,14 @@ class BroadcastResult:
     success: int
     failed: int
     failed_groups: list[int]
+
+
+@dataclass
+class PinnedMessageResult:
+    """Result of sending and pinning a single message."""
+    success: bool
+    message_id: Optional[int] = None
+    error: Optional[str] = None
 
 
 class GuardianBroadcaster:
@@ -53,6 +62,8 @@ class GuardianBroadcaster:
     def set_client(self, client) -> None:
         """Set Telegram client."""
         self._client = client
+        self._risk_guard = getattr(client, "risk_guard", None)
+        self._risk_account = getattr(client, "risk_account", bot_risk_identity("guardian_broadcast"))
     
     async def broadcast_node_status(
         self,
@@ -152,7 +163,8 @@ class GuardianBroadcaster:
         self,
         group_ids: list[int],
         message: str,
-        parse_mode: str = "Markdown"
+        parse_mode: str = "Markdown",
+        reply_markup: Optional[dict] = None,
     ) -> BroadcastResult:
         """
         Broadcast custom message to groups.
@@ -165,8 +177,46 @@ class GuardianBroadcaster:
         Returns:
             BroadcastResult
         """
-        return await self._broadcast(group_ids, message, parse_mode)
-    
+        return await self._broadcast(group_ids, message, parse_mode, reply_markup=reply_markup)
+
+    async def send_pinned_message(
+        self,
+        chat_id: int,
+        message: str,
+        parse_mode: str = "Markdown",
+        disable_web_page_preview: bool = False,
+        disable_notification: bool = True,
+    ) -> PinnedMessageResult:
+        """
+        Send a message to a managed group and pin it.
+
+        The guardian bot must be an admin in the target group with permission
+        to pin messages.
+        """
+        if not self._client:
+            return PinnedMessageResult(success=False, error="telegram_client_not_configured")
+
+        try:
+            sent_message = await self._client.send_message(
+                chat_id,
+                message,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+            await self._client.pin_chat_message(
+                chat_id,
+                sent_message.message_id,
+                disable_notification=disable_notification,
+            )
+            return PinnedMessageResult(success=True, message_id=sent_message.message_id)
+        except Exception as e:
+            self.logger.error(
+                "send_pinned_message_failed",
+                chat_id=chat_id,
+                error=str(e),
+            )
+            return PinnedMessageResult(success=False, error=str(e))
+
     async def broadcast_daily_stats(
         self,
         group_ids: list[int],
@@ -193,7 +243,8 @@ class GuardianBroadcaster:
         self,
         group_ids: list[int],
         message: str,
-        parse_mode: str = "Markdown"
+        parse_mode: str = "Markdown",
+        reply_markup: Optional[dict] = None,
     ) -> BroadcastResult:
         """
         Internal broadcast method.
@@ -219,7 +270,7 @@ class GuardianBroadcaster:
         
         for chat_id in group_ids:
             try:
-                await self._client.send_message(chat_id, message, parse_mode=parse_mode)
+                await self._client.send_message(chat_id, message, parse_mode=parse_mode, reply_markup=reply_markup)
                 success += 1
                 
                 await asyncio.sleep(0.1)

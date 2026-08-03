@@ -14,7 +14,16 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.pool import AccountPool
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.telegram_execution import TelegramExecutionService
+from app.core.automation_settings import (
+    get_private_reply_template_settings,
+    is_private_messaging_enabled,
+)
 from app.core.redis import RateLimiter, RedisCache
+from app.core.runtime_settings import (
+    render_runtime_template,
+)
 from app.modules.acquisition.private_msg.dialog_manager import DialogManager
 from app.modules.acquisition.private_msg.welcome import WelcomeGenerator
 from app.modules.acquisition.private_msg.guide_flow import GuideFlowManager
@@ -70,6 +79,8 @@ class PrivateHandler:
         self.config = config or AcquisitionConfig()
         self.welcome_generator = WelcomeGenerator()
         self.logger = logger.bind(module="private_handler")
+        self.risk_guard = AccountRiskGuard(db)
+        self.telegram_execution = TelegramExecutionService(self.risk_guard)
         self._send_lock = asyncio.Lock()
 
     async def handle_message(
@@ -112,17 +123,19 @@ class PrivateHandler:
                         user_message=message_text,
                         context=context,
                     )
-                    if guide_result.get("completed"):
+                    guide_reply = guide_result.get("reply")
+                    if guide_reply:
+                        success = await self.send_message(user_id, guide_reply, initiated_by_user=True)
                         return PrivateMessageResult(
-                            success=True,
-                            reply=guide_result.get("reply"),
+                            success=success,
+                            reply=guide_reply,
                             action_taken="guide_flow",
                         )
 
                 # 处理普通对话
                 reply = await self._generate_reply(user_id, message_text, context)
                 if reply:
-                    await self.send_message(user_id, reply)
+                    await self.send_message(user_id, reply, initiated_by_user=True)
 
                 return PrivateMessageResult(success=True, reply=reply)
 
@@ -147,9 +160,16 @@ class PrivateHandler:
         elif command == "/status":
             return await self._handle_status(user_id)
         else:
+            reply = await self._render_private_template(
+                "unknownCommand",
+                user_id,
+                command=command,
+            )
+            success = await self.send_message(user_id, reply, initiated_by_user=True)
             return PrivateMessageResult(
-                success=True,
-                reply="未知命令，请发送 /help 查看可用命令",
+                success=success,
+                reply=reply,
+                action_taken="unknown_command",
             )
 
     async def _handle_start(self, user_id: int, command: str = "/start") -> PrivateMessageResult:
@@ -159,9 +179,17 @@ class PrivateHandler:
         if tracking_code:
             await self.tracker.record_tracking_code(user_id=user_id, tracking_code=tracking_code)
 
-        # 发送欢迎消息
-        welcome = await self.welcome_generator.generate_welcome(user_id)
-        success = await self.send_message(user_id, welcome)
+        tracking_link = await self.tracker.generate_tracking_link(
+            user_id,
+            tracking_code=tracking_code,
+        )
+        welcome = await self._render_private_template(
+            "startWelcome",
+            user_id,
+            command=command,
+            register_link=tracking_link,
+        )
+        success = await self.send_message(user_id, welcome, initiated_by_user=True)
 
         # 创建引导流程
         if success:
@@ -175,34 +203,29 @@ class PrivateHandler:
 
     async def _handle_help(self, user_id: int) -> PrivateMessageResult:
         """Handle /help command."""
-        help_text = """
-可用命令：
-/start - 开始使用
-/help - 显示此帮助
-/register - 获取注册链接
-/status - 查看状态
-
-有其他问题欢迎随时咨询！
-"""
-        success = await self.send_message(user_id, help_text.strip())
-        return PrivateMessageResult(success=success, reply=help_text, action_taken="help")
+        reply = await self._render_private_template("help", user_id)
+        success = await self.send_message(user_id, reply, initiated_by_user=True)
+        return PrivateMessageResult(success=success, reply=reply, action_taken="help")
 
     async def _handle_register(self, user_id: int) -> PrivateMessageResult:
         """Handle /register command."""
-        # 获取追踪链接
         tracking_link = await self.tracker.generate_tracking_link(user_id)
-        reply = f"点击下面的链接注册：\n{tracking_link}\n\n注册成功后会有专属客服为您服务~"
-        success = await self.send_message(user_id, reply)
+        reply = await self._render_private_template(
+            "register",
+            user_id,
+            register_link=tracking_link,
+        )
+        success = await self.send_message(user_id, reply, initiated_by_user=True)
         return PrivateMessageResult(success=success, reply=reply, action_taken="register_link")
 
     async def _handle_status(self, user_id: int) -> PrivateMessageResult:
         """Handle /status command."""
         status = await self._get_xboard_status(user_id)
         if status:
-            reply = f"您的当前状态：{status}"
+            reply = await self._render_private_template("statusFound", user_id, status=status)
         else:
-            reply = "正在查询您的状态，请稍候..."
-        success = await self.send_message(user_id, reply)
+            reply = await self._render_private_template("statusPending", user_id, status="")
+        success = await self.send_message(user_id, reply, initiated_by_user=True)
         return PrivateMessageResult(success=success, reply=reply, action_taken="status_check")
 
     async def _generate_reply(
@@ -216,29 +239,58 @@ class PrivateHandler:
 
         # 检查意图
         if any(kw in text_lower for kw in ["谢谢", "好的", "收到"]):
-            return "不客气！有需要随时找我~"
+            return await self._render_private_template("thanks", user_id, message_text=message_text)
         elif any(kw in text_lower for kw in ["怎么用", "如何使用", "帮助"]):
-            return "可以发送 /help 查看帮助，或者直接告诉我您想了解什么~"
+            return await self._render_private_template("usageHelp", user_id, message_text=message_text)
         elif any(kw in text_lower for kw in ["注册", "试用", "体验"]):
             return await self._get_register_prompt(user_id)
         elif any(kw in text_lower for kw in ["价格", "多少钱", "收费"]):
-            return "XBoard 提供多种套餐，价格实惠。新用户有优惠活动，点击注册了解："
+            return await self._render_private_template("priceIntent", user_id, message_text=message_text)
         elif any(kw in text_lower for kw in ["节点", "速度", "稳定"]):
-            return "XBoard 节点覆盖全球，速度稳定。支持多设备同时使用，欢迎体验~"
+            return await self._render_private_template("nodeIntent", user_id, message_text=message_text)
 
         # 默认回复
-        return "收到您的消息了！有什么可以帮助您的吗？发送 /help 查看可用命令~"
+        return await self._render_private_template("default", user_id, message_text=message_text)
 
     async def _get_register_prompt(self, user_id: int) -> str:
         """Get registration prompt with tracking link."""
         tracking_link = await self.tracker.generate_tracking_link(user_id)
-        return f"点击下方链接注册体验：\n{tracking_link}\n\n新用户有免费试用机会哦~"
+        return await self._render_private_template(
+            "registerIntent",
+            user_id,
+            register_link=tracking_link,
+        )
+
+    async def _render_private_template(
+        self,
+        template_key: str,
+        user_id: int,
+        **variables,
+    ) -> str:
+        """Render a private reply template with common variables."""
+        templates = await get_private_reply_template_settings(self.db)
+        template = templates.get(template_key, "")
+        if "{register_link}" in template and "register_link" not in variables:
+            variables["register_link"] = await self.tracker.generate_tracking_link(user_id)
+
+        merged_variables = {
+            "user_id": user_id,
+            "user_name": variables.pop("user_name", None) or "朋友",
+            "message_text": variables.pop("message_text", ""),
+            "command": variables.pop("command", ""),
+            "status": variables.pop("status", ""),
+            "keyword": variables.pop("keyword", ""),
+            **variables,
+        }
+        return render_runtime_template(template, merged_variables)
 
     async def send_message(
         self,
         user_id: int,
         message: str,
         account_id: Optional[int] = None,
+        *,
+        initiated_by_user: bool = False,
     ) -> bool:
         """
         Send a private message to a user.
@@ -251,6 +303,26 @@ class PrivateHandler:
         Returns:
             True if successful
         """
+        message = (message or "").strip()
+        if not message:
+            self.logger.info(
+                "private_message_empty",
+                user_id=user_id,
+                account_id=account_id,
+                initiated_by_user=initiated_by_user,
+            )
+            return False
+
+        if not await is_private_messaging_enabled(self.db, initiated_by_user=initiated_by_user):
+            self.logger.info(
+                "private_messaging_paused",
+                user_id=user_id,
+                account_id=account_id,
+                initiated_by_user=initiated_by_user,
+                message_length=len(message),
+            )
+            return False
+
         self.logger.info("send_private_message", user_id=user_id, message_length=len(message))
 
         # 获取账号
@@ -274,18 +346,16 @@ class PrivateHandler:
                 self.logger.warning("send_interval_violated", user_id=user_id)
                 return False
 
-            client = getattr(account, "client", None)
-            if client is None:
-                client = await self._ensure_client(account)
-            if client is not None:
-                result = await client.send_message(user_id, message)
-                msg_id = getattr(result, "id", getattr(result, "message_id", None))
-            else:
-                self.logger.warning("private_send_no_client", user_id=user_id)
-                msg_id = None
-
+            success = await self.telegram_execution.send_private_message(
+                account,
+                user_id,
+                message,
+                initiated_by_user=initiated_by_user,
+                source="private_handler",
+            )
+            msg_id = None
             self.logger.info("message_sent", user_id=user_id, message_id=msg_id)
-            return True
+            return success
 
         except Exception as e:
             self.logger.error("send_message_failed", user_id=user_id, error=str(e))
@@ -310,7 +380,31 @@ class PrivateHandler:
         Returns:
             True if successful
         """
-        welcome = await self.welcome_generator.generate_welcome(user_id, source_info)
+        if not await is_private_messaging_enabled(self.db, initiated_by_user=False):
+            self.logger.info(
+                "private_messaging_paused",
+                user_id=user_id,
+                initiated_by_user=False,
+                source="send_welcome",
+            )
+            return False
+
+        source_info = source_info or {}
+        tracking_link = await self.tracker.generate_tracking_link(
+            user_id,
+            source_type=source_info.get("source", "tg_private"),
+            group_id=source_info.get("group_id"),
+            keyword=source_info.get("keyword"),
+            bot_id=source_info.get("bot_id"),
+            campaign_name=source_info.get("campaign"),
+            tracking_code=source_info.get("tracking_code") or source_info.get("ref"),
+        )
+        welcome = await self._render_private_template(
+            "startWelcome",
+            user_id,
+            user_name=source_info.get("user_name") or "朋友",
+            register_link=tracking_link,
+        )
         return await self.send_message(user_id, welcome)
 
     async def send_guide_message(
@@ -330,6 +424,15 @@ class PrivateHandler:
         Returns:
             True if successful
         """
+        if not await is_private_messaging_enabled(self.db, initiated_by_user=False):
+            self.logger.info(
+                "private_messaging_paused",
+                user_id=user_id,
+                initiated_by_user=False,
+                source="send_guide_message",
+            )
+            return False
+
         message = await self.guide_flow_manager.get_step_message(step, **kwargs)
         if message:
             return await self.send_message(user_id, message)
@@ -350,11 +453,24 @@ class PrivateHandler:
         Returns:
             True if successful
         """
+        if not await is_private_messaging_enabled(self.db, initiated_by_user=False):
+            self.logger.info(
+                "private_messaging_paused",
+                user_id=user_id,
+                initiated_by_user=False,
+                source="send_registration_link",
+            )
+            return False
+
         if not tracking_code:
             tracking_code = str(user_id)
 
         link = await self.tracker.generate_tracking_link(user_id, tracking_code=tracking_code)
-        message = f"点击下方链接注册：\n{link}\n\n注册成功后即可享受新用户优惠~"
+        message = await self._render_private_template(
+            "register",
+            user_id,
+            register_link=link,
+        )
         return await self.send_message(user_id, message)
 
     async def generate_invite_message(
@@ -380,7 +496,12 @@ class PrivateHandler:
             keyword=keyword,
         )
 
-        message = f"您好！感谢您的兴趣~\n\n点击链接注册体验：\n{tracking_link}\n\n新用户有免费试用机会，期待您的加入！"
+        message = await self._render_private_template(
+            "triggerInvite",
+            user_id,
+            register_link=tracking_link,
+            keyword=keyword or "",
+        )
 
         return message
 
@@ -451,3 +572,6 @@ class PrivateHandler:
 
         await cache.set(f"acquisition:last_private:{user_id}", str(datetime.utcnow().timestamp()), ttl=24 * 3600)
         return True
+
+
+

@@ -11,11 +11,13 @@ import argparse
 import asyncio
 import json
 import socket
+import time
 from datetime import datetime
 from typing import Any, Optional
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 from telethon import events as telethon_events
 
 from app.core.account.models import (
@@ -26,7 +28,13 @@ from app.core.account.models import (
     GuardianBotProfile,
     TelegramAccount,
 )
-from app.core.account.pool import AccountPool
+from app.core.account.pool import AccountPool, _resolve_account_api_credentials
+from app.core.account.proxy_policy_events import (
+    start_account_proxy_policy_listener,
+    stop_account_proxy_policy_listener,
+)
+from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.system_identity import bot_risk_identity
 from app.core.config import settings
 from app.core.database import close_db, get_db_session, init_db
 from app.core.redis import close_redis, init_redis
@@ -35,9 +43,23 @@ from app.integrations.telegram.client import TelegramClient, TelegramConfig
 from app.modules.acquisition.handler import AcquisitionEventHandler, MemberJoinEvent, MessageEvent
 from app.modules.acquisition.models import AdCampaign, GroupSearchKeyword, KeywordTrigger, MessageTemplate, SearchKeywordStatus
 from app.modules.guardian.main import create_guardian_bot
-from app.modules.guardian.models import ManagedGroupBinding, ManagedGroupBindingStatus, ModerationRule, ModerationSensitiveKeyword
+from app.modules.guardian.models import (
+    ManagedGroupBinding,
+    ManagedGroupBindingStatus,
+    ManagedGroupBotRole,
+    ModerationRule,
+    ModerationSensitiveKeyword,
+)
+from app.modules.guardian.sync import (
+    ManagedGroupSyncConflict,
+    guardian_role_and_status_from_member,
+    sync_managed_group_binding,
+)
 
 logger = structlog.get_logger()
+
+ENTITY_NAME_CACHE_TTL_SECONDS = 30 * 60
+ENTITY_NAME_CACHE_MAX_SIZE = 5000
 
 
 class TelegramWorker:
@@ -49,10 +71,12 @@ class TelegramWorker:
         self._account_pool: Optional[AccountPool] = AccountPool() if role == TelegramWorkerRole.GROWTH_USER else None
         self._guardian_update_offsets: dict[int, int] = {}
         self._growth_listener_sessions: dict[int, str] = {}
+        self._entity_name_cache: dict[int, tuple[float, str]] = {}
 
     async def run(self) -> None:
         await init_db(create_tables=not settings.is_production)
         await init_redis()
+        await start_account_proxy_policy_listener()
         self._running = True
         try:
             await self._heartbeat(TelegramWorkerStatusValue.STARTING.value, {"phase": "startup"})
@@ -69,6 +93,7 @@ class TelegramWorker:
         finally:
             if self._account_pool is not None:
                 await self._account_pool.close_all()
+            await stop_account_proxy_policy_listener()
             await close_redis()
             await close_db()
 
@@ -113,6 +138,7 @@ class TelegramWorker:
                 accounts = (
                     await db.execute(
                         select(TelegramAccount)
+                        .options(selectinload(TelegramAccount.static_proxy))
                         .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
                         .where(TelegramAccount.account_type == AccountType.PROMOTER)
                         .where(TelegramAccount.is_active == True)
@@ -211,6 +237,7 @@ class TelegramWorker:
             accounts = (
                 await db.execute(
                     select(TelegramAccount)
+                        .options(selectinload(TelegramAccount.static_proxy))
                         .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
                         .where(TelegramAccount.account_type == AccountType.PROMOTER)
                         .where(TelegramAccount.is_active == True)
@@ -219,11 +246,7 @@ class TelegramWorker:
                     )
                 ).scalars().all()
 
-        runtime_accounts = [
-            account
-            for account in accounts
-            if account.phone and account.api_config and account.api_config.api_id and account.api_config.api_hash
-        ]
+        runtime_accounts = [account for account in accounts if self._is_runtime_capable_account(account)]
         synced = await self._account_pool.sync_from_db(runtime_accounts)
         listener_state = await self._ensure_growth_listeners(runtime_accounts)
         pool_stats = await self._account_pool.health_check()
@@ -238,6 +261,10 @@ class TelegramWorker:
                 "listener": "telethon_user_listener",
             }
         }
+
+    def _is_runtime_capable_account(self, account: TelegramAccount) -> bool:
+        api_id, api_hash = _resolve_account_api_credentials(account)
+        return bool(account.phone and api_id and api_hash)
 
     async def _ensure_growth_listeners(self, accounts: list[TelegramAccount]) -> dict[str, Any]:
         if self._account_pool is None:
@@ -317,6 +344,69 @@ class TelegramWorker:
         client.add_event_handler(handle_chat_action, telethon_events.ChatAction())
         logger.info("growth_event_handlers_attached", account_id=account_id, session_name=account.session_name)
 
+    def _get_cached_entity_name(self, user_id: int) -> Optional[str]:
+        cached = self._entity_name_cache.get(int(user_id))
+        if cached is None:
+            return None
+        expires_at, name = cached
+        if expires_at <= time.monotonic():
+            self._entity_name_cache.pop(int(user_id), None)
+            return None
+        return name
+
+    def _cache_entity_name(self, user_id: int, name: str) -> None:
+        if not name:
+            return
+        now = time.monotonic()
+        if len(self._entity_name_cache) >= ENTITY_NAME_CACHE_MAX_SIZE:
+            expired = [
+                key
+                for key, (expires_at, _cached_name) in self._entity_name_cache.items()
+                if expires_at <= now
+            ]
+            for key in expired:
+                self._entity_name_cache.pop(key, None)
+            while len(self._entity_name_cache) >= ENTITY_NAME_CACHE_MAX_SIZE:
+                oldest_key = next(iter(self._entity_name_cache))
+                self._entity_name_cache.pop(oldest_key, None)
+        self._entity_name_cache[int(user_id)] = (now + ENTITY_NAME_CACHE_TTL_SECONDS, name)
+
+    @staticmethod
+    def _display_name_from_entity(entity: Any, fallback: str) -> str:
+        return (
+            getattr(entity, "username", None)
+            or getattr(entity, "first_name", None)
+            or getattr(entity, "title", None)
+            or fallback
+        )
+
+    async def _resolve_sender_name_from_event(self, event: Any, sender_id: int) -> str:
+        cached = self._get_cached_entity_name(sender_id)
+        if cached:
+            return cached
+
+        fallback = str(sender_id)
+        sender = getattr(event, "sender", None)
+        if sender is None:
+            sender = getattr(getattr(event, "message", None), "sender", None)
+        if sender is None:
+            sender = await event.get_sender()
+
+        name = self._display_name_from_entity(sender, fallback)
+        self._cache_entity_name(sender_id, name)
+        return name
+
+    async def _resolve_entity_name_from_client(self, client: Any, user_id: int) -> str:
+        cached = self._get_cached_entity_name(user_id)
+        if cached:
+            return cached
+
+        fallback = str(user_id)
+        entity = await client.get_entity(user_id)
+        name = self._display_name_from_entity(entity, fallback)
+        self._cache_entity_name(user_id, name)
+        return name
+
     async def _handle_growth_new_message(self, account_id: int, event: Any) -> None:
         text = getattr(event, "raw_text", None) or getattr(event, "text", None) or ""
         if not text:
@@ -328,19 +418,13 @@ class TelegramWorker:
         if sender_id is None or chat_id is None:
             return
 
-        sender_name = str(sender_id)
-        try:
-            sender = await event.get_sender()
-            sender_name = (
-                getattr(sender, "username", None)
-                or getattr(sender, "first_name", None)
-                or getattr(sender, "title", None)
-                or sender_name
-            )
-        except Exception:
-            pass
+        sender_name = self._get_cached_entity_name(int(sender_id)) or str(sender_id)
 
         is_private = bool(getattr(event, "is_private", False))
+
+        async def resolve_sender_name() -> str:
+            return await self._resolve_sender_name_from_event(event, int(sender_id))
+
         message_event = MessageEvent(
             message_id=int(message_id or 0),
             chat_id=int(chat_id),
@@ -349,6 +433,8 @@ class TelegramWorker:
             content=text,
             is_group=not is_private,
             timestamp=datetime.utcnow(),
+            account_id=account_id,
+            sender_name_resolver=resolve_sender_name,
         )
 
         try:
@@ -398,8 +484,7 @@ class TelegramWorker:
 
             user_name = str(user_id)
             try:
-                user = await event.client.get_entity(user_id)
-                user_name = getattr(user, "username", None) or getattr(user, "first_name", None) or user_name
+                user_name = await self._resolve_entity_name_from_client(event.client, int(user_id))
             except Exception:
                 pass
             added_by = getattr(event, "added_by", None)
@@ -449,25 +534,50 @@ class TelegramWorker:
 
         processed_updates = 0
         failed_bots = 0
+        discovered_groups = 0
+        synced_groups = 0
+        group_sync_errors = 0
         errors: list[dict[str, Any]] = []
-        active_bindings = snapshot.get("active_group_bindings", 0)
 
         for profile in profiles:
             client = TelegramClient(TelegramConfig(bot_token=profile.bot_token, timeout=min(self.heartbeat_interval, 30)))
             try:
+                profile_group_sync_errors = 0
+                bot_user = await client.get_me()
                 offset = self._guardian_update_offsets.get(profile.id)
                 updates = await client.get_updates(offset=offset, limit=50, timeout=0)
                 if updates:
                     self._guardian_update_offsets[profile.id] = max(update["update_id"] for update in updates) + 1
+                    chat_payloads = self._guardian_chat_payloads_from_updates(updates)
+                    discovered_groups += len(chat_payloads)
+                    for chat_payload in chat_payloads:
+                        try:
+                            if await self._sync_guardian_group_from_chat(profile, client, bot_user.user_id, chat_payload):
+                                synced_groups += 1
+                        except Exception as exc:
+                            group_sync_errors += 1
+                            profile_group_sync_errors += 1
+                            errors.append({"bot_profile_id": profile.id, "chat_id": chat_payload.get("id"), "error": str(exc)})
+                            logger.warning(
+                                "guardian_group_sync_failed",
+                                bot_profile_id=profile.id,
+                                chat_id=chat_payload.get("id"),
+                                error=str(exc),
+                            )
                     processed_updates += await self._dispatch_guardian_updates(profile.id, client, updates)
+                active_bindings = await self._guardian_active_binding_count(profile.account_id)
                 await self._mark_guardian_profile(
                     profile.id,
                     GuardianBotHealthStatus.HEALTHY if active_bindings else GuardianBotHealthStatus.DEGRADED,
+                    sync_status="partial" if profile_group_sync_errors else "synced",
+                    last_synced_at=datetime.utcnow(),
+                    bot_username=bot_user.username,
+                    bot_user_id=bot_user.user_id,
                 )
             except Exception as exc:
                 failed_bots += 1
                 errors.append({"bot_profile_id": profile.id, "error": str(exc)})
-                await self._mark_guardian_profile(profile.id, GuardianBotHealthStatus.DEGRADED)
+                await self._mark_guardian_profile(profile.id, GuardianBotHealthStatus.DEGRADED, sync_status="failed")
                 logger.warning("guardian_bot_cycle_failed", bot_profile_id=profile.id, error=str(exc))
             finally:
                 await client.close()
@@ -477,9 +587,110 @@ class TelegramWorker:
                 "bot_api_polling": True,
                 "processed_updates": processed_updates,
                 "failed_bots": failed_bots,
+                "discovered_groups": discovered_groups,
+                "synced_groups": synced_groups,
+                "group_sync_errors": group_sync_errors,
                 "errors": errors[:5],
             }
         }
+
+    @staticmethod
+    def _is_guardian_managed_chat(chat: dict[str, Any]) -> bool:
+        return chat.get("type") in {"group", "supergroup", "channel"} and chat.get("id") is not None
+
+    @classmethod
+    def _guardian_chat_payloads_from_updates(cls, updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        chats: dict[int, dict[str, Any]] = {}
+        for update in updates:
+            for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+                message = update.get(key) or {}
+                chat = message.get("chat") or {}
+                if cls._is_guardian_managed_chat(chat):
+                    chats[int(chat["id"])] = chat
+
+            for key in ("my_chat_member", "chat_member"):
+                membership_update = update.get(key) or {}
+                chat = membership_update.get("chat") or {}
+                if cls._is_guardian_managed_chat(chat):
+                    chats[int(chat["id"])] = chat
+        return list(chats.values())
+
+    @staticmethod
+    def _guardian_role_and_status(member: dict[str, Any]) -> tuple[ManagedGroupBotRole, ManagedGroupBindingStatus]:
+        return guardian_role_and_status_from_member(member)
+
+    async def _sync_guardian_group_from_chat(
+        self,
+        profile: GuardianBotProfile,
+        client: TelegramClient,
+        bot_user_id: int,
+        chat_payload: dict[str, Any],
+    ) -> bool:
+        chat_id = int(chat_payload["id"])
+        chat_title = chat_payload.get("title")
+        chat_username = chat_payload.get("username")
+        chat_type = chat_payload.get("type")
+        member_count: Optional[int] = None
+
+        try:
+            chat_info = await client.get_chat(chat_id)
+            chat_title = chat_info.title or chat_title
+            chat_username = chat_info.username if chat_info.username is not None else chat_username
+            chat_type = chat_info.type or chat_type
+            member_count = chat_info.member_count
+        except Exception as exc:
+            logger.debug("guardian_get_chat_failed", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+
+        if member_count is None:
+            try:
+                member_count = await client.get_chat_member_count(chat_id)
+            except Exception as exc:
+                logger.debug("guardian_get_chat_member_count_failed", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+
+        member: dict[str, Any]
+        try:
+            member = await client.get_chat_member(chat_id, bot_user_id)
+        except Exception as exc:
+            member = {"status": "unknown", "sync_error": str(exc)}
+
+        bot_role, binding_status = self._guardian_role_and_status(member)
+        permissions_snapshot = {
+            "chat_type": chat_type,
+            "bot_member": member,
+            "source": "guardian_worker_updates",
+            "synced_at": datetime.utcnow().isoformat(),
+        }
+
+        try:
+            async with get_db_session() as db:
+                await sync_managed_group_binding(
+                    db,
+                    bot_account_id=profile.account_id,
+                    telegram_group_id=chat_id,
+                    title=chat_title,
+                    username=chat_username,
+                    member_count=member_count,
+                    binding_status=binding_status,
+                    bot_role=bot_role,
+                    permissions_snapshot=permissions_snapshot,
+                    discovery_source="guardian_auto_sync",
+                    allow_existing=True,
+                )
+        except ManagedGroupSyncConflict as exc:
+            logger.info("guardian_group_sync_conflict", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+            return False
+        return True
+
+    async def _guardian_active_binding_count(self, bot_account_id: int) -> int:
+        async with get_db_session() as db:
+            return (
+                await db.execute(
+                    select(func.count(ManagedGroupBinding.id)).where(
+                        ManagedGroupBinding.bot_account_id == bot_account_id,
+                        ManagedGroupBinding.binding_status == ManagedGroupBindingStatus.ACTIVE,
+                    )
+                )
+            ).scalar() or 0
 
     async def _dispatch_guardian_updates(
         self,
@@ -489,6 +700,8 @@ class TelegramWorker:
     ) -> int:
         processed = 0
         async with get_db_session() as db:
+            telegram_client.risk_guard = AccountRiskGuard(db)
+            telegram_client.risk_account = bot_risk_identity(f"guardian_worker:{bot_profile_id}")
             bot = await create_guardian_bot(db, telegram_client=telegram_client)
             for update in updates:
                 message = update.get("message") or update.get("edited_message")
@@ -539,13 +752,30 @@ class TelegramWorker:
 
         return processed
 
-    async def _mark_guardian_profile(self, profile_id: int, status: GuardianBotHealthStatus) -> None:
+    async def _mark_guardian_profile(
+        self,
+        profile_id: int,
+        status: GuardianBotHealthStatus,
+        *,
+        sync_status: Optional[str] = None,
+        last_synced_at: Optional[datetime] = None,
+        bot_username: Optional[str] = None,
+        bot_user_id: Optional[int] = None,
+    ) -> None:
         async with get_db_session() as db:
             profile = await db.get(GuardianBotProfile, profile_id)
             if profile is None:
                 return
             profile.health_status = status
             profile.last_heartbeat_at = datetime.utcnow()
+            if sync_status is not None:
+                profile.sync_status = sync_status
+            if last_synced_at is not None:
+                profile.last_synced_at = last_synced_at
+            if bot_username:
+                profile.bot_username = bot_username
+            if bot_user_id:
+                profile.bot_user_id = bot_user_id
 
     def _status_for_snapshot(self, snapshot: dict[str, Any]) -> str:
         runtime = snapshot.get("runtime") or {}

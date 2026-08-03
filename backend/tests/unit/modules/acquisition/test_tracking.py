@@ -2,12 +2,14 @@
 Tests for Tracking Module
 """
 
+import asyncio
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timedelta
 
-from app.modules.acquisition.tracking.url_builder import URLBuilder, URLBuilderConfig
-from app.modules.acquisition.tracking.attribution import AttributionAnalyzer, AttributionModel, TouchPoint
+from app.modules.acquisition.tracking.url_builder import URLBuilder
+from app.modules.acquisition.tracking.attribution import AttributionAnalyzer, TouchPoint
 from app.modules.acquisition.private_msg.welcome import WelcomeGenerator
 from app.modules.acquisition.keyword_trigger.matcher import KeywordMatcher, TriggerMatch
 from app.modules.acquisition.models import TriggerType
@@ -22,8 +24,7 @@ class TestURLBuilder:
 
     def test_build_tracking_url(self):
         """Test building a basic tracking URL."""
-        import asyncio
-        url = asyncio.get_event_loop().run_until_complete(
+        url = asyncio.run(
             self.builder.build_tracking_url(
                 tracking_code="acq_123_abc",
                 source_type="tg_group",
@@ -36,8 +37,7 @@ class TestURLBuilder:
 
     def test_build_tracking_url_with_params(self):
         """Test building tracking URL with additional parameters."""
-        import asyncio
-        url = asyncio.get_event_loop().run_until_complete(
+        url = asyncio.run(
             self.builder.build_tracking_url(
                 tracking_code="acq_123",
                 source_type="tg_group",
@@ -55,8 +55,7 @@ class TestURLBuilder:
 
     def test_build_invite_url(self):
         """Test building an invite URL."""
-        import asyncio
-        url = asyncio.get_event_loop().run_until_complete(
+        url = asyncio.run(
             self.builder.build_invite_url(user_id=12345, source="group_123")
         )
 
@@ -76,10 +75,9 @@ class TestURLBuilder:
 
     def test_parse_tracking_params(self):
         """Test parsing tracking parameters from URL."""
-        import asyncio
         url = "https://xboard.com/register?source=tg_group&ref=acq_123&campaign=test&group_id=456"
 
-        params = asyncio.get_event_loop().run_until_complete(
+        params = asyncio.run(
             self.builder.parse_tracking_params(url)
         )
 
@@ -108,8 +106,7 @@ class TestURLBuilder:
 
     def test_generate_short_code(self):
         """Test generating short codes."""
-        import asyncio
-        short = asyncio.get_event_loop().run_until_complete(
+        short = asyncio.run(
             self.builder.generate_short_code("acq_123_abcdefgh")
         )
 
@@ -118,8 +115,7 @@ class TestURLBuilder:
 
     def test_build_deep_link(self):
         """Test building deep links."""
-        import asyncio
-        link = asyncio.get_event_loop().run_until_complete(
+        link = asyncio.run(
             self.builder.build_deep_link(
                 action="register",
                 params={"campaign": "test"},
@@ -139,8 +135,7 @@ class TestWelcomeGenerator:
         url_builder.build_tracking_url = AsyncMock(return_value="https://xboard.com/register?source=tg_private&ref=inv_1_tg_private")
         generator = WelcomeGenerator(url_builder=url_builder)
 
-        import asyncio
-        link = asyncio.get_event_loop().run_until_complete(
+        link = asyncio.run(
             generator._build_tracking_link(1, {"source": "tg_private", "campaign": "spring"})
         )
 

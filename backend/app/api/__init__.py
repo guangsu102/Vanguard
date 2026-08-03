@@ -25,6 +25,8 @@ from app.api.guardian_bots import router as guardian_bots
 from app.api.managed_groups import router as managed_groups
 from app.api.moderation_sensitive_keywords import router as moderation_sensitive_keywords
 from app.api.workers import router as workers
+from app.api.qq import router as qq
+from app.api.sub2api_alerts import router as sub2api_alerts
 
 __all__ = [
     "auth",
@@ -50,4 +52,6 @@ __all__ = [
     "managed_groups",
     "moderation_sensitive_keywords",
     "workers",
+    "qq",
+    "sub2api_alerts",
 ]

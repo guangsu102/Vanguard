@@ -42,6 +42,7 @@ onMounted(fetchWorkers)
           { label: '全部', value: '' },
           { label: '引流账号', value: 'growth_user_worker' },
           { label: '群管机器人', value: 'guardian_bot_worker' },
+          { label: 'NapCat OneBot', value: 'qq_onebot_worker' },
         ]"
         @change="fetchWorkers"
       />

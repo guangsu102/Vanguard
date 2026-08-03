@@ -32,7 +32,7 @@ fi
 
 # Run migrations
 echo "Running database migrations..."
-docker-compose run --rm backend python -m alembic upgrade head
+docker-compose run --rm backend sh -c 'PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py'
 
 # Restart services
 echo "Restarting services..."

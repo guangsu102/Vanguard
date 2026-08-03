@@ -100,8 +100,12 @@ const violationColumns = [
 ]
 
 const loadStats = async () => {
-  const response = await moderationApi.getStats()
-  stats.value = response.data.data
+  try {
+    const response = await moderationApi.getStats()
+    stats.value = response.data.data
+  } catch (error) {
+    console.error('Failed to load moderation stats:', error)
+  }
 }
 
 const loadSuggestions = async (params?: Record<string, any>) => {
@@ -116,16 +120,22 @@ const loadSuggestions = async (params?: Record<string, any>) => {
     const payload = normalizeListPayload<ModerationSuggestion>(response.data)
     suggestions.value = payload.list
     suggestionTotal.value = payload.total
+  } catch (error) {
+    console.error('Failed to load moderation suggestions:', error)
   } finally {
     loading.value = false
   }
 }
 
 const loadViolations = async () => {
-  const response = await moderationApi.listViolations({ page: 1, page_size: 10 })
-  const payload = normalizeListPayload<ViolationRecord>(response.data)
-  violations.value = payload.list
-  violationTotal.value = payload.total
+  try {
+    const response = await moderationApi.listViolations({ page: 1, page_size: 10 })
+    const payload = normalizeListPayload<ViolationRecord>(response.data)
+    violations.value = payload.list
+    violationTotal.value = payload.total
+  } catch (error) {
+    console.error('Failed to load moderation violations:', error)
+  }
 }
 
 const refreshPage = async () => {

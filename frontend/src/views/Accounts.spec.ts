@@ -18,6 +18,12 @@ vi.mock('vue-router', () => ({
   }),
 }))
 
+vi.mock('@/api/proxies', () => ({
+  proxiesApi: {
+    list: vi.fn().mockResolvedValue({ data: { data: { list: [] } } }),
+  },
+}))
+
 vi.mock('@/stores/account', () => ({
   useAccountStore: () => ({
     list: [
@@ -94,6 +100,18 @@ const globalStubs = {
   'el-icon': { template: '<span><slot /></span>' },
   'el-tag': { template: '<span><slot /></span>' },
   'el-alert': { template: '<div><slot /></div>' },
+  'el-drawer': { template: '<div />' },
+  'el-table': { template: '<table />' },
+  'el-table-column': { template: '<td />' },
+  'el-descriptions': { template: '<div />' },
+  'el-descriptions-item': { template: '<div />' },
+}
+
+const globalConfig = {
+  stubs: globalStubs,
+  directives: {
+    loading: { mounted: () => undefined },
+  },
 }
 
 describe('Accounts view', () => {
@@ -107,7 +125,7 @@ describe('Accounts view', () => {
 
   it('renders page and account row', () => {
     const wrapper = mount(Accounts, {
-      global: { stubs: globalStubs },
+      global: globalConfig,
     })
 
     expect(wrapper.text()).toContain('推广账号')
@@ -116,7 +134,7 @@ describe('Accounts view', () => {
   })
 
   it('loads accounts on mount', () => {
-    mount(Accounts, { global: { stubs: globalStubs } })
+    mount(Accounts, { global: globalConfig })
     expect(fetchList).toHaveBeenCalledTimes(1)
     expect(setAccountTypeFilter).toHaveBeenCalledWith('promoter')
     expect(fetchList).toHaveBeenCalledWith({ account_type: 'promoter' })
@@ -124,7 +142,7 @@ describe('Accounts view', () => {
 
   it('calls enable and disable actions', async () => {
     const wrapper = mount(Accounts, {
-      global: { stubs: globalStubs },
+      global: globalConfig,
     })
 
     const vm = wrapper.vm as any
