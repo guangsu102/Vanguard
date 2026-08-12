@@ -449,6 +449,7 @@ class AccountDynamicFrequencyService:
             select(GroupAccountMembership.probe_status, func.count(GroupAccountMembership.id))
             .where(
                 GroupAccountMembership.account_id == account_id,
+                GroupAccountMembership.status == "joined",
                 GroupAccountMembership.last_probe_at >= now - timedelta(hours=24),
             )
             .group_by(GroupAccountMembership.probe_status)
@@ -732,6 +733,7 @@ class AccountDynamicFrequencyService:
         join_attempts: dict[str, Any],
         *,
         config_enabled: bool = True,
+        include_ad_health: bool = True,
         asset_policy: dict[str, Any] | None = None,
         warmup_policy: dict[str, Any] | None = None,
     ) -> str:
@@ -769,7 +771,9 @@ class AccountDynamicFrequencyService:
         probe_rate_unhealthy = recent_probe_success + recent_probe_failed >= 3 and probe_rate < 0.45
         ad_rate_unhealthy = recent_ad_success + recent_ad_failed >= 3 and ad_rate < 0.35
 
-        if health_score < 45 or writable_rate < 0.45 or probe_rate_unhealthy or ad_rate_unhealthy:
+        if health_score < 45 or writable_rate < 0.45 or probe_rate_unhealthy:
+            return "cooldown"
+        if include_ad_health and ad_rate_unhealthy:
             return "cooldown"
         if (
             health_score >= 88
@@ -860,6 +864,7 @@ class AccountDynamicFrequencyService:
             join_metrics,
             join_attempts,
             config_enabled=bool(config.enabled),
+            include_ad_health=False,
             asset_policy=asset_policy,
             warmup_policy=warmup_policy,
         )
@@ -917,6 +922,7 @@ class AccountDynamicFrequencyService:
             join_metrics,
             join_attempts,
             config_enabled=bool(config.enabled),
+            include_ad_health=False,
             asset_policy=asset_policy,
             warmup_policy=warmup_policy,
         )

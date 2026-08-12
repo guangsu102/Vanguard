@@ -1469,6 +1469,67 @@ class TestAdDeliveryFailureHandling:
         assert "leave_error" in membership.note
 
     @pytest.mark.asyncio
+    async def test_group_control_failure_waits_for_configured_threshold(self, test_db, monkeypatch):
+        account = TelegramAccount(
+            phone="+15550000011",
+            identifier="+15550000011",
+            session_name="ad_failure_threshold_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        group = Group(group_id=1946699890, title="Threshold Group", level=GroupLevel.B, status="active")
+        test_db.add_all([account, group])
+        await test_db.flush()
+        membership = GroupAccountMembership(
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            account_id=account.id,
+            status="joined",
+            join_method="manual",
+        )
+        test_db.add_all(
+            [
+                membership,
+                AdDeliveryLog(
+                    account_id=account.id,
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    ad_campaign_id=1,
+                    status=DeliveryStatus.FAILED.value,
+                    error=f"{acquisition_automation.AD_GROUP_CONTROL_ERROR_PREFIX}can't write",
+                ),
+            ]
+        )
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db)
+        service._leave_group = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            acquisition_automation,
+            "get_ad_failure_policy_settings",
+            AsyncMock(
+                return_value={
+                    "enabled": True,
+                    "leave_on_group_control_failure": True,
+                    "group_control_failure_limit": 2,
+                    "group_control_failure_window_hours": 24,
+                    "levels": ["B"],
+                }
+            ),
+        )
+
+        await service._handle_group_control_ad_failure(
+            account.id,
+            group,
+            f"{acquisition_automation.AD_GROUP_CONTROL_ERROR_PREFIX}can't write",
+        )
+
+        await test_db.refresh(membership)
+        assert membership.status == "joined"
+        service._leave_group.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_account_group_ad_daily_capacity_uses_asset_multiplier(self, test_db, monkeypatch):
         account = TelegramAccount(
             phone="+15550000002",
@@ -1703,6 +1764,8 @@ class TestAdDeliveryFailureHandling:
                     telegram_group_id=left_group.group_id,
                     account_id=account.id,
                     status="left",
+                    probe_status="failed",
+                    last_probe_at=now,
                     note='{"passed": false, "can_send_messages": false}',
                     updated_at=now,
                 ),
@@ -1719,6 +1782,8 @@ class TestAdDeliveryFailureHandling:
         assert metrics["writable_checked"] == 1
         assert metrics["writable_success"] == 1
         assert metrics["writable_rate"] == 1.0
+        assert metrics["probe_failed_24h"] == 0
+        assert metrics["probe_success_rate_24h"] == 1.0
 
     @pytest.mark.asyncio
     async def test_limited_account_retains_reduced_join_capacity(self, test_db):
@@ -1877,6 +1942,49 @@ class TestAdDeliveryFailureHandling:
 
         assert segment == "normal"
         assert service.AD_DAILY_RANGES["normal"].maximum == 18
+
+    def test_ad_failures_pause_ads_without_pausing_join_lifecycle(self):
+        now = datetime(2026, 1, 1, 12, 0, 0)
+        account = TelegramAccount(
+            phone="+15550000933",
+            identifier="+15550000933",
+            session_name="ad_join_lifecycle_isolation",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            created_at=now - timedelta(days=30),
+            managed_started_at=now - timedelta(days=30),
+        )
+        service = AccountDynamicFrequencyService(MagicMock())
+        join_metrics = {
+            "writable_rate": 1.0,
+            "probe_success_rate_24h": 1.0,
+            "probe_success_24h": 3,
+            "probe_failed_24h": 0,
+            "ad_success_rate_24h": 0.0,
+            "ad_success_24h": 0,
+            "ad_failed_24h": 3,
+            "average_group_quality_score": 60.0,
+        }
+
+        ad_segment = service.lifecycle_segment(
+            account,
+            now,
+            80.0,
+            join_metrics,
+            {"peer_flood": 0},
+        )
+        join_segment = service.lifecycle_segment(
+            account,
+            now,
+            80.0,
+            join_metrics,
+            {"peer_flood": 0},
+            include_ad_health=False,
+        )
+
+        assert ad_segment == "cooldown"
+        assert join_segment in {"normal", "stable"}
 
     @pytest.mark.asyncio
     async def test_join_health_counts_post_join_filters_as_transport_success(self, test_db):

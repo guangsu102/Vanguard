@@ -7380,7 +7380,27 @@ class AcquisitionAutomationService:
         policy = await get_ad_failure_policy_settings(self.db)
         if not policy["enabled"] or not policy["leave_on_group_control_failure"]:
             return
+        group_level = getattr(group.level, "value", group.level)
+        if str(group_level or "UNRATED").upper() not in set(policy["levels"]):
+            return
         now = _now()
+        since = now - timedelta(hours=int(policy["group_control_failure_window_hours"]))
+        failure_count = int(
+            (
+                await self.db.execute(
+                    select(func.count(AdDeliveryLog.id)).where(
+                        AdDeliveryLog.account_id == account_id,
+                        AdDeliveryLog.group_id == group.id,
+                        AdDeliveryLog.status == DeliveryStatus.FAILED.value,
+                        AdDeliveryLog.error.like(f"{AD_GROUP_CONTROL_ERROR_PREFIX}%"),
+                        AdDeliveryLog.created_at >= since,
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+        if failure_count < int(policy["group_control_failure_limit"]):
+            return
         membership = (
             await self.db.execute(
                 select(GroupAccountMembership).where(
