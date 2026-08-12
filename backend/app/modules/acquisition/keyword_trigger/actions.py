@@ -11,7 +11,7 @@ from typing import Optional
 import structlog
 
 from app.core.account.pool import AccountPool
-from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.account.telegram_execution import TelegramExecutionService
 from app.core.automation_settings import get_group_ai_interaction_settings, is_private_messaging_enabled
 from app.modules.acquisition.rate_limit import AcquisitionRateLimitService
@@ -141,6 +141,8 @@ class ActionExecutor:
             account_id = getattr(account, "id", None) or getattr(account, "account_id", 0)
             if account_id and not await self._group_ai_reply_allowed(account_id, group_id):
                 return None
+            if await self._leave_group_after_repeated_write_forbidden(account, group_id):
+                return None
 
             return await self.telegram_execution.send_group_message(
                 account,
@@ -150,8 +152,41 @@ class ActionExecutor:
                 source="keyword_trigger",
             )
         except Exception as e:
+            if (
+                self.risk_guard is not None
+                and AccountRiskGuard.classify_error(
+                    e, action=AccountRiskAction.GROUP_MESSAGE, target_type="group"
+                )
+                == "group_write_forbidden"
+            ):
+                await self._leave_group_after_repeated_write_forbidden(account, group_id)
             self.logger.error("send_group_reply_failed", group_id=group_id, error=str(e))
             raise
+
+    async def _leave_group_after_repeated_write_forbidden(self, account, group_id: int) -> bool:
+        if self.risk_guard is None or not await self.risk_guard.should_leave_group_after_write_forbidden(
+            account, group_id
+        ):
+            return False
+
+        try:
+            await self.telegram_execution.leave_group_by_id(
+                account, group_id, source="keyword_trigger_write_forbidden"
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "group_write_forbidden_leave_failed", group_id=group_id, error=str(exc)
+            )
+        else:
+            membership_updated = await self.risk_guard.mark_group_write_forbidden_group_left(
+                account, group_id
+            )
+            self.logger.info(
+                "group_write_forbidden_left_group",
+                group_id=group_id,
+                membership_updated=membership_updated,
+            )
+        return True
 
     async def send_private_message(
         self,

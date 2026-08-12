@@ -1,9 +1,24 @@
 from app.core.automation_settings import (
+    normalize_account_risk_guard_settings,
     normalize_account_warmup_policy_settings,
     normalize_ad_capacity_settings,
     normalize_ad_delivery_execution_settings,
     normalize_group_ai_interaction_settings,
 )
+
+
+def test_normalize_account_risk_guard_settings_configures_group_leave_policy():
+    config = normalize_account_risk_guard_settings(
+        {
+            "groupWriteForbidden": {
+                "leaveAfterFailures": 0,
+                "leaveWindowHours": 1000,
+            }
+        }
+    )
+
+    assert config["group_write_forbidden"]["leave_after_failures"] == 1
+    assert config["group_write_forbidden"]["leave_window_hours"] == 720
 
 
 def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():

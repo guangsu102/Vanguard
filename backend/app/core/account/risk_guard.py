@@ -372,7 +372,9 @@ class AccountRiskGuard:
                 action=action,
                 details=merged_details,
             )
-        elif reason == "group_write_forbidden":
+        elif reason == "group_write_forbidden" and self._confirmed_account_wide_group_write_ban(
+            merged_details
+        ):
             await self._escalate_repeated_group_write_forbidden(
                 account,
                 action=action,
@@ -572,7 +574,13 @@ class AccountRiskGuard:
             await self._apply_risk_lifecycle(
                 db_account, datetime.utcnow(), risk_settings=risk_settings, commit=False
             )
-        if db_account is not None and status in {"failure", "freeze"}:
+        group_scoped_write_failure = (
+            status == "failure"
+            and reason == "group_write_forbidden"
+            and target_type == "group"
+            and not self._confirmed_account_wide_group_write_ban(event_details)
+        )
+        if db_account is not None and status in {"failure", "freeze"} and not group_scoped_write_failure:
             now = datetime.utcnow()
             db_account.last_risk_event_at = now
             preserve_group_freeze_reason = (
@@ -590,21 +598,102 @@ class AccountRiskGuard:
                     float(db_account.risk_score or 0.0)
                     + self._risk_score_delta(reason, event_details, risk_settings),
                 )
-                if (
-                    reason == "group_write_forbidden"
-                    and not self._confirmed_account_wide_group_write_ban(event_details)
-                ):
-                    # Group permissions are group-scoped evidence. They may justify a
-                    # temporary freeze, but cannot prove an account-wide write ban.
-                    frozen_threshold = float(
-                        risk_settings.get("level_thresholds", {}).get("frozen", 70.0)
-                    )
-                    db_account.risk_score = min(
-                        db_account.risk_score, max(0.0, frozen_threshold - 1.0)
-                    )
             self._sync_risk_level(db_account, risk_settings=risk_settings)
             self.db.add(db_account)
         await self.db.commit()
+
+    async def should_leave_group_after_write_forbidden(
+        self, account: Any, target_id: Any
+    ) -> bool:
+        """Return whether repeated write failures require leaving this group."""
+        account_id = self._account_id(account)
+        canonical_target_id = self._canonical_group_target_id(target_id)
+        if account_id is None or canonical_target_id is None:
+            return False
+
+        risk_settings = await get_account_risk_guard_settings(self.db)
+        policy = risk_settings.get("group_write_forbidden", {})
+        threshold = int(policy.get("leave_after_failures", 2))
+        window_hours = int(policy.get("leave_window_hours", 24))
+        since = datetime.utcnow() - timedelta(hours=window_hours)
+        result = await self.db.execute(
+            select(AccountRiskEvent.target_id).where(
+                AccountRiskEvent.account_id == account_id,
+                AccountRiskEvent.status == "failure",
+                AccountRiskEvent.reason == "group_write_forbidden",
+                AccountRiskEvent.target_type == "group",
+                AccountRiskEvent.created_at >= since,
+            )
+        )
+        failures = sum(
+            self._canonical_group_target_id(event_target_id) == canonical_target_id
+            for event_target_id in result.scalars().all()
+        )
+        return failures >= threshold
+
+    async def mark_group_write_forbidden_group_left(self, account: Any, target_id: Any) -> bool:
+        """Mark only this account's membership as left after a confirmed group leave."""
+        account_id = self._account_id(account)
+        target_ids = self._group_membership_target_ids(target_id)
+        if account_id is None or not target_ids:
+            return False
+
+        from app.core.group.models import GroupAccountMembership
+
+        membership = None
+        for telegram_group_id in target_ids:
+            result = await self.db.execute(
+                select(GroupAccountMembership).where(
+                    GroupAccountMembership.account_id == account_id,
+                    GroupAccountMembership.telegram_group_id == telegram_group_id,
+                )
+            )
+            membership = result.scalar_one_or_none()
+            if membership is not None:
+                break
+        if membership is None:
+            return False
+
+        now = datetime.utcnow()
+        membership.status = "left"
+        membership.left_at = now
+        membership.last_checked_at = now
+        membership.warmup_status = "blocked"
+        membership.probe_status = "failed"
+        membership.ad_status = "blocked"
+        membership.last_probe_error = "group_write_forbidden"
+        self.db.add(membership)
+        await self.db.commit()
+        return True
+
+    @staticmethod
+    def _canonical_group_target_id(target_id: Any) -> Optional[str]:
+        text = str(target_id or "").strip()
+        if not text:
+            return None
+        if text.startswith("-100") and text[4:].isdigit():
+            return text[4:].lstrip("0") or "0"
+        try:
+            return str(abs(int(text)))
+        except (TypeError, ValueError):
+            return text
+
+    @staticmethod
+    def _group_membership_target_ids(target_id: Any) -> list[int]:
+        text = str(target_id or "").strip()
+        try:
+            exact = int(text)
+        except (TypeError, ValueError):
+            return []
+
+        candidates = [exact]
+        if text.startswith("-100") and text[4:].isdigit():
+            candidates.append(int(text[4:]))
+        elif exact < 0:
+            candidates.append(abs(exact))
+        elif exact > 0:
+            candidates.append(int(f"-100{exact}"))
+        return list(dict.fromkeys(candidates))
 
     async def _escalate_repeated_group_write_forbidden(
         self,
@@ -619,16 +708,7 @@ class AccountRiskGuard:
         account_id = self._account_id(account)
         if account_id is None:
             return
-        if (
-            action
-            not in {
-                AccountRiskAction.AD_DELIVERY,
-                AccountRiskAction.GROUP_MESSAGE,
-                AccountRiskAction.AD_PROBE,
-                AccountRiskAction.AI_WARMUP,
-            }
-            and target_type != "group"
-        ):
+        if not self._confirmed_account_wide_group_write_ban(details):
             return
 
         db_account = await self._get_db_account(account_id)

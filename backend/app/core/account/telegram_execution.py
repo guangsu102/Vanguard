@@ -851,3 +851,17 @@ class TelegramExecutionService:
             user = await client.get_me()
         chat_id = getattr(entity, "id", group_id)
         await client(DeleteChatUserRequest(chat_id, user))
+
+    async def leave_group_by_id(
+        self,
+        account: Any,
+        group_id: int,
+        *,
+        source: str = "group_write_forbidden",
+    ) -> None:
+        """Resolve a known group ID and leave it."""
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        entity = await client.get_input_entity(group_id)
+        await self.leave_group(account, entity, group_id=group_id, source=source)

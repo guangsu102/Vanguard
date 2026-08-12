@@ -281,12 +281,19 @@ class TriggerHandler:
                 )
 
             # 发送回复
-            await self.action_executor.send_group_reply(
+            sent_message_id = await self.action_executor.send_group_reply(
                 account=account,
                 group_id=group_id,
                 message=reply_content,
                 reply_to=message_id,
             )
+            if sent_message_id is None:
+                return TriggerResult(
+                    success=False,
+                    action_taken=TriggerActionType.REPLY,
+                    error="Group reply was not sent",
+                    matched_keyword=match.keyword_text,
+                )
 
             # 记录
             record_action = (

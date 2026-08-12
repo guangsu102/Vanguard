@@ -7,12 +7,23 @@ import pytest
 from sqlalchemy import select
 
 import app.modules.acquisition.automation as acquisition_automation
-from app.core.account.models import AccountOperationConfig, AccountStatus, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountOperationConfig,
+    AccountStatus,
+    AccountType,
+    TelegramAccount,
+)
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.automation import AcquisitionAutomationService
 from app.modules.acquisition.auto_reply.semantic_reply import SemanticGroupReplyEngine
+from app.modules.acquisition.keyword_trigger.actions import ActionExecutor, TriggerActionType
 from app.modules.acquisition.keyword_trigger.handler import TriggerHandler
-from app.modules.acquisition.models import AcquisitionMessage, AcquisitionTracking, MessageType
+from app.modules.acquisition.models import (
+    AcquisitionMessage,
+    AcquisitionTracking,
+    MessageType,
+    TriggerAction,
+)
 
 
 @pytest.mark.asyncio
@@ -140,3 +151,69 @@ async def test_capacity_cleanup_leaves_only_old_zero_conversion_group(test_db, m
     assert zero_membership.status == "left"
     assert "capacity_cleanup_no_recent_conversion" in zero_membership.note
     assert converted_membership.status == "joined"
+
+
+@pytest.mark.asyncio
+async def test_group_reply_leaves_repeated_write_forbidden_group_without_sending():
+    account = SimpleNamespace(account_id=41)
+    risk_guard = SimpleNamespace(
+        should_leave_group_after_write_forbidden=AsyncMock(return_value=True),
+        mark_group_write_forbidden_group_left=AsyncMock(return_value=True),
+    )
+    executor = ActionExecutor(SimpleNamespace(), risk_guard=risk_guard)
+    executor._group_ai_reply_allowed = AsyncMock(return_value=True)
+    executor.telegram_execution = SimpleNamespace(
+        leave_group_by_id=AsyncMock(),
+        send_group_message=AsyncMock(return_value=99),
+    )
+
+    result = await executor.send_group_reply(account, -100123, "hello", reply_to=8)
+
+    assert result is None
+    executor.telegram_execution.leave_group_by_id.assert_awaited_once_with(
+        account,
+        -100123,
+        source="keyword_trigger_write_forbidden",
+    )
+    executor.telegram_execution.send_group_message.assert_not_awaited()
+    risk_guard.mark_group_write_forbidden_group_left.assert_awaited_once_with(
+        account, -100123
+    )
+
+
+@pytest.mark.asyncio
+async def test_unsent_keyword_reply_is_not_recorded_as_success(monkeypatch):
+    account = SimpleNamespace(account_id=42)
+    pool = SimpleNamespace(
+        acquire=AsyncMock(return_value=account),
+        release=AsyncMock(),
+    )
+    handler = TriggerHandler.__new__(TriggerHandler)
+    handler.db = MagicMock()
+    handler.account_pool = pool
+    handler.action_executor = SimpleNamespace(send_group_reply=AsyncMock(return_value=None))
+    handler._generate_reply = AsyncMock(return_value="generated reply")
+    handler._record_trigger = AsyncMock()
+    handler.logger = MagicMock()
+    trigger = SimpleNamespace(id=1, action=TriggerAction.REPLY_TEMPLATE)
+    match = SimpleNamespace(keyword_text="promo")
+    monkeypatch.setattr(
+        "app.modules.acquisition.keyword_trigger.handler.get_group_ai_interaction_settings",
+        AsyncMock(return_value={"allowKeywordTriggeredReply": True}),
+    )
+
+    result = await handler._execute_reply(
+        trigger,
+        match,
+        "promo",
+        user_id=10,
+        group_id=-100123,
+        message_id=11,
+        context=None,
+    )
+
+    assert result.success is False
+    assert result.action_taken == TriggerActionType.REPLY
+    assert result.error == "Group reply was not sent"
+    handler._record_trigger.assert_not_awaited()
+    pool.release.assert_awaited_once_with(account)

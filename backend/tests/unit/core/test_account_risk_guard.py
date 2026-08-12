@@ -4,8 +4,15 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
-from app.core.account.models import AccountRiskDailyStat, AccountRiskEvent, AccountStatus, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountRiskDailyStat,
+    AccountRiskEvent,
+    AccountStatus,
+    AccountType,
+    TelegramAccount,
+)
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 
 
 @pytest.mark.asyncio
@@ -266,7 +273,7 @@ async def test_risk_guard_quarantines_banned_account(test_db):
 
 
 @pytest.mark.asyncio
-async def test_ad_delivery_group_ban_adds_risk_without_immediate_quarantine(test_db):
+async def test_group_scoped_write_ban_does_not_add_account_risk(test_db):
     account = TelegramAccount(
         phone="+15559990036",
         identifier="+15559990036",
@@ -291,9 +298,9 @@ async def test_ad_delivery_group_ban_adds_risk_without_immediate_quarantine(test
     )
     await test_db.refresh(account)
 
-    assert account.risk_score == 12.0
+    assert account.risk_score == 0.0
     assert account.risk_level == "normal"
-    assert account.risk_reason == "group_write_forbidden"
+    assert account.risk_reason is None
 
     events = (await test_db.execute(select(AccountRiskEvent))).scalars().all()
     assert len(events) == 1
@@ -302,7 +309,7 @@ async def test_ad_delivery_group_ban_adds_risk_without_immediate_quarantine(test
 
 
 @pytest.mark.asyncio
-async def test_repeated_group_write_forbidden_freezes_account(test_db):
+async def test_repeated_group_write_forbidden_triggers_only_same_group_leave(test_db):
     account = TelegramAccount(
         phone="+15559990038",
         identifier="+15559990038",
@@ -312,35 +319,77 @@ async def test_repeated_group_write_forbidden_freezes_account(test_db):
         session_name="risk_repeated_group_ban_session",
         status=AccountStatus.ONLINE,
     )
-    test_db.add(account)
+    other_account = TelegramAccount(
+        phone="+15559990048",
+        identifier="+15559990048",
+        account_type=AccountType.PROMOTER,
+        api_config_name="default",
+        country_code="US",
+        session_name="risk_other_group_ban_session",
+        status=AccountStatus.ONLINE,
+    )
+    group = Group(group_id=-100987654321, title="Read Only", level=GroupLevel.C)
+    test_db.add_all([account, other_account, group])
+    await test_db.flush()
+    membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=-100987654321,
+        account_id=account.id,
+        status="joined",
+    )
+    other_membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=-100987654321,
+        account_id=other_account.id,
+        status="joined",
+    )
+    test_db.add_all([membership, other_membership])
     await test_db.commit()
     await test_db.refresh(account)
 
     wrapper = SimpleNamespace(account_id=account.id, country_code="US")
     guard = AccountRiskGuard(test_db)
-    for index in range(5):
-        await guard.record_failure(
-            wrapper,
-            AccountRiskAction.AD_DELIVERY,
-            "You're banned from sending messages in supergroups/channels",
-            target_type="group",
-            target_id=f"@example_{index}",
-        )
+    await guard.record_failure(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        "CHAT_WRITE_FORBIDDEN",
+        target_type="group",
+        target_id="-100987654321",
+    )
+    assert await guard.should_leave_group_after_write_forbidden(wrapper, 987654321) is False
+
+    await guard.record_failure(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        "CHAT_WRITE_FORBIDDEN",
+        target_type="group",
+        target_id="987654321",
+    )
+    assert await guard.should_leave_group_after_write_forbidden(wrapper, -100987654321) is True
+    assert await guard.should_leave_group_after_write_forbidden(wrapper, -100111111111) is False
+    assert await guard.mark_group_write_forbidden_group_left(wrapper, 987654321) is True
 
     await test_db.refresh(account)
+    await test_db.refresh(membership)
+    await test_db.refresh(other_membership)
 
-    assert account.risk_pause_until is not None
-    assert account.risk_level == "frozen"
-    assert account.risk_reason == "platform_group_write_repeated"
-    assert account.risk_score == 60.0
+    assert account.risk_pause_until is None
+    assert account.risk_level == "normal"
+    assert account.risk_score == 0.0
+    assert membership.status == "left"
+    assert membership.warmup_status == "blocked"
+    assert membership.probe_status == "failed"
+    assert membership.ad_status == "blocked"
+    assert membership.last_probe_error == "group_write_forbidden"
+    assert other_membership.status == "joined"
 
     events = (await test_db.execute(select(AccountRiskEvent).order_by(AccountRiskEvent.id))).scalars().all()
-    assert events[-1].status == "freeze"
-    assert events[-1].reason == "platform_group_write_repeated"
+    assert len(events) == 2
+    assert all(event.status == "failure" for event in events)
 
 
 @pytest.mark.asyncio
-async def test_many_group_write_forbidden_does_not_quarantine_without_control_probe(test_db):
+async def test_many_group_scoped_write_failures_do_not_freeze_account(test_db):
     account = TelegramAccount(
         phone="+15559990039",
         identifier="+15559990039",
@@ -367,18 +416,18 @@ async def test_many_group_write_forbidden_does_not_quarantine_without_control_pr
 
     await test_db.refresh(account)
 
-    assert account.risk_score == 69.0
-    assert account.risk_level == "frozen"
-    assert account.risk_reason == "platform_group_write_repeated"
+    assert account.risk_score == 0.0
+    assert account.risk_level == "normal"
+    assert account.risk_reason is None
 
     decision = await guard.check_and_reserve(
         wrapper,
-        AccountRiskAction.AD_DELIVERY,
+        AccountRiskAction.REACTION,
         target_type="group",
         target_id="@next_group",
     )
-    assert decision.allowed is False
-    assert decision.reason == "platform_group_write_repeated"
+    assert decision.allowed is True
+    assert decision.reason == "allowed"
 
 
 @pytest.mark.asyncio

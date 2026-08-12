@@ -292,3 +292,22 @@ async def test_update_channel_username_uses_owner_session():
     request = client.request_calls[-1]
     assert request.username == "pipenai_news"
     risk_guard.record_success.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_leave_group_by_id_resolves_entity_before_leaving():
+    entity = SimpleNamespace(id=123, megagroup=True)
+    client = SimpleNamespace(get_input_entity=AsyncMock(return_value=entity))
+    account = SimpleNamespace(account_id=9, client=client)
+    service = TelegramExecutionService()
+    service.leave_group = AsyncMock()
+
+    await service.leave_group_by_id(account, -100123, source="test_write_forbidden")
+
+    client.get_input_entity.assert_awaited_once_with(-100123)
+    service.leave_group.assert_awaited_once_with(
+        account,
+        entity,
+        group_id=-100123,
+        source="test_write_forbidden",
+    )

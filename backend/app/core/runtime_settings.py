@@ -219,6 +219,8 @@ DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
         "max_budget_multiplier": 1.0,
     },
     "group_write_forbidden": {
+        "leave_after_failures": 2,
+        "leave_window_hours": 24,
         "freeze_window_hours": 2,
         "freeze_distinct_groups": 5,
         "quarantine_window_hours": 24,
@@ -1374,6 +1376,24 @@ def get_account_risk_guard_settings() -> dict[str, Any]:
         group_write_raw = {}
     group_write_defaults = defaults["group_write_forbidden"]
     group_write_forbidden = {
+        "leave_after_failures": _int_setting(
+            group_write_raw.get(
+                "leave_after_failures",
+                group_write_raw.get("leaveAfterFailures", group_write_defaults["leave_after_failures"]),
+            ),
+            group_write_defaults["leave_after_failures"],
+            min_value=1,
+            max_value=20,
+        ),
+        "leave_window_hours": _int_setting(
+            group_write_raw.get(
+                "leave_window_hours",
+                group_write_raw.get("leaveWindowHours", group_write_defaults["leave_window_hours"]),
+            ),
+            group_write_defaults["leave_window_hours"],
+            min_value=1,
+            max_value=720,
+        ),
         "freeze_window_hours": _int_setting(
             group_write_raw.get("freeze_window_hours", group_write_raw.get("freezeWindowHours", group_write_defaults["freeze_window_hours"])),
             group_write_defaults["freeze_window_hours"],
