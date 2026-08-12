@@ -245,6 +245,42 @@ async def test_risk_guard_recovers_after_pause_and_decays_score(test_db):
 
 
 @pytest.mark.asyncio
+async def test_risk_failure_resets_decay_baseline(test_db):
+    stale_decay = datetime.utcnow() - timedelta(days=10)
+    account = TelegramAccount(
+        phone="+15559990038",
+        identifier="+15559990038",
+        account_type=AccountType.PROMOTER,
+        api_config_name="default",
+        country_code="US",
+        session_name="risk_decay_baseline_session",
+        status=AccountStatus.ONLINE,
+        risk_score=10.0,
+        risk_level="normal",
+        last_risk_event_at=stale_decay,
+        last_risk_decay_at=stale_decay,
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    before = datetime.utcnow()
+    wrapper = SimpleNamespace(account_id=account.id, country_code="US")
+    guard = AccountRiskGuard(test_db)
+    await guard.record_failure(
+        wrapper,
+        AccountRiskAction.JOIN,
+        "flood_wait",
+        target_type="group",
+        target_id="demo",
+    )
+    await test_db.refresh(account)
+
+    assert account.last_risk_event_at >= before
+    assert account.last_risk_decay_at >= before
+    assert account.last_risk_decay_at == account.last_risk_event_at
+
+@pytest.mark.asyncio
 async def test_risk_guard_quarantines_banned_account(test_db):
     account = TelegramAccount(
         phone="+15559990034",

@@ -1654,6 +1654,113 @@ class TestAdDeliveryFailureHandling:
         assert config.business_stage == "cooldown"
 
     @pytest.mark.asyncio
+    async def test_zero_dynamic_join_limit_reports_health_pause(self, test_db):
+        service = AcquisitionAutomationService(db=test_db)
+        service._auto_join_dynamic_daily_limit = AsyncMock(return_value=0)
+
+        reason = await service._check_join_quota(SimpleNamespace(account_id=3))
+
+        assert reason == "account_dynamic_health_paused"
+
+    @pytest.mark.asyncio
+    async def test_join_health_includes_old_joined_memberships_and_ignores_left(self, test_db):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            phone="+15550000931",
+            identifier="+15550000931",
+            session_name="old_joined_health_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            created_at=now - timedelta(days=60),
+        )
+        joined_group = Group(
+            group_id=903001,
+            title="Old Joined Group",
+            level=GroupLevel.B,
+            status="active",
+        )
+        left_group = Group(
+            group_id=903002,
+            title="Recently Left Group",
+            level=GroupLevel.B,
+            status="active",
+        )
+        test_db.add_all([account, joined_group, left_group])
+        await test_db.flush()
+        test_db.add_all(
+            [
+                GroupAccountMembership(
+                    group_id=joined_group.id,
+                    telegram_group_id=joined_group.group_id,
+                    account_id=account.id,
+                    status="joined",
+                    note='{"passed": true, "can_send_messages": true}',
+                    updated_at=now - timedelta(days=30),
+                ),
+                GroupAccountMembership(
+                    group_id=left_group.id,
+                    telegram_group_id=left_group.group_id,
+                    account_id=account.id,
+                    status="left",
+                    note='{"passed": false, "can_send_messages": false}',
+                    updated_at=now,
+                ),
+            ]
+        )
+        await test_db.commit()
+
+        metrics = await AccountDynamicFrequencyService(test_db).account_join_quality_metrics(
+            account.id,
+            now,
+        )
+
+        assert metrics["joined_groups"] == 1
+        assert metrics["writable_checked"] == 1
+        assert metrics["writable_success"] == 1
+        assert metrics["writable_rate"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_limited_account_retains_reduced_join_capacity(self, test_db):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            phone="+15550000932",
+            identifier="+15550000932",
+            session_name="limited_join_capacity_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            risk_score=69.0,
+            risk_level="limited",
+            created_at=now - timedelta(days=30),
+            managed_started_at=now - timedelta(days=30),
+            warmup_stage="normal",
+        )
+        config = AccountOperationConfig(
+            account=account,
+            auto_join_enabled=True,
+            max_groups_per_day=100,
+            max_groups_total=1000,
+            business_stage="cooldown",
+            enabled=True,
+        )
+        test_db.add_all([account, config])
+        await test_db.commit()
+
+        service = AccountDynamicFrequencyService(test_db)
+        health = await service.account_health(account.id, now)
+        limit = await service.auto_join_dynamic_daily_limit(config, now)
+
+        assert health["health_score"] >= 45
+        assert not any(
+
+            item["reason"] in {"risk_score", "risk_level_limited"}
+            for item in health["adjustments"]
+        )
+        assert service.account_risk_limit_multiplier(account, now) == 0.35
+        assert limit > 0
+
+    @pytest.mark.asyncio
     async def test_business_stage_sync_clears_stale_join_cooldown(self, test_db):
         now = datetime(2026, 1, 1, 12, 0, 0)
         account = TelegramAccount(

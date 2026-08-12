@@ -489,10 +489,12 @@ class AccountRiskGuard:
             )
         pause_until = datetime.utcnow() + timedelta(seconds=max(60, int(seconds)))
         if db_account is not None:
+            now = datetime.utcnow()
             if db_account.risk_pause_until is None or db_account.risk_pause_until < pause_until:
                 db_account.risk_pause_until = pause_until
             db_account.risk_reason = reason
-            db_account.last_risk_event_at = datetime.utcnow()
+            db_account.last_risk_event_at = now
+            db_account.last_risk_decay_at = now
             db_account.risk_level = AccountRiskLevel.FROZEN.value
             self.db.add(db_account)
             await self.db.commit()
@@ -515,10 +517,12 @@ class AccountRiskGuard:
         account_id = self._account_id(account)
         db_account = await self._get_db_account(account_id)
         if db_account is not None:
+            now = datetime.utcnow()
             db_account.risk_score = 100.0
             db_account.risk_level = AccountRiskLevel.QUARANTINED.value
             db_account.risk_reason = reason
-            db_account.last_risk_event_at = datetime.utcnow()
+            db_account.last_risk_event_at = now
+            db_account.last_risk_decay_at = now
             self.db.add(db_account)
             await self.db.commit()
         await self.record_event(
@@ -583,6 +587,7 @@ class AccountRiskGuard:
         if db_account is not None and status in {"failure", "freeze"} and not group_scoped_write_failure:
             now = datetime.utcnow()
             db_account.last_risk_event_at = now
+            db_account.last_risk_decay_at = now
             preserve_group_freeze_reason = (
                 status == "failure"
                 and reason == "group_write_forbidden"

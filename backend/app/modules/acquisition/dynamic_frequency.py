@@ -414,7 +414,7 @@ class AccountDynamicFrequencyService:
             .options(selectinload(GroupAccountMembership.group))
             .where(
                 GroupAccountMembership.account_id == account_id,
-                GroupAccountMembership.updated_at >= now - timedelta(days=14),
+                GroupAccountMembership.status == "joined",
             )
             .order_by(desc(GroupAccountMembership.updated_at))
             .limit(120)
@@ -432,7 +432,7 @@ class AccountDynamicFrequencyService:
                 writable_checked += 1
                 if audit.get("can_send_messages") is True:
                     writable_success += 1
-            if membership.status != "joined" or membership.group is None:
+            if membership.group is None:
                 continue
             joined_groups += 1
             group = membership.group
@@ -633,7 +633,6 @@ class AccountDynamicFrequencyService:
             adjustments.append({"reason": reason, "delta": round(delta, 2)})
 
         risk_score = float(getattr(account, "risk_score", 0.0) or 0.0) if account is not None else 50.0
-        adjust("risk_score", -risk_score)
         if account is None:
             adjust("account_missing", -50.0)
         else:
@@ -645,11 +644,7 @@ class AccountDynamicFrequencyService:
                 adjust(account.risk_reason or "account_risk_paused", -100.0)
             if account.risk_recovery_until and account.risk_recovery_until > now:
                 adjust("risk_recovery", -18.0)
-            if account.risk_level == AccountRiskLevel.WATCH.value:
-                adjust("risk_level_watch", -8.0)
-            elif account.risk_level == AccountRiskLevel.LIMITED.value:
-                adjust("risk_level_limited", -22.0)
-            elif account.risk_level == AccountRiskLevel.FROZEN.value:
+            if account.risk_level == AccountRiskLevel.FROZEN.value:
                 adjust("risk_level_frozen", -100.0)
             elif account.risk_level == AccountRiskLevel.QUARANTINED.value:
                 adjust("risk_level_quarantined", -100.0)

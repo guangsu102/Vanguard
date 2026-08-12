@@ -1555,6 +1555,8 @@ class AcquisitionAutomationService:
         now = _now()
         today = _day_start(now)
         join_daily_limit = await self._auto_join_dynamic_daily_limit(config, now)
+        if join_daily_limit <= 0:
+            return "account_dynamic_health_paused"
         attempted_today = await self.db.execute(
             select(func.count(AutoJoinAttempt.id)).where(
                 AutoJoinAttempt.account_id == config.account_id,
