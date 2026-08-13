@@ -156,26 +156,35 @@ const defaultRiskActions = () =>
       item.value,
       {
         daily_limit:
-          item.value === 'search' || item.value === 'join'
+          item.value === 'search'
             ? 100
-            : item.value === 'ad_delivery'
-              ? 40000
-              : 1,
+            : item.value === 'join'
+              ? 6
+              : item.value === 'group_message'
+                ? 4
+                : item.value === 'ad_delivery'
+                  ? 5
+                  : 1,
         cooldown_seconds:
           item.value === 'search'
             ? 30
-            : item.value === 'join'
-              ? 60
-              : item.value === 'channel_create'
+            : item.value === 'join' || item.value === 'group_message'
+              ? 7200
+              : item.value === 'ad_probe' || item.value === 'channel_create'
                 ? 86400
-                : 0,
+                : item.value === 'ai_warmup'
+                  ? 21600
+                  : item.value === 'ad_delivery'
+                    ? 9000
+                    : 0,
       },
     ]),
   )
 
 const accountRiskGuardForm = reactive<AccountRiskGuardSettings>({
   enabled: true,
-  global_daily_limit: 200,
+  global_daily_limit: 30,
+  group_write_daily_limit: 8,
   redis_fail_closed: null,
   actions: defaultRiskActions(),
   level_thresholds: { watch: 20, limited: 45, frozen: 70, quarantined: 90 },
@@ -482,6 +491,7 @@ const schedulerSummary = computed<PolicySummaryItem[]>(() => [
 const riskSummary = computed<PolicySummaryItem[]>(() => [
   { label: '风控开关', value: booleanText(accountRiskGuardForm.enabled), type: booleanTagType(accountRiskGuardForm.enabled) },
   { label: '单号总日额度', value: accountRiskGuardForm.global_daily_limit },
+  { label: '共享群写日额度', value: accountRiskGuardForm.group_write_daily_limit },
   { label: '单号加群额度', value: accountRiskGuardForm.actions.join?.daily_limit ?? '-' },
   { label: '单号广告额度', value: accountRiskGuardForm.actions.ad_delivery?.daily_limit ?? '-' },
   { label: '单号群消息额度', value: accountRiskGuardForm.actions.group_message?.daily_limit ?? '-' },
@@ -602,6 +612,7 @@ const fillAdFailurePolicyForm = (config: AdFailurePolicy) => {
 const fillAccountRiskGuardForm = (config: AccountRiskGuardSettings) => {
   accountRiskGuardForm.enabled = config.enabled
   accountRiskGuardForm.global_daily_limit = config.global_daily_limit
+  accountRiskGuardForm.group_write_daily_limit = config.group_write_daily_limit
   accountRiskGuardForm.redis_fail_closed = config.redis_fail_closed
   const actions = defaultRiskActions()
   for (const item of riskActionOptions) {

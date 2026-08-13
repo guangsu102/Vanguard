@@ -158,17 +158,18 @@ DEFAULT_PRIVATE_MESSAGING_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "global_daily_limit": 200,
+    "global_daily_limit": 30,
+    "group_write_daily_limit": 8,
     "redis_fail_closed": None,
     "actions": {
         "search": {"daily_limit": 100, "cooldown_seconds": 30},
-        "join": {"daily_limit": 15, "cooldown_seconds": 1200},
+        "join": {"daily_limit": 6, "cooldown_seconds": 7200},
         "private_message": {"daily_limit": 20, "cooldown_seconds": 300},
-        "group_message": {"daily_limit": 20, "cooldown_seconds": 300},
-        "ad_probe": {"daily_limit": 10, "cooldown_seconds": 1800},
-        "ai_warmup": {"daily_limit": 10, "cooldown_seconds": 1800},
+        "group_message": {"daily_limit": 4, "cooldown_seconds": 7200},
+        "ad_probe": {"daily_limit": 1, "cooldown_seconds": 86400},
+        "ai_warmup": {"daily_limit": 1, "cooldown_seconds": 21600},
         "moderation": {"daily_limit": 60, "cooldown_seconds": 15},
-        "ad_delivery": {"daily_limit": 50, "cooldown_seconds": 300},
+        "ad_delivery": {"daily_limit": 5, "cooldown_seconds": 9000},
         "profile_update": {"daily_limit": 5, "cooldown_seconds": 3600},
         "reaction": {"daily_limit": 120, "cooldown_seconds": 10},
         "forward": {"daily_limit": 25, "cooldown_seconds": 120},
@@ -288,7 +289,7 @@ DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS: dict[str, Any] = {
 DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "default_warmup_days": 15,
-    "minimum_warmup_days": 5,
+    "minimum_warmup_days": 7,
     "user_initiated_private_message_multiplier": 1.0,
     "tiers": {
         "unknown": {"warmup_days": 15},
@@ -369,11 +370,11 @@ DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "delivery_interval_seconds": 3600,
+    "delivery_interval_seconds": 9000,
     "batch_window_seconds": 3600,
     "batch_size_min": 1,
     "batch_size_max": 1,
-    "cooldown_min_seconds": 3600,
+    "cooldown_min_seconds": 9000,
     "cooldown_max_seconds": 10800,
 }
 DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
@@ -381,7 +382,7 @@ DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "dispatcher_interval_seconds": 60,
     "max_deliveries_per_run": 1,
     "max_deliveries_per_account_per_run": 1,
-    "group_campaign_cooldown_minutes": 1440,
+    "group_campaign_cooldown_minutes": 4320,
     "stop_account_after_success": True,
     "stop_account_after_failure": True,
 }
@@ -397,11 +398,11 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "survival_retry_max_attempts": 3,
     "survival_retry_base_seconds": 300,
     "account_ad_daily_hard_cap": 5,
-    "account_group_daily_cap_default": 3,
+    "account_group_daily_cap_default": 1,
     "group_global_daily_hard_cap": 400,
-    "group_min_interval_seconds": 3600,
+    "group_min_interval_seconds": 259200,
     "max_groups_per_account": 400,
-    "max_new_ad_groups_per_day": 3,
+    "max_new_ad_groups_per_day": 2,
     "leave_on_deleted_ad": True,
     "block_group_on_probe_failure": True,
     "ad_policy_ai_enabled": True,
@@ -961,14 +962,16 @@ def get_ad_delivery_throttle_settings() -> dict[str, Any]:
         raw.get("batch_size_min", raw.get("batchSizeMin", DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["batch_size_min"])),
         DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["batch_size_min"],
         min_value=1,
-        max_value=10000,
+        max_value=1,
     )
     batch_size_max = _int_setting(
         raw.get("batch_size_max", raw.get("batchSizeMax", DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["batch_size_max"])),
         DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["batch_size_max"],
         min_value=1,
-        max_value=10000,
+        max_value=1,
     )
+    batch_size_min = 1
+    batch_size_max = 1
     if batch_size_max < batch_size_min:
         batch_size_max = batch_size_min
 
@@ -978,7 +981,7 @@ def get_ad_delivery_throttle_settings() -> dict[str, Any]:
             raw.get("cooldownMinSeconds", DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["cooldown_min_seconds"]),
         ),
         DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["cooldown_min_seconds"],
-        min_value=0,
+        min_value=9000,
         max_value=86400,
     )
     cooldown_max_seconds = _int_setting(
@@ -987,7 +990,7 @@ def get_ad_delivery_throttle_settings() -> dict[str, Any]:
             raw.get("cooldownMaxSeconds", DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["cooldown_max_seconds"]),
         ),
         DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["cooldown_max_seconds"],
-        min_value=0,
+        min_value=9000,
         max_value=86400,
     )
     if cooldown_max_seconds < cooldown_min_seconds:
@@ -1001,8 +1004,8 @@ def get_ad_delivery_throttle_settings() -> dict[str, Any]:
                 raw.get("deliveryIntervalSeconds", DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["delivery_interval_seconds"]),
             ),
             DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS["delivery_interval_seconds"],
-            min_value=0,
-            max_value=3600,
+            min_value=9000,
+            max_value=86400,
         ),
         "batch_window_seconds": _int_setting(
             raw.get(
@@ -1038,8 +1041,8 @@ def save_ad_delivery_throttle_settings(config: dict[str, Any]) -> dict[str, Any]
             "delivery_interval_seconds": _int_setting(
                 config.get("delivery_interval_seconds", config.get("deliveryIntervalSeconds", current["delivery_interval_seconds"])),
                 current["delivery_interval_seconds"],
-                min_value=0,
-                max_value=3600,
+                min_value=9000,
+                max_value=86400,
             ),
             "batch_window_seconds": _int_setting(
                 config.get("batch_window_seconds", config.get("batchWindowSeconds", current["batch_window_seconds"])),
@@ -1051,28 +1054,30 @@ def save_ad_delivery_throttle_settings(config: dict[str, Any]) -> dict[str, Any]
                 config.get("batch_size_min", config.get("batchSizeMin", current["batch_size_min"])),
                 current["batch_size_min"],
                 min_value=1,
-                max_value=10000,
+                max_value=1,
             ),
             "batch_size_max": _int_setting(
                 config.get("batch_size_max", config.get("batchSizeMax", current["batch_size_max"])),
                 current["batch_size_max"],
                 min_value=1,
-                max_value=10000,
+                max_value=1,
             ),
             "cooldown_min_seconds": _int_setting(
                 config.get("cooldown_min_seconds", config.get("cooldownMinSeconds", current["cooldown_min_seconds"])),
                 current["cooldown_min_seconds"],
-                min_value=0,
+                min_value=9000,
                 max_value=86400,
             ),
             "cooldown_max_seconds": _int_setting(
                 config.get("cooldown_max_seconds", config.get("cooldownMaxSeconds", current["cooldown_max_seconds"])),
                 current["cooldown_max_seconds"],
-                min_value=0,
+                min_value=9000,
                 max_value=86400,
             ),
         }
     )
+    throttle["batch_size_min"] = 1
+    throttle["batch_size_max"] = 1
     if throttle["batch_size_max"] < throttle["batch_size_min"]:
         throttle["batch_size_max"] = throttle["batch_size_min"]
     if throttle["cooldown_max_seconds"] < throttle["cooldown_min_seconds"]:
@@ -1107,7 +1112,7 @@ def get_ad_delivery_execution_settings() -> dict[str, Any]:
             raw.get("max_deliveries_per_run", raw.get("maxDeliveriesPerRun", defaults["max_deliveries_per_run"])),
             defaults["max_deliveries_per_run"],
             min_value=1,
-            max_value=20,
+            max_value=1,
         ),
         "max_deliveries_per_account_per_run": _int_setting(
             raw.get(
@@ -1116,12 +1121,12 @@ def get_ad_delivery_execution_settings() -> dict[str, Any]:
             ),
             defaults["max_deliveries_per_account_per_run"],
             min_value=1,
-            max_value=5,
+            max_value=1,
         ),
         "group_campaign_cooldown_minutes": _int_setting(
             raw.get("group_campaign_cooldown_minutes", raw.get("groupCampaignCooldownMinutes", defaults["group_campaign_cooldown_minutes"])),
             defaults["group_campaign_cooldown_minutes"],
-            min_value=0,
+            min_value=4320,
             max_value=10080,
         ),
         "stop_account_after_success": _bool_setting(
@@ -1160,7 +1165,7 @@ def save_ad_delivery_execution_settings(config: dict[str, Any]) -> dict[str, Any
                 config.get("max_deliveries_per_run", config.get("maxDeliveriesPerRun", current["max_deliveries_per_run"])),
                 current["max_deliveries_per_run"],
                 min_value=1,
-                max_value=20,
+                max_value=1,
             ),
             "max_deliveries_per_account_per_run": _int_setting(
                 config.get(
@@ -1169,12 +1174,12 @@ def save_ad_delivery_execution_settings(config: dict[str, Any]) -> dict[str, Any
                 ),
                 current["max_deliveries_per_account_per_run"],
                 min_value=1,
-                max_value=5,
+                max_value=1,
             ),
             "group_campaign_cooldown_minutes": _int_setting(
                 config.get("group_campaign_cooldown_minutes", config.get("groupCampaignCooldownMinutes", current["group_campaign_cooldown_minutes"])),
                 current["group_campaign_cooldown_minutes"],
-                min_value=0,
+                min_value=4320,
                 max_value=10080,
             ),
             "stop_account_after_success": _bool_setting(
@@ -1210,6 +1215,22 @@ def get_account_risk_guard_settings() -> dict[str, Any]:
     if not isinstance(actions_raw, dict):
         actions_raw = {}
     actions: dict[str, dict[str, int]] = {}
+    action_hard_limits = {
+        "join": 6,
+        "group_message": 4,
+        "ad_probe": 1,
+        "ai_warmup": 1,
+        "ad_delivery": 5,
+        "channel_create": 1,
+    }
+    action_min_cooldowns = {
+        "join": 7200,
+        "group_message": 7200,
+        "ad_probe": 86400,
+        "ai_warmup": 21600,
+        "ad_delivery": 9000,
+        "channel_create": 86400,
+    }
     for action, default_budget in defaults["actions"].items():
         item = actions_raw.get(action, {})
         if not isinstance(item, dict):
@@ -1219,13 +1240,16 @@ def get_account_risk_guard_settings() -> dict[str, Any]:
                 item.get("daily_limit", item.get("dailyLimit", default_budget["daily_limit"])),
                 default_budget["daily_limit"],
                 min_value=1,
-                max_value=100000,
+                max_value=action_hard_limits.get(action, 100000),
             ),
-            "cooldown_seconds": _int_setting(
-                item.get("cooldown_seconds", item.get("cooldownSeconds", default_budget["cooldown_seconds"])),
-                default_budget["cooldown_seconds"],
-                min_value=0,
-                max_value=86400,
+            "cooldown_seconds": max(
+                action_min_cooldowns.get(action, 0),
+                _int_setting(
+                    item.get("cooldown_seconds", item.get("cooldownSeconds", default_budget["cooldown_seconds"])),
+                    default_budget["cooldown_seconds"],
+                    min_value=0,
+                    max_value=86400,
+                ),
             ),
         }
 
@@ -1462,7 +1486,16 @@ def get_account_risk_guard_settings() -> dict[str, Any]:
             raw.get("global_daily_limit", raw.get("globalDailyLimit", defaults["global_daily_limit"])),
             defaults["global_daily_limit"],
             min_value=1,
-            max_value=200,
+            max_value=30,
+        ),
+        "group_write_daily_limit": _int_setting(
+            raw.get(
+                "group_write_daily_limit",
+                raw.get("groupWriteDailyLimit", defaults["group_write_daily_limit"]),
+            ),
+            defaults["group_write_daily_limit"],
+            min_value=1,
+            max_value=8,
         ),
         "redis_fail_closed": redis_fail_closed,
         "actions": actions,
@@ -1492,7 +1525,16 @@ def save_account_risk_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
         config.get("global_daily_limit", config.get("globalDailyLimit", current["global_daily_limit"])),
         current["global_daily_limit"],
         min_value=1,
-        max_value=200,
+        max_value=30,
+    )
+    guard["group_write_daily_limit"] = _int_setting(
+        config.get(
+            "group_write_daily_limit",
+            config.get("groupWriteDailyLimit", current["group_write_daily_limit"]),
+        ),
+        current["group_write_daily_limit"],
+        min_value=1,
+        max_value=8,
     )
 
     if "redis_fail_closed" in config or "redisFailClosed" in config:
@@ -1512,12 +1554,12 @@ def save_account_risk_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
                     item.get("daily_limit", item.get("dailyLimit", existing["daily_limit"])),
                     existing["daily_limit"],
                     min_value=1,
-                    max_value=100000,
+                    max_value=existing["daily_limit"],
                 ),
                 "cooldown_seconds": _int_setting(
                     item.get("cooldown_seconds", item.get("cooldownSeconds", existing["cooldown_seconds"])),
                     existing["cooldown_seconds"],
-                    min_value=0,
+                    min_value=existing["cooldown_seconds"],
                     max_value=86400,
                 ),
             }

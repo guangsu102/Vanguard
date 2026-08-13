@@ -1,8 +1,10 @@
 from app.core.automation_settings import (
+    normalize_account_asset_policy_settings,
     normalize_account_risk_guard_settings,
     normalize_account_warmup_policy_settings,
     normalize_ad_capacity_settings,
     normalize_ad_delivery_execution_settings,
+    normalize_ad_delivery_throttle_settings,
     normalize_group_ai_interaction_settings,
 )
 
@@ -21,6 +23,41 @@ def test_normalize_account_risk_guard_settings_configures_group_leave_policy():
     assert config["group_write_forbidden"]["leave_window_hours"] == 720
 
 
+def test_normalize_account_risk_guard_settings_enforces_acquisition_hard_caps():
+    config = normalize_account_risk_guard_settings(
+        {
+            "globalDailyLimit": 999,
+            "groupWriteDailyLimit": 999,
+            "actions": {
+                "join": {"dailyLimit": 999, "cooldownSeconds": 0},
+                "group_message": {"dailyLimit": 999, "cooldownSeconds": 0},
+                "ad_probe": {"dailyLimit": 999, "cooldownSeconds": 0},
+                "ai_warmup": {"dailyLimit": 999, "cooldownSeconds": 0},
+                "ad_delivery": {"dailyLimit": 999, "cooldownSeconds": 0},
+            },
+        }
+    )
+
+    assert config["global_daily_limit"] == 30
+    assert config["group_write_daily_limit"] == 8
+    assert config["actions"]["join"] == {"daily_limit": 6, "cooldown_seconds": 7200}
+    assert config["actions"]["group_message"] == {
+        "daily_limit": 4,
+        "cooldown_seconds": 7200,
+    }
+    assert config["actions"]["ad_probe"] == {
+        "daily_limit": 1,
+        "cooldown_seconds": 86400,
+    }
+    assert config["actions"]["ai_warmup"] == {
+        "daily_limit": 1,
+        "cooldown_seconds": 21600,
+    }
+    assert config["actions"]["ad_delivery"] == {
+        "daily_limit": 5,
+        "cooldown_seconds": 9000,
+    }
+
 def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     config = normalize_ad_capacity_settings(None)
 
@@ -32,11 +69,11 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["survival_one_hour_seconds"] == 3600
     assert config["survival_twenty_four_hour_seconds"] == 86400
     assert config["account_ad_daily_hard_cap"] == 5
-    assert config["account_group_daily_cap_default"] == 3
+    assert config["account_group_daily_cap_default"] == 1
     assert config["group_global_daily_hard_cap"] == 400
-    assert config["group_min_interval_seconds"] == 3600
+    assert config["group_min_interval_seconds"] == 259200
     assert config["max_groups_per_account"] == 400
-    assert config["max_new_ad_groups_per_day"] == 3
+    assert config["max_new_ad_groups_per_day"] == 2
     assert config["leave_on_deleted_ad"] is True
     assert config["warmup_days_before_ads"] == 15
     assert config["warmup_daily_interactions_min"] == 0
@@ -109,9 +146,9 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     )
 
     assert config["survival_check_delay_seconds"] == 30
-    assert config["account_group_daily_cap_default"] == 500
+    assert config["account_group_daily_cap_default"] == 1
     assert config["max_groups_per_account"] == 150
-    assert config["max_new_ad_groups_per_day"] == 40
+    assert config["max_new_ad_groups_per_day"] == 2
     assert config["warmup_days_before_ads"] == 20
     assert config["warmup_daily_interactions_min"] == 4
     assert config["warmup_daily_interactions_max"] == 9
@@ -121,6 +158,23 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["hourly_weights"]["2"] == 18
 
 
+def test_normalize_ad_delivery_throttle_settings_enforces_single_slow_delivery():
+    config = normalize_ad_delivery_throttle_settings(
+        {
+            "deliveryIntervalSeconds": 0,
+            "batchSizeMin": 100,
+            "batchSizeMax": 100,
+            "cooldownMinSeconds": 0,
+            "cooldownMaxSeconds": 0,
+        }
+    )
+
+    assert config["delivery_interval_seconds"] == 9000
+    assert config["batch_size_min"] == 1
+    assert config["batch_size_max"] == 1
+    assert config["cooldown_min_seconds"] == 9000
+    assert config["cooldown_max_seconds"] == 9000
+
 def test_normalize_ad_delivery_execution_settings_enforces_hard_run_caps():
     config = normalize_ad_delivery_execution_settings(
         {
@@ -129,9 +183,22 @@ def test_normalize_ad_delivery_execution_settings_enforces_hard_run_caps():
         }
     )
 
-    assert config["max_deliveries_per_run"] == 20
-    assert config["max_deliveries_per_account_per_run"] == 5
+    assert config["max_deliveries_per_run"] == 1
+    assert config["max_deliveries_per_account_per_run"] == 1
 
+
+def test_normalize_account_asset_policy_enforces_seven_day_ad_warmup():
+    config = normalize_account_asset_policy_settings(
+        {
+            "tiers": {
+                "year_2": {"warmupDays": 3},
+                "year_3_plus": {"warmupDays": 0},
+            }
+        }
+    )
+
+    assert config["tiers"]["year_2"]["warmup_days"] == 7
+    assert config["tiers"]["year_3_plus"]["warmup_days"] == 7
 
 def test_normalize_account_warmup_policy_settings_defaults_and_camel_case():
     config = normalize_account_warmup_policy_settings(
@@ -153,10 +220,10 @@ def test_normalize_account_warmup_policy_settings_defaults_and_camel_case():
     )
 
     assert config["enabled"] is True
-    assert config["default_warmup_days"] == 5
-    assert config["minimum_warmup_days"] == 5
+    assert config["default_warmup_days"] == 7
+    assert config["minimum_warmup_days"] == 7
     assert config["user_initiated_private_message_multiplier"] == 1.5
-    assert config["tiers"]["year_3_plus"]["warmup_days"] == 6
+    assert config["tiers"]["year_3_plus"]["warmup_days"] == 7
     assert config["stages"]["observe"]["join_multiplier"] == 0.2
     assert config["stages"]["observe"]["ad_multiplier"] == 0
     assert config["stages"]["observe"]["allow_proactive_private_message"] is False

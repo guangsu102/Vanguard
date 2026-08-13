@@ -72,13 +72,13 @@ class RiskDecision:
 
 DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.SEARCH: RiskBudget(daily_limit=100, cooldown_seconds=30),
-    AccountRiskAction.JOIN: RiskBudget(daily_limit=15, cooldown_seconds=1200),
+    AccountRiskAction.JOIN: RiskBudget(daily_limit=6, cooldown_seconds=7200),
     AccountRiskAction.PRIVATE_MESSAGE: RiskBudget(daily_limit=40, cooldown_seconds=45),
-    AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=20, cooldown_seconds=300),
-    AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=10, cooldown_seconds=1800),
-    AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=10, cooldown_seconds=1800),
+    AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=4, cooldown_seconds=7200),
+    AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
+    AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=1, cooldown_seconds=21600),
     AccountRiskAction.MODERATION: RiskBudget(daily_limit=60, cooldown_seconds=15),
-    AccountRiskAction.AD_DELIVERY: RiskBudget(daily_limit=50, cooldown_seconds=300),
+    AccountRiskAction.AD_DELIVERY: RiskBudget(daily_limit=5, cooldown_seconds=9000),
     AccountRiskAction.PROFILE_UPDATE: RiskBudget(daily_limit=5, cooldown_seconds=3600),
     AccountRiskAction.REACTION: RiskBudget(daily_limit=120, cooldown_seconds=10),
     AccountRiskAction.FORWARD: RiskBudget(daily_limit=25, cooldown_seconds=120),
@@ -88,7 +88,8 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.CHANNEL_CREATE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
 }
 
-GLOBAL_DAILY_LIMIT = 200
+GLOBAL_DAILY_LIMIT = 30
+GROUP_WRITE_DAILY_LIMIT = 8
 DEFAULT_FREEZE_SECONDS = 3600
 FLOOD_WAIT_BUFFER_SECONDS = 60
 PEER_FLOOD_FREEZE_SECONDS = 24 * 3600
@@ -104,10 +105,6 @@ LOW_VALUE_DETAIL_RETENTION_DAYS = 14
 HIGH_VALUE_DETAIL_RETENTION_DAYS = 90
 GROUP_WRITE_FORBIDDEN_BASE_SCORE = 4.0
 GROUP_WRITE_FORBIDDEN_PLATFORM_SCORE = 12.0
-GROUP_WRITE_FORBIDDEN_FREEZE_WINDOW = timedelta(hours=2)
-GROUP_WRITE_FORBIDDEN_FREEZE_DISTINCT_GROUPS = 5
-GROUP_WRITE_FORBIDDEN_QUARANTINE_WINDOW = timedelta(hours=24)
-GROUP_WRITE_FORBIDDEN_QUARANTINE_DISTINCT_GROUPS = 10
 GROUP_WRITE_CAPABILITY_RECOVERY_REASON = "group_write_capability_confirmed"
 PLATFORM_GROUP_WRITE_BAN_MARKERS = (
     "banned from sending messages in supergroups",
@@ -138,6 +135,12 @@ MESSAGE_ACTIONS = {
     AccountRiskAction.AI_WARMUP,
     AccountRiskAction.AD_DELIVERY,
     AccountRiskAction.BOT_MESSAGE,
+}
+ACQUISITION_GROUP_WRITE_ACTIONS = {
+    AccountRiskAction.GROUP_MESSAGE,
+    AccountRiskAction.AD_PROBE,
+    AccountRiskAction.AI_WARMUP,
+    AccountRiskAction.AD_DELIVERY,
 }
 CONTENT_DEDUP_EXEMPT_SOURCES = {
     "managed_group_channel_announcement",
@@ -187,6 +190,18 @@ class AccountRiskGuard:
                     account,
                     action,
                     f"account_status_{db_account.status.value}",
+                    target_type,
+                    target_id,
+                    details,
+                )
+            if (
+                db_account.risk_reason == "platform_group_write_banned"
+                and action in ACQUISITION_GROUP_WRITE_ACTIONS
+            ):
+                return await self._block(
+                    account,
+                    action,
+                    "platform_group_write_banned",
                     target_type,
                     target_id,
                     details,
@@ -375,14 +390,7 @@ class AccountRiskGuard:
         elif reason == "group_write_forbidden" and self._confirmed_account_wide_group_write_ban(
             merged_details
         ):
-            await self._escalate_repeated_group_write_forbidden(
-                account,
-                action=action,
-                target_type=target_type,
-                target_id=target_id,
-                details=merged_details,
-                risk_settings=risk_settings,
-            )
+            await self._persist_platform_group_write_ban(account)
 
     async def _classify_error(
         self,
@@ -492,7 +500,8 @@ class AccountRiskGuard:
             now = datetime.utcnow()
             if db_account.risk_pause_until is None or db_account.risk_pause_until < pause_until:
                 db_account.risk_pause_until = pause_until
-            db_account.risk_reason = reason
+            if db_account.risk_reason != "platform_group_write_banned":
+                db_account.risk_reason = reason
             db_account.last_risk_event_at = now
             db_account.last_risk_decay_at = now
             db_account.risk_level = AccountRiskLevel.FROZEN.value
@@ -582,20 +591,16 @@ class AccountRiskGuard:
             status == "failure"
             and reason == "group_write_forbidden"
             and target_type == "group"
-            and not self._confirmed_account_wide_group_write_ban(event_details)
         )
         if db_account is not None and status in {"failure", "freeze"} and not group_scoped_write_failure:
             now = datetime.utcnow()
             db_account.last_risk_event_at = now
             db_account.last_risk_decay_at = now
-            preserve_group_freeze_reason = (
-                status == "failure"
-                and reason == "group_write_forbidden"
-                and db_account.risk_reason == "platform_group_write_repeated"
-                and db_account.risk_pause_until is not None
-                and db_account.risk_pause_until > now
-            )
-            if not preserve_group_freeze_reason:
+            preserve_group_risk_reason = db_account.risk_reason in {
+                "platform_group_write_repeated",
+                "platform_group_write_banned",
+            }
+            if not preserve_group_risk_reason:
                 db_account.risk_reason = reason or status
             if status == "failure":
                 db_account.risk_score = min(
@@ -700,76 +705,21 @@ class AccountRiskGuard:
             candidates.append(int(f"-100{exact}"))
         return list(dict.fromkeys(candidates))
 
-    async def _escalate_repeated_group_write_forbidden(
-        self,
-        account: Any,
-        *,
-        action: AccountRiskAction,
-        target_type: Optional[str],
-        target_id: Optional[Any],
-        details: Optional[dict[str, Any]],
-        risk_settings: dict[str, Any],
-    ) -> None:
+    async def _persist_platform_group_write_ban(self, account: Any) -> None:
         account_id = self._account_id(account)
         if account_id is None:
             return
-        if not self._confirmed_account_wide_group_write_ban(details):
-            return
 
         db_account = await self._get_db_account(account_id)
-        if db_account is None:
-            return
-        if (
-            db_account.risk_level == AccountRiskLevel.QUARANTINED.value
-            and db_account.risk_reason == "platform_group_write_banned"
-        ):
+        if db_account is None or db_account.risk_reason == "platform_group_write_banned":
             return
 
         now = datetime.utcnow()
-        group_policy = risk_settings.get("group_write_forbidden", {})
-        thresholds = risk_settings.get("level_thresholds", {})
-        lifecycle = risk_settings.get("lifecycle", {})
-        freeze_groups = await self._recent_distinct_group_write_forbidden_targets(
-            account_id,
-            since=now - timedelta(hours=float(group_policy.get("freeze_window_hours", 2))),
-        )
-        quarantine_groups = await self._recent_distinct_group_write_forbidden_targets(
-            account_id,
-            since=now - timedelta(hours=float(group_policy.get("quarantine_window_hours", 24))),
-        )
-        escalation_details = {
-            **(details or {}),
-            "source": "repeated_group_write_forbidden",
-            "freeze_window_distinct_groups": len(freeze_groups),
-            "quarantine_window_distinct_groups": len(quarantine_groups),
-            "current_target_id": str(target_id) if target_id is not None else None,
-        }
-
-        if self._confirmed_account_wide_group_write_ban(details):
-            await self.quarantine_account(
-                account,
-                reason="platform_group_write_banned",
-                action=action,
-                details=escalation_details,
-            )
-            return
-
-        if len(freeze_groups) >= int(
-            group_policy.get("freeze_distinct_groups", GROUP_WRITE_FORBIDDEN_FREEZE_DISTINCT_GROUPS)
-        ) or float(db_account.risk_score or 0.0) >= float(thresholds.get("frozen", 70.0)):
-            if db_account.risk_pause_until and db_account.risk_pause_until > now:
-                return
-            await self.freeze_account(
-                account,
-                reason="platform_group_write_repeated",
-                seconds=int(
-                    lifecycle.get(
-                        "group_write_forbidden_freeze_seconds", GROUP_WRITE_FORBIDDEN_FREEZE_SECONDS
-                    )
-                ),
-                action=action,
-                details=escalation_details,
-            )
+        db_account.risk_reason = "platform_group_write_banned"
+        db_account.last_risk_event_at = now
+        db_account.last_risk_decay_at = now
+        self.db.add(db_account)
+        await self.db.commit()
 
     async def _reconcile_group_write_success(self, account: Any) -> None:
         """Clear only risk state that a successful group send directly disproves."""
@@ -778,7 +728,6 @@ class AccountRiskGuard:
         if db_account is None or db_account.risk_reason not in {
             "group_write_forbidden",
             "platform_group_write_repeated",
-            "platform_group_write_banned",
         }:
             return
 
@@ -802,20 +751,6 @@ class AccountRiskGuard:
         self.db.add(db_account)
         await self.db.commit()
 
-    async def _recent_distinct_group_write_forbidden_targets(
-        self, account_id: int, *, since: datetime
-    ) -> set[str]:
-        result = await self.db.execute(
-            select(AccountRiskEvent.target_id).where(
-                AccountRiskEvent.account_id == account_id,
-                AccountRiskEvent.status == "failure",
-                AccountRiskEvent.reason == "group_write_forbidden",
-                AccountRiskEvent.target_type == "group",
-                AccountRiskEvent.created_at >= since,
-            )
-        )
-        return {str(target_id) for target_id in result.scalars().all() if target_id is not None}
-
     async def _reserve_budget(
         self,
         account_id: int,
@@ -834,6 +769,9 @@ class AccountRiskGuard:
         day_key = datetime.utcnow().strftime("%Y%m%d")
         total_key = f"risk:account:{account_id}:daily:total:{day_key}"
         action_key = f"risk:account:{account_id}:daily:{action.value}:{day_key}"
+        group_write_key = (
+            f"risk:account:{account_id}:daily:acquisition_group_write:{day_key}"
+        )
         cooldown_key = f"risk:account:{account_id}:cooldown:{action.value}"
 
         cooldown = await self.cache.get(cooldown_key)
@@ -850,6 +788,16 @@ class AccountRiskGuard:
         global_daily_limit = int(risk_settings.get("global_daily_limit", GLOBAL_DAILY_LIMIT))
         if total_count > global_daily_limit:
             return False, "account_global_daily_budget", None
+
+        if action in ACQUISITION_GROUP_WRITE_ACTIONS:
+            group_write_count = await self.cache.incr(group_write_key)
+            await self.cache.expire(group_write_key, 48 * 3600)
+            group_write_daily_limit = min(
+                GROUP_WRITE_DAILY_LIMIT,
+                int(risk_settings.get("group_write_daily_limit", GROUP_WRITE_DAILY_LIMIT)),
+            )
+            if group_write_count > group_write_daily_limit:
+                return False, "acquisition_group_write_daily_budget", None
 
         action_count = await self.cache.incr(action_key)
         await self.cache.expire(action_key, 48 * 3600)
@@ -1011,6 +959,7 @@ class AccountRiskGuard:
         risk_settings = risk_settings or await get_account_risk_guard_settings(self.db)
         lifecycle = risk_settings.get("lifecycle", {})
         changed = False
+
         if account.risk_pause_until and account.risk_pause_until <= now:
             account.risk_pause_until = None
             account.risk_recovery_until = now + timedelta(
@@ -1022,7 +971,8 @@ class AccountRiskGuard:
             )
             if account.risk_level == AccountRiskLevel.FROZEN.value:
                 account.risk_level = AccountRiskLevel.LIMITED.value
-            account.risk_reason = "risk_recovery"
+            if account.risk_reason != "platform_group_write_banned":
+                account.risk_reason = "risk_recovery"
             changed = True
 
         last_decay = account.last_risk_decay_at or account.last_risk_event_at or account.created_at
@@ -1454,11 +1404,5 @@ class AccountRiskGuard:
 
     @staticmethod
     def _confirmed_account_wide_group_write_ban(details: Optional[dict[str, Any]]) -> bool:
-        """Require a failed probe in a previously writable control group."""
-        if not details:
-            return False
-        return (
-            details.get("control_probe_confirmed") is True
-            and details.get("control_group_previously_writable") is True
-            and AccountRiskGuard._looks_like_platform_group_write_ban(details)
-        )
+        """Treat Telegram's explicit platform-level group write ban as authoritative."""
+        return AccountRiskGuard._looks_like_platform_group_write_ban(details)

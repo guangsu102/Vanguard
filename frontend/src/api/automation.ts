@@ -178,6 +178,7 @@ export interface AccountRiskActionBudget {
 export interface AccountRiskGuardSettings {
   enabled: boolean
   global_daily_limit: number
+  group_write_daily_limit: number
   redis_fail_closed: boolean | null
   actions: Record<string, AccountRiskActionBudget>
   level_thresholds: Record<string, number>

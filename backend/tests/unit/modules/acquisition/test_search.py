@@ -2390,3 +2390,26 @@ class TestAdDeliveryFailureHandling:
         assert parsed == []
         assert not AcquisitionAutomationService._is_valid_generated_ad_creative("<head>")
         assert not AcquisitionAutomationService._is_valid_generated_ad_creative('<html lang="zh-CN">')
+
+
+@pytest.mark.asyncio
+async def test_account_asset_warmup_days_never_bypasses_seven_day_floor(monkeypatch):
+    service = AcquisitionAutomationService.__new__(AcquisitionAutomationService)
+    service.db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(asset_tier="year_2")))
+
+    async def low_warmup_policy(_db):
+        return {
+            "enabled": True,
+            "tiers": {
+                "year_2": {"warmup_days": 3},
+            },
+        }
+
+    monkeypatch.setattr(
+        acquisition_automation,
+        "get_account_asset_policy_settings",
+        low_warmup_policy,
+    )
+
+    assert await service._account_asset_warmup_days(1, 0) == 7
+    assert await service._account_asset_warmup_days(1, 15) == 15

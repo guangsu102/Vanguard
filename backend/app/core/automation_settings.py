@@ -812,19 +812,19 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
 
     actions: dict[str, dict[str, int]] = {}
     action_hard_limits = {
-        "join": 15,
-        "group_message": 20,
-        "ad_probe": 10,
-        "ai_warmup": 10,
-        "ad_delivery": 50,
+        "join": 6,
+        "group_message": 4,
+        "ad_probe": 1,
+        "ai_warmup": 1,
+        "ad_delivery": 5,
         "channel_create": 1,
     }
     action_min_cooldowns = {
-        "join": 1200,
-        "group_message": 300,
-        "ad_probe": 1800,
-        "ai_warmup": 1800,
-        "ad_delivery": 300,
+        "join": 7200,
+        "group_message": 7200,
+        "ad_probe": 86400,
+        "ai_warmup": 21600,
+        "ad_delivery": 9000,
         "channel_create": 86400,
     }
     for action, default_budget in defaults["actions"].items():
@@ -1081,7 +1081,16 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
             raw.get("global_daily_limit", raw.get("globalDailyLimit", defaults["global_daily_limit"])),
             defaults["global_daily_limit"],
             min_value=1,
-            max_value=200,
+            max_value=30,
+        ),
+        "group_write_daily_limit": _int_setting(
+            raw.get(
+                "group_write_daily_limit",
+                raw.get("groupWriteDailyLimit", defaults["group_write_daily_limit"]),
+            ),
+            defaults["group_write_daily_limit"],
+            min_value=1,
+            max_value=8,
         ),
         "redis_fail_closed": redis_fail_closed,
         "actions": actions,
@@ -1148,7 +1157,7 @@ def normalize_account_asset_policy_settings(payload: dict[str, Any] | None) -> d
             "warmup_days": _int_setting(
                 item.get("warmup_days", item.get("warmupDays", default_policy["warmup_days"])),
                 int(default_policy["warmup_days"]),
-                min_value=0,
+                min_value=7,
                 max_value=120,
             ),
             "age_floor_days": _int_setting(
@@ -1195,7 +1204,7 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "warmup_days": _int_setting(
                 item.get("warmup_days", item.get("warmupDays", default_policy["warmup_days"])),
                 int(default_policy["warmup_days"]),
-                min_value=0,
+                min_value=7,
                 max_value=120,
             ),
         }
@@ -1276,13 +1285,13 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
     minimum_days = _int_setting(
         raw.get("minimum_warmup_days", raw.get("minimumWarmupDays", defaults["minimum_warmup_days"])),
         int(defaults["minimum_warmup_days"]),
-        min_value=0,
+        min_value=7,
         max_value=120,
     )
     default_days = _int_setting(
         raw.get("default_warmup_days", raw.get("defaultWarmupDays", defaults["default_warmup_days"])),
         int(defaults["default_warmup_days"]),
-        min_value=0,
+        min_value=7,
         max_value=120,
     )
     if default_days < minimum_days:
@@ -1337,21 +1346,21 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
         raw.get("batch_size_max", raw.get("batchSizeMax", defaults["batch_size_max"])),
         defaults["batch_size_max"],
         min_value=1,
-        max_value=10000,
+        max_value=1,
     )
-    if batch_size_max < batch_size_min:
-        batch_size_max = batch_size_min
+    batch_size_min = 1
+    batch_size_max = 1
 
     cooldown_min_seconds = _int_setting(
         raw.get("cooldown_min_seconds", raw.get("cooldownMinSeconds", defaults["cooldown_min_seconds"])),
         defaults["cooldown_min_seconds"],
-        min_value=0,
+        min_value=9000,
         max_value=86400,
     )
     cooldown_max_seconds = _int_setting(
         raw.get("cooldown_max_seconds", raw.get("cooldownMaxSeconds", defaults["cooldown_max_seconds"])),
         defaults["cooldown_max_seconds"],
-        min_value=0,
+        min_value=9000,
         max_value=86400,
     )
     if cooldown_max_seconds < cooldown_min_seconds:
@@ -1362,8 +1371,8 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
         "delivery_interval_seconds": _int_setting(
             raw.get("delivery_interval_seconds", raw.get("deliveryIntervalSeconds", defaults["delivery_interval_seconds"])),
             defaults["delivery_interval_seconds"],
-            min_value=0,
-            max_value=3600,
+            min_value=9000,
+            max_value=86400,
         ),
         "batch_window_seconds": _int_setting(
             raw.get("batch_window_seconds", raw.get("batchWindowSeconds", defaults["batch_window_seconds"])),
@@ -1408,7 +1417,7 @@ def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> 
             raw.get("max_deliveries_per_run", raw.get("maxDeliveriesPerRun", defaults["max_deliveries_per_run"])),
             defaults["max_deliveries_per_run"],
             min_value=1,
-            max_value=20,
+            max_value=1,
         ),
         "max_deliveries_per_account_per_run": _int_setting(
             raw.get(
@@ -1417,12 +1426,12 @@ def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> 
             ),
             defaults["max_deliveries_per_account_per_run"],
             min_value=1,
-            max_value=5,
+            max_value=1,
         ),
         "group_campaign_cooldown_minutes": _int_setting(
             raw.get("group_campaign_cooldown_minutes", raw.get("groupCampaignCooldownMinutes", defaults["group_campaign_cooldown_minutes"])),
             defaults["group_campaign_cooldown_minutes"],
-            min_value=0,
+            min_value=4320,
             max_value=10080,
         ),
         "stop_account_after_success": _bool_setting(
@@ -1511,7 +1520,7 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             raw.get("account_group_daily_cap_default", raw.get("accountGroupDailyCapDefault", defaults["account_group_daily_cap_default"])),
             defaults["account_group_daily_cap_default"],
             min_value=1,
-            max_value=500,
+            max_value=1,
         ),
         "survival_retry_max_attempts": _int_setting(
             raw.get(
@@ -1535,7 +1544,7 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             raw.get("account_ad_daily_hard_cap", raw.get("accountAdDailyHardCap", defaults["account_ad_daily_hard_cap"])),
             defaults["account_ad_daily_hard_cap"],
             min_value=1,
-            max_value=500,
+            max_value=5,
         ),
         "group_global_daily_hard_cap": _int_setting(
             raw.get(
@@ -1552,8 +1561,8 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
                 raw.get("groupMinIntervalSeconds", defaults["group_min_interval_seconds"]),
             ),
             defaults["group_min_interval_seconds"],
-            min_value=60,
-            max_value=3600,
+            min_value=259200,
+            max_value=604800,
         ),
         "max_groups_per_account": _int_setting(
             raw.get("max_groups_per_account", raw.get("maxGroupsPerAccount", defaults["max_groups_per_account"])),
@@ -1565,7 +1574,7 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             raw.get("max_new_ad_groups_per_day", raw.get("maxNewAdGroupsPerDay", defaults["max_new_ad_groups_per_day"])),
             defaults["max_new_ad_groups_per_day"],
             min_value=0,
-            max_value=500,
+            max_value=2,
         ),
         "leave_on_deleted_ad": _bool_setting(
             raw.get("leave_on_deleted_ad", raw.get("leaveOnDeletedAd", defaults["leave_on_deleted_ad"])),
@@ -1710,7 +1719,7 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
         "warmup_days_before_ads": _int_setting(
             raw.get("warmup_days_before_ads", raw.get("warmupDaysBeforeAds", defaults["warmup_days_before_ads"])),
             defaults["warmup_days_before_ads"],
-            min_value=0,
+            min_value=7,
             max_value=90,
         ),
         "warmup_daily_interactions_min": _int_setting(

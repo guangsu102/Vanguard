@@ -11,7 +11,7 @@ from app.core.account.models import (
     AccountType,
     TelegramAccount,
 )
-from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard, RiskBudget
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 
 
@@ -302,6 +302,7 @@ async def test_risk_guard_quarantines_banned_account(test_db):
 
     assert account.risk_score == 100.0
     assert account.risk_level == "quarantined"
+    assert account.risk_reason == "account_banned"
 
     decision = await guard.check_and_reserve(wrapper, AccountRiskAction.PRIVATE_MESSAGE)
     assert decision.allowed is False
@@ -328,7 +329,7 @@ async def test_group_scoped_write_ban_does_not_add_account_risk(test_db):
     await guard.record_failure(
         wrapper,
         AccountRiskAction.AD_DELIVERY,
-        "You're banned from sending messages in supergroups/channels",
+        "CHAT_WRITE_FORBIDDEN",
         target_type="group",
         target_id="@example",
     )
@@ -445,7 +446,7 @@ async def test_many_group_scoped_write_failures_do_not_freeze_account(test_db):
         await guard.record_failure(
             wrapper,
             AccountRiskAction.GROUP_MESSAGE,
-            "You're banned from sending messages in supergroups/channels",
+            "CHAT_WRITE_FORBIDDEN",
             target_type="group",
             target_id=f"@restricted_{index}",
         )
@@ -467,7 +468,7 @@ async def test_many_group_scoped_write_failures_do_not_freeze_account(test_db):
 
 
 @pytest.mark.asyncio
-async def test_control_group_probe_can_confirm_account_wide_group_write_ban(test_db):
+async def test_explicit_platform_group_write_ban_fuses_only_group_writes(test_db):
     account = TelegramAccount(
         phone="+15559990040",
         identifier="+15559990040",
@@ -476,28 +477,59 @@ async def test_control_group_probe_can_confirm_account_wide_group_write_ban(test
         country_code="US",
         session_name="risk_control_probe_session",
         status=AccountStatus.ONLINE,
+        created_at=datetime.utcnow() - timedelta(days=30),
+        managed_started_at=datetime.utcnow() - timedelta(days=30),
     )
     test_db.add(account)
     await test_db.commit()
     await test_db.refresh(account)
 
     wrapper = SimpleNamespace(account_id=account.id, country_code="US")
-    guard = AccountRiskGuard(test_db)
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
     await guard.record_failure(
         wrapper,
         AccountRiskAction.AD_PROBE,
         "You're banned from sending messages in supergroups/channels",
         target_type="group",
-        target_id="@known_writable_control",
-        details={
-            "control_probe_confirmed": True,
-            "control_group_previously_writable": True,
-        },
+        target_id="@ordinary_business_group",
     )
     await test_db.refresh(account)
 
-    assert account.risk_score == 100.0
-    assert account.risk_level == "quarantined"
+    assert account.risk_score == 0.0
+    assert account.risk_level == "normal"
+    assert account.risk_reason == "platform_group_write_banned"
+
+    for action in (
+        AccountRiskAction.GROUP_MESSAGE,
+        AccountRiskAction.AD_PROBE,
+        AccountRiskAction.AI_WARMUP,
+        AccountRiskAction.AD_DELIVERY,
+    ):
+        decision = await guard.check_and_reserve(
+            wrapper,
+            action,
+            target_type="group",
+            target_id="@next_group",
+        )
+        assert decision.allowed is False
+        assert decision.reason == "platform_group_write_banned"
+
+    for action in (AccountRiskAction.JOIN, AccountRiskAction.SEARCH):
+        decision = await guard.check_and_reserve(
+            wrapper,
+            action,
+            target_type="group",
+            target_id=f"@{action.value}_target",
+        )
+        assert decision.allowed is True
+
+    await guard.record_success(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        target_type="group",
+        target_id="@stale_inflight_send",
+    )
+    await test_db.refresh(account)
     assert account.risk_reason == "platform_group_write_banned"
 
 
@@ -645,6 +677,39 @@ class FakeCache:
     async def expire(self, key, ttl):
         return await self.client.expire(key, ttl)
 
+@pytest.mark.asyncio
+async def test_acquisition_group_writes_share_daily_budget(test_db):
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    settings = {"global_daily_limit": 30, "group_write_daily_limit": 8}
+    actions = (
+        AccountRiskAction.GROUP_MESSAGE,
+        AccountRiskAction.AD_PROBE,
+        AccountRiskAction.AI_WARMUP,
+        AccountRiskAction.AD_DELIVERY,
+    )
+
+    for index in range(8):
+        allowed, reason, _ = await guard._reserve_budget(
+            999,
+            actions[index % len(actions)],
+            RiskBudget(daily_limit=100),
+            settings,
+        )
+        assert allowed is True
+        assert reason == "reserved"
+        guard.cache.client.values.pop(
+            f"risk:account:999:cooldown:{actions[index % len(actions)].value}",
+            None,
+        )
+
+    allowed, reason, _ = await guard._reserve_budget(
+        999,
+        AccountRiskAction.GROUP_MESSAGE,
+        RiskBudget(daily_limit=100),
+        settings,
+    )
+    assert allowed is False
+    assert reason == "acquisition_group_write_daily_budget"
 
 @pytest.mark.asyncio
 async def test_risk_guard_blocks_repeated_message_content(test_db):

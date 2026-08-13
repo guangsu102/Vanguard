@@ -151,11 +151,13 @@ const groupAiToneOptions = [
 
 const defaultRiskActions = (): AccountRiskGuardSettings['actions'] => ({
   search: { daily_limit: 100, cooldown_seconds: 30 },
-  join: { daily_limit: 100, cooldown_seconds: 60 },
+  join: { daily_limit: 6, cooldown_seconds: 7200 },
   private_message: { daily_limit: 20, cooldown_seconds: 300 },
-  group_message: { daily_limit: 1000, cooldown_seconds: 60 },
+  group_message: { daily_limit: 4, cooldown_seconds: 7200 },
+  ad_probe: { daily_limit: 1, cooldown_seconds: 86400 },
+  ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
   moderation: { daily_limit: 60, cooldown_seconds: 15 },
-  ad_delivery: { daily_limit: 40000, cooldown_seconds: 90 },
+  ad_delivery: { daily_limit: 5, cooldown_seconds: 9000 },
   profile_update: { daily_limit: 5, cooldown_seconds: 3600 },
   reaction: { daily_limit: 120, cooldown_seconds: 10 },
   forward: { daily_limit: 25, cooldown_seconds: 120 },
@@ -344,7 +346,8 @@ const schedulerForm = reactive<AutoJoinSchedulerConfig>({
 
 const riskGuardForm = reactive<AccountRiskGuardSettings>({
   enabled: true,
-  global_daily_limit: 200,
+  global_daily_limit: 30,
+  group_write_daily_limit: 8,
   redis_fail_closed: null,
   actions: defaultRiskActions(),
   level_thresholds: defaultRiskLevelThresholds(),
@@ -641,6 +644,7 @@ const fillSchedulerForm = (config: AutoJoinSchedulerConfig) => {
 const fillRiskGuardForm = (config: AccountRiskGuardSettings) => {
   riskGuardForm.enabled = config.enabled
   riskGuardForm.global_daily_limit = config.global_daily_limit
+  riskGuardForm.group_write_daily_limit = config.group_write_daily_limit
   riskGuardForm.redis_fail_closed = config.redis_fail_closed
   const actions = defaultRiskActions()
   for (const item of riskActionOptions) {
@@ -1435,7 +1439,10 @@ onMounted(() => {
                 <el-switch v-model="riskGuardForm.enabled" />
               </el-form-item>
               <el-form-item label="单号总日额度">
-                <el-input-number v-model="riskGuardForm.global_daily_limit" :min="1" :max="200" />
+                <el-input-number v-model="riskGuardForm.global_daily_limit" :min="1" :max="30" />
+              </el-form-item>
+              <el-form-item label="共享群写日额度">
+                <el-input-number v-model="riskGuardForm.group_write_daily_limit" :min="1" :max="8" />
               </el-form-item>
               <el-form-item label="Redis失败关闭">
                 <el-select v-model="redisFailClosedValue">

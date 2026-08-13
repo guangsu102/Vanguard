@@ -4635,16 +4635,16 @@ class AcquisitionAutomationService:
         config.next_join_after = now + timedelta(seconds=interval_seconds)
 
     async def _account_asset_warmup_days(self, account_id: int, default_days: int) -> int:
+        minimum_days = max(7, int(default_days or 0))
         policy = await get_account_asset_policy_settings(self.db)
         if not policy.get("enabled", True):
-            return max(0, int(default_days or 0))
+            return minimum_days
         account = await self.db.get(TelegramAccount, account_id)
         tier_policy = AccountDynamicFrequencyService.account_asset_tier_policy(policy, account)
         try:
-            return max(0, int(tier_policy.get("warmup_days", default_days) or 0))
+            return max(minimum_days, int(tier_policy.get("warmup_days", minimum_days) or 0))
         except (TypeError, ValueError):
-            return max(0, int(default_days or 0))
-
+            return minimum_days
     # ------------------------------------------------------------------
     # Advertisement delivery
     # ------------------------------------------------------------------

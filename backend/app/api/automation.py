@@ -149,7 +149,8 @@ class AccountRiskActionBudgetUpdate(BaseModel):
 
 class AccountRiskGuardUpdate(BaseModel):
     enabled: bool = True
-    global_daily_limit: int = Field(default=50000, ge=1, le=100000)
+    global_daily_limit: int = Field(default=30, ge=1, le=30)
+    group_write_daily_limit: int = Field(default=8, ge=1, le=8)
     redis_fail_closed: Optional[bool] = None
     actions: dict[str, AccountRiskActionBudgetUpdate] = Field(default_factory=dict)
     level_thresholds: dict[str, float] = Field(default_factory=dict)
@@ -165,7 +166,7 @@ class AccountAssetTierPolicyUpdate(BaseModel):
     ad_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
     run_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
     probe_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
-    warmup_days: int = Field(default=15, ge=0, le=120)
+    warmup_days: int = Field(default=15, ge=7, le=120)
     age_floor_days: int = Field(default=0, ge=0, le=3650)
 
 
@@ -175,7 +176,7 @@ class AccountAssetPolicyUpdate(BaseModel):
 
 
 class AccountWarmupTierPolicyUpdate(BaseModel):
-    warmup_days: int = Field(default=15, ge=0, le=120)
+    warmup_days: int = Field(default=15, ge=7, le=120)
 
 
 class AccountWarmupStagePolicyUpdate(BaseModel):
@@ -192,8 +193,8 @@ class AccountWarmupStagePolicyUpdate(BaseModel):
 
 class AccountWarmupPolicyUpdate(BaseModel):
     enabled: bool = True
-    default_warmup_days: int = Field(default=15, ge=0, le=120)
-    minimum_warmup_days: int = Field(default=5, ge=0, le=120)
+    default_warmup_days: int = Field(default=15, ge=7, le=120)
+    minimum_warmup_days: int = Field(default=7, ge=7, le=120)
     user_initiated_private_message_multiplier: float = Field(default=1.0, ge=0.0, le=2.0)
     tiers: dict[str, AccountWarmupTierPolicyUpdate] = Field(default_factory=dict)
     stages: dict[str, AccountWarmupStagePolicyUpdate] = Field(default_factory=dict)
@@ -201,20 +202,20 @@ class AccountWarmupPolicyUpdate(BaseModel):
 
 class AdDeliveryThrottleUpdate(BaseModel):
     enabled: bool = True
-    delivery_interval_seconds: int = Field(default=3600, ge=0, le=3600)
+    delivery_interval_seconds: int = Field(default=9000, ge=9000, le=86400)
     batch_window_seconds: int = Field(default=3600, ge=1, le=3600)
-    batch_size_min: int = Field(default=1, ge=1, le=10000)
-    batch_size_max: int = Field(default=1, ge=1, le=10000)
-    cooldown_min_seconds: int = Field(default=3600, ge=0, le=86400)
-    cooldown_max_seconds: int = Field(default=10800, ge=0, le=86400)
+    batch_size_min: int = Field(default=1, ge=1, le=1)
+    batch_size_max: int = Field(default=1, ge=1, le=1)
+    cooldown_min_seconds: int = Field(default=9000, ge=9000, le=86400)
+    cooldown_max_seconds: int = Field(default=10800, ge=9000, le=86400)
 
 
 class AdDeliveryExecutionUpdate(BaseModel):
     enabled: bool = True
     dispatcher_interval_seconds: int = Field(default=60, ge=1, le=86400)
-    max_deliveries_per_run: int = Field(default=1, ge=1, le=20)
-    max_deliveries_per_account_per_run: int = Field(default=1, ge=1, le=5)
-    group_campaign_cooldown_minutes: int = Field(default=1440, ge=0, le=10080)
+    max_deliveries_per_run: int = Field(default=1, ge=1, le=1)
+    max_deliveries_per_account_per_run: int = Field(default=1, ge=1, le=1)
+    group_campaign_cooldown_minutes: int = Field(default=4320, ge=4320, le=10080)
     stop_account_after_success: bool = True
     stop_account_after_failure: bool = True
 
@@ -228,12 +229,12 @@ class AdCapacityUpdate(BaseModel):
     survival_one_hour_seconds: int = Field(default=3600, ge=300, le=7200)
     survival_twenty_four_hour_seconds: int = Field(default=86400, ge=3600, le=172800)
     survival_check_batch_size: int = Field(default=50, ge=1, le=500)
-    account_ad_daily_hard_cap: int = Field(default=5, ge=1, le=500)
-    account_group_daily_cap_default: int = Field(default=3, ge=1, le=500)
+    account_ad_daily_hard_cap: int = Field(default=5, ge=1, le=5)
+    account_group_daily_cap_default: int = Field(default=1, ge=1, le=1)
     group_global_daily_hard_cap: int = Field(default=400, ge=1, le=400)
-    group_min_interval_seconds: int = Field(default=3600, ge=60, le=86400)
+    group_min_interval_seconds: int = Field(default=259200, ge=259200, le=604800)
     max_groups_per_account: int = Field(default=400, ge=1, le=1000)
-    max_new_ad_groups_per_day: int = Field(default=3, ge=0, le=100)
+    max_new_ad_groups_per_day: int = Field(default=2, ge=0, le=2)
     leave_on_deleted_ad: bool = True
     block_group_on_probe_failure: bool = True
     ad_policy_ai_enabled: bool = True
@@ -255,7 +256,7 @@ class AdCapacityUpdate(BaseModel):
     premium_clean_days_verified: int = Field(default=3, ge=3, le=30)
     deleted_ad_pause_hours: int = Field(default=72, ge=1, le=720)
     membership_delete_block_count: int = Field(default=2, ge=1, le=20)
-    warmup_days_before_ads: int = Field(default=15, ge=0, le=90)
+    warmup_days_before_ads: int = Field(default=15, ge=7, le=90)
     warmup_daily_interactions_min: int = Field(default=0, ge=0, le=20)
     warmup_daily_interactions_max: int = Field(default=1, ge=0, le=20)
     mature_daily_interactions_min: int = Field(default=0, ge=0, le=20)
