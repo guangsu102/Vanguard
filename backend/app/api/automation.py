@@ -38,6 +38,7 @@ from app.core.database import get_db
 from app.core.group.models import Group, GroupAccountMembership
 from app.core.scheduler.tasks import (
     auto_join_groups_task,
+    recover_orphaned_groups_task,
     check_ad_survival_task,
     deliver_ads_task,
     replenish_keywords_task,
@@ -57,6 +58,8 @@ from app.modules.acquisition.models import (
     AdDeliveryLog,
     AdSendMode,
     AutoJoinAttempt,
+    GroupFailoverStatus,
+    GroupFailoverTask,
     GroupAdPolicyMode,
     GroupAdPolicyEvent,
     GroupAdProfile,
@@ -125,6 +128,7 @@ def _auto_join_verification_log_from_membership(
 # =============================================================================
 # Auto-join Scheduler Config
 # =============================================================================
+
 
 class AutoJoinSchedulerConfigUpdate(BaseModel):
     enabled: bool = True
@@ -424,13 +428,21 @@ def _build_dynamic_health_diagnostic(
             )
         )
     if warmup_action_multiplier <= 0:
-        reasons.append(_diagnostic_reason("warmup_multiplier_zero", "暖号阶段禁止广告动作", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("warmup_multiplier_zero", "暖号阶段禁止广告动作", severity="danger")
+        )
     if int(probe_budget.get("probe_based_limit", 0) or 0) <= 0:
-        reasons.append(_diagnostic_reason("probe_budget_zero", "已验证群广告容量为 0", severity="warning"))
+        reasons.append(
+            _diagnostic_reason("probe_budget_zero", "已验证群广告容量为 0", severity="warning")
+        )
     if daily_limit <= 0:
-        reasons.append(_diagnostic_reason("ad_daily_limit_zero", "广告日额度为 0", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("ad_daily_limit_zero", "广告日额度为 0", severity="danger")
+        )
     if run_limit <= 0:
-        reasons.append(_diagnostic_reason("ad_run_limit_zero", "广告单轮额度为 0", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("ad_run_limit_zero", "广告单轮额度为 0", severity="danger")
+        )
     if not reasons and negative_adjustments:
         first = negative_adjustments[0]
         reasons.append(
@@ -458,7 +470,9 @@ def _build_dynamic_health_diagnostic(
         "probe_based_daily_limit": int(probe_budget.get("probe_based_limit", 0) or 0),
         "probe_factor": round(float(probe_budget.get("probe_factor", 0.0) or 0.0), 3),
         "writable_rate": round(float(join_metrics.get("writable_rate", 0.0) or 0.0), 3),
-        "probe_success_rate_24h": round(float(join_metrics.get("probe_success_rate_24h", 0.0) or 0.0), 3),
+        "probe_success_rate_24h": round(
+            float(join_metrics.get("probe_success_rate_24h", 0.0) or 0.0), 3
+        ),
         "ad_success_rate_24h": round(float(join_metrics.get("ad_success_rate_24h", 0.0) or 0.0), 3),
     }
 
@@ -489,7 +503,9 @@ async def _build_ad_delivery_diagnostic(
     next_action_at: Optional[datetime] = None
 
     if op_config is None:
-        reasons.append(_diagnostic_reason("operation_config_missing", "缺少运营配置", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("operation_config_missing", "缺少运营配置", severity="danger")
+        )
     elif not op_config.enabled:
         reasons.append(_diagnostic_reason("operation_disabled", "账号运营关闭", severity="danger"))
     elif not op_config.auto_ads_enabled:
@@ -499,7 +515,11 @@ async def _build_ad_delivery_diagnostic(
     if not account.is_active:
         reasons.append(_diagnostic_reason("account_inactive", "账号未启用", severity="danger"))
     if str(account_status) in {"error", "banned"}:
-        reasons.append(_diagnostic_reason("account_status_blocked", f"账号状态 {account_status}", severity="danger"))
+        reasons.append(
+            _diagnostic_reason(
+                "account_status_blocked", f"账号状态 {account_status}", severity="danger"
+            )
+        )
     if account.risk_pause_until and account.risk_pause_until > now:
         reasons.append(
             _diagnostic_reason(
@@ -511,14 +531,22 @@ async def _build_ad_delivery_diagnostic(
         )
         next_action_at = account.risk_pause_until
     if account.risk_level in {"frozen", "quarantined"}:
-        reasons.append(_diagnostic_reason("risk_level_blocked", f"风控等级 {account.risk_level}", severity="danger"))
+        reasons.append(
+            _diagnostic_reason(
+                "risk_level_blocked", f"风控等级 {account.risk_level}", severity="danger"
+            )
+        )
     elif account.risk_level in {"limited", "watch"}:
         reasons.append(_diagnostic_reason("risk_level_limited", f"风控等级 {account.risk_level}"))
 
     if campaign is None:
-        reasons.append(_diagnostic_reason("campaign_missing", "没有启用的广告计划", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("campaign_missing", "没有启用的广告计划", severity="danger")
+        )
     elif not _campaign_is_active_for_status(campaign, now):
-        reasons.append(_diagnostic_reason("campaign_inactive", "广告计划未处于活动状态", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("campaign_inactive", "广告计划未处于活动状态", severity="danger")
+        )
 
     binding_query = select(func.count(AccountAdBinding.id)).where(
         AccountAdBinding.account_id == account.id,
@@ -528,29 +556,43 @@ async def _build_ad_delivery_diagnostic(
         binding_query = binding_query.where(AccountAdBinding.ad_campaign_id == campaign.id)
     binding_count = (await db.execute(binding_query)).scalar() or 0
     if campaign is not None and binding_count <= 0:
-        reasons.append(_diagnostic_reason("binding_missing", "账号未绑定当前广告计划素材", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("binding_missing", "账号未绑定当前广告计划素材", severity="danger")
+        )
 
     if daily_limit <= 0:
-        reasons.append(_diagnostic_reason("dynamic_daily_limit_zero", "动态日额度为 0", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("dynamic_daily_limit_zero", "动态日额度为 0", severity="danger")
+        )
     if run_limit <= 0:
-        reasons.append(_diagnostic_reason("dynamic_run_limit_zero", "动态单轮额度为 0", severity="danger"))
+        reasons.append(
+            _diagnostic_reason("dynamic_run_limit_zero", "动态单轮额度为 0", severity="danger")
+        )
 
     memberships = (
-        await db.execute(
-            select(GroupAccountMembership)
-            .options(selectinload(GroupAccountMembership.group))
-            .where(
-                GroupAccountMembership.account_id == account.id,
-                GroupAccountMembership.status == "joined",
+        (
+            await db.execute(
+                select(GroupAccountMembership)
+                .options(selectinload(GroupAccountMembership.group))
+                .where(
+                    GroupAccountMembership.account_id == account.id,
+                    GroupAccountMembership.status == "joined",
+                )
+                .order_by(
+                    GroupAccountMembership.updated_at.desc(), GroupAccountMembership.id.desc()
+                )
+                .limit(200)
             )
-            .order_by(GroupAccountMembership.updated_at.desc(), GroupAccountMembership.id.desc())
-            .limit(200)
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     group_ids = [int(item.group_id) for item in memberships if item.group_id is not None]
     profile_map: dict[int, GroupAdProfile] = {}
     if group_ids:
-        profile_rows = await db.execute(select(GroupAdProfile).where(GroupAdProfile.group_id.in_(group_ids)))
+        profile_rows = await db.execute(
+            select(GroupAdProfile).where(GroupAdProfile.group_id.in_(group_ids))
+        )
         profile_map = {int(item.group_id): item for item in profile_rows.scalars().all()}
 
     target_levels = set(campaign.get_target_levels()) if campaign is not None else set()
@@ -607,7 +649,11 @@ async def _build_ad_delivery_diagnostic(
             group_label = f"群等级 {group.level.value} 未命中"
             severity = "info"
             group_counts["level_not_targeted"] += 1
-        elif membership.warmup_status == "blocked" or membership.probe_status == "failed" or membership.ad_status == "blocked":
+        elif (
+            membership.warmup_status == "blocked"
+            or membership.probe_status == "failed"
+            or membership.ad_status == "blocked"
+        ):
             group_reason = "probe_or_ad_blocked"
             group_label = "探针或广告状态阻断"
             severity = "danger"
@@ -690,7 +736,9 @@ async def _build_ad_delivery_diagnostic(
                     "first_ad_allowed_at": _iso_datetime(membership.first_ad_allowed_at),
                     "ad_eligible_after": _iso_datetime(membership.ad_eligible_after),
                     "last_probe_error": (membership.last_probe_error or "")[:300],
-                    "ad_policy_mode": profile.ad_policy_mode if profile else GroupAdPolicyMode.UNKNOWN.value,
+                    "ad_policy_mode": profile.ad_policy_mode
+                    if profile
+                    else GroupAdPolicyMode.UNKNOWN.value,
                     "ad_tier": profile.ad_tier if profile else "observing",
                     "ad_daily_capacity": int(profile.daily_capacity or 0) if profile else 0,
                 }
@@ -699,7 +747,11 @@ async def _build_ad_delivery_diagnostic(
     if memberships and group_counts["ready"] <= 0:
         if group_counts["pending_probe"]:
             reasons.append(
-                _diagnostic_reason("groups_pending_probe", "已入群但等待探针", detail=f"{group_counts['pending_probe']} 个群")
+                _diagnostic_reason(
+                    "groups_pending_probe",
+                    "已入群但等待探针",
+                    detail=f"{group_counts['pending_probe']} 个群",
+                )
             )
             next_action = "send_probe"
             next_action_label = "等待探针发送"
@@ -754,7 +806,9 @@ async def _build_ad_delivery_diagnostic(
             next_action = "adjust_campaign_levels"
             next_action_label = "调整广告目标等级或提升群评级"
         elif group_counts["probe_failed"] or group_counts["blocked"]:
-            reasons.append(_diagnostic_reason("groups_blocked", "候选群被探针/权限阻断", severity="danger"))
+            reasons.append(
+                _diagnostic_reason("groups_blocked", "候选群被探针/权限阻断", severity="danger")
+            )
             next_action = "find_more_groups"
             next_action_label = "继续加群或清理阻断群"
     elif not memberships:
@@ -776,14 +830,13 @@ async def _build_ad_delivery_diagnostic(
     }
     probe_execution_allowed = not any(item["reason"] in probe_blocking_reasons for item in reasons)
     ad_delivery_allowed = (
-        probe_execution_allowed
-        and daily_limit > 0
-        and run_limit > 0
-        and group_counts["ready"] > 0
+        probe_execution_allowed and daily_limit > 0 and run_limit > 0 and group_counts["ready"] > 0
     )
 
     hard_reason = next((item for item in reasons if item["severity"] == "danger"), None)
-    primary = hard_reason or (reasons[0] if reasons else _diagnostic_reason("ready", "可以尝试投放", severity="success"))
+    primary = hard_reason or (
+        reasons[0] if reasons else _diagnostic_reason("ready", "可以尝试投放", severity="success")
+    )
     if primary["reason"] in {"dynamic_daily_limit_zero", "dynamic_run_limit_zero"}:
         if probe_execution_allowed and group_counts["pending_probe"] > 0:
             next_action = "send_probe_while_ads_paused"
@@ -933,7 +986,9 @@ async def update_ad_capacity_config(
     return {"code": 0, "message": "success", "data": config}
 
 
-def _group_ad_profile_payload(profile: GroupAdProfile, metrics: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _group_ad_profile_payload(
+    profile: GroupAdProfile, metrics: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     group = profile.group
     return {
         "id": profile.id,
@@ -966,7 +1021,11 @@ async def list_group_ad_profiles(
     limit: int = Query(default=100, ge=1, le=300),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    query = select(GroupAdProfile).options(selectinload(GroupAdProfile.group)).order_by(GroupAdProfile.updated_at.desc())
+    query = (
+        select(GroupAdProfile)
+        .options(selectinload(GroupAdProfile.group))
+        .order_by(GroupAdProfile.updated_at.desc())
+    )
     if policy_mode:
         query = query.where(GroupAdProfile.ad_policy_mode == policy_mode)
     if tier:
@@ -977,7 +1036,11 @@ async def list_group_ad_profiles(
     now = datetime.utcnow()
     data = []
     for profile in profiles:
-        metrics = await service._refresh_group_ad_profile_tier(profile, profile.group, now, capacity) if profile.group else {}
+        metrics = (
+            await service._refresh_group_ad_profile_tier(profile, profile.group, now, capacity)
+            if profile.group
+            else {}
+        )
         data.append(_group_ad_profile_payload(profile, metrics))
     return {"code": 0, "message": "success", "data": data}
 
@@ -1030,11 +1093,15 @@ async def update_group_ad_policy(
     now = datetime.utcnow()
     mode = GroupAdPolicyMode(request.mode).value
     required_confidence = 80 if mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
-    if mode in {
-        GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-        GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-        GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
-    } and request.confidence < required_confidence:
+    if (
+        mode
+        in {
+            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+            GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+        }
+        and request.confidence < required_confidence
+    ):
         raise HTTPException(
             status_code=400,
             detail=f"Selected ad policy requires confidence >= {required_confidence}",
@@ -1106,18 +1173,24 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
     ).scalar_one_or_none()
 
     accounts = (
-        await db.execute(
-            select(TelegramAccount)
-            .where(TelegramAccount.account_type == AccountType.PROMOTER)
-            .order_by(TelegramAccount.id.asc())
+        (
+            await db.execute(
+                select(TelegramAccount)
+                .where(TelegramAccount.account_type == AccountType.PROMOTER)
+                .order_by(TelegramAccount.id.asc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     data: list[dict[str, Any]] = []
     for account in accounts:
         op_config = (
             await db.execute(
-                select(AccountOperationConfig).where(AccountOperationConfig.account_id == account.id)
+                select(AccountOperationConfig).where(
+                    AccountOperationConfig.account_id == account.id
+                )
             )
         ).scalar_one_or_none()
         health = await service._ad_dynamic_account_health(account.id, now)
@@ -1224,17 +1297,24 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
         data.append(
             {
                 "account_id": account.id,
-                "account_label": account.display_name or account.identifier or account.phone or account.session_name,
+                "account_label": account.display_name
+                or account.identifier
+                or account.phone
+                or account.session_name,
                 "account_status": getattr(account.status, "value", account.status),
                 "risk_level": account.risk_level,
                 "risk_score": account.risk_score,
                 "risk_reason": account.risk_reason,
-                "risk_pause_until": account.risk_pause_until.isoformat() if account.risk_pause_until else None,
+                "risk_pause_until": account.risk_pause_until.isoformat()
+                if account.risk_pause_until
+                else None,
                 "auto_join_enabled": bool(op_config.auto_join_enabled) if op_config else False,
                 "auto_ads_enabled": bool(op_config.auto_ads_enabled) if op_config else False,
                 "business_stage": business_stage,
                 "warmup_stage": warmup_context.stage,
-                "managed_started_at": warmup_context.managed_started_at.isoformat() if warmup_context.managed_started_at else None,
+                "managed_started_at": warmup_context.managed_started_at.isoformat()
+                if warmup_context.managed_started_at
+                else None,
                 "managed_age_days": warmup_context.managed_age_days,
                 "warmup_remaining_days": warmup_context.remaining_days,
                 "warmup_action_multiplier": round(float(warmup_context.action_multiplier), 3),
@@ -1254,7 +1334,9 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "probe_quality_multiplier": round(float(probe_budget["quality_multiplier"]), 3),
                 "recent_probe_success_6h": int(recent_probe_success),
                 "recent_probe_failed_6h": int(probe_budget["recent_probe_failed"]),
-                "recent_probe_success_rate_6h": round(float(probe_budget["recent_probe_success_rate"]), 3),
+                "recent_probe_success_rate_6h": round(
+                    float(probe_budget["recent_probe_success_rate"]), 3
+                ),
                 "ad_eligible_groups": int(ad_eligible_groups),
                 "pending_probe_groups": int(pending_probe_groups),
                 "join_dynamic_daily_limit": int(join_daily_limit),
@@ -1262,7 +1344,9 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "writable_rate": round(float(join_metrics["writable_rate"]), 3),
                 "probe_success_rate_24h": round(float(join_metrics["probe_success_rate_24h"]), 3),
                 "ad_success_rate_24h": round(float(join_metrics["ad_success_rate_24h"]), 3),
-                "average_group_quality_score": round(float(join_metrics["average_group_quality_score"]), 2),
+                "average_group_quality_score": round(
+                    float(join_metrics["average_group_quality_score"]), 2
+                ),
                 "warmup_summary": warmup_summary,
                 "recent_errors": recent_errors,
                 "delivery_diagnostic": delivery_diagnostic,
@@ -1276,6 +1360,7 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
 # =============================================================================
 # Advertisement Failure Policy
 # =============================================================================
+
 
 @router.get("/ads/failure-policy")
 async def get_ad_failure_policy(db: AsyncSession = Depends(get_db)) -> dict:
@@ -1294,6 +1379,7 @@ async def update_ad_failure_policy(
 # =============================================================================
 # Account Operation Config
 # =============================================================================
+
 
 class AccountOperationConfigUpdate(BaseModel):
     auto_join_enabled: Optional[bool] = None
@@ -1350,13 +1436,19 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
     }
 
 
-async def _get_or_create_operation_config(db: AsyncSession, account_id: int) -> AccountOperationConfig:
-    account_result = await db.execute(select(TelegramAccount).where(TelegramAccount.id == account_id))
+async def _get_or_create_operation_config(
+    db: AsyncSession, account_id: int
+) -> AccountOperationConfig:
+    account_result = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == account_id)
+    )
     account = account_result.scalar_one_or_none()
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
     if account.account_type != AccountType.PROMOTER:
-        raise HTTPException(status_code=400, detail="Only promoter accounts support growth automation config")
+        raise HTTPException(
+            status_code=400, detail="Only promoter accounts support growth automation config"
+        )
 
     result = await db.execute(
         select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id)
@@ -1372,7 +1464,9 @@ async def _get_or_create_operation_config(db: AsyncSession, account_id: int) -> 
     return config
 
 
-def _prepare_operation_config_update(config: AccountOperationConfig, payload: dict[str, Any]) -> dict[str, Any]:
+def _prepare_operation_config_update(
+    config: AccountOperationConfig, payload: dict[str, Any]
+) -> dict[str, Any]:
     data = dict(payload)
     if "keyword_types" in data:
         data["keyword_types"] = json.dumps(data["keyword_types"], ensure_ascii=False)
@@ -1448,13 +1542,16 @@ async def update_account_operation_configs_batch(
 # Manual Automation Runs
 # =============================================================================
 
+
 class KeywordReplenishRequest(BaseModel):
     min_per_type: Optional[dict[str, int]] = None
     generate_counts: Optional[dict[str, int]] = None
     auto_approve: bool = False
 
 
-def _queued_automation_result(task_name: str, async_result: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def _queued_automation_result(
+    task_name: str, async_result: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "queued": True,
         "status": "queued",
@@ -1520,6 +1617,22 @@ async def run_auto_join(request: AutoJoinRunRequest) -> dict:
     return {"code": 0, "message": "success", "data": result}
 
 
+class GroupFailoverRunRequest(BaseModel):
+    max_tasks: int = Field(default=20, ge=1, le=100)
+    dry_run: bool = False
+
+
+@router.post("/auto-join/failover/run", status_code=status.HTTP_202_ACCEPTED)
+async def run_group_failover(request: GroupFailoverRunRequest) -> dict:
+    result = _enqueue_automation_task(
+        recover_orphaned_groups_task,
+        "recover_orphaned_groups_task",
+        max_tasks=request.max_tasks,
+        dry_run=request.dry_run,
+    )
+    return {"code": 0, "message": "success", "data": result}
+
+
 class AdDeliveryRunRequest(BaseModel):
     max_deliveries: int = Field(default=300, ge=1, le=10000)
     dry_run: bool = False
@@ -1553,6 +1666,138 @@ async def run_ad_survival_check(request: AdSurvivalCheckRunRequest) -> dict:
 # =============================================================================
 # Auto-join Logs
 # =============================================================================
+
+
+class GroupFailoverRetryRequest(BaseModel):
+    target_account_id: Optional[int] = None
+
+
+def _group_failover_task_to_dict(item: GroupFailoverTask) -> dict[str, Any]:
+    return {
+        "id": item.id,
+        "source_membership_id": item.source_membership_id,
+        "source_account_id": item.source_account_id,
+        "source_account_label": (
+            item.source_account.display_name or item.source_account.identifier
+            if item.source_account
+            else None
+        ),
+        "target_account_id": item.target_account_id,
+        "target_account_label": (
+            item.target_account.display_name or item.target_account.identifier
+            if item.target_account
+            else None
+        ),
+        "group_id": item.group_id,
+        "telegram_group_id": item.telegram_group_id,
+        "group_title": item.group.title if item.group else None,
+        "group_username": item.group.username if item.group else None,
+        "status": item.status,
+        "reason": item.reason,
+        "error": item.error,
+        "attempt_count": item.attempt_count,
+        "next_retry_at": item.next_retry_at.isoformat() if item.next_retry_at else None,
+        "last_attempt_at": item.last_attempt_at.isoformat() if item.last_attempt_at else None,
+        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+        "created_at": item.created_at.isoformat() if item.created_at else "",
+        "updated_at": item.updated_at.isoformat() if item.updated_at else "",
+    }
+
+
+@router.get("/auto-join/failover/tasks")
+async def list_group_failover_tasks(
+    status_filter: Optional[str] = Query(None, alias="status"),
+    source_account_id: Optional[int] = None,
+    target_account_id: Optional[int] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    query = select(GroupFailoverTask).options(
+        selectinload(GroupFailoverTask.source_account),
+        selectinload(GroupFailoverTask.target_account),
+        selectinload(GroupFailoverTask.group),
+    )
+    count_query = select(func.count(GroupFailoverTask.id))
+    filters = []
+    if status_filter:
+        filters.append(GroupFailoverTask.status == status_filter)
+    if source_account_id:
+        filters.append(GroupFailoverTask.source_account_id == source_account_id)
+    if target_account_id:
+        filters.append(GroupFailoverTask.target_account_id == target_account_id)
+    if filters:
+        query = query.where(*filters)
+        count_query = count_query.where(*filters)
+    total = int((await db.execute(count_query)).scalar() or 0)
+    rows = await db.execute(
+        query.order_by(GroupFailoverTask.updated_at.desc(), GroupFailoverTask.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    summary_rows = await db.execute(
+        select(GroupFailoverTask.status, func.count(GroupFailoverTask.id)).group_by(
+            GroupFailoverTask.status
+        )
+    )
+    summary = {status_value: int(count) for status_value, count in summary_rows.all()}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_group_failover_task_to_dict(item) for item in rows.scalars().all()],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "summary": summary,
+    }
+
+
+@router.post("/auto-join/failover/tasks/{task_id:int}/retry")
+async def retry_group_failover_task(
+    task_id: int,
+    request: GroupFailoverRetryRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    task = await db.get(GroupFailoverTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Group failover task not found")
+    if task.status == GroupFailoverStatus.SUCCEEDED.value:
+        raise HTTPException(status_code=409, detail="Succeeded task cannot be retried")
+    if request.target_account_id is not None:
+        account = await db.get(TelegramAccount, request.target_account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="Target account not found")
+        task.target_account_id = account.id
+    task.status = GroupFailoverStatus.RETRY.value
+    task.reason = "manual_retry"
+    task.error = None
+    task.next_retry_at = datetime.utcnow()
+    task.completed_at = None
+    task.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(task)
+    return {"code": 0, "message": "success", "data": _group_failover_task_to_dict(task)}
+
+
+@router.post("/auto-join/failover/tasks/{task_id:int}/cancel")
+async def cancel_group_failover_task(
+    task_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    task = await db.get(GroupFailoverTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Group failover task not found")
+    if task.status == GroupFailoverStatus.SUCCEEDED.value:
+        raise HTTPException(status_code=409, detail="Succeeded task cannot be cancelled")
+    task.status = GroupFailoverStatus.CANCELLED.value
+    task.reason = "manual_cancelled"
+    task.next_retry_at = None
+    task.completed_at = datetime.utcnow()
+    task.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(task)
+    return {"code": 0, "message": "success", "data": _group_failover_task_to_dict(task)}
+
 
 @router.get("/auto-join/attempts")
 async def list_auto_join_attempts(
@@ -1630,6 +1875,7 @@ async def list_auto_join_verification_logs(
 # Advertisement CRUD
 # =============================================================================
 
+
 class AdCreativeCreate(BaseModel):
     name: str = Field(..., max_length=120)
     content: str = Field(..., min_length=1)
@@ -1655,7 +1901,9 @@ def _validate_ad_creative_content(content: Optional[str]) -> None:
         return
     text = content.strip()
     if HTML_RESPONSE_RE.search(text) or WEB_ERROR_RESPONSE_RE.search(text):
-        raise HTTPException(status_code=400, detail="Creative content looks like an HTML or web error response")
+        raise HTTPException(
+            status_code=400, detail="Creative content looks like an HTML or web error response"
+        )
 
 
 def _creative_to_dict(item: AdCreative) -> dict:
@@ -1689,7 +1937,12 @@ async def list_ad_creatives(
     rows = await db.execute(
         query.order_by(AdCreative.id.desc()).offset((page - 1) * page_size).limit(page_size)
     )
-    return {"code": 0, "message": "success", "data": [_creative_to_dict(i) for i in rows.scalars().all()], "total": total}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_creative_to_dict(i) for i in rows.scalars().all()],
+        "total": total,
+    }
 
 
 @router.post("/ads/creatives", status_code=status.HTTP_201_CREATED)
@@ -1731,11 +1984,15 @@ async def update_ad_creative(
     request: AdCreativeUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    creative = (await db.execute(select(AdCreative).where(AdCreative.id == creative_id))).scalar_one_or_none()
+    creative = (
+        await db.execute(select(AdCreative).where(AdCreative.id == creative_id))
+    ).scalar_one_or_none()
     if not creative:
         raise HTTPException(status_code=404, detail="Creative not found")
     data = request.model_dump(exclude_none=True)
-    if "creative_type" in data and data["creative_type"] not in {item.value for item in AdCreativeType}:
+    if "creative_type" in data and data["creative_type"] not in {
+        item.value for item in AdCreativeType
+    }:
         raise HTTPException(status_code=400, detail="Invalid creative_type")
     _validate_ad_creative_content(data.get("content"))
     for field, value in data.items():
@@ -1747,7 +2004,9 @@ async def update_ad_creative(
 
 @router.delete("/ads/creatives/{creative_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ad_creative(creative_id: int, db: AsyncSession = Depends(get_db)) -> None:
-    creative = (await db.execute(select(AdCreative).where(AdCreative.id == creative_id))).scalar_one_or_none()
+    creative = (
+        await db.execute(select(AdCreative).where(AdCreative.id == creative_id))
+    ).scalar_one_or_none()
     if not creative:
         raise HTTPException(status_code=404, detail="Creative not found")
     await db.delete(creative)
@@ -1846,7 +2105,9 @@ async def _validate_target_group_ids(group_ids: list[int], db: AsyncSession) -> 
 
 def _validate_campaign_schedule(send_mode: str, scheduled_times: list[str]) -> None:
     if send_mode == AdSendMode.SCHEDULED.value and not scheduled_times:
-        raise HTTPException(status_code=400, detail="scheduled_times is required for scheduled campaigns")
+        raise HTTPException(
+            status_code=400, detail="scheduled_times is required for scheduled campaigns"
+        )
 
 
 def _campaign_payload(data: dict) -> dict:
@@ -1874,8 +2135,15 @@ async def list_ad_campaigns(
         query = query.where(AdCampaign.enabled == enabled)
         count_query = count_query.where(AdCampaign.enabled == enabled)
     total = (await db.execute(count_query)).scalar() or 0
-    rows = await db.execute(query.order_by(AdCampaign.id.desc()).offset((page - 1) * page_size).limit(page_size))
-    return {"code": 0, "message": "success", "data": [_campaign_to_dict(i) for i in rows.scalars().all()], "total": total}
+    rows = await db.execute(
+        query.order_by(AdCampaign.id.desc()).offset((page - 1) * page_size).limit(page_size)
+    )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_campaign_to_dict(i) for i in rows.scalars().all()],
+        "total": total,
+    }
 
 
 @router.post("/ads/campaigns", status_code=status.HTTP_201_CREATED)
@@ -1899,7 +2167,9 @@ async def update_ad_campaign(
     request: AdCampaignUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    campaign = (await db.execute(select(AdCampaign).where(AdCampaign.id == campaign_id))).scalar_one_or_none()
+    campaign = (
+        await db.execute(select(AdCampaign).where(AdCampaign.id == campaign_id))
+    ).scalar_one_or_none()
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     data = request.model_dump(exclude_none=True)
@@ -1921,7 +2191,9 @@ async def update_ad_campaign(
 
 @router.delete("/ads/campaigns/{campaign_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ad_campaign(campaign_id: int, db: AsyncSession = Depends(get_db)) -> None:
-    campaign = (await db.execute(select(AdCampaign).where(AdCampaign.id == campaign_id))).scalar_one_or_none()
+    campaign = (
+        await db.execute(select(AdCampaign).where(AdCampaign.id == campaign_id))
+    ).scalar_one_or_none()
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
     await db.delete(campaign)
@@ -1974,12 +2246,20 @@ async def list_account_ad_bindings(
         query = query.where(AccountAdBinding.account_id == account_id)
     if campaign_id:
         query = query.where(AccountAdBinding.ad_campaign_id == campaign_id)
-    rows = await db.execute(query.order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id.desc()))
-    return {"code": 0, "message": "success", "data": [_binding_to_dict(i) for i in rows.scalars().all()]}
+    rows = await db.execute(
+        query.order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id.desc())
+    )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_binding_to_dict(i) for i in rows.scalars().all()],
+    }
 
 
 @router.post("/ads/bindings", status_code=status.HTTP_201_CREATED)
-async def create_account_ad_binding(request: AccountAdBindingCreate, db: AsyncSession = Depends(get_db)) -> dict:
+async def create_account_ad_binding(
+    request: AccountAdBindingCreate, db: AsyncSession = Depends(get_db)
+) -> dict:
     binding = AccountAdBinding(**request.model_dump())
     db.add(binding)
     await db.commit()
@@ -1996,15 +2276,21 @@ async def create_account_ad_bindings_batch(
         raise HTTPException(status_code=400, detail="creative_ids is required")
 
     creatives = (
-        await db.execute(
-            select(AdCreative).where(
-                AdCreative.id.in_(request.creative_ids),
-                AdCreative.enabled == True,
+        (
+            await db.execute(
+                select(AdCreative).where(
+                    AdCreative.id.in_(request.creative_ids),
+                    AdCreative.enabled == True,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     creative_ids = {item.id for item in creatives}
-    missing = [creative_id for creative_id in request.creative_ids if creative_id not in creative_ids]
+    missing = [
+        creative_id for creative_id in request.creative_ids if creative_id not in creative_ids
+    ]
     if missing:
         raise HTTPException(status_code=404, detail=f"Creative not found: {missing[0]}")
 
@@ -2071,7 +2357,9 @@ async def update_account_ad_binding(
     request: AccountAdBindingUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    binding = (await db.execute(select(AccountAdBinding).where(AccountAdBinding.id == binding_id))).scalar_one_or_none()
+    binding = (
+        await db.execute(select(AccountAdBinding).where(AccountAdBinding.id == binding_id))
+    ).scalar_one_or_none()
     if not binding:
         raise HTTPException(status_code=404, detail="Binding not found")
     for field, value in request.model_dump(exclude_none=True).items():
@@ -2083,7 +2371,9 @@ async def update_account_ad_binding(
 
 @router.delete("/ads/bindings/{binding_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_account_ad_binding(binding_id: int, db: AsyncSession = Depends(get_db)) -> None:
-    binding = (await db.execute(select(AccountAdBinding).where(AccountAdBinding.id == binding_id))).scalar_one_or_none()
+    binding = (
+        await db.execute(select(AccountAdBinding).where(AccountAdBinding.id == binding_id))
+    ).scalar_one_or_none()
     if not binding:
         raise HTTPException(status_code=404, detail="Binding not found")
     await db.delete(binding)
@@ -2137,8 +2427,12 @@ async def list_ad_delivery_logs(
                 "status": item.status,
                 "telegram_message_id": item.telegram_message_id,
                 "survival_status": item.survival_status,
-                "survival_check_due_at": item.survival_check_due_at.isoformat() if item.survival_check_due_at else None,
-                "survival_checked_at": item.survival_checked_at.isoformat() if item.survival_checked_at else None,
+                "survival_check_due_at": item.survival_check_due_at.isoformat()
+                if item.survival_check_due_at
+                else None,
+                "survival_checked_at": item.survival_checked_at.isoformat()
+                if item.survival_checked_at
+                else None,
                 "survival_error": item.survival_error,
                 "error": item.error,
                 "sent_at": item.sent_at.isoformat() if item.sent_at else None,

@@ -19,6 +19,8 @@ import {
   type AdCampaign,
   type AdCreative,
   type AutoJoinVerificationLog,
+  type GroupFailoverStatus,
+  type GroupFailoverTask,
   type AutomationRunResult,
 } from '@/api/automation'
 import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS } from '@/api/keywords'
@@ -44,6 +46,11 @@ const router = useRouter()
 const lastResult = ref<AutomationRunResult | null>(null)
 const autoJoinAttempts = ref<any[]>([])
 const autoJoinVerificationLogs = ref<AutoJoinVerificationLog[]>([])
+const groupFailoverTasks = ref<GroupFailoverTask[]>([])
+const groupFailoverSummary = ref<Partial<Record<GroupFailoverStatus, number>>>({})
+const groupFailoverTotal = ref(0)
+const groupFailoverStatusFilter = ref<GroupFailoverStatus | "">("")
+
 const deliveryLogs = ref<any[]>([])
 const creatives = ref<AdCreative[]>([])
 const campaigns = ref<AdCampaign[]>([])
@@ -88,6 +95,21 @@ const autoJoinForm = reactive({
   max_groups_per_keyword: 20,
   dry_run: true,
 })
+
+const groupFailoverForm = reactive({
+  max_tasks: 20,
+  dry_run: false,
+})
+
+const groupFailoverStatusOptions: Array<{ label: string; value: GroupFailoverStatus }> = [
+  { label: '\u5f85\u63a5\u7ba1', value: 'queued' },
+  { label: '\u63a5\u7ba1\u4e2d', value: 'joining' },
+  { label: '\u7b49\u5f85\u91cd\u8bd5', value: 'retry' },
+  { label: '\u5df2\u6062\u590d', value: 'succeeded' },
+  { label: '\u9700\u4eba\u5de5\u5904\u7406', value: 'manual_required' },
+  { label: '\u5931\u8d25', value: 'failed' },
+  { label: '\u5df2\u53d6\u6d88', value: 'cancelled' },
+]
 
 const schedulerConfigForm = reactive({
   enabled: true,
@@ -962,6 +984,16 @@ const handleDeliveryPageSizeChange = async (pageSize: number) => {
   await loadDeliveryLogs()
 }
 
+const loadGroupFailovers = async () => {
+  const response = await automationApi.getGroupFailoverTasks({
+    status: groupFailoverStatusFilter.value || undefined,
+    page_size: 100,
+  })
+  groupFailoverTasks.value = response.data.data
+  groupFailoverSummary.value = response.data.summary || {}
+  groupFailoverTotal.value = response.data.total || 0
+}
+
 const refreshData = async () => {
   loading.value = true
   try {
@@ -978,6 +1010,7 @@ const refreshData = async () => {
     creatives.value = creativesRes.data.data
     campaigns.value = campaignsRes.data.data
     bindings.value = bindingsRes.data.data
+    await loadGroupFailovers()
     dynamicStatuses.value = dynamicStatusRes.data.data
     creativePoolStatus.value = null
     await loadDeliveryLogs()
@@ -1030,6 +1063,40 @@ const runKeywordReplenish = () => {
 const runAutoJoin = () => {
   runTask('autoJoin', () => automationApi.runAutoJoin({ ...autoJoinForm }))
 }
+
+const runGroupFailover = () => {
+  runTask('groupFailover', () => automationApi.runGroupFailover({ ...groupFailoverForm }))
+}
+
+const retryGroupFailover = async (task: any) => {
+  await automationApi.retryGroupFailoverTask(task.id)
+  ElMessage.success('\u6062\u590d\u4efb\u52a1\u5df2\u91cd\u65b0\u6392\u961f')
+  await loadGroupFailovers()
+}
+
+const cancelGroupFailover = async (task: any) => {
+  await ElMessageBox.confirm(
+    `\u786e\u8ba4\u53d6\u6d88\u300c${task.group_title || task.telegram_group_id}\u300d\u7684\u6062\u590d\u4efb\u52a1\uff1f`,
+    '\u53d6\u6d88\u6062\u590d',
+    { type: 'warning' },
+  )
+  await automationApi.cancelGroupFailoverTask(task.id)
+  ElMessage.success('\u6062\u590d\u4efb\u52a1\u5df2\u53d6\u6d88')
+  await loadGroupFailovers()
+}
+
+const groupFailoverStatusText = (value: GroupFailoverStatus) =>
+  groupFailoverStatusOptions.find((item) => item.value === value)?.label || value
+
+const groupFailoverStatusType = (value: GroupFailoverStatus) => {
+  if (value === 'succeeded') return 'success'
+  if (value === 'failed') return 'danger'
+  if (value === 'retry' || value === 'manual_required') return 'warning'
+  if (value === 'joining') return 'primary'
+  return 'info'
+}
+
+const formatTimestamp = (value?: string) => (value ? value.replace('T', ' ').slice(0, 19) : '-')
 
 const runAds = () => {
   runTask('ads', () => automationApi.runAds({ ...adRunForm }))
@@ -1435,6 +1502,103 @@ onMounted(refreshPage)
               </el-form>
             </div>
           </el-card>
+
+        <el-card shadow="never" class="failover-card">
+          <template #header>
+            <div class="card-header">
+              <div class="failover-heading">
+                <span>&#x5C01;&#x53F7;&#x7FA4;&#x8D44;&#x6E90;&#x6062;&#x590D;</span>
+                <el-tag type="warning" effect="plain">&#x5F85;&#x5904;&#x7406; {{ groupFailoverTotal }}</el-tag>
+                <el-tag type="success" effect="plain">&#x5DF2;&#x6062;&#x590D; {{ groupFailoverSummary.succeeded || 0 }}</el-tag>
+                <el-tag v-if="groupFailoverSummary.manual_required" type="warning" effect="plain">
+                  &#x4EBA;&#x5DE5; {{ groupFailoverSummary.manual_required }}
+                </el-tag>
+              </div>
+              <el-select
+                v-model="groupFailoverStatusFilter"
+                clearable
+                placeholder="&#x5168;&#x90E8;&#x72B6;&#x6001;"
+                class="status-filter"
+                @change="loadGroupFailovers"
+              >
+                <el-option
+                  v-for="item in groupFailoverStatusOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+            </div>
+          </template>
+
+          <el-form inline class="failover-toolbar">
+            <el-form-item label="&#x5355;&#x8F6E;&#x4EFB;&#x52A1;&#x6570;">
+              <el-input-number v-model="groupFailoverForm.max_tasks" :min="1" :max="100" />
+            </el-form-item>
+            <el-form-item label="Dry Run">
+              <el-switch v-model="groupFailoverForm.dry_run" />
+            </el-form-item>
+            <el-form-item>
+              <el-button
+                type="primary"
+                :loading="running === 'groupFailover'"
+                @click="runGroupFailover"
+              >
+                <el-icon><VideoPlay /></el-icon>
+                &#x6267;&#x884C;&#x6062;&#x590D;&#x626B;&#x63CF;
+              </el-button>
+            </el-form-item>
+          </el-form>
+
+          <el-table :data="groupFailoverTasks" stripe max-height="480">
+            <el-table-column label="&#x7FA4;" min-width="180">
+              <template #default="{ row }">
+                <div>{{ row.group_title || row.telegram_group_id }}</div>
+                <small v-if="row.group_username">@{{ row.group_username }}</small>
+              </template>
+            </el-table-column>
+            <el-table-column label="&#x6E90;&#x8D26;&#x53F7;" min-width="150">
+              <template #default="{ row }">{{ row.source_account_label || `#${row.source_account_id}` }}</template>
+            </el-table-column>
+            <el-table-column label="&#x63A5;&#x7BA1;&#x8D26;&#x53F7;" min-width="150">
+              <template #default="{ row }">{{ row.target_account_label || (row.target_account_id ? `#${row.target_account_id}` : "-") }}</template>
+            </el-table-column>
+            <el-table-column label="&#x72B6;&#x6001;" width="120">
+              <template #default="{ row }">
+                <el-tag :type="groupFailoverStatusType(row.status)" effect="plain">
+                  {{ groupFailoverStatusText(row.status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="reason" label="&#x539F;&#x56E0;" min-width="170" show-overflow-tooltip />
+            <el-table-column prop="attempt_count" label="&#x5C1D;&#x8BD5;" width="70" />
+            <el-table-column label="&#x4E0B;&#x6B21;&#x5904;&#x7406;" width="180">
+              <template #default="{ row }">{{ formatTimestamp(row.next_retry_at) }}</template>
+            </el-table-column>
+            <el-table-column label="&#x64CD;&#x4F5C;" width="150" fixed="right">
+              <template #default="{ row }">
+                <el-button
+                  v-if="!['succeeded', 'cancelled', 'joining'].includes(row.status)"
+                  link
+                  type="primary"
+                  @click="retryGroupFailover(row)"
+                >
+                  <el-icon><Refresh /></el-icon>
+                  &#x91CD;&#x8BD5;
+                </el-button>
+                <el-button
+                  v-if="!['succeeded', 'cancelled'].includes(row.status)"
+                  link
+                  type="danger"
+                  @click="cancelGroupFailover(row)"
+                >
+                  <el-icon><Close /></el-icon>
+                  &#x53D6;&#x6D88;
+                </el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
 
         </div>
       </el-tab-pane>
@@ -2489,6 +2653,25 @@ onMounted(refreshPage)
   justify-content: flex-end;
   margin-top: 16px;
   overflow-x: auto;
+}
+
+.failover-card {
+  grid-column: 1 / -1;
+}
+
+.failover-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.status-filter {
+  width: 160px;
+}
+
+.failover-toolbar {
+  margin-bottom: 8px;
 }
 
 @media (max-width: 1200px) {

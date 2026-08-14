@@ -23,6 +23,7 @@ def _env_int(name: str, default: int) -> int:
         return default
     return max(1, parsed)
 
+
 celery_app = Celery(
     "vanguard",
     broker=settings.CELERY_BROKER_URL,
@@ -81,7 +82,6 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,  # Every minute
         "options": {"queue": "default"},
     },
-
     # -------------------------------------------------------------------------
     # Minute-level Tasks
     # -------------------------------------------------------------------------
@@ -111,6 +111,12 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"scheduled": True, "keywords_per_account": 10, "max_groups_per_keyword": 20},
         "options": {"queue": "automation", "rate_limit": "60/h"},
     },
+    "recover-orphaned-groups-every-5min": {
+        "task": "app.core.scheduler.tasks.recover_orphaned_groups_task",
+        "schedule": crontab(minute="*/5"),
+        "kwargs": {"max_tasks": 20},
+        "options": {"queue": "automation", "rate_limit": "12/h"},
+    },
     "deliver-ads-every-10min": {
         "task": "app.core.scheduler.tasks.deliver_ads_task",
         "schedule": 60.0,
@@ -132,7 +138,6 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,
         "options": {"queue": "automation", "rate_limit": "60/h"},
     },
-
     # -------------------------------------------------------------------------
     # Hour-level Tasks
     # -------------------------------------------------------------------------
@@ -169,7 +174,6 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=20, minute=30),  # Daily at 8:30 PM
         "options": {"queue": "broadcast"},
     },
-
     # -------------------------------------------------------------------------
     # Trial Reminder (check every hour, send actual reminder at specific times)
     # -------------------------------------------------------------------------
@@ -201,6 +205,7 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.replenish_keywords_task": {"queue": "automation"},
     "app.core.scheduler.tasks.auto_join_groups_task": {"queue": "automation"},
     "app.core.scheduler.tasks.deliver_ads_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.recover_orphaned_groups_task": {"queue": "automation"},
     "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "automation"},
     "app.core.scheduler.tasks.audit_group_ad_policies_task": {"queue": "automation"},
     "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},

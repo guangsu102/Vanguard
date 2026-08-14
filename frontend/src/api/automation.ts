@@ -16,6 +16,38 @@ export interface AutomationRunResult {
   details: Record<string, any>[]
 }
 
+export type GroupFailoverStatus =
+  | 'queued'
+  | 'joining'
+  | 'retry'
+  | 'succeeded'
+  | 'manual_required'
+  | 'failed'
+  | 'cancelled'
+
+export interface GroupFailoverTask {
+  id: number
+  source_membership_id: number
+  source_account_id: number
+  source_account_label?: string
+  target_account_id?: number
+  target_account_label?: string
+  group_id: number
+  telegram_group_id: number
+  group_title?: string
+  group_username?: string
+  status: GroupFailoverStatus
+  reason?: string
+  error?: string
+  attempt_count: number
+  next_retry_at?: string
+  last_attempt_at?: string
+  completed_at?: string
+  created_at: string
+  updated_at: string
+}
+
+
 export interface AccountOperationConfig {
   id: number
   account_id: number
@@ -590,6 +622,38 @@ export const automationApi = {
   runAutoJoin: (data: { max_accounts?: number; keywords_per_account?: number; max_groups_per_keyword?: number; dry_run?: boolean }) => {
     return apiClient.post<{ data: AutomationRunResult }>('/automation/auto-join/run', data)
   },
+  runGroupFailover: (data: { max_tasks?: number; dry_run?: boolean }) => {
+    return apiClient.post<{ data: AutomationRunResult }>('/automation/auto-join/failover/run', data)
+  },
+
+  getGroupFailoverTasks: (params?: {
+    status?: GroupFailoverStatus
+    source_account_id?: number
+    target_account_id?: number
+    page?: number
+    page_size?: number
+  }) => {
+    return apiClient.get<{
+      data: GroupFailoverTask[]
+      total: number
+      page: number
+      page_size: number
+      summary: Partial<Record<GroupFailoverStatus, number>>
+    }>('/automation/auto-join/failover/tasks', { params })
+  },
+
+  retryGroupFailoverTask: (id: number, targetAccountId?: number) => {
+    return apiClient.post<{ data: GroupFailoverTask }>(
+      `/automation/auto-join/failover/tasks/${id}/retry`,
+      { target_account_id: targetAccountId },
+    )
+  },
+
+  cancelGroupFailoverTask: (id: number) => {
+    return apiClient.post<{ data: GroupFailoverTask }>(`/automation/auto-join/failover/tasks/${id}/cancel`)
+  },
+
+
 
   runAds: (data: { max_deliveries?: number; dry_run?: boolean }) => {
     return apiClient.post<{ data: AutomationRunResult }>('/automation/ads/run', data)

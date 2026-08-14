@@ -65,7 +65,9 @@ async def _ensure_db_initialized():
     return db_module
 
 
-async def _run_with_db(handler: Callable[[AsyncSession], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+async def _run_with_db(
+    handler: Callable[[AsyncSession], Awaitable[dict[str, Any]]],
+) -> dict[str, Any]:
     db_module = await _ensure_db_initialized()
     async with db_module.get_db_session() as db:
         return await handler(db)
@@ -343,7 +345,10 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
     try:
         await _ensure_db_initialized()
         from app.core import database as db_module
-        from app.core.automation_settings import get_ad_capacity_settings, get_ad_delivery_execution_settings
+        from app.core.automation_settings import (
+            get_ad_capacity_settings,
+            get_ad_delivery_execution_settings,
+        )
 
         async with db_module.get_db_session() as db:
             execution = await get_ad_delivery_execution_settings(db)
@@ -474,7 +479,11 @@ async def _reserve_group_ai_warmup_execution() -> dict[str, Any]:
         }
     except Exception as exc:
         logger.warning("group_ai_warmup_execution_lock_unavailable", error=str(exc))
-        return {"should_run": False, "reason": "group_ai_warmup_lock_unavailable", "started_at": now}
+        return {
+            "should_run": False,
+            "reason": "group_ai_warmup_lock_unavailable",
+            "started_at": now,
+        }
     finally:
         if client is not None:
             await _close_scheduler_redis_client(client)
@@ -515,7 +524,9 @@ async def _health_check_accounts_async() -> dict[str, Any]:
         summary = await pool.health_check()
         await pool.close_all()
         unhealthy = sum(
-            1 for account in runtime_accounts if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            1
+            for account in runtime_accounts
+            if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}
         )
         return {
             "checked": len(runtime_accounts),
@@ -625,7 +636,9 @@ async def _generate_daily_report_async() -> dict[str, Any]:
 
 
 async def _broadcast_node_status_async() -> dict[str, Any]:
-    return _skipped_result("broadcast_node_status", "node_status_broadcast_integration_not_implemented")
+    return _skipped_result(
+        "broadcast_node_status", "node_status_broadcast_integration_not_implemented"
+    )
 
 
 async def _execute_broadcast_record_async(broadcast_id: int) -> dict[str, Any]:
@@ -637,7 +650,9 @@ async def _execute_broadcast_record_async(broadcast_id: int) -> dict[str, Any]:
         result = await db.execute(select(BroadcastRecord).where(BroadcastRecord.id == broadcast_id))
         broadcast = result.scalar_one_or_none()
         if not broadcast:
-            return _skipped_result("execute_broadcast_record", "broadcast_not_found", broadcast_id=broadcast_id)
+            return _skipped_result(
+                "execute_broadcast_record", "broadcast_not_found", broadcast_id=broadcast_id
+            )
 
         try:
             target_groups = json.loads(broadcast.target_groups or "[]")
@@ -673,7 +688,11 @@ async def _execute_broadcast_record_async(broadcast_id: int) -> dict[str, Any]:
         broadcast.status = "sending"
         await db.commit()
 
-        client = TelegramClient(TelegramConfig(bot_token=settings.BOT_TOKEN), risk_guard=AccountRiskGuard(db), risk_account=bot_risk_identity("scheduler"))
+        client = TelegramClient(
+            TelegramConfig(bot_token=settings.BOT_TOKEN),
+            risk_guard=AccountRiskGuard(db),
+            risk_account=bot_risk_identity("scheduler"),
+        )
         success = 0
         failed_groups: list[int] = []
 
@@ -721,7 +740,8 @@ async def _process_pending_campaigns_async() -> dict[str, Any]:
     combined = {
         key: int(global_result.get(key, 0) or 0) + int(managed_group_result.get(key, 0) or 0)
         for key in keys
-        if isinstance(global_result.get(key, 0), int) or isinstance(managed_group_result.get(key, 0), int)
+        if isinstance(global_result.get(key, 0), int)
+        or isinstance(managed_group_result.get(key, 0), int)
     }
     return {
         **combined,
@@ -751,7 +771,9 @@ async def _send_bulk_messages_async(targets: list, message: str) -> dict[str, An
                     await client.send_message(target, message)
                     results["success"] += 1
                     if (index + 1) % 100 == 0:
-                        logger.info("send_bulk_messages_progress", processed=index + 1, total=len(targets))
+                        logger.info(
+                            "send_bulk_messages_progress", processed=index + 1, total=len(targets)
+                        )
                 except Exception as exc:
                     logger.warning("send_bulk_message_failed", target=target, error=str(exc))
                     results["failed"] += 1
@@ -808,7 +830,9 @@ async def _import_accounts_batch_async(accounts_data: list[dict[str, Any]]) -> d
     return await _run_with_db(handler)
 
 
-async def _process_user_registration_async(user_id: int, campaign_id: Optional[int]) -> dict[str, Any]:
+async def _process_user_registration_async(
+    user_id: int, campaign_id: Optional[int]
+) -> dict[str, Any]:
     from app.core.campaign.engine import CampaignEngine
     from app.core.campaign.runner import CampaignRunner
     from app.core.user.models import User
@@ -848,13 +872,17 @@ async def _process_user_registration_async(user_id: int, campaign_id: Optional[i
             "user_id": user_id,
             "campaign_id": campaign_id,
             "reward": getattr(execution, "reward_granted", False),
-            "details": [asdict(item) for item in execution] if isinstance(execution, list) else asdict(execution),
+            "details": [asdict(item) for item in execution]
+            if isinstance(execution, list)
+            else asdict(execution),
         }
 
     return await _run_with_db(handler)
 
 
-async def _execute_campaign_rewards_async(campaign_id: int, user_id: Optional[int] = None) -> dict[str, Any]:
+async def _execute_campaign_rewards_async(
+    campaign_id: int, user_id: Optional[int] = None
+) -> dict[str, Any]:
     from app.core.campaign.engine import CampaignEngine
     from app.core.campaign.models import CampaignDistributionMode, CampaignScope
     from app.core.campaign.runner import CampaignRunner
@@ -867,14 +895,11 @@ async def _execute_campaign_rewards_async(campaign_id: int, user_id: Optional[in
         if campaign is None:
             return {"status": "error", "message": "Campaign not found", "campaign_id": campaign_id}
 
-        if (
-            campaign.campaign_scope == CampaignScope.MANAGED_GROUP
-            and (
-                campaign.trigger_event == GroupCampaignTriggerEvent.MANUAL_BROADCAST.value
-                or (
-                    not campaign.trigger_event
-                    and campaign.distribution_mode == CampaignDistributionMode.MANUAL
-                )
+        if campaign.campaign_scope == CampaignScope.MANAGED_GROUP and (
+            campaign.trigger_event == GroupCampaignTriggerEvent.MANUAL_BROADCAST.value
+            or (
+                not campaign.trigger_event
+                and campaign.distribution_mode == CampaignDistributionMode.MANUAL
             )
         ):
             runner = ManagedGroupCampaignRunner(db)
@@ -934,7 +959,11 @@ async def _send_trial_reminder_async(user_id: int, hours_before_expiry: int) -> 
             f"提醒：您的试用将在约 {hours_before_expiry} 小时后到期。\n"
             f"到期时间：{user.trial_expires_at.isoformat()}"
         )
-        client = TelegramClient(TelegramConfig(bot_token=settings.BOT_TOKEN), risk_guard=AccountRiskGuard(db), risk_account=bot_risk_identity("scheduler"))
+        client = TelegramClient(
+            TelegramConfig(bot_token=settings.BOT_TOKEN),
+            risk_guard=AccountRiskGuard(db),
+            risk_account=bot_risk_identity("scheduler"),
+        )
         try:
             await client.send_message(user.telegram_id, message)
         finally:
@@ -1108,7 +1137,9 @@ def broadcast_node_status():
         return {"error": str(exc)}
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=30, time_limit=1800, soft_time_limit=1500)
+@celery_app.task(
+    bind=True, max_retries=2, default_retry_delay=30, time_limit=1800, soft_time_limit=1500
+)
 def execute_broadcast_record(self, broadcast_id: int):
     logger.info("execute_broadcast_record", broadcast_id=broadcast_id)
     try:
@@ -1171,7 +1202,9 @@ def auto_join_groups_task(
     scheduled: bool = False,
 ):
     logger.info("auto_join_groups_task", task="auto_join_groups_task", scheduled=scheduled)
-    reservation = _run_async(_reserve_scheduled_auto_join() if scheduled else _reserve_manual_auto_join())
+    reservation = _run_async(
+        _reserve_scheduled_auto_join() if scheduled else _reserve_manual_auto_join()
+    )
     if not reservation.get("should_run"):
         logger.info(
             "auto_join_groups_execution_skipped",
@@ -1217,6 +1250,25 @@ def auto_join_groups_task(
 
 
 @celery_app.task
+def recover_orphaned_groups_task(max_tasks: int = 20, dry_run: bool = False):
+    logger.info("recover_orphaned_groups_task", task="recover_orphaned_groups_task")
+    try:
+        from app.modules.acquisition.failover import run_group_failover_with_db
+
+        result = _run_async(run_group_failover_with_db(max_tasks=max_tasks, dry_run=dry_run))
+        logger.info(
+            "recover_orphaned_groups_completed",
+            created=result.get("created", 0),
+            succeeded=result.get("succeeded", 0),
+            failed=result.get("failed", 0),
+        )
+        return result
+    except Exception as exc:
+        logger.error("recover_orphaned_groups_failed", error=str(exc))
+        return {"error": str(exc)}
+
+
+@celery_app.task
 def group_ai_warmup_task(max_groups: Optional[int] = None, dry_run: bool = False):
     logger.info("group_ai_warmup_task", task="group_ai_warmup_task")
     reservation = _run_async(_reserve_group_ai_warmup_execution())
@@ -1233,7 +1285,9 @@ def group_ai_warmup_task(max_groups: Optional[int] = None, dry_run: bool = False
 
         config = reservation.get("config") or {}
         resolved_max_groups = max_groups or int(config.get("proactiveWarmupMaxGroupsPerRun") or 5)
-        result = _run_async(run_group_ai_warmup_with_db(max_groups=resolved_max_groups, dry_run=dry_run))
+        result = _run_async(
+            run_group_ai_warmup_with_db(max_groups=resolved_max_groups, dry_run=dry_run)
+        )
         result["execution_lock"] = reservation
         logger.info(
             "group_ai_warmup_completed",
@@ -1271,8 +1325,12 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
         from app.modules.acquisition.automation import run_ad_delivery_with_db
 
         execution = reservation.get("execution") or {}
-        resolved_max_deliveries = max_deliveries or int(execution.get("max_deliveries_per_run") or 20)
-        result = _run_async(run_ad_delivery_with_db(max_deliveries=resolved_max_deliveries, dry_run=dry_run))
+        resolved_max_deliveries = max_deliveries or int(
+            execution.get("max_deliveries_per_run") or 20
+        )
+        result = _run_async(
+            run_ad_delivery_with_db(max_deliveries=resolved_max_deliveries, dry_run=dry_run)
+        )
         result["execution_lock"] = reservation
         logger.info(
             "deliver_ads_completed",
@@ -1352,12 +1410,16 @@ def campaign_check_task(self):
 # =============================================================================
 
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=60, time_limit=1800, soft_time_limit=1500)
+@celery_app.task(
+    bind=True, max_retries=3, default_retry_delay=60, time_limit=1800, soft_time_limit=1500
+)
 def send_bulk_messages(self, targets: list, message: str, account_id: Optional[int] = None):
     logger.info("send_bulk_messages", target_count=len(targets), account_id=account_id)
     try:
         results = _run_async(_send_bulk_messages_async(targets, message))
-        logger.info("send_bulk_messages_completed", success=results["success"], failed=results["failed"])
+        logger.info(
+            "send_bulk_messages_completed", success=results["success"], failed=results["failed"]
+        )
         return results
     except Exception as exc:
         logger.error("send_bulk_messages_failed", error=str(exc))

@@ -21,11 +21,13 @@ from app.modules.acquisition.models import (
     AdCreativeType,
     AdSendMode,
     DeliveryStatus,
+    GroupFailoverStatus,
     AdSurvivalStatus,
     GroupAdTier,
     # Search & Tracking
     GroupSearchRecord,
     AutoJoinAttempt,
+    GroupFailoverTask,
     AcquisitionTracking,
     # Message & Trigger
     AcquisitionMessage,
@@ -156,12 +158,14 @@ __all__ = [
     "AdCreativeType",
     "AdSendMode",
     "DeliveryStatus",
+    "GroupFailoverStatus",
     "AdSurvivalStatus",
     "GroupAdTier",
 
     # Models - Search & Tracking
     "GroupSearchRecord",
     "AutoJoinAttempt",
+    "GroupFailoverTask",
     "AcquisitionTracking",
 
     # Models - Message & Trigger
