@@ -502,7 +502,11 @@ async def _health_check_accounts_async() -> dict[str, Any]:
         manager = AccountManager(db)
         accounts = await manager.list_accounts(limit=10_000)
         runtime_accounts = []
+        skipped_inactive = 0
         for account in accounts:
+            if not account.is_active:
+                skipped_inactive += 1
+                continue
             api_id, api_hash = _resolve_account_api_credentials(account)
             if account.phone and api_id and api_hash:
                 runtime_accounts.append(account)
@@ -517,6 +521,7 @@ async def _health_check_accounts_async() -> dict[str, Any]:
             "checked": len(runtime_accounts),
             "healthy": max(len(runtime_accounts) - unhealthy, 0),
             "unhealthy": unhealthy,
+            "skipped_inactive": skipped_inactive,
             "summary": summary,
         }
 
@@ -960,6 +965,7 @@ def health_check_accounts(self):
             checked=result.get("checked", 0),
             healthy=result.get("healthy", 0),
             unhealthy=result.get("unhealthy", 0),
+            skipped_inactive=result.get("skipped_inactive", 0),
         )
         return result
     except Exception as exc:
