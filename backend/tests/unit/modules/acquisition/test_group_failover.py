@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,7 +14,12 @@ from app.core.account.models import (
 from app.core.group.models import Group, GroupAccountMembership
 from app.modules.acquisition.automation import AcquisitionAutomationService, JoinedGroupAuditResult
 from app.modules.acquisition.failover import GroupFailoverService
-from app.modules.acquisition.models import GroupFailoverStatus, GroupFailoverTask
+from app.modules.acquisition.models import (
+    AccountAdBinding,
+    AdCampaign,
+    GroupFailoverStatus,
+    GroupFailoverTask,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -200,3 +206,116 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
 
     await test_db.refresh(source_membership)
     assert source_membership.status == "account_lost"
+
+
+async def test_existing_ad_capable_membership_reuses_and_enables_binding(test_db):
+    source = await _add_account(
+        test_db,
+        identifier="banned-source-3",
+        status=AccountStatus.BANNED,
+        risk_reason="account_banned",
+    )
+    group, source_membership = await _add_group_membership(
+        test_db,
+        source,
+        telegram_group_id=30001,
+        username="already_covered_group",
+    )
+    target = await _add_account(
+        test_db,
+        identifier="healthy-existing-target",
+        status=AccountStatus.ONLINE,
+    )
+    test_db.add_all(
+        [
+            AccountOperationConfig(
+                account_id=target.id,
+                enabled=True,
+                auto_join_enabled=False,
+                auto_ads_enabled=True,
+            ),
+            GroupAccountMembership(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                account_id=target.id,
+                status="joined",
+                join_method="manual",
+            ),
+        ]
+    )
+    campaign = AdCampaign(name="failover-binding-campaign", enabled=True, status="active")
+    test_db.add(campaign)
+    await test_db.commit()
+    await test_db.refresh(campaign)
+
+    source_binding = AccountAdBinding(
+        account_id=source.id,
+        ad_campaign_id=campaign.id,
+        enabled=True,
+        priority=10,
+    )
+    target_binding = AccountAdBinding(
+        account_id=target.id,
+        ad_campaign_id=campaign.id,
+        enabled=False,
+        priority=5,
+    )
+    test_db.add_all([source_binding, target_binding])
+    await test_db.commit()
+
+    automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    service = GroupFailoverService(test_db, automation)
+    result = await service.run(max_tasks=1)
+
+    assert result["created"] == 1
+    task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
+    assert task.status == GroupFailoverStatus.SUCCEEDED.value
+    assert task.reason == "already_covered"
+    assert task.target_account_id == target.id
+    await test_db.refresh(target_binding)
+    await test_db.refresh(source_membership)
+    assert target_binding.enabled is True
+    assert source_membership.status == "account_lost"
+
+
+async def test_stale_joining_task_is_requeued(test_db):
+    source = await _add_account(
+        test_db,
+        identifier="banned-source-4",
+        status=AccountStatus.BANNED,
+        risk_reason="account_banned",
+    )
+    group, source_membership = await _add_group_membership(
+        test_db,
+        source,
+        telegram_group_id=40001,
+        username="stale_claim_group",
+    )
+    source_membership.status = "account_lost"
+    task = GroupFailoverTask(
+        source_membership_id=source_membership.id,
+        source_account_id=source.id,
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        status=GroupFailoverStatus.JOINING.value,
+        reason="target_assigned",
+        attempt_count=1,
+        last_attempt_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    test_db.add(task)
+    await test_db.commit()
+
+    automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    service = GroupFailoverService(test_db, automation)
+    await service.run(max_tasks=1, dry_run=True)
+    await test_db.refresh(task)
+    assert task.status == GroupFailoverStatus.JOINING.value
+
+    recovered = await service._recover_stale_claims(datetime.utcnow())
+
+    assert recovered == 1
+    await test_db.refresh(task)
+    assert task.status == GroupFailoverStatus.RETRY.value
+    assert task.reason == "stale_claim_recovered"
+    assert task.target_account_id is None
+    assert task.next_retry_at is not None

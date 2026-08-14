@@ -38,6 +38,7 @@ logger = structlog.get_logger()
 
 FAILOVER_MAX_ATTEMPTS = 5
 FAILOVER_RETRY_BASE_MINUTES = 15
+FAILOVER_JOINING_STALE_MINUTES = 30
 FAILOVER_SOURCE_MEMBERSHIP_STATUS = "account_lost"
 FAILOVER_DUE_STATUSES = (GroupFailoverStatus.QUEUED.value, GroupFailoverStatus.RETRY.value)
 FAILOVER_TERMINAL_STATUSES = (
@@ -108,6 +109,7 @@ class GroupFailoverService:
             result.details.append({"action": "would_process_existing", "count": due_count})
             return result.as_dict()
 
+        result.updated += await self._recover_stale_claims(now)
         result.created += await self._enqueue_orphaned_memberships(orphaned, now)
         result.updated += await self._complete_tasks_with_existing_coverage(now)
 
@@ -227,6 +229,8 @@ class GroupFailoverService:
                 completed_at=now if status == GroupFailoverStatus.SUCCEEDED.value else None,
             )
             self.db.add(task)
+            if covered_account_id is not None:
+                await self._copy_source_ad_bindings(source_account.id, covered_account_id)
             membership.status = FAILOVER_SOURCE_MEMBERSHIP_STATUS
             membership.last_checked_at = now
             membership.warmup_status = "blocked"
@@ -249,15 +253,19 @@ class GroupFailoverService:
         row = await self.db.execute(
             select(GroupAccountMembership.account_id)
             .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
+            .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
             .where(
                 GroupAccountMembership.group_id == group_id,
                 GroupAccountMembership.status == "joined",
                 GroupAccountMembership.account_id != source_account_id,
                 TelegramAccount.is_active,
+                TelegramAccount.account_type == AccountType.PROMOTER,
                 TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
                 TelegramAccount.risk_level.in_(
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
+                AccountOperationConfig.enabled,
+                AccountOperationConfig.auto_ads_enabled,
                 or_(
                     TelegramAccount.risk_pause_until.is_(None),
                     TelegramAccount.risk_pause_until <= now,
@@ -282,6 +290,7 @@ class GroupFailoverService:
             )
             if account_id is None:
                 continue
+            await self._copy_source_ad_bindings(task.source_account_id, account_id)
             task.target_account_id = account_id
             task.status = GroupFailoverStatus.SUCCEEDED.value
             task.reason = "existing_membership_covered"
@@ -292,6 +301,30 @@ class GroupFailoverService:
         if updated:
             await self.db.commit()
         return updated
+
+    async def _recover_stale_claims(self, now: datetime) -> int:
+        cutoff = now - timedelta(minutes=FAILOVER_JOINING_STALE_MINUTES)
+        recovered = await self.db.execute(
+            update(GroupFailoverTask)
+            .where(
+                GroupFailoverTask.status == GroupFailoverStatus.JOINING.value,
+                or_(
+                    GroupFailoverTask.last_attempt_at.is_(None),
+                    GroupFailoverTask.last_attempt_at <= cutoff,
+                ),
+            )
+            .values(
+                status=GroupFailoverStatus.RETRY.value,
+                reason="stale_claim_recovered",
+                target_account_id=None,
+                next_retry_at=now,
+                updated_at=now,
+            )
+        )
+        count = int(recovered.rowcount or 0)
+        if count:
+            await self.db.commit()
+        return count
 
     async def _due_task_count(self, now: datetime) -> int:
         value = await self.db.execute(
@@ -663,14 +696,19 @@ class GroupFailoverService:
         )
         copied = 0
         for source in source_rows.scalars().all():
-            existing = await self.db.execute(
-                select(AccountAdBinding.id).where(
-                    AccountAdBinding.account_id == target_account_id,
-                    AccountAdBinding.ad_campaign_id == source.ad_campaign_id,
-                    AccountAdBinding.creative_id == source.creative_id,
+            existing = (
+                await self.db.execute(
+                    select(AccountAdBinding).where(
+                        AccountAdBinding.account_id == target_account_id,
+                        AccountAdBinding.ad_campaign_id == source.ad_campaign_id,
+                        AccountAdBinding.creative_id == source.creative_id,
+                    )
                 )
-            )
-            if existing.scalar_one_or_none() is not None:
+            ).scalar_one_or_none()
+            if existing is not None:
+                if not existing.enabled:
+                    existing.enabled = True
+                    copied += 1
                 continue
             self.db.add(
                 AccountAdBinding(
@@ -682,8 +720,6 @@ class GroupFailoverService:
                 )
             )
             copied += 1
-        if copied:
-            await self.db.commit()
         return copied
 
     async def _defer_without_attempt(

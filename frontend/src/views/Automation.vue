@@ -991,7 +991,8 @@ const loadGroupFailovers = async () => {
   })
   groupFailoverTasks.value = response.data.data
   groupFailoverSummary.value = response.data.summary || {}
-  groupFailoverTotal.value = response.data.total || 0
+  groupFailoverTotal.value = (['queued', 'joining', 'retry', 'manual_required', 'failed'] as GroupFailoverStatus[])
+    .reduce((total, status) => total + (groupFailoverSummary.value[status] || 0), 0)
 }
 
 const refreshData = async () => {

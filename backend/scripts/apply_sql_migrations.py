@@ -7,7 +7,6 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = ROOT / "migrations"
 DEFAULT_MIGRATIONS = [
@@ -29,6 +28,7 @@ DEFAULT_MIGRATIONS = [
     "025_add_account_business_stage.sql",
     "026_add_ad_campaign_target_groups.sql",
     "027_add_qq_official.sql",
+    "028_add_group_failover_tasks.sql",
 ]
 
 
