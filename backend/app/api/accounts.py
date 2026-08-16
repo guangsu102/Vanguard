@@ -234,6 +234,11 @@ class AccountRiskManualAdjustRequest(BaseModel):
     clear_pause: bool = Field(default=False)
     reason: str = Field(default="manual_adjust", max_length=255)
 
+class AccountManualBanRequest(BaseModel):
+    """Admin request to permanently disable an account for failover."""
+
+    reason: str = Field(default="manual_ban", max_length=255)
+
 class AccountStatsResponse(BaseModel):
     """Account statistics response."""
     code: int = 0
@@ -1151,6 +1156,28 @@ async def manual_adjust_account_risk(
             "latest_environment_event": None,
         }
     )
+
+@router.post("/{account_id:int}/manual-ban", response_model=AccountResponse)
+async def manually_ban_account(
+    account_id: int,
+    request: AccountManualBanRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin),
+) -> AccountResponse:
+    """Manually ban and deactivate an account, making its groups eligible for failover."""
+    guard = AccountRiskGuard(db)
+    try:
+        account = await guard.manual_ban_account(
+            account_id,
+            reason=request.reason.strip() or "manual_ban",
+            operator=current_user.get("username"),
+        )
+    except ValueError as exc:
+        if str(exc) == "account_not_found":
+            raise HTTPException(status_code=404, detail="Account not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await invalidate_account_in_all_pools(account.id, reason="manual_account_ban")
+    return _account_to_response(account)
 
 # =============================================================================
 # Batch Operations

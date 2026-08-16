@@ -138,7 +138,7 @@ const columns = [
   { prop: 'error_count', label: '错误数', width: '90' },
   { prop: 'last_active_at', label: '最近活跃', width: '170', slot: 'lastActive' },
   { prop: 'created_at', label: '创建时间', width: '170', slot: 'createdAt' },
-  { prop: 'actions', label: '操作', width: '300', fixed: 'right', slot: 'actions' },
+  { prop: 'actions', label: '操作', width: '380', fixed: 'right', slot: 'actions' },
 ]
 
 const promoterAccounts = computed(() => accountStore.list.filter((item) => item.account_type === 'promoter'))
@@ -368,6 +368,33 @@ const handleLowerRiskScore = async () => {
     securityLoading.value = false
   }
 }
+const handleManualBan = async (row: Account) => {
+  if (row.status === 'banned') return
+  try {
+    const { value } = await ElMessageBox.prompt(
+      `确定要手动封禁推广账号 ${row.display_name || row.identifier} 吗？封禁后账号会停用，并进入群资源接管流程。`,
+      '手动封禁账号',
+      {
+        confirmButtonText: '确认封禁',
+        cancelButtonText: '取消',
+        inputValue: 'manual_ban',
+        inputPlaceholder: '请输入封禁原因',
+        inputValidator: (value: string) => (value.trim() ? true : '请输入封禁原因'),
+        type: 'warning',
+      },
+    )
+    await accountsApi.manualBan(row.id, value.trim())
+    await fetchData()
+    if (selectedSecurityAccount.value?.id === row.id) {
+      await refreshSecurity()
+    }
+    ElMessage.success('账号已手动封禁')
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Failed to manually ban account:', error)
+    }
+  }
+}
 const handleDelete = async (row: Account) => {
   try {
     await ElMessageBox.confirm(`确定要删除推广账号 ${row.display_name || row.identifier} 吗？`, '提示', {
@@ -563,6 +590,16 @@ onMounted(() => {
         <el-button type="primary" link size="small" @click="handleSyncProfileBio(row)">
           <el-icon><RefreshLeft /></el-icon>
           同步简介
+        </el-button>
+        <el-button
+          v-if="row.status !== 'banned'"
+          type="danger"
+          link
+          size="small"
+          @click="handleManualBan(row)"
+        >
+          <el-icon><CircleClose /></el-icon>
+          手动封禁
         </el-button>
         <el-button type="danger" link size="small" @click="handleDelete(row)">
           <el-icon><Delete /></el-icon>

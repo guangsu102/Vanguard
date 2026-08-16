@@ -622,7 +622,7 @@ export const automationApi = {
   runAutoJoin: (data: { max_accounts?: number; keywords_per_account?: number; max_groups_per_keyword?: number; dry_run?: boolean }) => {
     return apiClient.post<{ data: AutomationRunResult }>('/automation/auto-join/run', data)
   },
-  runGroupFailover: (data: { max_tasks?: number; dry_run?: boolean }) => {
+  runGroupFailover: (data: { max_tasks?: number; dry_run?: boolean; target_account_ids?: number[] }) => {
     return apiClient.post<{ data: AutomationRunResult }>('/automation/auto-join/failover/run', data)
   },
 

@@ -939,6 +939,43 @@ class AccountRiskGuard:
         await self.db.refresh(account)
         return account
 
+    async def manual_ban_account(
+        self,
+        account_id: int,
+        *,
+        reason: str = "manual_ban",
+        operator: Optional[str] = None,
+    ) -> TelegramAccount:
+        """Permanently disable an account through an auditable admin action."""
+        account = await self._get_db_account(account_id)
+        if account is None:
+            raise ValueError("account_not_found")
+        now = datetime.utcnow()
+        account.status = AccountStatus.BANNED
+        account.is_active = False
+        account.risk_score = 100.0
+        account.risk_level = AccountRiskLevel.QUARANTINED.value
+        account.risk_pause_until = None
+        account.risk_recovery_until = None
+        account.risk_reason = "account_banned"
+        account.last_risk_event_at = now
+        account.last_risk_decay_at = now
+        self.db.add(account)
+        await self.record_event(
+            account,
+            AccountRiskAction.JOIN,
+            "quarantine",
+            reason="account_banned",
+            details={
+                "operator": operator,
+                "manual_reason": reason,
+                "action": "manual_ban",
+            },
+        )
+        await self.db.refresh(account)
+        return account
+
+
     @staticmethod
     def _budget_for_action(action: AccountRiskAction, risk_settings: dict[str, Any]) -> RiskBudget:
         raw = risk_settings.get("actions", {}).get(action.value, {})

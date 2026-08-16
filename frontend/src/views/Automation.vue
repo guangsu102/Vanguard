@@ -58,6 +58,11 @@ const bindings = ref<AccountAdBinding[]>([])
 const targetGroups = ref<Group[]>([])
 const dynamicStatuses = ref<AdDynamicStatus[]>([])
 const accounts = ref<AccountOption[]>([])
+const failoverTargetAccounts = computed(() =>
+  accounts.value.filter(
+    (account) => account.is_active && account.status !== 'banned' && account.status !== 'error',
+  ),
+)
 const creativePoolStatus = ref<{ pool_size: number; created_count: number; creative_ids: number[] } | null>(null)
 const accountConfigLoading = ref(false)
 const savingAccountConfig = ref(false)
@@ -99,6 +104,7 @@ const autoJoinForm = reactive({
 const groupFailoverForm = reactive({
   max_tasks: 20,
   dry_run: false,
+  target_account_ids: [] as number[],
 })
 
 const groupFailoverStatusOptions: Array<{ label: string; value: GroupFailoverStatus }> = [
@@ -1066,7 +1072,38 @@ const runAutoJoin = () => {
 }
 
 const runGroupFailover = () => {
-  runTask('groupFailover', () => automationApi.runGroupFailover({ ...groupFailoverForm }))
+  runTask('groupFailover', () =>
+    automationApi.runGroupFailover({
+      max_tasks: groupFailoverForm.max_tasks,
+      dry_run: groupFailoverForm.dry_run,
+    }),
+  )
+}
+
+const assignSelectedGroupFailover = async () => {
+  const targetAccountIds = [...groupFailoverForm.target_account_ids]
+  if (!targetAccountIds.length) {
+    ElMessage.warning('请先选择接管账号')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '将待接管群组分配给 ' + targetAccountIds.length + ' 个所选账号，并按负载均衡逐群接管，确认继续？',
+      '一键分配接管账号',
+      { type: 'warning', confirmButtonText: '确认分配', cancelButtonText: '取消' },
+    )
+    await runTask('groupFailoverAssign', () =>
+      automationApi.runGroupFailover({
+        max_tasks: groupFailoverForm.max_tasks,
+        dry_run: groupFailoverForm.dry_run,
+        target_account_ids: targetAccountIds,
+      }),
+    )
+  } catch (error) {
+    if (error !== 'cancel' && error !== 'close') {
+      console.error('Failed to assign failover accounts:', error)
+    }
+  }
 }
 
 const retryGroupFailover = async (task: any) => {
@@ -1533,7 +1570,26 @@ onMounted(refreshPage)
           </template>
 
           <el-form inline class="failover-toolbar">
-            <el-form-item label="&#x5355;&#x8F6E;&#x4EFB;&#x52A1;&#x6570;">
+            <el-form-item label="接管账号">
+              <el-select
+                v-model="groupFailoverForm.target_account_ids"
+                multiple
+                filterable
+                clearable
+                collapse-tags
+                collapse-tags-tooltip
+                placeholder="留空自动均衡"
+                style="width: 320px"
+              >
+                <el-option
+                  v-for="account in failoverTargetAccounts"
+                  :key="account.id"
+                  :label="account.display_name || account.phone || account.session_name || account.identifier"
+                  :value="account.id"
+                />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="单轮任务数">
               <el-input-number v-model="groupFailoverForm.max_tasks" :min="1" :max="100" />
             </el-form-item>
             <el-form-item label="Dry Run">
@@ -1546,7 +1602,16 @@ onMounted(refreshPage)
                 @click="runGroupFailover"
               >
                 <el-icon><VideoPlay /></el-icon>
-                &#x6267;&#x884C;&#x6062;&#x590D;&#x626B;&#x63CF;
+                执行恢复扫描
+              </el-button>
+              <el-button
+                type="warning"
+                :loading="running === 'groupFailoverAssign'"
+                :disabled="!groupFailoverForm.target_account_ids.length"
+                @click="assignSelectedGroupFailover"
+              >
+                <el-icon><Select /></el-icon>
+                一键分配所选账号
               </el-button>
             </el-form-item>
           </el-form>

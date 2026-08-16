@@ -1250,12 +1250,22 @@ def auto_join_groups_task(
 
 
 @celery_app.task
-def recover_orphaned_groups_task(max_tasks: int = 20, dry_run: bool = False):
+def recover_orphaned_groups_task(
+    max_tasks: int = 20,
+    dry_run: bool = False,
+    target_account_ids: list[int] | None = None,
+):
     logger.info("recover_orphaned_groups_task", task="recover_orphaned_groups_task")
     try:
         from app.modules.acquisition.failover import run_group_failover_with_db
 
-        result = _run_async(run_group_failover_with_db(max_tasks=max_tasks, dry_run=dry_run))
+        result = _run_async(
+            run_group_failover_with_db(
+                max_tasks=max_tasks,
+                dry_run=dry_run,
+                target_account_ids=target_account_ids,
+            )
+        )
         logger.info(
             "recover_orphaned_groups_completed",
             created=result.get("created", 0),

@@ -1620,6 +1620,7 @@ async def run_auto_join(request: AutoJoinRunRequest) -> dict:
 class GroupFailoverRunRequest(BaseModel):
     max_tasks: int = Field(default=20, ge=1, le=100)
     dry_run: bool = False
+    target_account_ids: list[int] = Field(default_factory=list, max_length=100)
 
 
 @router.post("/auto-join/failover/run", status_code=status.HTTP_202_ACCEPTED)
@@ -1628,6 +1629,7 @@ async def run_group_failover(request: GroupFailoverRunRequest) -> dict:
         recover_orphaned_groups_task,
         "recover_orphaned_groups_task",
         max_tasks=request.max_tasks,
+        target_account_ids=list(dict.fromkeys(request.target_account_ids)),
         dry_run=request.dry_run,
     )
     return {"code": 0, "message": "success", "data": result}

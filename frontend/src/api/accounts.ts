@@ -273,6 +273,10 @@ export const accountsApi = {
     const response = await apiClient.post(`/accounts/${id}/risk/manual-adjust`, data)
     return response.data.data
   },
+  manualBan: async (id: number, reason = 'manual_ban'): Promise<Account> => {
+    const response = await apiClient.post(`/accounts/${id}/manual-ban`, { reason })
+    return normalizeAccount(response.data)
+  },
   updateProxyPolicy: async (
     id: number,
     data: { proxy_mode: ProxyMode; static_proxy_id?: number },

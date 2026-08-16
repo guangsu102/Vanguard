@@ -88,9 +88,16 @@ class GroupFailoverService:
         self.automation = automation
         self.logger = logger.bind(module="group_failover")
 
-    async def run(self, *, max_tasks: int = 20, dry_run: bool = False) -> dict[str, Any]:
+    async def run(
+        self,
+        *,
+        max_tasks: int = 20,
+        dry_run: bool = False,
+        target_account_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
         result = FailoverRunResult()
         now = _now()
+        selected_target_ids = set(target_account_ids or []) or None
         orphaned = await self._list_orphaned_memberships()
         result.processed += len(orphaned)
 
@@ -110,8 +117,12 @@ class GroupFailoverService:
             return result.as_dict()
 
         result.updated += await self._recover_stale_claims(now)
-        result.created += await self._enqueue_orphaned_memberships(orphaned, now)
-        result.updated += await self._complete_tasks_with_existing_coverage(now)
+        result.created += await self._enqueue_orphaned_memberships(
+            orphaned, now, target_account_ids=selected_target_ids
+        )
+        result.updated += await self._complete_tasks_with_existing_coverage(
+            now, target_account_ids=selected_target_ids
+        )
 
         tasks = await self._list_due_tasks(now, max(1, min(int(max_tasks), 100)))
         for task in tasks:
@@ -122,7 +133,9 @@ class GroupFailoverService:
                 result.failed += 1
                 continue
 
-            target = await self._resolve_target_account(task, now)
+            target = await self._resolve_target_account(
+                task, now, target_account_ids=selected_target_ids
+            )
             if target is None:
                 if not group.username:
                     await self._mark_terminal(
@@ -187,6 +200,8 @@ class GroupFailoverService:
         self,
         orphaned: list[tuple[GroupAccountMembership, TelegramAccount, Group]],
         now: datetime,
+        *,
+        target_account_ids: set[int] | None = None,
     ) -> int:
         if not orphaned:
             return 0
@@ -202,7 +217,7 @@ class GroupFailoverService:
             if membership.id in existing_ids:
                 continue
             covered_account_id = await self._healthy_joined_account_id(
-                group.id, source_account.id, now
+                group.id, source_account.id, now, target_account_ids=target_account_ids
             )
             status = (
                 GroupFailoverStatus.SUCCEEDED.value
@@ -249,13 +264,19 @@ class GroupFailoverService:
         group_id: int,
         source_account_id: int,
         now: datetime,
+        *,
+        target_account_ids: set[int] | None = None,
     ) -> int | None:
+        target_account_filter = (
+            TelegramAccount.id.in_(target_account_ids) if target_account_ids else True
+        )
         row = await self.db.execute(
             select(GroupAccountMembership.account_id)
             .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
             .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
             .where(
                 GroupAccountMembership.group_id == group_id,
+                target_account_filter,
                 GroupAccountMembership.status == "joined",
                 GroupAccountMembership.account_id != source_account_id,
                 TelegramAccount.is_active,
@@ -277,7 +298,12 @@ class GroupFailoverService:
         value = row.scalar_one_or_none()
         return int(value) if value is not None else None
 
-    async def _complete_tasks_with_existing_coverage(self, now: datetime) -> int:
+    async def _complete_tasks_with_existing_coverage(
+        self,
+        now: datetime,
+        *,
+        target_account_ids: set[int] | None = None,
+    ) -> int:
         rows = await self.db.execute(
             select(GroupFailoverTask).where(
                 GroupFailoverTask.status.notin_(FAILOVER_TERMINAL_STATUSES)
@@ -286,7 +312,10 @@ class GroupFailoverService:
         updated = 0
         for task in rows.scalars().all():
             account_id = await self._healthy_joined_account_id(
-                task.group_id, task.source_account_id, now
+                task.group_id,
+                task.source_account_id,
+                now,
+                target_account_ids=target_account_ids,
             )
             if account_id is None:
                 continue
@@ -362,11 +391,21 @@ class GroupFailoverService:
         self,
         task: GroupFailoverTask,
         now: datetime,
+        *,
+        target_account_ids: set[int] | None = None,
     ) -> TelegramAccount | None:
-        if task.target_account_id is not None:
+        target_account_filter = (
+            TelegramAccount.id.in_(target_account_ids) if target_account_ids else True
+        )
+        if task.target_account_id is not None and (
+            target_account_ids is None or task.target_account_id in target_account_ids
+        ):
             account = await self.db.get(TelegramAccount, task.target_account_id)
             if await self._account_is_eligible(account, task.group_id, now, allow_existing=True):
                 return account
+            task.target_account_id = None
+            await self.db.commit()
+        elif task.target_account_id is not None:
             task.target_account_id = None
             await self.db.commit()
 
@@ -422,6 +461,7 @@ class GroupFailoverService:
             .outerjoin(active_assignments, active_assignments.c.account_id == TelegramAccount.id)
             .where(
                 TelegramAccount.id != task.source_account_id,
+                target_account_filter,
                 TelegramAccount.account_type == AccountType.PROMOTER,
                 TelegramAccount.is_active,
                 TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),

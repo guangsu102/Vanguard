@@ -278,6 +278,73 @@ async def test_existing_ad_capable_membership_reuses_and_enables_binding(test_db
     assert source_membership.status == "account_lost"
 
 
+async def test_selected_target_accounts_are_balanced_across_groups(test_db):
+    source = await _add_account(
+        test_db,
+        identifier="selected-source",
+        status=AccountStatus.BANNED,
+        risk_reason="account_banned",
+    )
+    for group_id in range(3):
+        await _add_group_membership(
+            test_db,
+            source,
+            telegram_group_id=50001 + group_id,
+            username=f"selected_group_{group_id}",
+        )
+
+    targets = []
+    for target_id in range(3):
+        target = await _add_account(
+            test_db,
+            identifier=f"selected-target-{target_id}",
+            status=AccountStatus.ONLINE,
+        )
+        test_db.add(
+            AccountOperationConfig(
+                account_id=target.id,
+                enabled=True,
+                auto_join_enabled=True,
+                auto_ads_enabled=True,
+                max_groups_per_day=10,
+                max_groups_total=100,
+            )
+        )
+        targets.append(target)
+    await test_db.commit()
+
+    automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    automation._join_group = AsyncMock()
+    automation._evaluate_joined_group = AsyncMock(
+        return_value=JoinedGroupAuditResult(
+            passed=True,
+            can_send_messages=True,
+            should_leave=False,
+            ad_allowed=True,
+        )
+    )
+    automation._record_join_attempt = AsyncMock()
+    automation._sync_group_ad_policy_from_audit = AsyncMock()
+    automation.group_manager.update_group = AsyncMock()
+    automation._schedule_next_join = MagicMock()
+    service = GroupFailoverService(test_db, automation)
+
+    result = await service.run(
+        max_tasks=3,
+        target_account_ids=[target.id for target in targets],
+    )
+
+    assert result["succeeded"] == 3
+    tasks = (
+        await test_db.execute(
+            select(GroupFailoverTask).order_by(GroupFailoverTask.telegram_group_id)
+        )
+    ).scalars().all()
+    assert len(tasks) == 3
+    assert {task.target_account_id for task in tasks} == {target.id for target in targets}
+    assert automation._join_group.await_count == 3
+
+
 async def test_stale_joining_task_is_requeued(test_db):
     source = await _add_account(
         test_db,

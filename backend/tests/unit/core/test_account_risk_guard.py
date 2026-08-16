@@ -16,6 +16,38 @@ from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 
 
 @pytest.mark.asyncio
+async def test_manual_ban_account_sets_banned_state_and_audits(test_db):
+    account = TelegramAccount(
+        identifier="manual-ban-account",
+        session_name="manual-ban-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    guard = AccountRiskGuard(test_db)
+    banned = await guard.manual_ban_account(
+        account.id,
+        reason="production_account_banned",
+        operator="admin",
+    )
+
+    assert banned.status == AccountStatus.BANNED
+    assert banned.is_active is False
+    assert banned.risk_score == 100.0
+    assert banned.risk_level == "quarantined"
+    assert banned.risk_reason == "account_banned"
+
+    event = (await test_db.execute(select(AccountRiskEvent))).scalars().one()
+    assert event.status == "quarantine"
+    assert event.reason == "account_banned"
+    assert "production_account_banned" in (event.details or "")
+
+
+@pytest.mark.asyncio
 async def test_risk_guard_blocks_paused_account(test_db):
     account = TelegramAccount(
         phone="+15559990001",
