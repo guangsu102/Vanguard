@@ -28,10 +28,19 @@ import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS }
 
 type AccountOption = {
   id: number
+  identifier?: string
+  display_name?: string
   phone?: string
   session_name?: string
   status?: string
   is_active?: boolean
+}
+
+type CreativePoolSummary = {
+  account_count: number
+  pool_size: number
+  created_count: number
+  creative_ids: number[]
 }
 
 type PolicySummaryItem = {
@@ -64,7 +73,10 @@ const failoverTargetAccounts = computed(() =>
     (account) => account.is_active && account.status !== 'banned' && account.status !== 'error',
   ),
 )
-const creativePoolStatus = ref<{ pool_size: number; created_count: number; creative_ids: number[] } | null>(null)
+const adBindingAccounts = computed(() =>
+  accounts.value.filter((account) => account.status !== 'banned'),
+)
+const creativePoolStatus = ref<CreativePoolSummary | null>(null)
 const accountConfigLoading = ref(false)
 const savingAccountConfig = ref(false)
 const schedulerConfigLoading = ref(false)
@@ -446,7 +458,7 @@ const targetGroupForm = reactive({
 })
 
 const bindingForm = reactive({
-  account_id: undefined as number | undefined,
+  account_ids: [] as number[],
   ad_campaign_id: undefined as number | undefined,
   creative_ids: [] as number[],
   enabled: true,
@@ -727,13 +739,25 @@ const loadAccounts = async () => {
   accounts.value = payload.list
   if (!selectedAccountId.value && accounts.value.length > 0) {
     selectedAccountId.value = accounts.value[0].id
-    bindingForm.account_id = accounts.value[0].id
+  }
+  const bindableAccountIds = new Set(adBindingAccounts.value.map((account) => account.id))
+  bindingForm.account_ids = bindingForm.account_ids.filter((accountId) =>
+    bindableAccountIds.has(accountId),
+  )
+  if (!bindingForm.account_ids.length && selectedAccountId.value) {
+    const preferredAccount = adBindingAccounts.value.find(
+      (account) => account.id === selectedAccountId.value,
+    )
+    const fallbackAccount = preferredAccount || adBindingAccounts.value[0]
+    bindingForm.account_ids = fallbackAccount ? [fallbackAccount.id] : []
   }
 }
 
 const loadTargetGroups = async () => {
-  const response = await groupsApi.list({ page: 1, pageSize: 200 })
-  targetGroups.value = response.data.data
+  const response = await groupsApi.list({ page: 1, pageSize: 200, status: 'active' })
+  targetGroups.value = response.data.data.filter(
+    (group) => group.status === 'active' && group.accountCount > 0,
+  )
 }
 
 const loadAccountConfig = async (accountId?: number) => {
@@ -893,7 +917,9 @@ const editCampaign = (campaign: AdCampaign) => {
     status: campaign.status,
     send_mode: campaign.send_mode,
     target_group_levels: campaign.target_group_levels?.length ? campaign.target_group_levels : ['A'],
-    target_group_ids: campaign.target_group_ids || [],
+    target_group_ids: (campaign.target_group_ids || []).filter((groupId) =>
+      targetGroupMap.value.has(groupId),
+    ),
     start_at: campaign.start_at || '',
     end_at: campaign.end_at || '',
     min_wait_after_join_minutes: campaign.min_wait_after_join_minutes,
@@ -1198,19 +1224,31 @@ const cleanupInvalidCreatives = async () => {
 }
 
 const ensureCreativePool = async () => {
-  if (!bindingForm.account_id || !bindingForm.ad_campaign_id) {
+  if (!bindingForm.account_ids.length || !bindingForm.ad_campaign_id) {
     ElMessage.warning('请先选择账号和广告计划')
     return
   }
-  const response = await automationApi.ensureCreativePool({
-    account_id: bindingForm.account_id,
-    ad_campaign_id: bindingForm.ad_campaign_id,
-    min_pool_size: 3,
-    generate_count: 3,
-  })
-  creativePoolStatus.value = response.data.data
-  ElMessage.success(`素材池已补齐，新增 ${response.data.data.created_count} 条`)
+
+  const poolStatuses = []
+  for (const accountId of bindingForm.account_ids) {
+    const response = await automationApi.ensureCreativePool({
+      account_id: accountId,
+      ad_campaign_id: bindingForm.ad_campaign_id,
+      min_pool_size: 3,
+      generate_count: 3,
+    })
+    poolStatuses.push(response.data.data)
+  }
+
+  const summary: CreativePoolSummary = {
+    account_count: poolStatuses.length,
+    pool_size: Math.min(...poolStatuses.map((item) => item.pool_size)),
+    created_count: poolStatuses.reduce((total, item) => total + item.created_count, 0),
+    creative_ids: poolStatuses.flatMap((item) => item.creative_ids),
+  }
   await refreshData()
+  creativePoolStatus.value = summary
+  ElMessage.success(`已检查 ${summary.account_count} 个账号的素材池，共新增 ${summary.created_count} 条`)
 }
 
 const saveCampaign = async () => {
@@ -1302,7 +1340,7 @@ const deleteCampaign = async (campaign: AdCampaign) => {
 }
 
 const createBinding = async () => {
-  if (!bindingForm.account_id || !bindingForm.ad_campaign_id) {
+  if (!bindingForm.account_ids.length || !bindingForm.ad_campaign_id) {
     ElMessage.warning('请选择账号和广告计划')
     return
   }
@@ -1310,16 +1348,23 @@ const createBinding = async () => {
     ElMessage.warning('请至少选择一个素材')
     return
   }
-  await automationApi.createBindingsBatch({
-    account_id: bindingForm.account_id,
+  const response = await automationApi.createBindingsBatch({
+    account_ids: bindingForm.account_ids,
     ad_campaign_id: bindingForm.ad_campaign_id,
     creative_ids: bindingForm.creative_ids,
     enabled: bindingForm.enabled,
     priority: bindingForm.priority,
   })
-  ElMessage.success('账号广告绑定已创建')
+  const expectedCount = bindingForm.account_ids.length * bindingForm.creative_ids.length
+  const createdCount = response.data.data.length
+  const existingCount = expectedCount - createdCount
+  ElMessage.success(
+    existingCount > 0
+      ? `已创建 ${createdCount} 条绑定，跳过 ${existingCount} 条已有绑定`
+      : `已为 ${bindingForm.account_ids.length} 个账号创建 ${createdCount} 条绑定`,
+  )
   Object.assign(bindingForm, {
-    account_id: selectedAccountId.value,
+    account_ids: selectedAccountId.value ? [selectedAccountId.value] : [],
     ad_campaign_id: undefined,
     creative_ids: [],
     enabled: true,
@@ -1459,7 +1504,8 @@ const verificationActionText = (action?: string) => {
 
 watch(selectedAccountId, async (accountId) => {
   if (!accountId) return
-  bindingForm.account_id = accountId
+  const selectedAccount = accounts.value.find((account) => account.id === accountId)
+  bindingForm.account_ids = selectedAccount?.status === 'banned' ? [] : [accountId]
   await loadAccountConfig(accountId)
 })
 
@@ -2211,10 +2257,18 @@ onMounted(refreshPage)
           <el-card shadow="never">
             <template #header>账号绑定</template>
             <el-form label-width="88px">
-              <el-form-item label="账号">
-                <el-select v-model="bindingForm.account_id" filterable placeholder="选择账号">
+              <el-form-item label="投放账号">
+                <el-select
+                  v-model="bindingForm.account_ids"
+                  multiple
+                  filterable
+                  collapse-tags
+                  collapse-tags-tooltip
+                  clearable
+                  placeholder="选择投放账号"
+                >
                   <el-option
-                    v-for="item in accounts"
+                    v-for="item in adBindingAccounts"
                     :key="item.id"
                     :label="accountLabel(item.id)"
                     :value="item.id"
@@ -2235,7 +2289,8 @@ onMounted(refreshPage)
                 <div class="inline-tags">
                   <el-tag type="info">素材总数 {{ creativePoolCount }}</el-tag>
                   <el-tag v-if="creativePoolStatus" type="success">
-                    新增 {{ creativePoolStatus.created_count }} / 池 {{ creativePoolStatus.pool_size }}
+                    {{ creativePoolStatus.account_count }} 个账号 / 最小池 {{ creativePoolStatus.pool_size }} / 新增
+                    {{ creativePoolStatus.created_count }}
                   </el-tag>
                   <el-tag v-else type="warning">未补齐</el-tag>
                 </div>
@@ -2260,7 +2315,10 @@ onMounted(refreshPage)
               <el-form-item label="启用"><el-switch v-model="bindingForm.enabled" /></el-form-item>
               <el-form-item label="优先级"><el-input-number v-model="bindingForm.priority" /></el-form-item>
               <el-space>
-                <el-button @click="ensureCreativePool" :disabled="!bindingForm.account_id || !bindingForm.ad_campaign_id">
+                <el-button
+                  @click="ensureCreativePool"
+                  :disabled="!bindingForm.account_ids.length || !bindingForm.ad_campaign_id"
+                >
                   <el-icon><Select /></el-icon>
                   自动补齐素材池
                 </el-button>

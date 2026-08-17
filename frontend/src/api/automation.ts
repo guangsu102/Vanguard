@@ -512,6 +512,15 @@ export interface AccountAdBinding {
   updated_at?: string
 }
 
+export interface AccountAdBindingBatchCreatePayload {
+  account_ids?: number[]
+  account_id?: number
+  ad_campaign_id: number
+  creative_ids: number[]
+  enabled?: boolean
+  priority?: number
+}
+
 export interface CreativePoolEnsurePayload {
   account_id: number
   ad_campaign_id: number
@@ -726,7 +735,7 @@ export const automationApi = {
     return apiClient.delete(`/automation/ads/bindings/${id}`)
   },
 
-  createBindingsBatch: (data: { account_id: number; ad_campaign_id: number; creative_ids: number[]; enabled?: boolean; priority?: number }) => {
+  createBindingsBatch: (data: AccountAdBindingBatchCreatePayload) => {
     return apiClient.post<{ data: AccountAdBinding[] }>('/automation/ads/bindings/batch', data)
   },
 

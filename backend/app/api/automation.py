@@ -14,7 +14,13 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.account.models import AccountOperationConfig, AccountOperationMode, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountOperationConfig,
+    AccountOperationMode,
+    AccountStatus,
+    AccountType,
+    TelegramAccount,
+)
 from app.core.account.warmup import account_warmup_context
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
@@ -2114,6 +2120,32 @@ async def _validate_target_group_ids(group_ids: list[int], db: AsyncSession) -> 
     if missing_ids:
         raise HTTPException(status_code=400, detail=f"Target groups not found: {missing_ids}")
 
+    joined_membership_exists = (
+        select(GroupAccountMembership.id)
+        .where(
+            GroupAccountMembership.group_id == Group.id,
+            GroupAccountMembership.status == "joined",
+        )
+        .exists()
+    )
+    available_rows = await db.execute(
+        select(Group.id).where(
+            Group.id.in_(group_ids),
+            Group.status == "active",
+            joined_membership_exists,
+        )
+    )
+    available_ids = set(available_rows.scalars().all())
+    unavailable_ids = [group_id for group_id in group_ids if group_id not in available_ids]
+    if unavailable_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Target groups are not active or not currently joined: "
+                f"{unavailable_ids}"
+            ),
+        )
+
 
 def _validate_campaign_schedule(send_mode: str, scheduled_times: list[str]) -> None:
     if send_mode == AdSendMode.SCHEDULED.value and not scheduled_times:
@@ -2221,7 +2253,8 @@ class AccountAdBindingCreate(BaseModel):
 
 
 class AccountAdBindingBatchCreate(BaseModel):
-    account_id: int
+    account_id: Optional[int] = None
+    account_ids: list[int] = Field(default_factory=list)
     ad_campaign_id: int
     creative_ids: list[int] = Field(default_factory=list, min_length=1)
     enabled: bool = True
@@ -2287,11 +2320,47 @@ async def create_account_ad_bindings_batch(
     if not request.creative_ids:
         raise HTTPException(status_code=400, detail="creative_ids is required")
 
+    account_ids = list(
+        dict.fromkeys(
+            [
+                *request.account_ids,
+                *([request.account_id] if request.account_id is not None else []),
+            ]
+        )
+    )
+    if not account_ids:
+        raise HTTPException(status_code=400, detail='account_id or account_ids is required')
+    if any(account_id <= 0 for account_id in account_ids):
+        raise HTTPException(status_code=400, detail='account_ids must contain positive integers')
+
+    existing_account_rows = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id.in_(account_ids))
+    )
+    accounts_by_id = {
+        account.id: account for account in existing_account_rows.scalars().all()
+    }
+    missing_account_ids = [
+        account_id for account_id in account_ids if account_id not in accounts_by_id
+    ]
+    if missing_account_ids:
+        raise HTTPException(status_code=404, detail=f'Account not found: {missing_account_ids[0]}')
+    banned_account_ids = [
+        account_id
+        for account_id in account_ids
+        if accounts_by_id[account_id].status == AccountStatus.BANNED
+    ]
+    if banned_account_ids:
+        raise HTTPException(
+            status_code=409,
+            detail=f'Banned account cannot be bound: {banned_account_ids[0]}',
+        )
+
+    requested_creative_ids = list(dict.fromkeys(request.creative_ids))
     creatives = (
         (
             await db.execute(
                 select(AdCreative).where(
-                    AdCreative.id.in_(request.creative_ids),
+                    AdCreative.id.in_(requested_creative_ids),
                     AdCreative.enabled == True,
                 )
             )
@@ -2299,35 +2368,42 @@ async def create_account_ad_bindings_batch(
         .scalars()
         .all()
     )
-    creative_ids = {item.id for item in creatives}
+    available_creative_ids = {item.id for item in creatives}
     missing = [
-        creative_id for creative_id in request.creative_ids if creative_id not in creative_ids
+        creative_id
+        for creative_id in requested_creative_ids
+        if creative_id not in available_creative_ids
     ]
     if missing:
         raise HTTPException(status_code=404, detail=f"Creative not found: {missing[0]}")
 
     existing_rows = await db.execute(
-        select(AccountAdBinding.creative_id).where(
-            AccountAdBinding.account_id == request.account_id,
+        select(AccountAdBinding.account_id, AccountAdBinding.creative_id).where(
+            AccountAdBinding.account_id.in_(account_ids),
             AccountAdBinding.ad_campaign_id == request.ad_campaign_id,
-            AccountAdBinding.creative_id.in_(request.creative_ids),
+            AccountAdBinding.creative_id.in_(requested_creative_ids),
         )
     )
-    existing_ids = {item for item in existing_rows.scalars().all() if item is not None}
+    existing_pairs = {
+        (account_id, creative_id)
+        for account_id, creative_id in existing_rows.all()
+        if creative_id is not None
+    }
 
     rows = []
-    for creative_id in request.creative_ids:
-        if creative_id in existing_ids:
-            continue
-        binding = AccountAdBinding(
-            account_id=request.account_id,
-            ad_campaign_id=request.ad_campaign_id,
-            creative_id=creative_id,
-            enabled=request.enabled,
-            priority=request.priority,
-        )
-        db.add(binding)
-        rows.append(binding)
+    for account_id in account_ids:
+        for creative_id in requested_creative_ids:
+            if (account_id, creative_id) in existing_pairs:
+                continue
+            binding = AccountAdBinding(
+                account_id=account_id,
+                ad_campaign_id=request.ad_campaign_id,
+                creative_id=creative_id,
+                enabled=request.enabled,
+                priority=request.priority,
+            )
+            db.add(binding)
+            rows.append(binding)
 
     if not rows:
         return {"code": 0, "message": "success", "data": []}
