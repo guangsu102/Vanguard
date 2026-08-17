@@ -29,6 +29,7 @@ DEFAULT_MIGRATIONS = [
     "026_add_ad_campaign_target_groups.sql",
     "027_add_qq_official.sql",
     "028_add_group_failover_tasks.sql",
+    "029_add_account_operation_mode.sql",
 ]
 
 
