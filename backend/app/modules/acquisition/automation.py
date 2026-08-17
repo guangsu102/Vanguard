@@ -30,6 +30,7 @@ from sqlalchemy.orm import selectinload
 from app.core.account.models import (
     AccountBusinessStage,
     AccountOperationConfig,
+    AccountOperationMode,
     AccountRiskLevel,
     AccountStatus,
     AccountType,
