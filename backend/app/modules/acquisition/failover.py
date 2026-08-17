@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.account.models import (
     AccountOperationConfig,
+    AccountOperationMode,
     AccountRiskLevel,
     AccountStatus,
     AccountType,
@@ -475,6 +476,7 @@ class GroupFailoverService:
                 AccountOperationConfig.enabled,
                 AccountOperationConfig.auto_join_enabled,
                 AccountOperationConfig.auto_ads_enabled,
+                AccountOperationConfig.operation_mode != AccountOperationMode.AD_ONLY.value,
                 or_(
                     AccountOperationConfig.next_join_after.is_(None),
                     AccountOperationConfig.next_join_after <= now,
@@ -524,6 +526,8 @@ class GroupFailoverService:
             or not config.enabled
             or not config.auto_join_enabled
             or not config.auto_ads_enabled
+            or (getattr(config, "operation_mode", None) or AccountOperationMode.GROWTH.value)
+            == AccountOperationMode.AD_ONLY.value
         ):
             return False
         if config.next_join_after and config.next_join_after > now:

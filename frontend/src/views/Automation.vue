@@ -9,6 +9,7 @@ import {
   automationApi,
   type AccountAdBinding,
   type AccountOperationConfig,
+  type AccountOperationMode,
   type AccountRiskGuardSettings,
   type AccountWarmupPolicySettings,
   type AdDeliveryExecutionSettings,
@@ -453,6 +454,7 @@ const bindingForm = reactive({
 })
 
 const accountConfigForm = reactive({
+  operation_mode: 'growth' as AccountOperationMode,
   enabled: true,
   auto_join_enabled: false,
   auto_ads_enabled: true,
@@ -473,6 +475,15 @@ const accountConfigForm = reactive({
 })
 
 const keywordTypeOptions = GROUP_SEARCH_KEYWORD_TYPE_OPTIONS
+
+const isAdOnlyAccount = computed(() => accountConfigForm.operation_mode === 'ad_only')
+
+watch(() => accountConfigForm.operation_mode, (mode) => {
+  if (mode === 'ad_only') {
+    accountConfigForm.auto_join_enabled = false
+    accountConfigForm.keyword_auto_replenish_enabled = false
+  }
+})
 
 const deliveryStatusOptions = [
   { label: '成功', value: 'success' },
@@ -587,6 +598,7 @@ const campaignTargetLabel = (campaign: AdCampaign) => {
 
 const fillAccountConfigForm = (config: AccountOperationConfig) => {
   Object.assign(accountConfigForm, {
+    operation_mode: config.operation_mode || 'growth',
     enabled: config.enabled,
     auto_join_enabled: config.auto_join_enabled,
     auto_ads_enabled: config.auto_ads_enabled,
@@ -736,6 +748,7 @@ const loadAccountConfig = async (accountId?: number) => {
 }
 
 const accountConfigPayload = () => ({
+  operation_mode: accountConfigForm.operation_mode,
   enabled: accountConfigForm.enabled,
   auto_join_enabled: accountConfigForm.auto_join_enabled,
   auto_ads_enabled: accountConfigForm.auto_ads_enabled,
@@ -1856,11 +1869,17 @@ onMounted(refreshPage)
 
           <el-form v-loading="accountConfigLoading" label-width="150px" class="account-config-form">
             <div class="account-config-grid">
+              <el-form-item label="账号模式">
+                <el-select v-model="accountConfigForm.operation_mode">
+                  <el-option label="增长运营" value="growth" />
+                  <el-option label="广告专用" value="ad_only" />
+                </el-select>
+              </el-form-item>
               <el-form-item label="启用配置">
                 <el-switch v-model="accountConfigForm.enabled" />
               </el-form-item>
               <el-form-item label="自动加群">
-                <el-switch v-model="accountConfigForm.auto_join_enabled" />
+                <el-switch v-model="accountConfigForm.auto_join_enabled" :disabled="isAdOnlyAccount" />
               </el-form-item>
               <el-form-item label="自动广告">
                 <el-switch v-model="accountConfigForm.auto_ads_enabled" />
@@ -1884,7 +1903,7 @@ onMounted(refreshPage)
                 <el-input-number v-model="accountConfigForm.message_interval_seconds" :min="1" :max="86400" />
               </el-form-item>
               <el-form-item label="关键词不足自动补充">
-                <el-switch v-model="accountConfigForm.keyword_auto_replenish_enabled" />
+                <el-switch v-model="accountConfigForm.keyword_auto_replenish_enabled" :disabled="isAdOnlyAccount" />
               </el-form-item>
               <el-form-item label="补充后需要审核">
                 <el-switch v-model="accountConfigForm.keyword_replenish_requires_review" />

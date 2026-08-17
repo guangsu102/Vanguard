@@ -14,7 +14,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.account.models import AccountOperationConfig, AccountType, TelegramAccount
+from app.core.account.models import AccountOperationConfig, AccountOperationMode, AccountType, TelegramAccount
 from app.core.account.warmup import account_warmup_context
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
@@ -1382,6 +1382,7 @@ async def update_ad_failure_policy(
 
 
 class AccountOperationConfigUpdate(BaseModel):
+    operation_mode: Optional[str] = Field(None, pattern="^(growth|ad_only)$")
     auto_join_enabled: Optional[bool] = None
     auto_ads_enabled: Optional[bool] = None
     max_groups_per_day: Optional[int] = Field(None, ge=0, le=1000)
@@ -1414,6 +1415,7 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
     return {
         "id": config.id,
         "account_id": config.account_id,
+        "operation_mode": getattr(config, "operation_mode", None) or AccountOperationMode.GROWTH.value,
         "auto_join_enabled": config.auto_join_enabled,
         "auto_ads_enabled": config.auto_ads_enabled,
         "max_groups_per_day": config.max_groups_per_day,
@@ -1475,6 +1477,14 @@ def _prepare_operation_config_update(
     max_interval = data.get("join_interval_max_seconds", config.join_interval_max_seconds)
     if max_interval < min_interval:
         raise HTTPException(status_code=400, detail="join_interval_max_seconds must be >= min")
+
+    operation_mode = data.get(
+        "operation_mode",
+        getattr(config, "operation_mode", None) or AccountOperationMode.GROWTH.value,
+    )
+    if operation_mode == AccountOperationMode.AD_ONLY.value:
+        data["auto_join_enabled"] = False
+        data["keyword_auto_replenish_enabled"] = False
     return data
 
 

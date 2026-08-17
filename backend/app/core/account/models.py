@@ -92,6 +92,13 @@ class AccountBusinessStage(str, Enum):
     COOLDOWN = "cooldown"
 
 
+class AccountOperationMode(str, Enum):
+    """Scope of automation actions allowed for a promoter account."""
+
+    GROWTH = "growth"
+    AD_ONLY = "ad_only"
+
+
 class AccountWarmupStage(str, Enum):
     """Managed-account warmup stage after Vanguard starts operating an account."""
     OBSERVE = "observe"
@@ -582,6 +589,13 @@ class AccountOperationConfig(Base):
 
     auto_join_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, comment="是否自动加群")
     auto_ads_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, comment="是否允许自动广告")
+    operation_mode: Mapped[str] = mapped_column(
+        String(20),
+        default=AccountOperationMode.GROWTH.value,
+        server_default=AccountOperationMode.GROWTH.value,
+        nullable=False,
+        comment="自动化职责: growth/ad_only",
+    )
 
     max_groups_per_day: Mapped[int] = mapped_column(Integer, default=100, nullable=False, comment="每日最大加群数")
     max_groups_total: Mapped[int] = mapped_column(Integer, default=100, nullable=False, comment="账号总群数上限")
@@ -634,6 +648,7 @@ class AccountOperationConfig(Base):
         UniqueConstraint("account_id", name="uq_account_operation_config_account"),
         Index("idx_account_operation_auto_join", "auto_join_enabled"),
         Index("idx_account_operation_enabled", "enabled"),
+        Index("idx_account_operation_mode", "operation_mode"),
         Index("idx_account_operation_business_stage", "business_stage"),
     )
 

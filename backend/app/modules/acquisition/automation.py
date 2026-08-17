@@ -640,6 +640,7 @@ class AcquisitionAutomationService:
                 Group.status == "active",
                 AccountOperationConfig.enabled == True,
                 AccountOperationConfig.auto_ads_enabled == True,
+                AccountOperationConfig.operation_mode != AccountOperationMode.AD_ONLY.value,
                 TelegramAccount.account_type == AccountType.PROMOTER,
                 TelegramAccount.is_active == True,
                 TelegramAccount.risk_level.in_([AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]),
@@ -1029,6 +1030,8 @@ class AcquisitionAutomationService:
         if (
             not op_config.enabled
             or not op_config.auto_join_enabled
+            or (getattr(op_config, "operation_mode", None) or AccountOperationMode.GROWTH.value)
+            == AccountOperationMode.AD_ONLY.value
             or account is None
             or not account.is_active
             or account.status in [AccountStatus.ERROR, AccountStatus.BANNED]
@@ -1530,6 +1533,7 @@ class AcquisitionAutomationService:
             .where(
                 AccountOperationConfig.enabled == True,
                 AccountOperationConfig.auto_join_enabled == True,
+                AccountOperationConfig.operation_mode != AccountOperationMode.AD_ONLY.value,
             )
             .limit(limit)
         )
@@ -5947,6 +5951,16 @@ class AcquisitionAutomationService:
         *,
         dry_run: bool,
     ) -> Optional[str]:
+        operation_config = await self._get_account_operation_config(account_id)
+        if (
+            operation_config
+            and (getattr(operation_config, "operation_mode", None) or AccountOperationMode.GROWTH.value)
+            == AccountOperationMode.AD_ONLY.value
+        ):
+            if membership.warmup_status == "blocked" or membership.probe_status == "failed":
+                return "ad_only_group_blocked"
+            return None
+
         blocked = self._membership_latest_event(
             membership.note,
             {"ad_probe_failed", "ad_group_control_leave", "ad_group_control_leave_failed"},

@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException
 
-from app.api.automation import _build_ad_delivery_diagnostic, _build_dynamic_health_diagnostic, _enqueue_automation_task
-from app.core.account.models import AccountOperationConfig, AccountStatus, AccountType, TelegramAccount
+from app.api.automation import _build_ad_delivery_diagnostic, _build_dynamic_health_diagnostic, _enqueue_automation_task, _prepare_operation_config_update
+from app.core.account.models import AccountOperationConfig, AccountOperationMode, AccountStatus, AccountType, TelegramAccount
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
+import app.modules.acquisition.automation as automation_module
 from app.modules.acquisition.automation import AcquisitionAutomationService
 from app.modules.acquisition.models import AccountAdBinding, AdCampaign
 
@@ -268,3 +269,96 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
         "account_dynamic_health_paused",
     ]
     send_ad.assert_not_awaited()
+
+
+def test_ad_only_mode_disables_growth_controls():
+    config = AccountOperationConfig(join_interval_min_seconds=60, join_interval_max_seconds=900)
+    payload = _prepare_operation_config_update(
+        config,
+        {
+            "operation_mode": AccountOperationMode.AD_ONLY.value,
+            "auto_join_enabled": True,
+            "keyword_auto_replenish_enabled": True,
+        },
+    )
+
+    assert payload["operation_mode"] == AccountOperationMode.AD_ONLY.value
+    assert payload["auto_join_enabled"] is False
+    assert payload["keyword_auto_replenish_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_ad_only_account_is_excluded_from_group_ai_warmup(test_db, monkeypatch):
+    account = TelegramAccount(
+        identifier="ad-only-warmup",
+        session_name="ad-only-warmup",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=920010, title="Ad-only group", level=GroupLevel.A, status="active")
+    config = AccountOperationConfig(
+        account=account,
+        enabled=True,
+        auto_join_enabled=False,
+        auto_ads_enabled=True,
+        operation_mode=AccountOperationMode.AD_ONLY.value,
+    )
+    membership = GroupAccountMembership(
+        group=group,
+        account=account,
+        telegram_group_id=group.group_id,
+        status="joined",
+    )
+    test_db.add_all([account, group, config, membership])
+    await test_db.commit()
+
+    monkeypatch.setattr(
+        automation_module,
+        "get_group_ai_interaction_settings",
+        AsyncMock(
+            return_value={
+                "enabled": True,
+                "allowProactiveWarmup": True,
+                "proactiveWarmupMaxPerGroupPerDay": 1,
+                "proactiveWarmupMaxPerAccountPerDay": 1,
+            }
+        ),
+    )
+
+    result = await AcquisitionAutomationService(test_db).run_group_ai_warmup(dry_run=True)
+
+    assert result["details"] == [{"action": "skip", "reason": "group_ai_warmup_no_candidates"}]
+
+
+@pytest.mark.asyncio
+async def test_ad_only_account_skips_ad_probe_and_warmup(test_db):
+    account = TelegramAccount(
+        identifier="ad-only-probe",
+        session_name="ad-only-probe",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    config = AccountOperationConfig(
+        account=account,
+        enabled=True,
+        auto_ads_enabled=True,
+        operation_mode=AccountOperationMode.AD_ONLY.value,
+    )
+    test_db.add_all([account, config])
+    await test_db.commit()
+    membership = SimpleNamespace(
+        warmup_status="joined_pending_test",
+        probe_status="not_started",
+        note="",
+    )
+
+    reason = await AcquisitionAutomationService(test_db)._ad_warmup_skip_reason(
+        account.id,
+        membership,
+        datetime.utcnow(),
+        dry_run=False,
+    )
+
+    assert reason is None

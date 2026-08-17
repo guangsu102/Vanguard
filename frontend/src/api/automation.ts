@@ -48,9 +48,12 @@ export interface GroupFailoverTask {
 }
 
 
+export type AccountOperationMode = 'growth' | 'ad_only'
+
 export interface AccountOperationConfig {
   id: number
   account_id: number
+  operation_mode: AccountOperationMode
   auto_join_enabled: boolean
   auto_ads_enabled: boolean
   max_groups_per_day: number
