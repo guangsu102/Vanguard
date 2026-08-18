@@ -1547,6 +1547,22 @@ def save_account_risk_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
 
     raw_actions = config.get("actions", {})
     if isinstance(raw_actions, dict):
+        action_hard_limits = {
+            "join": 6,
+            "group_message": 4,
+            "ad_probe": 10,
+            "ai_warmup": 1,
+            "ad_delivery": 5,
+            "channel_create": 1,
+        }
+        action_min_cooldowns = {
+            "join": 7200,
+            "group_message": 7200,
+            "ad_probe": 3600,
+            "ai_warmup": 21600,
+            "ad_delivery": 9000,
+            "channel_create": 86400,
+        }
         actions = dict(current["actions"])
         for action, default_budget in DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS["actions"].items():
             item = raw_actions.get(action)
@@ -1558,12 +1574,12 @@ def save_account_risk_guard_settings(config: dict[str, Any]) -> dict[str, Any]:
                     item.get("daily_limit", item.get("dailyLimit", existing["daily_limit"])),
                     existing["daily_limit"],
                     min_value=1,
-                    max_value=existing["daily_limit"],
+                    max_value=action_hard_limits.get(action, 100000),
                 ),
                 "cooldown_seconds": _int_setting(
                     item.get("cooldown_seconds", item.get("cooldownSeconds", existing["cooldown_seconds"])),
                     existing["cooldown_seconds"],
-                    min_value=existing["cooldown_seconds"],
+                    min_value=action_min_cooldowns.get(action, 0),
                     max_value=86400,
                 ),
             }
