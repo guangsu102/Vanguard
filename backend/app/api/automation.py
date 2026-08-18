@@ -44,6 +44,7 @@ from app.core.database import get_db
 from app.core.group.models import Group, GroupAccountMembership
 from app.core.scheduler.tasks import (
     auto_join_groups_task,
+    auto_probe_unknown_group_ad_policies_task,
     recover_orphaned_groups_task,
     check_ad_survival_task,
     deliver_ads_task,
@@ -248,10 +249,13 @@ class AdCapacityUpdate(BaseModel):
     leave_on_deleted_ad: bool = True
     block_group_on_probe_failure: bool = True
     ad_policy_ai_enabled: bool = True
-    ad_policy_ai_model: str = Field(default="gpt-5.6-luna", min_length=1, max_length=100)
+    ad_policy_ai_model: str = Field(default="gpt-5.6-terra", min_length=1, max_length=100)
     ad_policy_ai_timeout_seconds: int = Field(default=45, ge=5, le=120)
     ad_policy_ai_min_confidence: int = Field(default=95, ge=90, le=100)
     ad_policy_ai_require_second_pass: bool = True
+    ad_policy_auto_probe_enabled: bool = False
+    ad_policy_auto_probe_daily_limit: int = Field(default=1, ge=0, le=20)
+    ad_policy_auto_probe_interval_hours: int = Field(default=24, ge=1, le=168)
     ad_policy_auto_ttl_days: int = Field(default=7, ge=1, le=90)
     ad_policy_manual_ttl_days: int = Field(default=30, ge=1, le=365)
     premium_min_samples: int = Field(default=20, ge=1, le=1000)
@@ -309,11 +313,15 @@ class AdCapacityUpdate(BaseModel):
 
 class GroupAdPolicyUpdate(BaseModel):
     mode: str = Field(
-        pattern="^(forbidden|unknown|approval_required|soft_ad_trial|soft_ad_allowed|high_volume_ad_allowed)$"
+        pattern="^(forbidden|unknown|unknown_probe|approval_required|soft_ad_trial|soft_ad_allowed|high_volume_ad_allowed)$"
     )
     confidence: int = Field(default=100, ge=0, le=100)
     expires_days: Optional[int] = Field(default=None, ge=1, le=365)
     note: Optional[str] = Field(default=None, max_length=500)
+
+
+class GroupAdPolicyProbeRequest(BaseModel):
+    account_id: Optional[int] = Field(default=None, ge=1)
 
 
 def _iso_datetime(value: Any) -> Optional[str]:
@@ -615,6 +623,7 @@ async def _build_ad_delivery_diagnostic(
         "level_not_targeted": 0,
         "ai_warmed": 0,
         "ad_permission_unknown": 0,
+        "ad_policy_probe_pending": 0,
         "ad_approval_required": 0,
         "ad_permission_low_confidence": 0,
         "ad_permission_forbidden": 0,
@@ -674,6 +683,11 @@ async def _build_ad_delivery_diagnostic(
             group_label = "广告许可未知"
             severity = "warning"
             group_counts["ad_permission_unknown"] += 1
+        elif profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
+            group_reason = "ad_permission_probe_pending"
+            group_label = "广告检测进行中"
+            severity = "warning"
+            group_counts["ad_policy_probe_pending"] += 1
         elif profile.ad_policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
             group_reason = "ad_approval_required"
             group_label = "需要管理员审批"
@@ -762,9 +776,28 @@ async def _build_ad_delivery_diagnostic(
             next_action = "send_probe"
             next_action_label = "等待探针发送"
             next_action_at = soonest_wait or next_action_at
+        elif group_counts["ad_policy_probe_pending"]:
+            reasons.append(
+                _diagnostic_reason(
+                    "groups_ad_policy_probe_pending",
+                    "未知群广告检测进行中",
+                    detail=f"{group_counts['ad_policy_probe_pending']} 个群",
+                )
+            )
+            next_action = "wait_ad_policy_probe"
+            next_action_label = "等待广告检测结果"
+        elif group_counts["ad_permission_unknown"]:
+            reasons.append(
+                _diagnostic_reason(
+                    "groups_ad_permission_unknown",
+                    "群广告许可未知，需要先发送检测广告",
+                    detail=f"{group_counts['ad_permission_unknown']} 个群",
+                )
+            )
+            next_action = "send_ad_policy_probe"
+            next_action_label = "发送广告检测"
         elif (
-            group_counts["ad_permission_unknown"]
-            or group_counts["ad_approval_required"]
+            group_counts["ad_approval_required"]
             or group_counts["ad_permission_low_confidence"]
             or group_counts["ad_policy_expired"]
         ):
@@ -1007,6 +1040,10 @@ def _group_ad_profile_payload(
         "ad_policy_confidence": int(profile.ad_policy_confidence or 0),
         "ad_policy_source": profile.ad_policy_source,
         "ad_policy_verified_at": _iso_datetime(profile.ad_policy_verified_at),
+        "ad_policy_probe_status": profile.ad_policy_probe_status,
+        "ad_policy_probe_at": _iso_datetime(profile.ad_policy_probe_at),
+        "ad_policy_probe_account_id": profile.ad_policy_probe_account_id,
+        "ad_policy_probe_error": profile.ad_policy_probe_error,
         "ad_policy_expires_at": _iso_datetime(profile.ad_policy_expires_at),
         "ad_tier": profile.ad_tier,
         "daily_capacity": int(profile.daily_capacity or 0),
@@ -1083,6 +1120,49 @@ async def list_group_ad_policy_events(
     return {"code": 0, "message": "success", "data": data}
 
 
+@router.post("/ads/group-profiles/{group_id}/probe")
+async def trigger_group_ad_policy_probe(
+    group_id: int,
+    request: GroupAdPolicyProbeRequest,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    service = AcquisitionAutomationService(db)
+    try:
+        result = await service.send_group_ad_policy_probe(
+            group_id,
+            account_id=request.account_id,
+            changed_by_user_id=current_user.get("id"),
+        )
+    except ValueError as exc:
+        if str(exc) == "group_not_found":
+            raise HTTPException(status_code=404, detail="Group not found") from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        detail = str(exc)
+        conflict_codes = {
+            "group_ad_policy_probe_already_pending",
+            "group_ad_policy_probe_cooldown",
+            "group_ad_policy_already_resolved",
+        }
+        known_precondition_codes = {
+            "group_ad_forbidden",
+            "group_ad_approval_required",
+            "no_probe_ready_membership",
+            "no_active_ad_binding_for_probe",
+            "account_ads_disabled",
+            "group_level_disallows_ads",
+        }
+        if detail in conflict_codes:
+            code = 409
+        elif detail in known_precondition_codes or detail.startswith("group_status_"):
+            code = 400
+        else:
+            code = 503
+        raise HTTPException(status_code=code, detail=detail) from exc
+    return {"code": 0, "message": "success", "data": result}
+
+
 @router.put("/ads/group-profiles/{group_id}/policy")
 async def update_group_ad_policy(
     group_id: int,
@@ -1117,6 +1197,10 @@ async def update_group_ad_policy(
     profile.ad_policy_confidence = request.confidence
     profile.ad_policy_source = "manual"
     profile.ad_policy_verified_at = now
+    profile.ad_policy_probe_status = "not_started"
+    profile.ad_policy_probe_at = None
+    profile.ad_policy_probe_account_id = None
+    profile.ad_policy_probe_error = None
     if mode == GroupAdPolicyMode.FORBIDDEN.value:
         group.status = GROUP_STATUS_AD_BLOCKED
         profile.ad_policy_expires_at = None
@@ -1126,6 +1210,7 @@ async def update_group_ad_policy(
         profile.blocked_reason = "manual_ad_policy_forbidden"
     elif mode in {
         GroupAdPolicyMode.UNKNOWN.value,
+        GroupAdPolicyMode.UNKNOWN_PROBE.value,
         GroupAdPolicyMode.APPROVAL_REQUIRED.value,
     }:
         if group.status == GROUP_STATUS_AD_BLOCKED:
@@ -1656,12 +1741,28 @@ class AdDeliveryRunRequest(BaseModel):
     dry_run: bool = False
 
 
+class AdPolicyAutoProbeRunRequest(BaseModel):
+    limit: Optional[int] = Field(default=None, ge=1, le=20)
+    dry_run: bool = False
+
+
 @router.post("/ads/run", status_code=status.HTTP_202_ACCEPTED)
 async def run_ad_delivery(request: AdDeliveryRunRequest) -> dict:
     result = _enqueue_automation_task(
         deliver_ads_task,
         "deliver_ads_task",
         max_deliveries=request.max_deliveries,
+        dry_run=request.dry_run,
+    )
+    return {"code": 0, "message": "success", "data": result}
+
+
+@router.post("/ads/auto-policy-probe/run", status_code=status.HTTP_202_ACCEPTED)
+async def run_auto_group_ad_policy_probe(request: AdPolicyAutoProbeRunRequest) -> dict:
+    result = _enqueue_automation_task(
+        auto_probe_unknown_group_ad_policies_task,
+        "auto_probe_unknown_group_ad_policies_task",
+        limit=request.limit,
         dry_run=request.dry_run,
     )
     return {"code": 0, "message": "success", "data": result}

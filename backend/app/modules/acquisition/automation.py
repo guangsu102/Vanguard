@@ -127,6 +127,14 @@ AD_PROBE_MESSAGES = (
     "你们现在用 cursor 还是 claude code 多",
     "openai api 最近延迟怎么样",
 )
+AD_POLICY_PROBE_MANUAL_SOURCE = "manual_ad_policy_probe"
+AD_POLICY_PROBE_AUTO_SOURCE = "auto_ad_policy_probe"
+AD_POLICY_PROBE_ATTEMPT_REASON = "unknown_group_probe_attempt"
+AD_POLICY_PROBE_MESSAGES = (
+    "最近在整理 GPT 和 Claude 的使用成本，有需要可以一起交流。",
+    "这边在做 AI 工具和 API 的低成本方案，有兴趣可以交流一下。",
+    "最近整理了一份 GPT、Claude 和 Codex 的使用方案，需要的可以聊聊。",
+)
 AD_WARMUP_INTERACTION_MESSAGES = (
     "最近大家用哪套工具链比较顺手",
     "问下群里现在 gpt pro 稳定吗",
@@ -3774,7 +3782,7 @@ class AcquisitionAutomationService:
             local_result.decision_source = "strict_gate"
             return local_result
 
-        model = str(capacity.get("ad_policy_ai_model") or "gpt-5.6-luna")[:100]
+        model = str(capacity.get("ad_policy_ai_model") or "gpt-5.6-terra")[:100]
         timeout_seconds = int(capacity.get("ad_policy_ai_timeout_seconds") or 45)
         min_confidence = int(capacity.get("ad_policy_ai_min_confidence") or 95)
         try:
@@ -4517,17 +4525,26 @@ class AcquisitionAutomationService:
 
         now = _now()
         reason = audit.ad_rule_reason or "group_rules_disallow_ads"
+        discovered = self._discovered_group_from_model(group)
+        leave_error = await self._leave_group(membership.account_id, discovered)
+        membership.status = (
+            "left"
+            if leave_error is None or self._leave_error_means_not_joined(leave_error)
+            else "rejected"
+        )
+        membership.left_at = now
         membership.warmup_status = "blocked"
         membership.probe_status = "skipped"
         membership.ad_status = MEMBERSHIP_AD_STATUS_BLOCKED
         membership.last_checked_at = now
         membership.updated_at = now
-        membership.last_probe_error = reason[:1000]
+        membership.last_probe_error = (leave_error or reason)[:1000]
         membership.note = self._append_membership_note(
             membership.note,
             {
-                "event": "group_rules_ad_blocked",
+                "event": "group_rules_ad_blocked_and_left",
                 "reason": reason,
+                "leave_error": (leave_error or "")[:500],
                 "ad_rule_details": audit.ad_rule_details,
             },
         )
@@ -4550,6 +4567,14 @@ class AcquisitionAutomationService:
         profile.blocked_reason = reason[:255]
         profile.updated_at = now
         await self.db.commit()
+        self.logger.warning(
+            "group_rules_ad_blocked_and_left",
+            account_id=membership.account_id,
+            group_db_id=group.id,
+            group_id=group.group_id,
+            reason=reason,
+            leave_error=leave_error,
+        )
 
     async def _reject_group_after_failed_audit(self, group: Group, reason: Optional[str]) -> bool:
         if reason in {"account_banned", "group_membership_banned", "account_not_participant"}:
@@ -5944,6 +5969,244 @@ class AcquisitionAutomationService:
         finally:
             await self.account_pool.release(account)
 
+    async def send_group_ad_policy_probe(
+        self,
+        group_id: int,
+        *,
+        account_id: Optional[int] = None,
+        changed_by_user_id: Optional[int] = None,
+        source: str = AD_POLICY_PROBE_MANUAL_SOURCE,
+    ) -> dict[str, Any]:
+        """Send one controlled no-link advertisement to an unknown-policy group."""
+        now = _now()
+        group_result = await self.db.execute(
+            select(Group).where(Group.id == group_id).with_for_update()
+        )
+        group = group_result.scalar_one_or_none()
+        if group is None:
+            raise ValueError("group_not_found")
+        probe_source = str(source or AD_POLICY_PROBE_MANUAL_SOURCE)[:80]
+        if group.status != "active":
+            raise RuntimeError(f"group_status_{group.status}")
+
+        capacity = await get_ad_capacity_settings(self.db)
+        profile = await self._get_or_create_group_ad_profile(group, capacity)
+        mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
+        if mode == GroupAdPolicyMode.FORBIDDEN.value:
+            raise RuntimeError("group_ad_forbidden")
+        if mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
+            raise RuntimeError("group_ad_approval_required")
+        if mode not in {
+            GroupAdPolicyMode.UNKNOWN.value,
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
+        }:
+            raise RuntimeError("group_ad_policy_already_resolved")
+        if profile.ad_policy_probe_status in {"sending", "sent"}:
+            raise RuntimeError("group_ad_policy_probe_already_pending")
+        if (
+            profile.ad_policy_probe_status == "failed"
+            and profile.ad_policy_probe_at
+            and now < profile.ad_policy_probe_at + timedelta(hours=24)
+        ):
+            raise RuntimeError("group_ad_policy_probe_cooldown")
+
+        membership_query = (
+            select(GroupAccountMembership)
+            .options(
+                selectinload(GroupAccountMembership.group),
+                selectinload(GroupAccountMembership.account),
+            )
+            .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
+            .where(
+                GroupAccountMembership.group_id == group.id,
+                GroupAccountMembership.status == "joined",
+                GroupAccountMembership.probe_status == "success",
+                TelegramAccount.is_active == True,
+            )
+            .order_by(GroupAccountMembership.joined_at.asc().nullsfirst(), GroupAccountMembership.id.asc())
+        )
+        if account_id is not None:
+            membership_query = membership_query.where(GroupAccountMembership.account_id == account_id)
+        memberships = list((await self.db.execute(membership_query)).scalars().all())
+        eligible_memberships: list[GroupAccountMembership] = []
+        for membership in memberships:
+            account = membership.account
+            account_status = str(getattr(account.status, "value", account.status) or "")
+            if account_status in {"banned", "error", "disabled"}:
+                continue
+            if membership.ad_status == MEMBERSHIP_AD_STATUS_BLOCKED:
+                continue
+            if membership.ad_eligible_after and membership.ad_eligible_after > now:
+                continue
+            if membership.first_ad_allowed_at and membership.first_ad_allowed_at > now:
+                continue
+            eligible_memberships.append(membership)
+        if not eligible_memberships:
+            raise RuntimeError("no_probe_ready_membership")
+
+        membership_by_account = {item.account_id: item for item in eligible_memberships}
+        binding_rows = await self.db.execute(
+            select(AccountAdBinding)
+            .options(
+                selectinload(AccountAdBinding.account),
+                selectinload(AccountAdBinding.campaign),
+            )
+            .where(
+                AccountAdBinding.enabled == True,
+                AccountAdBinding.account_id.in_(list(membership_by_account)),
+            )
+            .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id.asc())
+        )
+        binding = next(
+            (
+                item
+                for item in binding_rows.scalars().all()
+                if item.campaign is not None and self._campaign_is_active(item.campaign)
+            ),
+            None,
+        )
+        if binding is None:
+            raise RuntimeError("no_active_ad_binding_for_probe")
+        membership = membership_by_account[binding.account_id]
+        campaign = binding.campaign
+
+        operation_config = await self._get_account_operation_config(binding.account_id)
+        if operation_config and (not operation_config.enabled or not operation_config.auto_ads_enabled):
+            raise RuntimeError("account_ads_disabled")
+        risk_reason = await self._ad_account_risk_skip_reason(binding.account_id, now)
+        if risk_reason:
+            raise RuntimeError(risk_reason)
+        if not await self._group_can_receive_ads(group):
+            raise RuntimeError("group_level_disallows_ads")
+
+        previous_mode = mode
+        profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN_PROBE.value
+        profile.ad_policy_confidence = 0
+        profile.ad_policy_source = probe_source
+        profile.ad_policy_expires_at = now + timedelta(days=2)
+        profile.ad_tier = GroupAdTier.TRIAL.value
+        profile.daily_capacity = min(
+            1,
+            int((capacity.get("tier_daily_capacities") or {}).get(GroupAdTier.TRIAL.value, 1) or 1),
+        )
+        profile.ad_policy_probe_status = "sending"
+        profile.ad_policy_probe_at = now
+        profile.ad_policy_probe_account_id = binding.account_id
+        profile.ad_policy_probe_error = None
+        profile.blocked_at = None
+        profile.blocked_reason = None
+        profile.updated_at = now
+        self.db.add(
+            GroupAdPolicyEvent(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                previous_mode=previous_mode,
+                new_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                confidence=0,
+                source=probe_source,
+                reason=AD_POLICY_PROBE_ATTEMPT_REASON,
+                changed_by_user_id=changed_by_user_id,
+            )
+        )
+        await self.db.commit()
+
+        await self._sync_account_pool([membership.account])
+        slot_reserved, slot_reason, slot_key = await self._reserve_group_daily_delivery_slot(membership, now)
+        if not slot_reserved:
+            profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
+            profile.ad_tier = GroupAdTier.OBSERVING.value
+            profile.daily_capacity = 0
+            profile.ad_policy_probe_status = "failed"
+            profile.ad_policy_probe_error = slot_reason[:1000]
+            profile.updated_at = now
+            await self.db.commit()
+            raise RuntimeError(slot_reason)
+
+        message = random.choice(AD_POLICY_PROBE_MESSAGES)
+        delivery_log: Optional[AdDeliveryLog] = None
+        telegram_send_completed = False
+        try:
+            delivery_log = await self._record_ad_delivery(
+                binding.account_id,
+                group,
+                campaign,
+                None,
+                DeliveryStatus.PENDING,
+                reservation_token=uuid4().hex,
+            )
+            message_id = await self._send_ad_text(
+                binding.account_id,
+                membership.telegram_group_id,
+                message,
+                source="ad_policy_probe",
+            )
+            if message_id is None:
+                raise RuntimeError("ad_policy_probe_no_message_id")
+            telegram_send_completed = True
+            await self._finalize_ad_delivery_log(
+                delivery_log,
+                DeliveryStatus.SUCCESS,
+                telegram_message_id=message_id,
+                sent_at=now,
+                survival_required=True,
+            )
+            profile.ad_policy_probe_status = "sent"
+            profile.ad_policy_probe_at = now
+            profile.ad_policy_probe_error = None
+            profile.updated_at = now
+            membership.note = self._append_membership_note(
+                membership.note,
+                {
+                    "event": "ad_policy_probe_sent",
+                    "message_id": message_id,
+                    "campaign_id": campaign.id,
+                    "probe": message,
+                },
+            )
+            membership.updated_at = now
+            self.db.add(
+                GroupAdPolicyEvent(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    previous_mode=previous_mode,
+                    new_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                    confidence=0,
+                    source=probe_source,
+                    reason="unknown_group_probe_sent",
+                    changed_by_user_id=changed_by_user_id,
+                )
+            )
+            await self.db.commit()
+            return {
+                "group_id": group.id,
+                "telegram_group_id": group.group_id,
+                "account_id": binding.account_id,
+                "campaign_id": campaign.id,
+                "message_id": message_id,
+                "ad_policy_mode": profile.ad_policy_mode,
+                "ad_policy_probe_status": profile.ad_policy_probe_status,
+            }
+        except Exception as exc:
+            classified_error = self._classify_ad_delivery_error(exc)
+            if not telegram_send_completed:
+                await self._release_group_daily_delivery_slot(slot_key)
+                if delivery_log is not None:
+                    await self._finalize_ad_delivery_log(
+                        delivery_log,
+                        DeliveryStatus.FAILED,
+                        error=classified_error,
+                    )
+                profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
+                profile.ad_tier = GroupAdTier.OBSERVING.value
+                profile.daily_capacity = 0
+                profile.ad_policy_probe_status = "failed"
+            else:
+                profile.ad_policy_probe_status = "sent"
+            profile.ad_policy_probe_error = classified_error[:1000]
+            profile.updated_at = _now()
+            await self.db.commit()
+            raise RuntimeError(classified_error) from exc
+
     async def _ad_warmup_skip_reason(
         self,
         account_id: int,
@@ -6242,6 +6505,132 @@ class AcquisitionAutomationService:
                     await self.account_pool.release(account)
         return result.as_dict()
 
+    async def auto_probe_unknown_group_ad_policies(
+        self,
+        *,
+        limit: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Automatically run controlled ad probes for eligible unknown groups."""
+        now = _now()
+        capacity = await get_ad_capacity_settings(self.db)
+        result = AutomationRunResult()
+        if not capacity.get("enabled", True):
+            return {**result.as_dict(), "reason": "ad_capacity_disabled"}
+        if not capacity.get("ad_policy_auto_probe_enabled", False):
+            return {**result.as_dict(), "reason": "ad_policy_auto_probe_disabled"}
+
+        configured_limit = int(capacity.get("ad_policy_auto_probe_daily_limit") or 0)
+        requested_limit = configured_limit if limit is None else min(int(limit), configured_limit)
+        if requested_limit <= 0:
+            return {**result.as_dict(), "reason": "ad_policy_auto_probe_daily_limit_zero"}
+
+        day_start = self._ad_operating_day_start(now, capacity)
+        attempted_today = int(
+            await self.db.scalar(
+                select(func.count(GroupAdPolicyEvent.id)).where(
+                    GroupAdPolicyEvent.source == AD_POLICY_PROBE_AUTO_SOURCE,
+                    GroupAdPolicyEvent.reason == AD_POLICY_PROBE_ATTEMPT_REASON,
+                    GroupAdPolicyEvent.created_at >= day_start,
+                )
+            )
+            or 0
+        )
+        remaining = max(0, requested_limit - attempted_today)
+        if remaining <= 0:
+            return {**result.as_dict(), "reason": "ad_policy_auto_probe_daily_limit_reached"}
+
+        interval_hours = max(1, int(capacity.get("ad_policy_auto_probe_interval_hours") or 24))
+        probe_cutoff = now - timedelta(hours=interval_hours)
+        rows = await self.db.execute(
+            select(GroupAdProfile, Group, GroupAccountMembership, TelegramAccount)
+            .join(Group, Group.id == GroupAdProfile.group_id)
+            .join(GroupAccountMembership, GroupAccountMembership.group_id == Group.id)
+            .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
+            .where(
+                GroupAdProfile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value,
+                GroupAdProfile.ad_policy_probe_status.not_in(["sending", "sent"]),
+                Group.status == "active",
+                GroupAccountMembership.status == "joined",
+                GroupAccountMembership.probe_status == "success",
+                TelegramAccount.is_active == True,
+                or_(
+                    GroupAdProfile.ad_policy_probe_at.is_(None),
+                    GroupAdProfile.ad_policy_probe_at <= probe_cutoff,
+                ),
+                or_(
+                    GroupAccountMembership.first_ad_allowed_at.is_(None),
+                    GroupAccountMembership.first_ad_allowed_at <= now,
+                ),
+                or_(
+                    GroupAccountMembership.ad_eligible_after.is_(None),
+                    GroupAccountMembership.ad_eligible_after <= now,
+                ),
+            )
+            .order_by(GroupAdProfile.updated_at.asc(), GroupAdProfile.id.asc())
+            .limit(remaining * 4)
+        )
+        candidates: list[tuple[GroupAdProfile, Group, GroupAccountMembership, TelegramAccount]] = []
+        seen_group_ids: set[int] = set()
+        for profile, group, membership, account in rows.all():
+            if group.id in seen_group_ids:
+                continue
+            account_status = str(getattr(account.status, "value", account.status) or "")
+            if account_status in {"banned", "error", "disabled"}:
+                continue
+            if membership.ad_status == MEMBERSHIP_AD_STATUS_BLOCKED:
+                continue
+            seen_group_ids.add(group.id)
+            candidates.append((profile, group, membership, account))
+            if len(candidates) >= remaining:
+                break
+
+        for profile, group, membership, account in candidates:
+            result.processed += 1
+            if dry_run:
+                result.skipped += 1
+                result.details.append(
+                    {
+                        "group_id": group.id,
+                        "telegram_group_id": group.group_id,
+                        "account_id": membership.account_id,
+                        "action": "would_send_group_ad_policy_probe",
+                    }
+                )
+                continue
+            try:
+                probe = await self.send_group_ad_policy_probe(group.id, source=AD_POLICY_PROBE_AUTO_SOURCE)
+                result.succeeded += 1
+                result.details.append({"action": "send_group_ad_policy_probe", **probe})
+            except RuntimeError as exc:
+                reason = str(exc)
+                skippable = {
+                    "no_probe_ready_membership",
+                    "no_active_ad_binding_for_probe",
+                    "account_ads_disabled",
+                    "group_level_disallows_ads",
+                    "group_ad_policy_probe_cooldown",
+                }
+                if reason in skippable:
+                    result.skipped += 1
+                else:
+                    result.failed += 1
+                    result.errors.append(reason)
+                result.details.append(
+                    {
+                        "group_id": group.id,
+                        "telegram_group_id": group.group_id,
+                        "account_id": membership.account_id,
+                        "error": reason[:500],
+                    }
+                )
+        return {
+            **result.as_dict(),
+            "daily_limit": requested_limit,
+            "attempted_today": attempted_today,
+            "remaining": max(0, remaining - result.succeeded),
+        }
+
     async def _get_or_create_group_ad_profile(self, group: Group, capacity: Optional[dict[str, Any]] = None) -> GroupAdProfile:
         row = await self.db.execute(select(GroupAdProfile).where(GroupAdProfile.group_id == group.id))
         profile = row.scalar_one_or_none()
@@ -6391,11 +6780,18 @@ class AcquisitionAutomationService:
             profile.ad_policy_confidence = 0
 
         allowed_modes = {
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,
             GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
             GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
         }
-        confidence_floor = 80 if mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
+        confidence_floor = (
+            0
+            if mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
+            else 80
+            if mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
+            else 90
+        )
         if mode not in allowed_modes or int(profile.ad_policy_confidence or 0) < confidence_floor:
             target_tier = GroupAdTier.BLOCKED.value if mode == GroupAdPolicyMode.FORBIDDEN.value else GroupAdTier.OBSERVING.value
             metrics = {"completed_samples": 0, "survival_rate_24h": 0.0, "conversions": 0, "clean_days": 0}
@@ -6473,7 +6869,10 @@ class AcquisitionAutomationService:
                         reason="three_soft_ads_survived_twenty_four_hours",
                     )
                 )
-            if mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value:
+            if mode in {
+                GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+            }:
                 target_tier = GroupAdTier.TRIAL.value
             elif premium_ready:
                 target_tier = GroupAdTier.PREMIUM.value
@@ -6526,17 +6925,27 @@ class AcquisitionAutomationService:
             return 0
         policy_mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
         if policy_mode not in {
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,
             GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
             GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
         }:
             return 0
-        confidence_floor = 80 if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
+        confidence_floor = (
+            0
+            if policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
+            else 80
+            if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
+            else 90
+        )
         if int(profile.ad_policy_confidence or 0) < confidence_floor:
             return 0
         configured = int(profile.daily_capacity or tier_cap or 0)
         result = max(0, min(configured, tier_cap or configured, int(capacity.get("group_global_daily_hard_cap") or 400), 400))
-        if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value:
+        if policy_mode in {
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
+            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+        }:
             return min(result, 1)
         return result
 
@@ -6622,6 +7031,8 @@ class AcquisitionAutomationService:
             return "group_ad_forbidden"
         if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value:
             return "group_ad_permission_unknown"
+        if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
+            return "group_ad_policy_probe_pending"
         if profile.ad_policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
             return "group_ad_approval_required"
         confidence_floor = 80 if profile.ad_policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
@@ -7201,6 +7612,35 @@ class AcquisitionAutomationService:
         finally:
             await self.account_pool.release(account)
 
+    async def _send_ad_text(
+        self,
+        account_id: int,
+        telegram_group_id: int,
+        content: str,
+        *,
+        source: str,
+    ) -> Optional[int]:
+        if not content.strip():
+            raise ValueError("ad probe content is empty")
+        account = await self.account_pool.acquire_by_id(account_id, purpose=source)
+        if account is None:
+            raise RuntimeError("account unavailable")
+        try:
+            target = await self._ad_send_target(telegram_group_id)
+            result = await self.telegram_execution.send_ad(
+                account,
+                target,
+                content,
+                source=source,
+            )
+            account.record_message(success=result is not None)
+            return result
+        except Exception:
+            account.record_message(success=False)
+            raise
+        finally:
+            await self.account_pool.release(account)
+
     def _classify_ad_delivery_error(self, exc: Exception) -> str:
         raw = str(exc) or exc.__class__.__name__
         text = raw.lower()
@@ -7471,6 +7911,18 @@ class AcquisitionAutomationService:
         else:
             log.survival_status = AdSurvivalStatus.CHECK_FAILED.value
             log.survival_check_due_at = None
+            if log.group is not None:
+                profile = await self._get_or_create_group_ad_profile(log.group, capacity)
+                if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
+                    profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
+                    profile.ad_policy_confidence = 0
+                    profile.ad_policy_source = "ad_policy_probe_check_failed"
+                    profile.ad_policy_expires_at = None
+                    profile.ad_tier = GroupAdTier.OBSERVING.value
+                    profile.daily_capacity = 0
+                    profile.ad_policy_probe_status = "failed"
+                    profile.ad_policy_probe_error = error[:1000]
+                    profile.updated_at = now
         await self.db.commit()
         return "check_failed"
 
@@ -7485,6 +7937,28 @@ class AcquisitionAutomationService:
         if log.group is not None:
             capacity = await get_ad_capacity_settings(self.db)
             profile = await self._get_or_create_group_ad_profile(log.group, capacity)
+            if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
+                previous_mode = profile.ad_policy_mode
+                profile.ad_policy_mode = GroupAdPolicyMode.SOFT_AD_TRIAL.value
+                profile.ad_policy_confidence = max(80, int(profile.ad_policy_confidence or 0))
+                profile.ad_policy_source = "ad_policy_probe_survived"
+                profile.ad_policy_verified_at = now
+                profile.ad_policy_expires_at = now + timedelta(
+                    days=int(capacity.get("ad_policy_auto_ttl_days") or 7)
+                )
+                profile.ad_policy_probe_status = "survived"
+                profile.ad_policy_probe_error = None
+                self.db.add(
+                    GroupAdPolicyEvent(
+                        group_id=log.group.id,
+                        telegram_group_id=log.group.group_id,
+                        previous_mode=previous_mode,
+                        new_mode=GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+                        confidence=profile.ad_policy_confidence,
+                        source=profile.ad_policy_source,
+                        reason="unknown_group_probe_survived_twenty_four_hours",
+                    )
+                )
             if profile.ad_tier != GroupAdTier.BLOCKED.value:
                 profile.survival_count = int(profile.survival_count or 0) + 1
                 profile.consecutive_survivals = int(profile.consecutive_survivals or 0) + 1
@@ -7542,6 +8016,9 @@ class AcquisitionAutomationService:
         if log.group is not None:
             capacity = await get_ad_capacity_settings(self.db)
             profile = await self._get_or_create_group_ad_profile(log.group)
+            unknown_policy_probe = (
+                profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
+            )
             profile.deleted_count = int(profile.deleted_count or 0) + 1
             profile.consecutive_deletions = int(profile.consecutive_deletions or 0) + 1
             profile.consecutive_survivals = 0
@@ -7557,6 +8034,29 @@ class AcquisitionAutomationService:
             profile.ad_tier = downgrade.get(profile.ad_tier, GroupAdTier.TRIAL.value)
             profile.daily_capacity = int((capacity.get("tier_daily_capacities") or {}).get(profile.ad_tier, 0) or 0)
             profile.tier_changed_at = now
+            if unknown_policy_probe:
+                profile.ad_policy_mode = GroupAdPolicyMode.FORBIDDEN.value
+                profile.ad_policy_confidence = 100
+                profile.ad_policy_source = "ad_policy_probe_deleted"
+                profile.ad_policy_expires_at = None
+                profile.ad_tier = GroupAdTier.BLOCKED.value
+                profile.daily_capacity = 0
+                profile.ad_policy_probe_status = "deleted"
+                profile.ad_policy_probe_error = reason[:1000]
+                profile.blocked_at = now
+                profile.blocked_reason = "unknown_group_probe_deleted"
+                log.group.status = GROUP_STATUS_AD_BLOCKED
+                self.db.add(
+                    GroupAdPolicyEvent(
+                        group_id=log.group.id,
+                        telegram_group_id=log.group.group_id,
+                        previous_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                        new_mode=GroupAdPolicyMode.FORBIDDEN.value,
+                        confidence=100,
+                        source=profile.ad_policy_source,
+                        reason=profile.blocked_reason,
+                    )
+                )
 
             membership = (
                 await self.db.execute(
@@ -7572,6 +8072,31 @@ class AcquisitionAutomationService:
                 membership.ad_pause_until = membership_pause_until
                 membership.ad_status = "paused"
                 membership.updated_at = now
+
+            if unknown_policy_probe and membership is not None:
+                leave_error = await self._leave_group(
+                    log.account_id,
+                    self._discovered_group_from_model(log.group),
+                )
+                membership.status = (
+                    "left"
+                    if leave_error is None or self._leave_error_means_not_joined(leave_error)
+                    else "rejected"
+                )
+                membership.left_at = now
+                membership.ad_status = MEMBERSHIP_AD_STATUS_BLOCKED
+                membership.warmup_status = "blocked"
+                membership.last_probe_error = (leave_error or reason)[:1000]
+                membership.note = self._append_membership_note(
+                    membership.note,
+                    {
+                        "event": "ad_policy_probe_deleted_leave",
+                        "error": reason[:500],
+                        "leave_error": (leave_error or "")[:500],
+                    },
+                )
+                await self.db.commit()
+                return
 
             recent_since = now - timedelta(days=7)
             deletion_rows = await self.db.execute(
@@ -7707,7 +8232,7 @@ class AcquisitionAutomationService:
         account_id: int,
         group: Group,
         campaign: AdCampaign,
-        creative: AdCreative,
+        creative: Optional[AdCreative],
         status: DeliveryStatus,
         *,
         telegram_message_id: Optional[int] = None,
@@ -7730,7 +8255,7 @@ class AcquisitionAutomationService:
             group_id=group.id,
             telegram_group_id=group.group_id,
             ad_campaign_id=campaign.id,
-            creative_id=creative.id,
+            creative_id=creative.id if creative is not None else None,
             status=status.value,
             telegram_message_id=telegram_message_id,
             survival_status=survival_status,
@@ -7803,6 +8328,18 @@ async def run_group_ad_policy_audit_with_db(**kwargs) -> dict[str, Any]:
     async with db_module.get_db_session() as db:
         service = AcquisitionAutomationService(db)
         return await service.refresh_group_ad_policies(**kwargs)
+
+
+async def run_auto_group_ad_policy_probe_with_db(**kwargs) -> dict[str, Any]:
+    """Run automatic unknown-group advertisement probes."""
+    from app.core import database as db_module
+
+    if db_module.async_session_factory is None:
+        await db_module.init_db(create_tables=False)
+
+    async with db_module.get_db_session() as db:
+        service = AcquisitionAutomationService(db)
+        return await service.auto_probe_unknown_group_ad_policies(**kwargs)
 
 
 async def run_ad_survival_check_with_db(**kwargs) -> dict[str, Any]:

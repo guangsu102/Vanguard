@@ -63,7 +63,7 @@ class LLMClient:
     # Model configurations
     MODELS = {
         LLMProvider.OPENAI: {
-            "fast": "gpt-5.6-luna",
+            "fast": "gpt-5.6-terra",
             "balanced": "gpt-4o",
             "quality": "gpt-4-turbo",
         },

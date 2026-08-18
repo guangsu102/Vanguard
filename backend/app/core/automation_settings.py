@@ -1617,6 +1617,31 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
             defaults["ad_policy_ai_require_second_pass"],
         ),
+        "ad_policy_auto_probe_enabled": _bool_setting(
+            raw.get(
+                "ad_policy_auto_probe_enabled",
+                raw.get("adPolicyAutoProbeEnabled", defaults["ad_policy_auto_probe_enabled"]),
+            ),
+            defaults["ad_policy_auto_probe_enabled"],
+        ),
+        "ad_policy_auto_probe_daily_limit": _int_setting(
+            raw.get(
+                "ad_policy_auto_probe_daily_limit",
+                raw.get("adPolicyAutoProbeDailyLimit", defaults["ad_policy_auto_probe_daily_limit"]),
+            ),
+            defaults["ad_policy_auto_probe_daily_limit"],
+            min_value=0,
+            max_value=20,
+        ),
+        "ad_policy_auto_probe_interval_hours": _int_setting(
+            raw.get(
+                "ad_policy_auto_probe_interval_hours",
+                raw.get("adPolicyAutoProbeIntervalHours", defaults["ad_policy_auto_probe_interval_hours"]),
+            ),
+            defaults["ad_policy_auto_probe_interval_hours"],
+            min_value=1,
+            max_value=168,
+        ),
         "ad_policy_auto_ttl_days": _int_setting(
             raw.get("ad_policy_auto_ttl_days", raw.get("adPolicyAutoTtlDays", defaults["ad_policy_auto_ttl_days"])),
             defaults["ad_policy_auto_ttl_days"],

@@ -412,10 +412,13 @@ const adCapacityForm = reactive<AdCapacitySettings>({
   leave_on_deleted_ad: true,
   block_group_on_probe_failure: true,
   ad_policy_ai_enabled: true,
-  ad_policy_ai_model: 'gpt-5.6-luna',
+  ad_policy_ai_model: 'gpt-5.6-terra',
   ad_policy_ai_timeout_seconds: 45,
   ad_policy_ai_min_confidence: 95,
   ad_policy_ai_require_second_pass: true,
+  ad_policy_auto_probe_enabled: false,
+  ad_policy_auto_probe_daily_limit: 1,
+  ad_policy_auto_probe_interval_hours: 24,
   ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30,
   premium_min_samples: 20,
@@ -1698,6 +1701,15 @@ onMounted(() => {
               </el-form-item>
               <el-form-item label="双阶段复核">
                 <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
+              </el-form-item>
+              <el-form-item label="未知群自动检测">
+                <el-switch v-model="adCapacityForm.ad_policy_auto_probe_enabled" />
+              </el-form-item>
+              <el-form-item label="自动检测每日上限">
+                <el-input-number v-model="adCapacityForm.ad_policy_auto_probe_daily_limit" :min="0" :max="20" />
+              </el-form-item>
+              <el-form-item label="重复检测间隔小时">
+                <el-input-number v-model="adCapacityForm.ad_policy_auto_probe_interval_hours" :min="1" :max="168" />
               </el-form-item>
               <el-form-item label="Premium最小样本">
                 <el-input-number v-model="adCapacityForm.premium_min_samples" :min="1" :max="1000" />

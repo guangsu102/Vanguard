@@ -75,6 +75,9 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["max_groups_per_account"] == 400
     assert config["max_new_ad_groups_per_day"] == 2
     assert config["leave_on_deleted_ad"] is True
+    assert config["ad_policy_auto_probe_enabled"] is False
+    assert config["ad_policy_auto_probe_daily_limit"] == 1
+    assert config["ad_policy_auto_probe_interval_hours"] == 24
     assert config["warmup_days_before_ads"] == 15
     assert config["warmup_daily_interactions_min"] == 0
     assert config["warmup_daily_interactions_max"] == 1
@@ -112,6 +115,9 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
             "accountGroupDailyCapDefault": 500,
             "maxGroupsPerAccount": 150,
             "maxNewAdGroupsPerDay": 40,
+            "adPolicyAutoProbeEnabled": True,
+            "adPolicyAutoProbeDailyLimit": 99,
+            "adPolicyAutoProbeIntervalHours": 0,
             "warmupDaysBeforeAds": 20,
             "warmupDailyInteractionsMin": 4,
             "warmupDailyInteractionsMax": 9,
@@ -150,6 +156,9 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["max_groups_per_account"] == 150
     assert config["max_new_ad_groups_per_day"] == 2
     assert config["warmup_days_before_ads"] == 20
+    assert config["ad_policy_auto_probe_enabled"] is True
+    assert config["ad_policy_auto_probe_daily_limit"] == 20
+    assert config["ad_policy_auto_probe_interval_hours"] == 1
     assert config["warmup_daily_interactions_min"] == 4
     assert config["warmup_daily_interactions_max"] == 9
     assert config["tier_daily_capacities"]["premium"] == 400

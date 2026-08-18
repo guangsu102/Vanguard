@@ -5,6 +5,7 @@ RESTful API for group pool management, account membership, and group analytics.
 """
 
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -30,6 +31,11 @@ from app.core.database import get_db
 from app.core.group import Group, GroupAccountMembership, GroupLevel, GroupManager
 from app.core.security import require_admin
 from app.exceptions import GroupNotFoundError, ValidationError
+from app.modules.acquisition.automation import (
+    AcquisitionAutomationService,
+    JoinedGroupAuditResult,
+    JOIN_AUDIT_MESSAGE_LIMIT,
+)
 from app.modules.acquisition.models import (
     AcquisitionMessage,
     AcquisitionTracking,
@@ -39,6 +45,8 @@ from app.modules.acquisition.models import (
 from app.modules.acquisition.search.group_finder import extract_flood_wait_seconds
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 class GroupCreate(BaseModel):
@@ -791,6 +799,49 @@ async def join_group_by_link(
         membership.updated_at = now
 
     await db.commit()
+
+    policy_service = AcquisitionAutomationService(db)
+    policy_audit = None
+    policy_wrapper = None
+    try:
+        policy_wrapper = await account_pool.acquire_by_id(
+            account.id,
+            purpose="manual_group_link_policy_audit",
+        )
+        if policy_wrapper is not None and policy_wrapper.client is not None:
+            entity = await policy_wrapper.client.get_entity(group.username or group.group_id)
+            messages = await policy_service._fetch_recent_messages(
+                policy_wrapper.client,
+                entity,
+                limit=JOIN_AUDIT_MESSAGE_LIMIT,
+            )
+            policy_audit = await policy_service._audit_group_ad_rules(
+                policy_wrapper.client,
+                entity,
+                messages,
+            )
+    except Exception as exc:
+        logger.warning(
+            "manual_group_link_policy_audit_failed",
+            extra={"group_id": group.id, "error": str(exc)},
+        )
+    finally:
+        if policy_wrapper is not None:
+            await account_pool.release(policy_wrapper)
+
+    if policy_audit is not None:
+        audit = JoinedGroupAuditResult(
+            passed=True,
+            ad_allowed=policy_audit.ad_allowed,
+            ad_rule_reason=policy_audit.reason,
+            ad_rule_details=policy_audit.details(),
+        )
+        await policy_service._sync_group_ad_policy_from_audit(group, audit)
+        if policy_audit.ad_allowed is False:
+            await policy_service._apply_join_audit_ad_rule_decision(group, membership, audit)
+        else:
+            group.status = "active"
+            await db.commit()
     await db.refresh(group)
     metrics = await _get_group_metrics(db, [group.group_id])
     account_summary = await _get_group_account_summary(db, [group.id])

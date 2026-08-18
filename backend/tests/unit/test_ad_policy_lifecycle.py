@@ -278,7 +278,7 @@ async def test_group_history_two_pass_ai_can_enable_one_per_day_soft_ad_trial(te
         GroupAdRulesAuditResult(evidence=evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-luna",
+            "ad_policy_ai_model": "gpt-5.6-terra",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -316,7 +316,7 @@ async def test_relevant_public_group_profile_can_enable_controlled_soft_ad_trial
         GroupAdRulesAuditResult(evidence=evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-luna",
+            "ad_policy_ai_model": "gpt-5.6-terra",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -338,7 +338,7 @@ async def test_sync_group_policy_preserves_ai_soft_ad_trial_mode(test_db):
         policy_mode=GroupAdPolicyMode.SOFT_AD_TRIAL.value,
         reason="group_history_supports_soft_ad_trial",
         confidence=92,
-        decision_source="gpt-5.6-luna_two_pass",
+        decision_source="gpt-5.6-terra_two_pass",
     )
 
     profile = await service._sync_group_ad_policy_from_audit(

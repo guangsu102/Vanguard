@@ -173,8 +173,8 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str | None = Field(default=None, description="OpenAI-compatible API base URL")
     ANTHROPIC_API_KEY: str | None = Field(default=None, description="Anthropic API Key")
     LLM_PROVIDER: str = Field(default="openai", description="LLM provider: openai/anthropic/local")
-    LLM_MODEL: str = Field(default="gpt-5.6-luna", description="Default LLM model")
-    LLM_FAST_MODEL: str = Field(default="gpt-5.6-luna", description="Low-latency LLM model")
+    LLM_MODEL: str = Field(default="gpt-5.6-terra", description="Default LLM model")
+    LLM_FAST_MODEL: str = Field(default="gpt-5.6-terra", description="Low-latency LLM model")
 
     # CORS
     CORS_ORIGINS: str = Field(

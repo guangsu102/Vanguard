@@ -333,12 +333,19 @@ class AccountDynamicFrequencyService:
         tier = str(getattr(profile, "ad_tier", None) or cls.initial_group_ad_tier(group))
         policy_mode = str(getattr(profile, "ad_policy_mode", GroupAdPolicyMode.UNKNOWN.value) or GroupAdPolicyMode.UNKNOWN.value)
         if policy_mode not in {
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,
             GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
             GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
         }:
             return 0
-        confidence_floor = 80 if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
+        confidence_floor = (
+            0
+            if policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
+            else 80
+            if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
+            else 90
+        )
         if int(getattr(profile, "ad_policy_confidence", 0) or 0) < confidence_floor:
             return 0
         tier_caps = capacity.get("tier_daily_capacities") or {}
@@ -351,7 +358,10 @@ class AccountDynamicFrequencyService:
             configured = int(tier_cap or 0)
         hard_cap = int(capacity.get("group_global_daily_hard_cap") or 400)
         result = max(0, min(configured, tier_cap or configured, hard_cap, 400))
-        if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value:
+        if policy_mode in {
+            GroupAdPolicyMode.UNKNOWN_PROBE.value,
+            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+        }:
             return min(result, 1)
         return result
 

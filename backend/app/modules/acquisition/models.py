@@ -136,6 +136,7 @@ class GroupAdPolicyMode(str, Enum):
 
     FORBIDDEN = "forbidden"
     UNKNOWN = "unknown"
+    UNKNOWN_PROBE = "unknown_probe"
     APPROVAL_REQUIRED = "approval_required"
     SOFT_AD_TRIAL = "soft_ad_trial"
     SOFT_AD_ALLOWED = "soft_ad_allowed"
@@ -1006,7 +1007,7 @@ class GroupAdProfile(Base):
         String(40),
         default=GroupAdPolicyMode.UNKNOWN.value,
         nullable=False,
-        comment="广告许可: forbidden/unknown/approval_required/soft_ad_trial/soft_ad_allowed/high_volume_ad_allowed",
+        comment="广告许可: forbidden/unknown/unknown_probe/approval_required/soft_ad_trial/soft_ad_allowed/high_volume_ad_allowed",
     )
     ad_policy_confidence: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False, comment="广告许可置信度0-100"
@@ -1050,6 +1051,19 @@ class GroupAdProfile(Base):
     )
     last_probe_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="最近探测时间"
+    )
+    ad_policy_probe_status: Mapped[str] = mapped_column(
+        String(30), default="not_started", nullable=False,
+        comment="广告许可检测状态: not_started/sending/sent/survived/deleted/failed",
+    )
+    ad_policy_probe_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="最近广告许可检测时间"
+    )
+    ad_policy_probe_account_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, comment="最近广告许可检测账号ID"
+    )
+    ad_policy_probe_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="广告许可检测错误"
     )
     last_survived_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="最近广告存活时间"

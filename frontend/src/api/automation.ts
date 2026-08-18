@@ -307,6 +307,9 @@ export interface AdCapacitySettings {
   ad_policy_ai_timeout_seconds: number
   ad_policy_ai_min_confidence: number
   ad_policy_ai_require_second_pass: boolean
+  ad_policy_auto_probe_enabled: boolean
+  ad_policy_auto_probe_daily_limit: number
+  ad_policy_auto_probe_interval_hours: number
   ad_policy_auto_ttl_days: number
   ad_policy_manual_ttl_days: number
   premium_min_samples: number
@@ -337,10 +340,14 @@ export interface GroupAdProfile {
   group_title?: string
   group_status?: string
   group_level?: string
-  ad_policy_mode: 'forbidden' | 'unknown' | 'approval_required' | 'soft_ad_allowed' | 'high_volume_ad_allowed' | string
+  ad_policy_mode: 'forbidden' | 'unknown' | 'unknown_probe' | 'approval_required' | 'soft_ad_trial' | 'soft_ad_allowed' | 'high_volume_ad_allowed' | string
   ad_policy_confidence: number
   ad_policy_source?: string
   ad_policy_verified_at?: string
+  ad_policy_probe_status?: 'not_started' | 'sending' | 'sent' | 'survived' | 'deleted' | 'failed' | string
+  ad_policy_probe_at?: string
+  ad_policy_probe_account_id?: number
+  ad_policy_probe_error?: string
   ad_policy_expires_at?: string
   ad_tier: string
   daily_capacity: number
@@ -602,6 +609,18 @@ export const automationApi = {
     data: { mode: string; confidence?: number; expires_days?: number; note?: string },
   ) => {
     return apiClient.put<{ data: GroupAdProfile }>(`/automation/ads/group-profiles/${groupId}/policy`, data)
+  },
+
+  triggerGroupAdPolicyProbe: (groupId: number, accountId?: number) => {
+    return apiClient.post<{ data: {
+      group_id: number
+      telegram_group_id: number
+      account_id: number
+      campaign_id: number
+      message_id: number
+      ad_policy_mode: string
+      ad_policy_probe_status: string
+    } }>('/automation/ads/group-profiles/' + groupId + '/probe', accountId ? { account_id: accountId } : {})
   },
 
   getAdDynamicStatus: () => {

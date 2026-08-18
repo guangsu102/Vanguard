@@ -1,7 +1,20 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Close, Delete, Edit, Plus, Refresh, Select, Setting, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import {
+  CircleCheck,
+  Close,
+  Connection,
+  Document,
+  Plus,
+  Refresh,
+  Select,
+  Setting,
+  Timer,
+  UserFilled,
+  VideoPlay,
+  WarningFilled,
+} from "@element-plus/icons-vue";
 import { useRouter } from 'vue-router'
 import { accountsApi } from '@/api/accounts'
 import { groupsApi, type Group } from '@/api/groups'
@@ -22,6 +35,7 @@ import {
   type AutoJoinVerificationLog,
   type GroupFailoverStatus,
   type GroupFailoverTask,
+  type GroupAdProfile,
   type AutomationRunResult,
 } from '@/api/automation'
 import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS } from '@/api/keywords'
@@ -42,6 +56,23 @@ type CreativePoolSummary = {
   created_count: number
   creative_ids: number[]
 }
+
+type CampaignBindingStats = {
+  accountIds: number[];
+  creativeIds: number[];
+  bindingCount: number;
+  enabledBindingCount: number;
+};
+
+type BindingGroup = {
+  key: string;
+  accountId: number;
+  campaignId: number;
+  bindings: AccountAdBinding[];
+  creativeIds: number[];
+  enabledCount: number;
+  priority: number;
+};
 
 type PolicySummaryItem = {
   label: string
@@ -66,6 +97,8 @@ const creatives = ref<AdCreative[]>([])
 const campaigns = ref<AdCampaign[]>([])
 const bindings = ref<AccountAdBinding[]>([])
 const targetGroups = ref<Group[]>([])
+const groupAdProfiles = ref<GroupAdProfile[]>([])
+const groupPolicyProbeRunning = ref<number | null>(null)
 const dynamicStatuses = ref<AdDynamicStatus[]>([])
 const accounts = ref<AccountOption[]>([])
 const failoverTargetAccounts = computed(() =>
@@ -74,7 +107,9 @@ const failoverTargetAccounts = computed(() =>
   ),
 )
 const adBindingAccounts = computed(() =>
-  accounts.value.filter((account) => account.status !== 'banned'),
+  accounts.value.filter(
+    (account) => account.is_active !== false && !['banned', 'error'].includes(account.status || ''),
+  ),
 )
 const creativePoolStatus = ref<CreativePoolSummary | null>(null)
 const accountConfigLoading = ref(false)
@@ -465,6 +500,26 @@ const bindingForm = reactive({
   priority: 0,
 })
 
+const adWorkspaceView = ref("campaigns");
+const campaignDrawerVisible = ref(false);
+const creativeDrawerVisible = ref(false);
+const bindingDrawerVisible = ref(false);
+const adRunDialogVisible = ref(false);
+const campaignFilters = reactive({
+  query: "",
+  status: "",
+});
+const bindingFilters = reactive({
+  account_id: undefined as number | undefined,
+  campaign_id: undefined as number | undefined,
+  status: "",
+});
+
+const groupPolicyFilters = reactive({
+  mode: "",
+  tier: "",
+});
+
 const accountConfigForm = reactive({
   operation_mode: 'growth' as AccountOperationMode,
   enabled: true,
@@ -556,19 +611,291 @@ const warmupSummary = computed<PolicySummaryItem[]>(() => [
   { label: '提量阶段广告', value: accountWarmupPolicyForm.stages.ramp?.ad_multiplier ?? '-' },
 ])
 
-const adPolicySummary = computed<PolicySummaryItem[]>(() => [
-  { label: '自动投放', value: booleanText(adDeliveryExecutionForm.enabled), type: booleanTagType(adDeliveryExecutionForm.enabled) },
-  { label: '执行间隔', value: `${adDeliveryExecutionForm.dispatcher_interval_seconds} 秒` },
-  { label: '单轮上限', value: adDeliveryExecutionForm.max_deliveries_per_run },
-  { label: '单号单轮', value: adDeliveryExecutionForm.max_deliveries_per_account_per_run },
-  { label: '节流策略', value: booleanText(adDeliveryThrottleForm.enabled), type: booleanTagType(adDeliveryThrottleForm.enabled) },
-  { label: '发送间隔', value: `${adDeliveryThrottleForm.delivery_interval_seconds} 秒` },
-  { label: '失败策略', value: booleanText(adFailurePolicyForm.enabled), type: booleanTagType(adFailurePolicyForm.enabled) },
-  { label: '失败退群', value: booleanText(adFailurePolicyForm.leave_on_group_control_failure), type: booleanTagType(adFailurePolicyForm.leave_on_group_control_failure) },
-  { label: '失败阈值', value: `${adFailurePolicyForm.group_control_failure_limit} 次/${adFailurePolicyForm.group_control_failure_window_hours} 小时` },
-])
+const activeCampaignCount = computed(
+  () => campaigns.value.filter((item) => item.enabled).length,
+);
+const enabledCreativeCount = computed(
+  () => creatives.value.filter((item) => item.enabled).length,
+);
+const enabledBindingCount = computed(
+  () => bindings.value.filter((item) => item.enabled).length,
+);
+const adSuccess24h = computed(() =>
+  dynamicStatuses.value.reduce(
+    (total, item) => total + Number(item.success_24h || 0),
+    0,
+  ),
+);
+const adFailed24h = computed(() =>
+  dynamicStatuses.value.reduce(
+    (total, item) => total + Number(item.failed_24h || 0),
+    0,
+  ),
+);
+const adSuccessRate24h = computed(() => {
+  const total = adSuccess24h.value + adFailed24h.value;
+  return total ? Math.round((adSuccess24h.value / total) * 100) : 0;
+});
+const allowedGroupPolicyModes = new Set([
+  "soft_ad_trial",
+  "soft_ad_allowed",
+  "high_volume_ad_allowed",
+]);
+const adAllowedGroupCount = computed(
+  () =>
+    groupAdProfiles.value.filter(
+      (profile) =>
+        allowedGroupPolicyModes.has(profile.ad_policy_mode) &&
+        Number(profile.daily_capacity || 0) > 0,
+    ).length,
+);
+const pendingGroupPolicyCount = computed(
+  () =>
+    groupAdProfiles.value.filter((profile) =>
+      ["unknown", "unknown_probe", "approval_required"].includes(profile.ad_policy_mode),
+    ).length,
+);
+const forbiddenGroupCount = computed(
+  () =>
+    groupAdProfiles.value.filter(
+      (profile) => profile.ad_policy_mode === "forbidden",
+    ).length,
+);
+const groupDailyCapacityTotal = computed(() =>
+  groupAdProfiles.value.reduce(
+    (total, profile) => total + Number(profile.daily_capacity || 0),
+    0,
+  ),
+);
+const unboundCampaignCount = computed(
+  () =>
+    campaigns.value.filter(
+      (campaign) => campaign.enabled && !campaignBindingStats.value.has(campaign.id),
+    ).length,
+);
+const blockedAdAccountCount = computed(
+  () => adReadinessRows.value.filter((item) => !item.ready).length,
+);
+const adReadinessScore = computed(() => {
+  const checks = [
+    activeCampaignCount.value > 0,
+    readyAdAccountCount.value > 0,
+    enabledCreativeCount.value > 0,
+    enabledBindingCount.value > 0,
+    adAllowedGroupCount.value > 0,
+  ];
+  return checks.filter(Boolean).length * 20;
+});
+const filteredGroupAdProfiles = computed(() =>
+  [...groupAdProfiles.value]
+    .filter(
+      (profile) =>
+        !groupPolicyFilters.mode ||
+        profile.ad_policy_mode === groupPolicyFilters.mode,
+    )
+    .filter(
+      (profile) =>
+        !groupPolicyFilters.tier || profile.ad_tier === groupPolicyFilters.tier,
+    )
+    .sort(
+      (left, right) =>
+        Number(right.daily_capacity || 0) - Number(left.daily_capacity || 0) ||
+        right.id - left.id,
+    ),
+);
+const campaignBindingStats = computed(() => {
+  const grouped = new Map<
+    number,
+    {
+      accountIds: Set<number>;
+      creativeIds: Set<number>;
+      bindingCount: number;
+      enabledBindingCount: number;
+    }
+  >();
 
-const adPolicyLoading = computed(() => adExecutionLoading.value || adThrottleLoading.value || failurePolicyLoading.value)
+  for (const binding of bindings.value) {
+    const current = grouped.get(binding.ad_campaign_id) || {
+      accountIds: new Set<number>(),
+      creativeIds: new Set<number>(),
+      bindingCount: 0,
+      enabledBindingCount: 0,
+    };
+    current.accountIds.add(binding.account_id);
+    if (binding.creative_id) current.creativeIds.add(binding.creative_id);
+    current.bindingCount += 1;
+    if (binding.enabled) current.enabledBindingCount += 1;
+    grouped.set(binding.ad_campaign_id, current);
+  }
+
+  const result = new Map<number, CampaignBindingStats>();
+  grouped.forEach((item, campaignId) => {
+    result.set(campaignId, {
+      accountIds: [...item.accountIds],
+      creativeIds: [...item.creativeIds],
+      bindingCount: item.bindingCount,
+      enabledBindingCount: item.enabledBindingCount,
+    });
+  });
+  return result;
+});
+
+const filteredCampaigns = computed(() => {
+  const keyword = campaignFilters.query.trim().toLowerCase();
+  return [...campaigns.value]
+    .filter((campaign) => {
+      const matchesKeyword =
+        !keyword || campaign.name.toLowerCase().includes(keyword);
+      const matchesStatus =
+        !campaignFilters.status ||
+        (campaignFilters.status === "active" && campaign.enabled) ||
+        (campaignFilters.status === "paused" && !campaign.enabled) ||
+        campaign.status === campaignFilters.status;
+      return matchesKeyword && matchesStatus;
+    })
+    .sort(
+      (left, right) =>
+        Number(right.enabled) - Number(left.enabled) || right.id - left.id,
+    );
+});
+
+const creativeBindingCounts = computed(() => {
+  const counts = new Map<number, number>();
+  for (const binding of bindings.value) {
+    if (!binding.creative_id) continue;
+    counts.set(binding.creative_id, (counts.get(binding.creative_id) || 0) + 1);
+  }
+  return counts;
+});
+
+const bindingGroups = computed<BindingGroup[]>(() => {
+  const grouped = new Map<string, AccountAdBinding[]>();
+  for (const binding of bindings.value) {
+    const key = `${binding.account_id}:${binding.ad_campaign_id}`;
+    grouped.set(key, [...(grouped.get(key) || []), binding]);
+  }
+  return [...grouped.entries()].map(([key, groupBindings]) => ({
+    key,
+    accountId: groupBindings[0].account_id,
+    campaignId: groupBindings[0].ad_campaign_id,
+    bindings: groupBindings,
+    creativeIds: groupBindings
+      .map((binding) => binding.creative_id)
+      .filter((creativeId): creativeId is number => Boolean(creativeId)),
+    enabledCount: groupBindings.filter((binding) => binding.enabled).length,
+    priority: Math.max(
+      ...groupBindings.map((binding) => binding.priority || 0),
+    ),
+  }));
+});
+
+const filteredBindingGroups = computed(() =>
+  bindingGroups.value
+    .filter(
+      (group) =>
+        !bindingFilters.account_id ||
+        group.accountId === bindingFilters.account_id,
+    )
+    .filter(
+      (group) =>
+        !bindingFilters.campaign_id ||
+        group.campaignId === bindingFilters.campaign_id,
+    )
+    .filter((group) => {
+      if (!bindingFilters.status) return true;
+      if (bindingFilters.status === "enabled") return group.enabledCount > 0;
+      return group.enabledCount === 0;
+    })
+    .sort(
+      (left, right) =>
+        right.enabledCount - left.enabledCount ||
+        right.priority - left.priority,
+    ),
+);
+
+const adReadinessRows = computed(() =>
+  accounts.value
+    .map((account) => {
+      const status = dynamicStatuses.value.find(
+        (item) => item.account_id === account.id,
+      );
+      const accountBindings = bindings.value.filter(
+        (binding) => binding.account_id === account.id,
+      );
+      return {
+        account,
+        status,
+        bindingCount: accountBindings.length,
+        enabledBindingCount: accountBindings.filter(
+          (binding) => binding.enabled,
+        ).length,
+        ready:
+          account.status !== "banned" &&
+          account.status !== "error" &&
+          account.is_active !== false &&
+          Boolean(status?.delivery_diagnostic?.ad_delivery_allowed),
+      };
+    })
+    .sort(
+      (left, right) =>
+        Number(right.ready) - Number(left.ready) ||
+        right.enabledBindingCount - left.enabledBindingCount,
+    ),
+);
+
+const readyAdAccountCount = computed(
+  () => adReadinessRows.value.filter((item) => item.ready).length,
+);
+const campaignStats = (campaignId: number): CampaignBindingStats =>
+  campaignBindingStats.value.get(campaignId) || {
+    accountIds: [],
+    creativeIds: [],
+    bindingCount: 0,
+    enabledBindingCount: 0,
+  };
+
+const campaignTargetGroups = (campaign: any) =>
+  (campaign.target_group_ids || [])
+    .map((groupId: number) => targetGroupMap.value.get(groupId))
+    .filter((group: Group | undefined): group is Group => Boolean(group));
+
+const campaignFrequencyText = (campaign: any) => {
+  if (campaign.send_mode === "after_join")
+    return `入群 ${campaign.min_wait_after_join_minutes} 分钟后`;
+  if (campaign.send_mode === "interval")
+    return `每 ${campaign.interval_minutes} 分钟`;
+  return campaign.scheduled_times?.length
+    ? campaign.scheduled_times.join("、")
+    : "未设置时点";
+};
+
+const campaignWindowText = (campaign: any) => {
+  if (!campaign.start_at && !campaign.end_at) return "长期有效";
+  return `${formatTimestamp(campaign.start_at)} 至 ${formatTimestamp(campaign.end_at)}`;
+};
+
+const accountStatusType = (status?: string) => {
+  if (status === "active" || status === "connected") return "success";
+  if (status === "banned" || status === "error") return "danger";
+  return "info";
+};
+
+const accountStatusText = (status?: string) => {
+  const labels: Record<string, string> = {
+    active: "在线",
+    connected: "在线",
+    offline: "离线",
+    banned: "已封禁",
+    error: "异常",
+  };
+  return labels[status || ""] || status || "未知";
+};
+
+const deliveryBlockReason = (status?: AdDynamicStatus) =>
+  status?.delivery_diagnostic?.primary_block_label ||
+  status?.delivery_diagnostic?.next_action_label ||
+  status?.risk_reason ||
+  "等待状态评估";
 
 const accountMap = computed(() => {
   return new Map(accounts.value.map((item) => [item.id, item]))
@@ -601,7 +928,7 @@ const targetGroupLabel = (groupId: number) => {
   return `${group.title || identity} · ${identity}`
 }
 
-const campaignTargetLabel = (campaign: AdCampaign) => {
+const campaignTargetLabel = (campaign: any) => {
   if (campaign.target_group_ids?.length) {
     return campaign.target_group_ids.map(targetGroupLabel).join('、')
   }
@@ -756,7 +1083,7 @@ const loadAccounts = async () => {
 const loadTargetGroups = async () => {
   const response = await groupsApi.list({ page: 1, pageSize: 200, status: 'active' })
   targetGroups.value = response.data.data.filter(
-    (group) => group.status === 'active' && group.accountCount > 0,
+    (group: Group) => group.status === 'active' && group.accountCount > 0,
   )
 }
 
@@ -863,7 +1190,6 @@ const selectedBindingCreatives = computed(() => {
   return bindingForm.creative_ids.map((id) => map.get(id)).filter(Boolean) as AdCreative[]
 })
 
-const creativePoolCount = computed(() => creatives.value.filter((item) => item.enabled).length)
 
 const creativeById = (creativeId?: number) => {
   if (!creativeId) return undefined
@@ -886,49 +1212,83 @@ const sendModeText = (mode?: string) => {
 }
 
 const resetCreativeForm = () => {
-  Object.assign(creativeForm, emptyCreativeForm())
-  editingCreativeId.value = null
-}
+  Object.assign(creativeForm, emptyCreativeForm());
+  editingCreativeId.value = null;
+};
 
-const editCreative = (creative: AdCreative) => {
-  editingCreativeId.value = creative.id
+const openCreateCreative = () => {
+  resetCreativeForm();
+  creativeDrawerVisible.value = true;
+};
+
+const editCreative = (creative: any) => {
+  editingCreativeId.value = creative.id;
   Object.assign(creativeForm, {
     name: creative.name,
     content: creative.content,
     creative_type: creative.creative_type,
-    media_url: creative.media_url || '',
-    link_url: creative.link_url || '',
+    media_url: creative.media_url || "",
+    link_url: creative.link_url || "",
     weight: creative.weight,
     enabled: creative.enabled,
-  })
-}
+  });
+  creativeDrawerVisible.value = true;
+};
 
 const resetCampaignForm = () => {
-  Object.assign(campaignForm, emptyCampaignForm())
-  scheduledTimesText.value = ''
-  editingCampaignId.value = null
-}
+  Object.assign(campaignForm, emptyCampaignForm());
+  scheduledTimesText.value = "";
+  editingCampaignId.value = null;
+};
 
-const editCampaign = (campaign: AdCampaign) => {
-  editingCampaignId.value = campaign.id
+const openCreateCampaign = () => {
+  resetCampaignForm();
+  campaignDrawerVisible.value = true;
+};
+
+const editCampaign = (campaign: any) => {
+  editingCampaignId.value = campaign.id;
   Object.assign(campaignForm, {
     name: campaign.name,
     enabled: campaign.enabled,
     status: campaign.status,
     send_mode: campaign.send_mode,
-    target_group_levels: campaign.target_group_levels?.length ? campaign.target_group_levels : ['A'],
-    target_group_ids: (campaign.target_group_ids || []).filter((groupId) =>
-      targetGroupMap.value.has(groupId),
+    target_group_levels: campaign.target_group_levels?.length
+      ? campaign.target_group_levels
+      : ["A"],
+    target_group_ids: (campaign.target_group_ids || []).filter(
+      (groupId: number) => targetGroupMap.value.has(groupId),
     ),
-    start_at: campaign.start_at || '',
-    end_at: campaign.end_at || '',
+    start_at: campaign.start_at || "",
+    end_at: campaign.end_at || "",
     min_wait_after_join_minutes: campaign.min_wait_after_join_minutes,
     interval_minutes: campaign.interval_minutes,
     max_sends_per_group_per_day: campaign.max_sends_per_group_per_day,
     max_sends_per_account_per_day: campaign.max_sends_per_account_per_day,
-  })
-  scheduledTimesText.value = campaign.scheduled_times?.join(',') || ''
-}
+  });
+  scheduledTimesText.value = campaign.scheduled_times?.join(",") || "";
+  campaignDrawerVisible.value = true;
+};
+
+const resetBindingForm = (campaignId?: number) => {
+  const preferredAccount = adBindingAccounts.value.find(
+    (account) => account.id === selectedAccountId.value,
+  );
+  const fallbackAccount = preferredAccount || adBindingAccounts.value[0];
+  Object.assign(bindingForm, {
+    account_ids: fallbackAccount ? [fallbackAccount.id] : [],
+    ad_campaign_id: campaignId,
+    creative_ids: [],
+    enabled: true,
+    priority: 0,
+  });
+  creativePoolStatus.value = null;
+};
+
+const openBindingDrawer = (campaign?: any) => {
+  resetBindingForm(campaign?.id);
+  bindingDrawerVisible.value = true;
+};
 
 const saveAccountConfig = async () => {
   if (!selectedAccountId.value) {
@@ -1043,12 +1403,13 @@ const loadGroupFailovers = async () => {
 const refreshData = async () => {
   loading.value = true
   try {
-    const [attemptsRes, verificationLogsRes, creativesRes, campaignsRes, bindingsRes] = await Promise.all([
+    const [attemptsRes, verificationLogsRes, creativesRes, campaignsRes, bindingsRes, groupProfilesRes] = await Promise.all([
       automationApi.getAutoJoinAttempts({ limit: 30 }),
       automationApi.getAutoJoinVerificationLogs({ limit: 30 }),
       automationApi.getCreatives({ page_size: 50 }),
       automationApi.getCampaigns({ page_size: 50 }),
       automationApi.getBindings(),
+      automationApi.getGroupAdProfiles(),
     ])
     const dynamicStatusRes = await automationApi.getAdDynamicStatus()
     autoJoinAttempts.value = attemptsRes.data.data
@@ -1056,6 +1417,7 @@ const refreshData = async () => {
     creatives.value = creativesRes.data.data
     campaigns.value = campaignsRes.data.data
     bindings.value = bindingsRes.data.data
+    groupAdProfiles.value = groupProfilesRes.data.data
     await loadGroupFailovers()
     dynamicStatuses.value = dynamicStatusRes.data.data
     creativePoolStatus.value = null
@@ -1066,7 +1428,7 @@ const refreshData = async () => {
 }
 
 const refreshPage = async () => {
-  loading.value = true
+  loading.value = true;
   try {
     await Promise.all([
       loadAccounts(),
@@ -1078,14 +1440,30 @@ const refreshPage = async () => {
       loadAccountWarmupPolicy(),
       loadAdDeliveryExecution(),
       loadAdDeliveryThrottle(),
-    ])
+    ]);
     if (selectedAccountId.value) {
-      await loadAccountConfig(selectedAccountId.value)
+      await loadAccountConfig(selectedAccountId.value);
     }
   } finally {
-    loading.value = false
+    loading.value = false;
   }
-}
+};
+
+const refreshAdWorkspace = async () => {
+  loading.value = true;
+  try {
+    await Promise.all([
+      loadAccounts(),
+      loadTargetGroups(),
+      refreshData(),
+      loadAdFailurePolicy(),
+      loadAdDeliveryExecution(),
+      loadAdDeliveryThrottle(),
+    ]);
+  } finally {
+    loading.value = false;
+  }
+};
 
 const runTask = async (name: string, fn: () => Promise<any>) => {
   running.value = name
@@ -1175,178 +1553,202 @@ const groupFailoverStatusType = (value: GroupFailoverStatus) => {
 
 const formatTimestamp = (value?: string) => (value ? value.replace('T', ' ').slice(0, 19) : '-')
 
-const runAds = () => {
-  runTask('ads', () => automationApi.runAds({ ...adRunForm }))
-}
+const runAds = async () => {
+  await runTask("ads", () => automationApi.runAds({ ...adRunForm }));
+  adRunDialogVisible.value = false;
+};
 
 const saveCreative = async () => {
   if (!creativeForm.name || !creativeForm.content) {
-    ElMessage.warning('请填写广告名称和内容')
-    return
+    ElMessage.warning("请填写广告名称和内容");
+    return;
   }
-  savingCreative.value = true
+  savingCreative.value = true;
   try {
     if (editingCreativeId.value) {
-      await automationApi.updateCreative(editingCreativeId.value, { ...creativeForm })
-      ElMessage.success('广告素材已更新')
+      await automationApi.updateCreative(editingCreativeId.value, {
+        ...creativeForm,
+      });
+      ElMessage.success("广告素材已更新");
     } else {
-      await automationApi.createCreative({ ...creativeForm })
-      ElMessage.success('广告素材已创建')
+      await automationApi.createCreative({ ...creativeForm });
+      ElMessage.success("广告素材已创建");
     }
-    resetCreativeForm()
-    await refreshData()
+    creativeDrawerVisible.value = false;
+    resetCreativeForm();
+    await refreshData();
   } finally {
-    savingCreative.value = false
+    savingCreative.value = false;
   }
-}
+};
 
-const toggleCreative = async (creative: AdCreative) => {
-  await automationApi.updateCreative(creative.id, { enabled: !creative.enabled })
-  ElMessage.success(creative.enabled ? '素材已停用' : '素材已启用')
-  await refreshData()
-}
+const toggleCreative = async (creative: any) => {
+  await automationApi.updateCreative(creative.id, {
+    enabled: !creative.enabled,
+  });
+  ElMessage.success(creative.enabled ? "素材已停用" : "素材已启用");
+  await refreshData();
+};
 
-const deleteCreative = async (creative: AdCreative) => {
-  await ElMessageBox.confirm(`确认删除素材「${creative.name}」？相关绑定会失去该素材。`, '删除素材', {
-    type: 'warning',
-  })
-  await automationApi.deleteCreative(creative.id)
-  if (editingCreativeId.value === creative.id) resetCreativeForm()
-  ElMessage.success('广告素材已删除')
-  await refreshData()
-}
+const deleteCreative = async (creative: any) => {
+  await ElMessageBox.confirm(
+    `确认删除素材「${creative.name}」？相关绑定会失去该素材。`,
+    "删除素材",
+    {
+      type: "warning",
+    },
+  );
+  await automationApi.deleteCreative(creative.id);
+  if (editingCreativeId.value === creative.id) resetCreativeForm();
+  ElMessage.success("广告素材已删除");
+  await refreshData();
+};
 
 const cleanupInvalidCreatives = async () => {
-  const response = await automationApi.cleanupInvalidCreatives()
-  const count = response.data.data.disabled_count
-  ElMessage.success(count > 0 ? `已停用 ${count} 条异常素材` : '未发现异常素材')
-  await refreshData()
-}
+  const response = await automationApi.cleanupInvalidCreatives();
+  const count = response.data.data.disabled_count;
+  ElMessage.success(
+    count > 0 ? `已停用 ${count} 条异常素材` : "未发现异常素材",
+  );
+  await refreshData();
+};
 
 const ensureCreativePool = async () => {
   if (!bindingForm.account_ids.length || !bindingForm.ad_campaign_id) {
-    ElMessage.warning('请先选择账号和广告计划')
-    return
+    ElMessage.warning("请先选择账号和广告计划");
+    return;
   }
 
-  const poolStatuses = []
+  const poolStatuses = [];
   for (const accountId of bindingForm.account_ids) {
     const response = await automationApi.ensureCreativePool({
       account_id: accountId,
       ad_campaign_id: bindingForm.ad_campaign_id,
       min_pool_size: 3,
       generate_count: 3,
-    })
-    poolStatuses.push(response.data.data)
+    });
+    poolStatuses.push(response.data.data);
   }
 
   const summary: CreativePoolSummary = {
     account_count: poolStatuses.length,
     pool_size: Math.min(...poolStatuses.map((item) => item.pool_size)),
-    created_count: poolStatuses.reduce((total, item) => total + item.created_count, 0),
+    created_count: poolStatuses.reduce(
+      (total, item) => total + item.created_count,
+      0,
+    ),
     creative_ids: poolStatuses.flatMap((item) => item.creative_ids),
-  }
-  await refreshData()
-  creativePoolStatus.value = summary
-  ElMessage.success(`已检查 ${summary.account_count} 个账号的素材池，共新增 ${summary.created_count} 条`)
-}
+  };
+  await refreshData();
+  creativePoolStatus.value = summary;
+  ElMessage.success(
+    `已检查 ${summary.account_count} 个账号的素材池，共新增 ${summary.created_count} 条`,
+  );
+};
 
 const saveCampaign = async () => {
   if (!campaignForm.name) {
-    ElMessage.warning('请填写广告计划名称')
-    return
+    ElMessage.warning("请填写广告计划名称");
+    return;
   }
-  const scheduledTimes = parseScheduledTimes()
-  if (campaignForm.send_mode === 'scheduled' && !scheduledTimes.length) {
-    ElMessage.warning('请至少填写一个定时时点')
-    return
+  const scheduledTimes = parseScheduledTimes();
+  if (campaignForm.send_mode === "scheduled" && !scheduledTimes.length) {
+    ElMessage.warning("请至少填写一个定时时点");
+    return;
   }
   const payload = {
     ...campaignForm,
     start_at: campaignForm.start_at || undefined,
     end_at: campaignForm.end_at || undefined,
     scheduled_times: scheduledTimes,
-  }
-  savingCampaign.value = true
+  };
+  savingCampaign.value = true;
   try {
     if (editingCampaignId.value) {
-      await automationApi.updateCampaign(editingCampaignId.value, payload)
-      ElMessage.success('广告计划已更新')
+      await automationApi.updateCampaign(editingCampaignId.value, payload);
+      ElMessage.success("广告计划已更新");
     } else {
-      await automationApi.createCampaign(payload)
-      ElMessage.success('广告计划已创建')
+      await automationApi.createCampaign(payload);
+      ElMessage.success("广告计划已创建");
     }
-    resetCampaignForm()
-    await refreshData()
+    campaignDrawerVisible.value = false;
+    resetCampaignForm();
+    await refreshData();
   } finally {
-    savingCampaign.value = false
+    savingCampaign.value = false;
   }
-}
+};
 
 const openTargetGroupDialog = () => {
   Object.assign(targetGroupForm, {
-    groupLink: '',
+    groupLink: "",
     accountId: selectedAccountId.value,
-  })
-  targetGroupDialogVisible.value = true
-}
+  });
+  targetGroupDialogVisible.value = true;
+};
 
 const saveTargetGroup = async () => {
-  const groupLink = targetGroupForm.groupLink.trim()
+  const groupLink = targetGroupForm.groupLink.trim();
   if (!groupLink) {
-    ElMessage.warning('请输入 Telegram 群链接')
-    return
+    ElMessage.warning("请输入 Telegram 群链接");
+    return;
   }
   if (!targetGroupForm.accountId) {
-    ElMessage.warning('请选择执行入群的推广账号')
-    return
+    ElMessage.warning("请选择执行入群的推广账号");
+    return;
   }
 
-  savingTargetGroup.value = true
+  savingTargetGroup.value = true;
   try {
     const response = await groupsApi.joinByLink({
       groupLink,
       accountId: targetGroupForm.accountId,
-    })
-    const group = response.data.data
-    await loadTargetGroups()
+    });
+    const group = response.data.data;
+    await loadTargetGroups();
     if (!campaignForm.target_group_ids.includes(group.id)) {
-      campaignForm.target_group_ids.push(group.id)
+      campaignForm.target_group_ids.push(group.id);
     }
-    targetGroupDialogVisible.value = false
-    ElMessage.success(`已加入并添加 ${group.title || group.username || group.chatId}`)
+    targetGroupDialogVisible.value = false;
+    ElMessage.success(
+      `已加入并添加 ${group.title || group.username || group.chatId}`,
+    );
   } finally {
-    savingTargetGroup.value = false
+    savingTargetGroup.value = false;
   }
-}
+};
 
-const toggleCampaign = async (campaign: AdCampaign) => {
+const toggleCampaign = async (campaign: any) => {
   await automationApi.updateCampaign(campaign.id, {
     enabled: !campaign.enabled,
-    status: campaign.enabled ? 'paused' : 'active',
-  })
-  ElMessage.success(campaign.enabled ? '广告计划已停止' : '广告计划已启动')
-  await refreshData()
-}
+    status: campaign.enabled ? "paused" : "active",
+  });
+  ElMessage.success(campaign.enabled ? "广告计划已停止" : "广告计划已启动");
+  await refreshData();
+};
 
-const deleteCampaign = async (campaign: AdCampaign) => {
-  await ElMessageBox.confirm(`确认删除计划「${campaign.name}」？计划下的绑定也会删除。`, '删除计划', {
-    type: 'warning',
-  })
-  await automationApi.deleteCampaign(campaign.id)
-  if (editingCampaignId.value === campaign.id) resetCampaignForm()
-  ElMessage.success('广告计划已删除')
-  await refreshData()
-}
+const deleteCampaign = async (campaign: any) => {
+  await ElMessageBox.confirm(
+    `确认删除计划「${campaign.name}」？计划下的绑定也会删除。`,
+    "删除计划",
+    {
+      type: "warning",
+    },
+  );
+  await automationApi.deleteCampaign(campaign.id);
+  if (editingCampaignId.value === campaign.id) resetCampaignForm();
+  ElMessage.success("广告计划已删除");
+  await refreshData();
+};
 
 const createBinding = async () => {
   if (!bindingForm.account_ids.length || !bindingForm.ad_campaign_id) {
-    ElMessage.warning('请选择账号和广告计划')
-    return
+    ElMessage.warning("请选择账号和广告计划");
+    return;
   }
   if (!bindingForm.creative_ids.length) {
-    ElMessage.warning('请至少选择一个素材')
-    return
+    ElMessage.warning("请至少选择一个素材");
+    return;
   }
   const response = await automationApi.createBindingsBatch({
     account_ids: bindingForm.account_ids,
@@ -1354,39 +1756,80 @@ const createBinding = async () => {
     creative_ids: bindingForm.creative_ids,
     enabled: bindingForm.enabled,
     priority: bindingForm.priority,
-  })
-  const expectedCount = bindingForm.account_ids.length * bindingForm.creative_ids.length
-  const createdCount = response.data.data.length
-  const existingCount = expectedCount - createdCount
+  });
+  const expectedCount =
+    bindingForm.account_ids.length * bindingForm.creative_ids.length;
+  const createdCount = response.data.data.length;
+  const existingCount = expectedCount - createdCount;
   ElMessage.success(
     existingCount > 0
       ? `已创建 ${createdCount} 条绑定，跳过 ${existingCount} 条已有绑定`
       : `已为 ${bindingForm.account_ids.length} 个账号创建 ${createdCount} 条绑定`,
-  )
+  );
   Object.assign(bindingForm, {
     account_ids: selectedAccountId.value ? [selectedAccountId.value] : [],
     ad_campaign_id: undefined,
     creative_ids: [],
     enabled: true,
     priority: 0,
-  })
-  await refreshData()
-}
+  });
+  bindingDrawerVisible.value = false;
+  await refreshData();
+};
 
 const toggleBinding = async (binding: AccountAdBinding) => {
-  await automationApi.updateBinding(binding.id, { enabled: !binding.enabled })
-  ElMessage.success(binding.enabled ? '绑定已停用' : '绑定已启用')
-  await refreshData()
-}
+  await automationApi.updateBinding(binding.id, { enabled: !binding.enabled });
+  ElMessage.success(binding.enabled ? "绑定已停用" : "绑定已启用");
+  await refreshData();
+};
 
 const deleteBinding = async (binding: AccountAdBinding) => {
-  await ElMessageBox.confirm('确认删除这条账号广告绑定？', '删除绑定', {
-    type: 'warning',
-  })
-  await automationApi.deleteBinding(binding.id)
-  ElMessage.success('绑定已删除')
-  await refreshData()
-}
+  await ElMessageBox.confirm("确认删除这条账号广告绑定？", "删除绑定", {
+    type: "warning",
+  });
+  await automationApi.deleteBinding(binding.id);
+  ElMessage.success("绑定已删除");
+  await refreshData();
+};
+
+const toggleBindingGroup = async (group: any) => {
+  const shouldEnable = group.enabledCount === 0;
+  await Promise.all(
+    group.bindings.map((binding: AccountAdBinding) =>
+      automationApi.updateBinding(binding.id, { enabled: shouldEnable }),
+    ),
+  );
+  ElMessage.success(shouldEnable ? "账号计划绑定已启用" : "账号计划绑定已停用");
+  await refreshData();
+};
+
+const deleteBindingGroup = async (group: any) => {
+  await ElMessageBox.confirm(
+    `确认删除 ${accountLabel(group.accountId)} 在该计划下的 ${group.bindings.length} 条素材绑定？`,
+    "删除账号计划绑定",
+    { type: "warning" },
+  );
+  await Promise.all(
+    group.bindings.map((binding: AccountAdBinding) =>
+      automationApi.deleteBinding(binding.id),
+    ),
+  );
+  ElMessage.success("账号计划绑定已删除");
+  await refreshData();
+};
+
+const openAccountFromAds = (accountId: number) => {
+  selectedAccountId.value = accountId;
+  activeTab.value = "accounts";
+};
+
+const openDeliveryFromAds = (campaignId?: number, accountId?: number) => {
+  deliveryLogFilters.campaign_id = campaignId;
+  deliveryLogFilters.account_id = accountId;
+  deliveryLogPagination.page = 1;
+  activeTab.value = "delivery";
+  loadDeliveryLogs();
+};
 
 const statusType = (status: string) => {
   if (status === 'success') return 'success'
@@ -1415,6 +1858,76 @@ const tierText = (tier: string) => {
   return labels[tier] || tier || '-'
 }
 
+const groupPolicyType = (mode?: string) => {
+  if (mode === "forbidden") return "danger";
+  if (mode === "unknown" || mode === "unknown_probe" || mode === "approval_required") return "warning";
+  if (mode === "soft_ad_trial") return "info";
+  if (mode === "soft_ad_allowed" || mode === "high_volume_ad_allowed") return "success";
+  return "info";
+};
+
+const groupPolicyText = (mode?: string) => {
+  const labels: Record<string, string> = {
+    forbidden: "禁止投放",
+    unknown: "许可未知",
+    unknown_probe: "广告检测中",
+    approval_required: "待人工审批",
+    soft_ad_trial: "试投中",
+    soft_ad_allowed: "允许软广",
+    high_volume_ad_allowed: "高量许可",
+  };
+  return labels[mode || ""] || mode || "-";
+};
+
+const triggerGroupAdPolicyProbe = async (profile: any) => {
+  if (groupPolicyProbeRunning.value !== null) return
+  try {
+    await ElMessageBox.confirm(
+      "确认向「" + (profile.group_title || profile.telegram_group_id) + "」发送 1 条无链接广告检测？检测消息会观察 24 小时，若被删除将标记为禁止投放并退出该群。",
+      "发送广告检测",
+      { type: "warning", confirmButtonText: "发送检测", cancelButtonText: "取消" },
+    )
+  } catch (error) {
+    if (error === "cancel" || error === "close") return
+    throw error
+  }
+
+  groupPolicyProbeRunning.value = profile.group_id
+  try {
+    await automationApi.triggerGroupAdPolicyProbe(profile.group_id)
+    ElMessage.success("广告检测已发送，等待 24 小时结果")
+    await refreshData()
+  } catch (error: any) {
+    const detail = error?.response?.data?.detail
+    ElMessage.error(detail ? "检测未发送：" + detail : "广告检测发送失败")
+  } finally {
+    groupPolicyProbeRunning.value = null
+  }
+}
+
+const groupTierType = (tier?: string) => {
+  if (tier === "blocked") return "danger";
+  if (tier === "observing") return "warning";
+  if (tier === "trial") return "info";
+  if (tier === "validated" || tier === "stable") return "success";
+  if (tier === "high" || tier === "premium") return "primary";
+  return "info";
+};
+
+const groupTierText = (tier?: string) => {
+  const labels: Record<string, string> = {
+    blocked: "封禁",
+    observing: "观察",
+    trial: "试投",
+    validated: "已验证",
+    stable: "稳定",
+    low: "低量",
+    medium: "中量",
+    high: "高量",
+    premium: "优质",
+  };
+  return labels[tier || ""] || tier || "-";
+};
 const businessStageType = (stage: string) => {
   if (stage === 'hot') return 'success'
   if (stage === 'normal') return 'primary'
@@ -1997,150 +2510,981 @@ onMounted(refreshPage)
       </el-tab-pane>
 
       <el-tab-pane label="广告" name="ads">
-        <div class="config-grid">
-          <el-card shadow="never">
-            <template #header>广告投放</template>
-            <el-form label-width="140px">
-              <el-form-item label="发送上限">
-                <el-input-number v-model="adRunForm.max_deliveries" :min="1" :max="10000" />
-              </el-form-item>
-              <el-form-item label="Dry Run">
-                <el-switch v-model="adRunForm.dry_run" />
-              </el-form-item>
-              <el-button type="primary" :loading="running === 'ads'" @click="runAds">
-                <el-icon><VideoPlay /></el-icon>
-                执行投放任务
-              </el-button>
-            </el-form>
-          </el-card>
-
-          <el-card shadow="never">
-            <template #header>
-              <div class="card-header">
-                <span>广告全局策略</span>
-                <div>
-                  <el-button :loading="adPolicyLoading" @click="refreshData">
+        <div v-loading="loading" class="ad-workbench">
+                    <section class="ad-command-deck">
+            <div class="ad-command-main">
+              <div class="ad-command-topline">
+                <div class="ad-command-title">
+                  <div class="ad-command-kicker">
+                    <span
+                      class="ad-status-dot"
+                      :class="adDeliveryExecutionForm.enabled ? 'is-live' : 'is-off'"
+                    ></span>
+                    AD DELIVERY CONTROL
+                  </div>
+                  <h3>
+                    {{
+                      adDeliveryExecutionForm.enabled
+                        ? "自动投放运行中"
+                        : "自动投放已关闭"
+                    }}
+                  </h3>
+                  <p>从计划到账号、群资格和素材，一次看清每个投放环节。</p>
+                </div>
+                <div class="ad-header-actions">
+                  <el-button :loading="loading" @click="refreshAdWorkspace">
                     <el-icon><Refresh /></el-icon>
-                    读取配置
+                    刷新
                   </el-button>
-                  <el-button type="primary" @click="goGrowthConfig('ads')">
+                  <el-button @click="openDeliveryFromAds()">
+                    <el-icon><Document /></el-icon>
+                    发送记录
+                  </el-button>
+                  <el-button @click="goGrowthConfig('ads')">
                     <el-icon><Setting /></el-icon>
-                    去增长驾驶舱配置
+                    策略
+                  </el-button>
+                  <el-button type="primary" @click="adRunDialogVisible = true">
+                    <el-icon><VideoPlay /></el-icon>
+                    手动执行
                   </el-button>
                 </div>
               </div>
-            </template>
-            <div v-loading="adPolicyLoading">
-              <div class="single-entry-note">
-                广告执行、节流、动态容量和失败退群策略统一在增长驾驶舱维护。
-              </div>
-              <div class="policy-summary">
-                <div v-for="item in adPolicySummary" :key="item.label" class="policy-summary-item">
-                  <span class="policy-label">{{ item.label }}</span>
-                  <el-tag v-if="item.type" :type="item.type" effect="plain">{{ item.value }}</el-tag>
-                  <span v-else class="policy-value">{{ item.value }}</span>
-                </div>
+
+              <div class="ad-flow-grid" aria-label="广告投放流程">
+                <button
+                  type="button"
+                  class="ad-flow-step"
+                  :class="{ active: adWorkspaceView === 'campaigns' }"
+                  @click="adWorkspaceView = 'campaigns'"
+                >
+                  <span class="flow-step-icon flow-blue"><Timer /></span>
+                  <span>
+                    <small>01 / 计划</small>
+                    <strong>{{ activeCampaignCount }} 个运行</strong>
+                    <em>{{ campaigns.length }} 个总计划</em>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="ad-flow-step"
+                  :class="{ active: adWorkspaceView === 'accounts' }"
+                  @click="adWorkspaceView = 'accounts'"
+                >
+                  <span class="flow-step-icon flow-green"><UserFilled /></span>
+                  <span>
+                    <small>02 / 账号</small>
+                    <strong>{{ readyAdAccountCount }} 个可投</strong>
+                    <em>{{ blockedAdAccountCount }} 个需处理</em>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="ad-flow-step"
+                  :class="{ active: adWorkspaceView === 'groups' }"
+                  @click="adWorkspaceView = 'groups'"
+                >
+                  <span class="flow-step-icon flow-amber"><Connection /></span>
+                  <span>
+                    <small>03 / 群资格</small>
+                    <strong>{{ adAllowedGroupCount }} 个可投</strong>
+                    <em>{{ pendingGroupPolicyCount }} 个待确认</em>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="ad-flow-step"
+                  :class="{ active: adWorkspaceView === 'creatives' }"
+                  @click="adWorkspaceView = 'creatives'"
+                >
+                  <span class="flow-step-icon flow-violet"><Document /></span>
+                  <span>
+                    <small>04 / 素材</small>
+                    <strong>{{ enabledCreativeCount }} 个启用</strong>
+                    <em>{{ enabledBindingCount }} 条绑定生效</em>
+                  </span>
+                </button>
               </div>
             </div>
-          </el-card>
 
-          <el-card shadow="never">
-            <template #header>
-              <div class="card-header">
-                <span>{{ editingCreativeId ? '编辑广告素材' : '广告素材' }}</span>
-                <el-button v-if="editingCreativeId" link type="primary" @click="resetCreativeForm">
-                  <el-icon><Close /></el-icon>
-                  取消编辑
-                </el-button>
+            <aside class="ad-readiness-panel">
+              <div class="ad-readiness-heading">
+                <span>今日投放就绪度</span>
+                <strong>{{ adReadinessScore }}%</strong>
               </div>
-            </template>
-            <el-form label-width="88px">
-              <el-form-item label="名称"><el-input v-model="creativeForm.name" /></el-form-item>
-              <el-form-item label="类型">
-                <el-select v-model="creativeForm.creative_type">
-                  <el-option label="文本" value="text" />
-                  <el-option label="图片" value="image" />
-                  <el-option label="图文" value="mixed" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="内容">
-                <el-input v-model="creativeForm.content" type="textarea" :rows="4" />
-              </el-form-item>
-              <el-form-item label="媒体地址">
-                <el-input v-model="creativeForm.media_url" placeholder="图片 URL 或 Telegram file_id" />
-              </el-form-item>
-              <el-form-item label="链接"><el-input v-model="creativeForm.link_url" /></el-form-item>
-              <el-form-item label="权重"><el-input-number v-model="creativeForm.weight" :min="0" /></el-form-item>
-              <el-form-item label="启用"><el-switch v-model="creativeForm.enabled" /></el-form-item>
-              <el-button type="primary" :loading="savingCreative" @click="saveCreative">
-                <el-icon><Plus v-if="!editingCreativeId" /><Edit v-else /></el-icon>
-                {{ editingCreativeId ? '保存素材' : '创建素材' }}
-              </el-button>
-              <el-button @click="cleanupInvalidCreatives">
-                清理异常素材
-              </el-button>
-            </el-form>
+              <div class="ad-readiness-track">
+                <span :style="{ width: adReadinessScore + '%' }"></span>
+              </div>
+              <ul class="ad-readiness-list">
+                <li :class="{ ready: activeCampaignCount > 0 }">
+                  <span>运行计划</span><b>{{ activeCampaignCount }}</b>
+                </li>
+                <li :class="{ ready: readyAdAccountCount > 0 }">
+                  <span>可投账号</span><b>{{ readyAdAccountCount }}</b>
+                </li>
+                <li :class="{ ready: adAllowedGroupCount > 0 }">
+                  <span>群广告许可</span><b>{{ adAllowedGroupCount }}</b>
+                </li>
+                <li :class="{ ready: enabledBindingCount > 0 }">
+                  <span>生效绑定</span><b>{{ enabledBindingCount }}</b>
+                </li>
+              </ul>
+              <div class="ad-readiness-footnote">
+                <span v-if="forbiddenGroupCount">{{ forbiddenGroupCount }} 个群已禁止广告</span>
+                <span v-else-if="unboundCampaignCount">{{ unboundCampaignCount }} 个运行计划尚未绑定账号</span>
+                <span v-else>当前没有高优先级阻断</span>
+                <el-button link type="primary" @click="adWorkspaceView = 'groups'">查看资格</el-button>
+              </div>
+            </aside>
+          </section>
 
-            <el-table :data="creatives" class="creative-table" size="small" max-height="320">
-              <el-table-column prop="name" label="名称" min-width="150" show-overflow-tooltip />
-              <el-table-column prop="creative_type" label="类型" width="80" />
-              <el-table-column label="广告文案" min-width="260">
-                <template #default="{ row }">
-                  <div class="creative-preview-cell">
-                    <span class="creative-preview-text">{{ creativePreview(row.content) }}</span>
-                    <el-popover v-if="row.content" placement="top-start" width="460" trigger="click">
-                      <template #reference>
-                        <el-button link type="primary" size="small">查看</el-button>
-                      </template>
-                      <pre class="creative-full-text">{{ row.content }}</pre>
-                    </el-popover>
+          <section class="ad-status-ribbon">
+            <div>
+              <span>24 小时发送</span>
+              <strong>{{ adSuccess24h }} / {{ adFailed24h }}</strong>
+              <small>成功率 {{ adSuccessRate24h }}%</small>
+            </div>
+            <div>
+              <span>群每日容量</span>
+              <strong>{{ groupDailyCapacityTotal }}</strong>
+              <small>{{ adAllowedGroupCount }} 个群合计</small>
+            </div>
+            <div>
+              <span>调度间隔</span>
+              <strong>{{ adDeliveryExecutionForm.dispatcher_interval_seconds }} 秒</strong>
+              <small>单轮上限 {{ adDeliveryExecutionForm.max_deliveries_per_run }}</small>
+            </div>
+            <div>
+              <span>同群计划冷却</span>
+              <strong>{{ adDeliveryExecutionForm.group_campaign_cooldown_minutes }} 分钟</strong>
+              <small>失败退群 {{ adFailurePolicyForm.leave_on_group_control_failure ? "开启" : "关闭" }}</small>
+            </div>
+          </section>
+<el-tabs v-model="adWorkspaceView" class="ad-workspace-tabs">
+            <el-tab-pane name="campaigns">
+              <template #label>
+                <span class="ad-tab-label"
+                  ><Timer />投放计划 <b>{{ campaigns.length }}</b></span
+                >
+              </template>
+
+              <section class="ad-data-section">
+                <div class="ad-section-toolbar">
+                  <div>
+                    <h4>投放计划</h4>
+                    <p>按计划查看目标群、账号覆盖、素材池和发送频率</p>
                   </div>
-                </template>
-              </el-table-column>
-              <el-table-column prop="link_url" label="链接" min-width="150" show-overflow-tooltip />
-              <el-table-column prop="weight" label="权重" width="80" />
-              <el-table-column label="启用" width="80">
-                <template #default="{ row }">
-                  <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '是' : '否' }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="操作" width="190" fixed="right">
-                <template #default="{ row }">
-                  <el-button link type="primary" size="small" @click="editCreative(row)">
-                    <el-icon><Edit /></el-icon>
-                    编辑
-                  </el-button>
-                  <el-button link :type="row.enabled ? 'warning' : 'success'" size="small" @click="toggleCreative(row)">
-                    {{ row.enabled ? '停用' : '启用' }}
-                  </el-button>
-                  <el-button link type="danger" size="small" @click="deleteCreative(row)">
-                    <el-icon><Delete /></el-icon>
-                    删除
-                  </el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
+                  <div class="ad-toolbar-controls">
+                    <el-input
+                      v-model="campaignFilters.query"
+                      clearable
+                      placeholder="搜索计划名称"
+                      class="ad-search-control"
+                    />
+                    <el-select
+                      v-model="campaignFilters.status"
+                      clearable
+                      placeholder="全部状态"
+                      class="ad-status-control"
+                    >
+                      <el-option label="运行中" value="active" />
+                      <el-option label="已停止" value="paused" />
+                      <el-option label="草稿" value="draft" />
+                    </el-select>
+                    <el-button type="primary" @click="openCreateCampaign">
+                      <el-icon><Plus /></el-icon>
+                      新建计划
+                    </el-button>
+                  </div>
+                </div>
 
-          <el-card shadow="never">
-            <template #header>
-              <div class="card-header">
-                <span>{{ editingCampaignId ? '编辑广告计划' : '广告计划' }}</span>
-                <el-button v-if="editingCampaignId" link type="primary" @click="resetCampaignForm">
-                  <el-icon><Close /></el-icon>
-                  取消编辑
-                </el-button>
+                <el-table
+                  :data="filteredCampaigns"
+                  row-key="id"
+                  class="ad-primary-table"
+                >
+                  <el-table-column type="expand" width="44">
+                    <template #default="{ row }">
+                      <div class="campaign-detail-grid">
+                        <div class="campaign-detail-block">
+                          <span class="detail-label">目标群</span>
+                          <div
+                            v-if="campaignTargetGroups(row).length"
+                            class="detail-tag-list"
+                          >
+                            <el-tag
+                              v-for="group in campaignTargetGroups(row)"
+                              :key="group.id"
+                              type="info"
+                              effect="plain"
+                            >
+                              {{ group.title || group.chatId }} ·
+                              {{ group.level }}级 ·
+                              {{ group.accountCount }}个账号在群
+                            </el-tag>
+                          </div>
+                          <strong v-else
+                            >按等级
+                            {{
+                              row.target_group_levels?.join("/") || "-"
+                            }}
+                            自动匹配</strong
+                          >
+                        </div>
+                        <div class="campaign-detail-block">
+                          <span class="detail-label">投放账号</span>
+                          <div
+                            v-if="campaignStats(row.id).accountIds.length"
+                            class="detail-tag-list"
+                          >
+                            <el-tag
+                              v-for="accountId in campaignStats(row.id)
+                                .accountIds"
+                              :key="accountId"
+                              :type="
+                                accountStatusType(
+                                  accountMap.get(accountId)?.status,
+                                )
+                              "
+                              effect="plain"
+                            >
+                              {{ accountLabel(accountId) }} ·
+                              {{
+                                accountStatusText(
+                                  accountMap.get(accountId)?.status,
+                                )
+                              }}
+                            </el-tag>
+                          </div>
+                          <strong v-else class="text-warning"
+                            >尚未绑定账号</strong
+                          >
+                        </div>
+                        <div class="campaign-detail-block">
+                          <span class="detail-label">素材池</span>
+                          <div
+                            v-if="campaignStats(row.id).creativeIds.length"
+                            class="detail-tag-list"
+                          >
+                            <el-tag
+                              v-for="creativeId in campaignStats(row.id)
+                                .creativeIds"
+                              :key="creativeId"
+                              type="success"
+                              effect="plain"
+                            >
+                              {{ creativeById(creativeId)?.name || creativeId }}
+                            </el-tag>
+                          </div>
+                          <strong v-else class="text-warning"
+                            >尚未绑定素材</strong
+                          >
+                        </div>
+                        <div class="campaign-detail-block">
+                          <span class="detail-label">生效窗口</span>
+                          <strong>{{ campaignWindowText(row) }}</strong>
+                          <small
+                            >单群每日 {{ row.max_sends_per_group_per_day }} 次 ·
+                            单号每日
+                            {{ row.max_sends_per_account_per_day }} 次</small
+                          >
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="计划" min-width="180">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ row.name }}</strong>
+                        <small
+                          >#{{ row.id }} · {{ row.status || "draft" }}</small
+                        >
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="状态" width="96">
+                    <template #default="{ row }">
+                      <el-tag
+                        :type="row.enabled ? 'success' : 'info'"
+                        effect="plain"
+                      >
+                        {{ row.enabled ? "运行中" : "已停止" }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="目标" min-width="180">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong v-if="row.target_group_ids?.length"
+                          >指定 {{ row.target_group_ids.length }} 个群</strong
+                        >
+                        <strong v-else
+                          >等级
+                          {{
+                            row.target_group_levels?.join("/") || "-"
+                          }}</strong
+                        >
+                        <small>{{ campaignTargetLabel(row) }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="发送频率" min-width="150">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ sendModeText(row.send_mode) }}</strong>
+                        <small>{{ campaignFrequencyText(row) }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column
+                    label="账号 / 素材"
+                    width="140"
+                    align="center"
+                  >
+                    <template #default="{ row }">
+                      <strong
+                        >{{ campaignStats(row.id).accountIds.length }} /
+                        {{ campaignStats(row.id).creativeIds.length }}</strong
+                      >
+                      <small class="table-subline"
+                        >{{
+                          campaignStats(row.id).enabledBindingCount
+                        }}
+                        条生效</small
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="286" fixed="right">
+                    <template #default="{ row }">
+                      <el-button
+                        link
+                        type="primary"
+                        @click="openBindingDrawer(row)"
+                        >绑定</el-button
+                      >
+                      <el-button
+                        link
+                        :type="row.enabled ? 'warning' : 'success'"
+                        @click="toggleCampaign(row)"
+                      >
+                        {{ row.enabled ? "停止" : "启动" }}
+                      </el-button>
+                      <el-button link type="primary" @click="editCampaign(row)"
+                        >编辑</el-button
+                      >
+                      <el-button link @click="openDeliveryFromAds(row.id)"
+                        >记录</el-button
+                      >
+                      <el-button link type="danger" @click="deleteCampaign(row)"
+                        >删除</el-button
+                      >
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </section>
+            </el-tab-pane>
+
+            <el-tab-pane name="creatives">
+              <template #label>
+                <span class="ad-tab-label"
+                  ><Document />素材库 <b>{{ creatives.length }}</b></span
+                >
+              </template>
+
+              <section class="ad-data-section">
+                <div class="ad-section-toolbar">
+                  <div>
+                    <h4>广告素材库</h4>
+                    <p>素材正文、媒体、链接、权重和绑定覆盖</p>
+                  </div>
+                  <div class="ad-toolbar-controls">
+                    <el-button @click="cleanupInvalidCreatives"
+                      >清理异常素材</el-button
+                    >
+                    <el-button type="primary" @click="openCreateCreative">
+                      <el-icon><Plus /></el-icon>
+                      新建素材
+                    </el-button>
+                  </div>
+                </div>
+
+                <el-table
+                  :data="creatives"
+                  row-key="id"
+                  class="ad-primary-table"
+                >
+                  <el-table-column label="素材" min-width="180">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ row.name }}</strong>
+                        <small>#{{ row.id }} · {{ row.creative_type }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="广告文案" min-width="320">
+                    <template #default="{ row }">
+                      <div class="creative-preview-cell">
+                        <span class="creative-preview-text">{{
+                          creativePreview(row.content, 120)
+                        }}</span>
+                        <el-popover
+                          v-if="row.content"
+                          placement="top-start"
+                          width="460"
+                          trigger="click"
+                        >
+                          <template #reference
+                            ><el-button link type="primary"
+                              >全文</el-button
+                            ></template
+                          >
+                          <pre class="creative-full-text">{{
+                            row.content
+                          }}</pre>
+                        </el-popover>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="媒体 / 链接" min-width="190">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{
+                          row.media_url ? "含媒体" : "纯文本"
+                        }}</strong>
+                        <small>{{
+                          row.link_url || row.media_url || "-"
+                        }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column
+                    prop="weight"
+                    label="权重"
+                    width="80"
+                    align="center"
+                  />
+                  <el-table-column label="绑定" width="80" align="center">
+                    <template #default="{ row }">{{
+                      creativeBindingCounts.get(row.id) || 0
+                    }}</template>
+                  </el-table-column>
+                  <el-table-column label="状态" width="90">
+                    <template #default="{ row }">
+                      <el-tag
+                        :type="row.enabled ? 'success' : 'info'"
+                        effect="plain"
+                        >{{ row.enabled ? "启用" : "停用" }}</el-tag
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="更新时间" width="170">
+                    <template #default="{ row }">{{
+                      formatTimestamp(row.updated_at)
+                    }}</template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="178" fixed="right">
+                    <template #default="{ row }">
+                      <el-button link type="primary" @click="editCreative(row)"
+                        >编辑</el-button
+                      >
+                      <el-button
+                        link
+                        :type="row.enabled ? 'warning' : 'success'"
+                        @click="toggleCreative(row)"
+                      >
+                        {{ row.enabled ? "停用" : "启用" }}
+                      </el-button>
+                      <el-button link type="danger" @click="deleteCreative(row)"
+                        >删除</el-button
+                      >
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </section>
+            </el-tab-pane>
+
+            <el-tab-pane name="bindings">
+              <template #label>
+                <span class="ad-tab-label"
+                  ><Connection />账号绑定
+                  <b>{{ bindingGroups.length }}</b></span
+                >
+              </template>
+
+              <section class="ad-data-section">
+                <div class="ad-section-toolbar">
+                  <div>
+                    <h4>账号与计划绑定</h4>
+                    <p>每行代表一个账号在一个计划下的完整素材池</p>
+                  </div>
+                  <div class="ad-toolbar-controls">
+                    <el-select
+                      v-model="bindingFilters.account_id"
+                      clearable
+                      filterable
+                      placeholder="全部账号"
+                      class="ad-filter-control"
+                    >
+                      <el-option
+                        v-for="account in accounts"
+                        :key="account.id"
+                        :label="accountLabel(account.id)"
+                        :value="account.id"
+                      />
+                    </el-select>
+                    <el-select
+                      v-model="bindingFilters.campaign_id"
+                      clearable
+                      filterable
+                      placeholder="全部计划"
+                      class="ad-filter-control"
+                    >
+                      <el-option
+                        v-for="campaign in campaigns"
+                        :key="campaign.id"
+                        :label="campaign.name"
+                        :value="campaign.id"
+                      />
+                    </el-select>
+                    <el-select
+                      v-model="bindingFilters.status"
+                      clearable
+                      placeholder="全部状态"
+                      class="ad-status-control"
+                    >
+                      <el-option label="已启用" value="enabled" />
+                      <el-option label="已停用" value="disabled" />
+                    </el-select>
+                    <el-button type="primary" @click="openBindingDrawer()">
+                      <el-icon><Plus /></el-icon>
+                      新建绑定
+                    </el-button>
+                  </div>
+                </div>
+
+                <el-table
+                  :data="filteredBindingGroups"
+                  row-key="key"
+                  class="ad-primary-table"
+                >
+                  <el-table-column type="expand" width="44">
+                    <template #default="{ row }">
+                      <div class="binding-detail-list">
+                        <div
+                          v-for="binding in row.bindings"
+                          :key="binding.id"
+                          class="binding-detail-row"
+                        >
+                          <div>
+                            <strong>{{
+                              creativeById(binding.creative_id)?.name ||
+                              binding.creative_id ||
+                              "未指定素材"
+                            }}</strong>
+                            <small>{{
+                              creativePreview(
+                                creativeById(binding.creative_id)?.content,
+                                90,
+                              )
+                            }}</small>
+                          </div>
+                          <el-tag
+                            :type="binding.enabled ? 'success' : 'info'"
+                            effect="plain"
+                          >
+                            {{ binding.enabled ? "生效" : "停用" }}
+                          </el-tag>
+                          <span>优先级 {{ binding.priority }}</span>
+                          <el-button
+                            link
+                            :type="binding.enabled ? 'warning' : 'success'"
+                            @click="toggleBinding(binding)"
+                          >
+                            {{ binding.enabled ? "停用" : "启用" }}
+                          </el-button>
+                          <el-button
+                            link
+                            type="danger"
+                            @click="deleteBinding(binding)"
+                            >删除</el-button
+                          >
+                        </div>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="账号" min-width="190">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ accountLabel(row.accountId) }}</strong>
+                        <small>
+                          {{
+                            accountStatusText(
+                              accountMap.get(row.accountId)?.status,
+                            )
+                          }}
+                          · ID {{ row.accountId }}
+                        </small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="计划" min-width="180">
+                    <template #default="{ row }">
+                      {{
+                        campaigns.find(
+                          (campaign) => campaign.id === row.campaignId,
+                        )?.name || row.campaignId
+                      }}
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="素材池" min-width="260">
+                    <template #default="{ row }">
+                      <div class="detail-tag-list compact-tags">
+                        <el-tag
+                          v-for="creativeId in row.creativeIds"
+                          :key="creativeId"
+                          type="info"
+                          effect="plain"
+                        >
+                          {{ creativeById(creativeId)?.name || creativeId }}
+                        </el-tag>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="生效" width="100" align="center">
+                    <template #default="{ row }"
+                      >{{ row.enabledCount }} /
+                      {{ row.bindings.length }}</template
+                    >
+                  </el-table-column>
+                  <el-table-column
+                    prop="priority"
+                    label="优先级"
+                    width="90"
+                    align="center"
+                  />
+                  <el-table-column label="操作" width="236" fixed="right">
+                    <template #default="{ row }">
+                      <el-button
+                        link
+                        :type="row.enabledCount ? 'warning' : 'success'"
+                        @click="toggleBindingGroup(row)"
+                      >
+                        {{ row.enabledCount ? "全部停用" : "全部启用" }}
+                      </el-button>
+                      <el-button
+                        link
+                        @click="
+                          openDeliveryFromAds(row.campaignId, row.accountId)
+                        "
+                        >记录</el-button
+                      >
+                      <el-button
+                        link
+                        type="danger"
+                        @click="deleteBindingGroup(row)"
+                        >删除整组</el-button
+                      >
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </section>
+            </el-tab-pane>
+
+            <el-tab-pane name="groups">
+              <template #label>
+                <span class="ad-tab-label"
+                  ><Connection />群资格 <b>{{ groupAdProfiles.length }}</b></span
+                >
+              </template>
+
+              <section class="ad-data-section">
+                <div class="ad-section-toolbar">
+                  <div>
+                    <h4>群广告资格</h4>
+                    <p>许可决定能不能投，档位决定每天能投多少；这里展示投放前的最终资格。</p>
+                  </div>
+                  <div class="ad-toolbar-controls">
+                    <el-select
+                      v-model="groupPolicyFilters.mode"
+                      clearable
+                      placeholder="全部许可"
+                      class="ad-filter-control"
+                    >
+                      <el-option label="许可未知" value="unknown" />
+                      <el-option label="广告检测中" value="unknown_probe" />
+                      <el-option label="待人工审批" value="approval_required" />
+                      <el-option label="试投中" value="soft_ad_trial" />
+                      <el-option label="允许软广" value="soft_ad_allowed" />
+                      <el-option label="高量许可" value="high_volume_ad_allowed" />
+                      <el-option label="禁止投放" value="forbidden" />
+                    </el-select>
+                    <el-select
+                      v-model="groupPolicyFilters.tier"
+                      clearable
+                      placeholder="全部档位"
+                      class="ad-filter-control"
+                    >
+                      <el-option label="观察" value="observing" />
+                      <el-option label="试投" value="trial" />
+                      <el-option label="已验证" value="validated" />
+                      <el-option label="稳定" value="stable" />
+                      <el-option label="高量" value="high" />
+                      <el-option label="优质" value="premium" />
+                      <el-option label="封禁" value="blocked" />
+                    </el-select>
+                    <el-button @click="goGrowthConfig('ads')">
+                      <el-icon><Setting /></el-icon>
+                      调整策略
+                    </el-button>
+                  </div>
+                </div>
+
+                <div class="group-policy-note">
+                  <span><CircleCheck />允许投放 {{ adAllowedGroupCount }}</span>
+                  <span><WarningFilled />待确认 {{ pendingGroupPolicyCount }}</span>
+                  <span><Close />禁止投放 {{ forbiddenGroupCount }}</span>
+                  <strong>合计日容量 {{ groupDailyCapacityTotal }}</strong>
+                </div>
+
+                <el-table
+                  :data="filteredGroupAdProfiles"
+                  row-key="id"
+                  class="ad-primary-table group-policy-table"
+                >
+                  <el-table-column label="群组" min-width="220">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ row.group_title || `群组 #${row.telegram_group_id}` }}</strong>
+                        <small>ID {{ row.telegram_group_id }} · {{ row.group_level || "未分级" }}级 · {{ row.group_status || "-" }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="广告许可" width="140">
+                    <template #default="{ row }">
+                      <el-tag :type="groupPolicyType(row.ad_policy_mode)" effect="plain">
+                        {{ groupPolicyText(row.ad_policy_mode) }}
+                      </el-tag>
+                      <small class="table-subline">置信度 {{ row.ad_policy_confidence }} · {{ row.ad_policy_source || "-" }}</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="档位" width="110">
+                    <template #default="{ row }">
+                      <el-tag :type="groupTierType(row.ad_tier)" effect="plain">{{ groupTierText(row.ad_tier) }}</el-tag>
+                      <small class="table-subline">{{ row.daily_capacity || 0 }} 条 / 天</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="存活 / 删除" width="120" align="center">
+                    <template #default="{ row }">
+                      <strong>{{ row.survival_count || 0 }} / {{ row.deleted_count || 0 }}</strong>
+                      <small class="table-subline">24h样本 {{ row.metrics?.completed_samples || 0 }}</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="最近状态" min-width="170">
+                    <template #default="{ row }">
+                      <span v-if="row.ad_policy_probe_status === 'sent'" class="muted-text">
+                        检测已发送，等待 24 小时存活
+                      </span>
+                      <span v-else-if="row.ad_policy_probe_status === 'failed'" class="error-text">
+                        检测失败<span v-if="row.ad_policy_probe_error">：{{ row.ad_policy_probe_error }}</span>
+                      </span>
+                      <span v-else-if="row.ad_policy_probe_status === 'survived'" class="muted-text">
+                        检测通过 {{ formatTimestamp(row.ad_policy_probe_at) }}
+                      </span>
+                      <span v-else-if="row.blocked_reason" class="error-text">{{ row.blocked_reason }}</span>
+                      <span v-else-if="row.paused_until" class="muted-text">暂停至 {{ formatTimestamp(row.paused_until) }}</span>
+                      <span v-else class="muted-text">最近验证 {{ formatTimestamp(row.ad_policy_verified_at) }}</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="130" fixed="right">
+                    <template #default="{ row }">
+                      <el-button
+                        v-if="row.ad_policy_mode === 'unknown'"
+                        link
+                        type="primary"
+                        :loading="groupPolicyProbeRunning === row.group_id"
+                        @click="triggerGroupAdPolicyProbe(row)"
+                      >
+                        <el-icon><VideoPlay /></el-icon>
+                        发送检测
+                      </el-button>
+                      <el-tag v-else-if="row.ad_policy_mode === 'unknown_probe'" type="warning" effect="plain">
+                        检测中
+                      </el-tag>
+                      <el-button v-else link type="primary" @click="goGrowthConfig('ads')">人工调整</el-button>
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </section>
+            </el-tab-pane>
+            <el-tab-pane name="accounts">
+              <template #label>
+                <span class="ad-tab-label"
+                  ><UserFilled />账号状态 <b>{{ accounts.length }}</b></span
+                >
+              </template>
+
+              <section class="ad-data-section">
+                <div class="ad-section-toolbar">
+                  <div>
+                    <h4>账号投放状态</h4>
+                    <p>账号可用性、暖号、风控、群资格与近 24 小时结果</p>
+                  </div>
+                </div>
+
+                <el-table
+                  :data="adReadinessRows"
+                  row-key="account.id"
+                  class="ad-primary-table"
+                >
+                  <el-table-column label="账号" min-width="190">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <strong>{{ accountLabel(row.account.id) }}</strong>
+                        <small>ID {{ row.account.id }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="账号状态" width="105">
+                    <template #default="{ row }">
+                      <el-tag
+                        :type="accountStatusType(row.account.status)"
+                        effect="plain"
+                      >
+                        {{ accountStatusText(row.account.status) }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="投放状态" min-width="150">
+                    <template #default="{ row }">
+                      <div class="primary-cell">
+                        <el-tag
+                          :type="row.ready ? 'success' : 'warning'"
+                          effect="plain"
+                        >
+                          {{ row.ready ? "可投放" : "暂不可投" }}
+                        </el-tag>
+                        <small v-if="!row.ready">{{
+                          deliveryBlockReason(row.status)
+                        }}</small>
+                      </div>
+                    </template>
+                  </el-table-column>
+                  <el-table-column
+                    label="健康 / 风险"
+                    width="125"
+                    align="center"
+                  >
+                    <template #default="{ row }">
+                      <strong
+                        >{{ row.status?.health_score ?? "-" }} /
+                        {{ row.status?.risk_score ?? "-" }}</strong
+                      >
+                      <small class="table-subline">{{
+                        riskLevelText(row.status?.risk_level)
+                      }}</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="暖号阶段" width="120">
+                    <template #default="{ row }">
+                      <el-tag
+                        :type="warmupStageType(row.status?.warmup_stage || '')"
+                        effect="plain"
+                      >
+                        {{ warmupStageText(row.status?.warmup_stage || "") }}
+                      </el-tag>
+                      <small class="table-subline"
+                        >余
+                        {{ row.status?.warmup_remaining_days ?? "-" }} 天</small
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="额度" width="130" align="center">
+                    <template #default="{ row }">
+                      <strong
+                        >{{ row.status?.dynamic_daily_limit ?? 0 }} / 日</strong
+                      >
+                      <small class="table-subline"
+                        >单轮 {{ row.status?.dynamic_run_limit ?? 0 }}</small
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="群资格" width="135" align="center">
+                    <template #default="{ row }">
+                      <strong
+                        >{{ row.status?.ad_eligible_groups ?? 0 }} 可投</strong
+                      >
+                      <small class="table-subline"
+                        >{{
+                          row.status?.pending_probe_groups ?? 0
+                        }}
+                        待探测</small
+                      >
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="绑定" width="100" align="center">
+                    <template #default="{ row }"
+                      >{{ row.enabledBindingCount }} /
+                      {{ row.bindingCount }}</template
+                    >
+                  </el-table-column>
+                  <el-table-column label="24 小时" width="120" align="center">
+                    <template #default="{ row }">
+                      <strong
+                        >{{ row.status?.success_24h ?? 0 }} /
+                        {{ row.status?.failed_24h ?? 0 }}</strong
+                      >
+                      <small class="table-subline">成功 / 失败</small>
+                    </template>
+                  </el-table-column>
+                  <el-table-column label="操作" width="150" fixed="right">
+                    <template #default="{ row }">
+                      <el-button
+                        link
+                        type="primary"
+                        @click="openAccountFromAds(row.account.id)"
+                        >配置</el-button
+                      >
+                      <el-button
+                        link
+                        @click="openDeliveryFromAds(undefined, row.account.id)"
+                        >记录</el-button
+                      >
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </section>
+            </el-tab-pane>
+          </el-tabs>
+
+          <el-drawer
+            v-model="campaignDrawerVisible"
+            :title="editingCampaignId ? '编辑投放计划' : '新建投放计划'"
+            size="min(660px, 100vw)"
+            class="ad-form-drawer"
+            destroy-on-close
+          >
+            <el-form label-position="top" class="ad-drawer-form">
+              <div class="drawer-section-title">基础信息</div>
+              <div class="drawer-form-grid">
+                <el-form-item label="计划名称" required>
+                  <el-input
+                    v-model="campaignForm.name"
+                    placeholder="例如：核心群软广告"
+                  />
+                </el-form-item>
+                <el-form-item label="计划状态">
+                  <el-select v-model="campaignForm.status">
+                    <el-option label="草稿" value="draft" />
+                    <el-option label="运行中" value="active" />
+                    <el-option label="已暂停" value="paused" />
+                  </el-select>
+                </el-form-item>
               </div>
-            </template>
-            <el-form label-width="120px">
-              <el-form-item label="名称"><el-input v-model="campaignForm.name" /></el-form-item>
-              <el-form-item label="发送模式">
-                <el-select v-model="campaignForm.send_mode">
-                  <el-option label="入群后" value="after_join" />
-                  <el-option label="循环间隔（按群）" value="interval" />
-                  <el-option label="定时" value="scheduled" />
-                </el-select>
+              <el-form-item label="启用计划">
+                <el-switch v-model="campaignForm.enabled" />
               </el-form-item>
+
+              <div class="drawer-section-title">目标群</div>
               <el-form-item label="指定群">
                 <div class="target-group-control">
                   <el-select
@@ -2150,114 +3494,235 @@ onMounted(refreshPage)
                     collapse-tags
                     collapse-tags-tooltip
                     clearable
-                    placeholder="选择已加入群"
+                    placeholder="选择当前仍有账号加入的活跃群"
                   >
                     <el-option
-                      v-for="item in targetGroups"
-                      :key="item.id"
-                      :label="targetGroupLabel(item.id)"
-                      :value="item.id"
-                      :disabled="item.accountCount <= 0"
-                    />
+                      v-for="group in targetGroups"
+                      :key="group.id"
+                      :label="targetGroupLabel(group.id)"
+                      :value="group.id"
+                    >
+                      <div class="rich-option">
+                        <span>{{ group.title || group.chatId }}</span>
+                        <small
+                          >{{ group.level }}级 · {{ group.memberCount }} 人 ·
+                          {{ group.accountCount }} 个账号在群</small
+                        >
+                      </div>
+                    </el-option>
                   </el-select>
-                  <el-button @click="openTargetGroupDialog">
-                    <el-icon><Plus /></el-icon>
-                    添加群
-                  </el-button>
+                  <el-button @click="openTargetGroupDialog"
+                    ><el-icon><Plus /></el-icon>添加群</el-button
+                  >
                 </div>
               </el-form-item>
-              <el-form-item v-if="!campaignForm.target_group_ids.length" label="目标等级">
-                <el-select v-model="campaignForm.target_group_levels" multiple>
-                  <el-option label="A" value="A" />
-                  <el-option label="B" value="B" />
-                  <el-option label="C" value="C" />
+              <el-form-item
+                v-if="!campaignForm.target_group_ids.length"
+                label="目标等级"
+              >
+                <el-checkbox-group v-model="campaignForm.target_group_levels">
+                  <el-checkbox-button value="A">A级群</el-checkbox-button>
+                  <el-checkbox-button value="B">B级群</el-checkbox-button>
+                  <el-checkbox-button value="C">C级群</el-checkbox-button>
+                </el-checkbox-group>
+              </el-form-item>
+              <div
+                v-if="campaignForm.target_group_ids.length"
+                class="selected-target-summary"
+              >
+                已选 {{ campaignForm.target_group_ids.length }} 个群，覆盖
+                {{
+                  campaignForm.target_group_ids.reduce(
+                    (total, id) =>
+                      total + (targetGroupMap.get(id)?.accountCount || 0),
+                    0,
+                  )
+                }}
+                个账号群席位
+              </div>
+
+              <div class="drawer-section-title">发送节奏</div>
+              <el-form-item label="发送模式">
+                <el-segmented
+                  v-model="campaignForm.send_mode"
+                  :options="[
+                    { label: '入群后', value: 'after_join' },
+                    { label: '固定间隔', value: 'interval' },
+                    { label: '每日定时', value: 'scheduled' },
+                  ]"
+                />
+              </el-form-item>
+              <el-form-item
+                v-if="campaignForm.send_mode === 'after_join'"
+                label="入群后等待"
+              >
+                <el-input-number
+                  v-model="campaignForm.min_wait_after_join_minutes"
+                  :min="0"
+                  :max="43200"
+                />
+                <span class="input-suffix">分钟</span>
+              </el-form-item>
+              <el-form-item
+                v-if="campaignForm.send_mode === 'interval'"
+                label="每群发送间隔"
+              >
+                <el-input-number
+                  v-model="campaignForm.interval_minutes"
+                  :min="1"
+                  :max="43200"
+                />
+                <span class="input-suffix">分钟</span>
+              </el-form-item>
+              <el-form-item
+                v-if="campaignForm.send_mode === 'scheduled'"
+                label="每日发送时点"
+                required
+              >
+                <el-input
+                  v-model="scheduledTimesText"
+                  placeholder="09:00, 14:30, 21:00"
+                />
+              </el-form-item>
+
+              <div class="drawer-section-title">额度与有效期</div>
+              <div class="drawer-form-grid">
+                <el-form-item label="单群每日上限">
+                  <el-input-number
+                    v-model="campaignForm.max_sends_per_group_per_day"
+                    :min="0"
+                  />
+                </el-form-item>
+                <el-form-item label="单号每日上限">
+                  <el-input-number
+                    v-model="campaignForm.max_sends_per_account_per_day"
+                    :min="0"
+                  />
+                </el-form-item>
+                <el-form-item label="开始时间">
+                  <el-date-picker
+                    v-model="campaignForm.start_at"
+                    type="datetime"
+                    value-format="YYYY-MM-DDTHH:mm:ss"
+                    placeholder="立即生效"
+                  />
+                </el-form-item>
+                <el-form-item label="结束时间">
+                  <el-date-picker
+                    v-model="campaignForm.end_at"
+                    type="datetime"
+                    value-format="YYYY-MM-DDTHH:mm:ss"
+                    placeholder="长期有效"
+                  />
+                </el-form-item>
+              </div>
+            </el-form>
+            <template #footer>
+              <el-button @click="campaignDrawerVisible = false">取消</el-button>
+              <el-button
+                type="primary"
+                :loading="savingCampaign"
+                @click="saveCampaign"
+              >
+                {{ editingCampaignId ? "保存计划" : "创建计划" }}
+              </el-button>
+            </template>
+          </el-drawer>
+
+          <el-drawer
+            v-model="creativeDrawerVisible"
+            :title="editingCreativeId ? '编辑广告素材' : '新建广告素材'"
+            size="min(560px, 100vw)"
+            class="ad-form-drawer"
+            destroy-on-close
+          >
+            <el-form label-position="top" class="ad-drawer-form">
+              <div class="drawer-form-grid">
+                <el-form-item label="素材名称" required>
+                  <el-input v-model="creativeForm.name" />
+                </el-form-item>
+                <el-form-item label="素材类型">
+                  <el-select v-model="creativeForm.creative_type">
+                    <el-option label="文本" value="text" />
+                    <el-option label="图片" value="image" />
+                    <el-option label="图文" value="mixed" />
+                  </el-select>
+                </el-form-item>
+              </div>
+              <el-form-item label="广告文案" required>
+                <el-input
+                  v-model="creativeForm.content"
+                  type="textarea"
+                  :rows="10"
+                  maxlength="4096"
+                  show-word-limit
+                />
+              </el-form-item>
+              <el-form-item label="媒体地址">
+                <el-input
+                  v-model="creativeForm.media_url"
+                  placeholder="图片 URL 或 Telegram file_id"
+                />
+              </el-form-item>
+              <el-form-item label="跳转链接">
+                <el-input v-model="creativeForm.link_url" />
+              </el-form-item>
+              <div class="drawer-form-grid">
+                <el-form-item label="轮换权重">
+                  <el-input-number
+                    v-model="creativeForm.weight"
+                    :min="0"
+                    :max="10000"
+                  />
+                </el-form-item>
+                <el-form-item label="启用素材">
+                  <el-switch v-model="creativeForm.enabled" />
+                </el-form-item>
+              </div>
+            </el-form>
+            <template #footer>
+              <el-button @click="creativeDrawerVisible = false">取消</el-button>
+              <el-button
+                type="primary"
+                :loading="savingCreative"
+                @click="saveCreative"
+              >
+                {{ editingCreativeId ? "保存素材" : "创建素材" }}
+              </el-button>
+            </template>
+          </el-drawer>
+
+          <el-drawer
+            v-model="bindingDrawerVisible"
+            title="配置账号与素材池"
+            size="min(620px, 100vw)"
+            class="ad-form-drawer"
+            destroy-on-close
+          >
+            <el-form label-position="top" class="ad-drawer-form">
+              <el-form-item label="广告计划" required>
+                <el-select
+                  v-model="bindingForm.ad_campaign_id"
+                  filterable
+                  @change="bindingForm.creative_ids = []"
+                >
+                  <el-option
+                    v-for="campaign in campaigns"
+                    :key="campaign.id"
+                    :label="campaign.name"
+                    :value="campaign.id"
+                  >
+                    <div class="rich-option">
+                      <span>{{ campaign.name }}</span>
+                      <small
+                        >{{ sendModeText(campaign.send_mode) }} ·
+                        {{ campaignFrequencyText(campaign) }}</small
+                      >
+                    </div>
+                  </el-option>
                 </el-select>
               </el-form-item>
-              <el-form-item label="开始时间">
-                <el-date-picker
-                  v-model="campaignForm.start_at"
-                  type="datetime"
-                  placeholder="可选"
-                  value-format="YYYY-MM-DDTHH:mm:ss"
-                />
-              </el-form-item>
-              <el-form-item label="结束时间">
-                <el-date-picker
-                  v-model="campaignForm.end_at"
-                  type="datetime"
-                  placeholder="可选"
-                  value-format="YYYY-MM-DDTHH:mm:ss"
-                />
-              </el-form-item>
-              <el-form-item v-if="campaignForm.send_mode === 'after_join'" label="入群等待(分)">
-                <el-input-number v-model="campaignForm.min_wait_after_join_minutes" :min="0" />
-              </el-form-item>
-              <el-form-item v-if="campaignForm.send_mode === 'interval'" label="每群发送间隔(分)">
-                <el-input-number v-model="campaignForm.interval_minutes" :min="1" />
-              </el-form-item>
-              <el-form-item v-if="campaignForm.send_mode === 'scheduled'" label="每日时点">
-                <el-input v-model="scheduledTimesText" placeholder="例如 09:00,14:30,21:00" />
-              </el-form-item>
-              <el-form-item label="单群每日上限">
-                <el-input-number v-model="campaignForm.max_sends_per_group_per_day" :min="0" />
-              </el-form-item>
-              <el-form-item label="单号每日上限">
-                <el-input-number v-model="campaignForm.max_sends_per_account_per_day" :min="0" />
-              </el-form-item>
-              <el-form-item label="状态"><el-input v-model="campaignForm.status" /></el-form-item>
-              <el-form-item label="启用"><el-switch v-model="campaignForm.enabled" /></el-form-item>
-              <el-button type="primary" :loading="savingCampaign" @click="saveCampaign">
-                <el-icon><Plus v-if="!editingCampaignId" /><Edit v-else /></el-icon>
-                {{ editingCampaignId ? '保存计划' : '创建计划' }}
-              </el-button>
-            </el-form>
-
-            <el-table :data="campaigns" class="campaign-table" size="small" max-height="320">
-              <el-table-column prop="name" label="计划" min-width="150" show-overflow-tooltip />
-              <el-table-column label="运行" width="90">
-                <template #default="{ row }">
-                  <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '已启动' : '已停止' }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="模式" width="90">
-                <template #default="{ row }">{{ sendModeText(row.send_mode) }}</template>
-              </el-table-column>
-              <el-table-column label="目标群" min-width="220" show-overflow-tooltip>
-                <template #default="{ row }">
-                  {{ campaignTargetLabel(row) }}
-                </template>
-              </el-table-column>
-              <el-table-column label="频率" min-width="150">
-                <template #default="{ row }">
-                  <span v-if="row.send_mode === 'after_join'">入群 {{ row.min_wait_after_join_minutes }} 分后</span>
-                  <span v-else-if="row.send_mode === 'interval'">每 {{ row.interval_minutes }} 分钟</span>
-                  <span v-else>{{ row.scheduled_times?.join(', ') || '-' }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column prop="max_sends_per_account_per_day" label="单号/日" width="90" />
-              <el-table-column label="操作" width="220" fixed="right">
-                <template #default="{ row }">
-                  <el-button link :type="row.enabled ? 'warning' : 'success'" size="small" @click="toggleCampaign(row)">
-                    <el-icon><VideoPause v-if="row.enabled" /><VideoPlay v-else /></el-icon>
-                    {{ row.enabled ? '停止' : '启动' }}
-                  </el-button>
-                  <el-button link type="primary" size="small" @click="editCampaign(row)">
-                    <el-icon><Edit /></el-icon>
-                    编辑
-                  </el-button>
-                  <el-button link type="danger" size="small" @click="deleteCampaign(row)">
-                    <el-icon><Delete /></el-icon>
-                    删除
-                  </el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
-
-          <el-card shadow="never">
-            <template #header>账号绑定</template>
-            <el-form label-width="88px">
-              <el-form-item label="投放账号">
+              <el-form-item label="投放账号" required>
                 <el-select
                   v-model="bindingForm.account_ids"
                   multiple
@@ -2265,107 +3730,152 @@ onMounted(refreshPage)
                   collapse-tags
                   collapse-tags-tooltip
                   clearable
-                  placeholder="选择投放账号"
+                  placeholder="选择一个或多个可用账号"
                 >
                   <el-option
-                    v-for="item in adBindingAccounts"
-                    :key="item.id"
-                    :label="accountLabel(item.id)"
-                    :value="item.id"
-                  />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="计划">
-                <el-select v-model="bindingForm.ad_campaign_id" @change="bindingForm.creative_ids = []">
-                  <el-option v-for="item in campaigns" :key="item.id" :label="item.name" :value="item.id" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="素材池">
-                <el-select v-model="bindingForm.creative_ids" multiple filterable collapse-tags collapse-tags-tooltip clearable>
-                  <el-option v-for="item in creatives" :key="item.id" :label="item.name" :value="item.id" />
-                </el-select>
-              </el-form-item>
-              <el-form-item label="池状态">
-                <div class="inline-tags">
-                  <el-tag type="info">素材总数 {{ creativePoolCount }}</el-tag>
-                  <el-tag v-if="creativePoolStatus" type="success">
-                    {{ creativePoolStatus.account_count }} 个账号 / 最小池 {{ creativePoolStatus.pool_size }} / 新增
-                    {{ creativePoolStatus.created_count }}
-                  </el-tag>
-                  <el-tag v-else type="warning">未补齐</el-tag>
-                </div>
-              </el-form-item>
-              <el-form-item label="已选素材">
-                <div class="inline-tags">
-                  <el-popover
-                    v-for="item in selectedBindingCreatives"
-                    :key="item.id"
-                    placement="top-start"
-                    width="460"
-                    trigger="click"
+                    v-for="account in adBindingAccounts"
+                    :key="account.id"
+                    :label="accountLabel(account.id)"
+                    :value="account.id"
                   >
-                    <template #reference>
-                      <el-tag type="success" class="clickable-tag">{{ item.name }}</el-tag>
-                    </template>
-                    <pre class="creative-full-text">{{ item.content }}</pre>
-                  </el-popover>
-                  <span v-if="!selectedBindingCreatives.length">-</span>
-                </div>
+                    <div class="rich-option">
+                      <span>{{ accountLabel(account.id) }}</span>
+                      <small
+                        >{{ accountStatusText(account.status) }} · ID
+                        {{ account.id }}</small
+                      >
+                    </div>
+                  </el-option>
+                </el-select>
               </el-form-item>
-              <el-form-item label="启用"><el-switch v-model="bindingForm.enabled" /></el-form-item>
-              <el-form-item label="优先级"><el-input-number v-model="bindingForm.priority" /></el-form-item>
-              <el-space>
-                <el-button
-                  @click="ensureCreativePool"
-                  :disabled="!bindingForm.account_ids.length || !bindingForm.ad_campaign_id"
+              <el-form-item label="素材池" required>
+                <el-select
+                  v-model="bindingForm.creative_ids"
+                  multiple
+                  filterable
+                  collapse-tags
+                  collapse-tags-tooltip
+                  clearable
+                  placeholder="选择用于轮换发送的素材"
                 >
-                  <el-icon><Select /></el-icon>
-                  自动补齐素材池
+                  <el-option
+                    v-for="creative in creatives"
+                    :key="creative.id"
+                    :label="creative.name"
+                    :value="creative.id"
+                    :disabled="!creative.enabled"
+                  >
+                    <div class="rich-option">
+                      <span>{{ creative.name }}</span>
+                      <small
+                        >{{ creative.creative_type }} · 权重
+                        {{ creative.weight }} ·
+                        {{ creativePreview(creative.content, 36) }}</small
+                      >
+                    </div>
+                  </el-option>
+                </el-select>
+              </el-form-item>
+              <div class="binding-pool-summary">
+                <div>
+                  <span>所选账号</span
+                  ><strong>{{ bindingForm.account_ids.length }}</strong>
+                </div>
+                <div>
+                  <span>所选素材</span
+                  ><strong>{{ bindingForm.creative_ids.length }}</strong>
+                </div>
+                <div>
+                  <span>将创建绑定</span
+                  ><strong>{{
+                    bindingForm.account_ids.length *
+                    bindingForm.creative_ids.length
+                  }}</strong>
+                </div>
+              </div>
+              <div
+                v-if="selectedBindingCreatives.length"
+                class="selected-creative-list"
+              >
+                <div
+                  v-for="creative in selectedBindingCreatives"
+                  :key="creative.id"
+                >
+                  <strong>{{ creative.name }}</strong>
+                  <span>{{ creativePreview(creative.content, 88) }}</span>
+                </div>
+              </div>
+              <div class="drawer-form-grid">
+                <el-form-item label="优先级">
+                  <el-input-number
+                    v-model="bindingForm.priority"
+                    :min="0"
+                    :max="10000"
+                  />
+                </el-form-item>
+                <el-form-item label="立即启用">
+                  <el-switch v-model="bindingForm.enabled" />
+                </el-form-item>
+              </div>
+              <div class="drawer-secondary-action">
+                <el-button
+                  :disabled="
+                    !bindingForm.account_ids.length ||
+                    !bindingForm.ad_campaign_id
+                  "
+                  @click="ensureCreativePool"
+                >
+                  自动补齐每个账号的素材池
                 </el-button>
-                <el-button type="primary" @click="createBinding">
-                  <el-icon><Plus /></el-icon>
-                  批量创建绑定
-                </el-button>
-              </el-space>
+                <span v-if="creativePoolStatus">
+                  已检查 {{ creativePoolStatus.account_count }} 个账号，新建
+                  {{ creativePoolStatus.created_count }} 条素材
+                </span>
+              </div>
             </el-form>
+            <template #footer>
+              <el-button @click="bindingDrawerVisible = false">取消</el-button>
+              <el-button type="primary" @click="createBinding"
+                >创建绑定</el-button
+              >
+            </template>
+          </el-drawer>
 
-            <el-table :data="bindings" class="binding-table" size="small" max-height="280">
-              <el-table-column label="账号" min-width="140">
-                <template #default="{ row }">{{ accountLabel(row.account_id) }}</template>
-              </el-table-column>
-              <el-table-column label="计划" min-width="140">
-                <template #default="{ row }">{{ campaigns.find((item) => item.id === row.ad_campaign_id)?.name || row.ad_campaign_id }}</template>
-              </el-table-column>
-              <el-table-column label="素材" min-width="200">
-                <template #default="{ row }">
-                  <el-popover v-if="creativeById(row.creative_id)?.content" placement="top-start" width="460" trigger="click">
-                    <template #reference>
-                      <el-button link type="primary">{{ creativeById(row.creative_id)?.name || row.creative_id }}</el-button>
-                    </template>
-                    <pre class="creative-full-text">{{ creativeById(row.creative_id)?.content }}</pre>
-                  </el-popover>
-                  <span v-else>{{ creativeById(row.creative_id)?.name || row.creative_id || '-' }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column prop="priority" label="优先级" width="90" />
-              <el-table-column label="启用" width="80">
-                <template #default="{ row }">
-                  <el-tag :type="row.enabled ? 'success' : 'info'">{{ row.enabled ? '是' : '否' }}</el-tag>
-                </template>
-              </el-table-column>
-              <el-table-column label="操作" width="150" fixed="right">
-                <template #default="{ row }">
-                  <el-button link :type="row.enabled ? 'warning' : 'success'" size="small" @click="toggleBinding(row)">
-                    {{ row.enabled ? '停用' : '启用' }}
-                  </el-button>
-                  <el-button link type="danger" size="small" @click="deleteBinding(row)">
-                    <el-icon><Delete /></el-icon>
-                    删除
-                  </el-button>
-                </template>
-              </el-table-column>
-            </el-table>
-          </el-card>
+          <el-dialog
+            v-model="adRunDialogVisible"
+            title="手动执行广告投放"
+            width="min(480px, 94vw)"
+          >
+            <el-form label-position="top">
+              <el-form-item label="本次最大发送数">
+                <el-input-number
+                  v-model="adRunForm.max_deliveries"
+                  :min="1"
+                  :max="10000"
+                />
+              </el-form-item>
+              <el-form-item label="执行模式">
+                <el-segmented
+                  v-model="adRunForm.dry_run"
+                  :options="[
+                    { label: '仅预演', value: true },
+                    { label: '实际发送', value: false },
+                  ]"
+                />
+              </el-form-item>
+            </el-form>
+            <template #footer>
+              <el-button @click="adRunDialogVisible = false">取消</el-button>
+              <el-button
+                type="primary"
+                :loading="running === 'ads'"
+                @click="runAds"
+              >
+                <el-icon><VideoPlay /></el-icon>
+                {{ adRunForm.dry_run ? "执行预演" : "确认发送" }}
+              </el-button>
+            </template>
+          </el-dialog>
         </div>
       </el-tab-pane>
 
@@ -2837,6 +4347,1043 @@ onMounted(refreshPage)
 
   .pagination-bar {
     justify-content: flex-start;
+  }
+}
+.ad-workbench {
+  min-width: 0;
+  color: #1f2937;
+}
+
+.ad-command-deck {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 292px;
+  margin-top: 12px;
+  overflow: hidden;
+  color: #f8fafc;
+  background: #171a1e;
+  border: 1px solid #2d3339;
+  border-radius: 8px;
+}
+
+.ad-command-main {
+  min-width: 0;
+  padding: 24px;
+}
+
+.ad-command-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.ad-command-title {
+  min-width: 0;
+
+  h3 {
+    margin: 8px 0 0;
+    color: #fff;
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+
+  p {
+    margin: 8px 0 0;
+    color: #aab2ba;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+}
+
+.ad-command-kicker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9ba4ad;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.ad-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #69737d;
+}
+
+.ad-status-dot.is-live {
+  background: #51cf66;
+  box-shadow: 0 0 0 4px rgb(81 207 102 / 12%);
+}
+
+.ad-status-dot.is-off {
+  background: #ff8787;
+}
+
+.ad-command-deck .ad-header-actions {
+  :deep(.el-button) {
+    color: #dbe2e8;
+    background: transparent;
+    border-color: #46505a;
+  }
+
+  :deep(.el-button:hover) {
+    color: #fff;
+    border-color: #8b99a6;
+  }
+
+  :deep(.el-button--primary) {
+    color: #101315;
+    background: #69db7c;
+    border-color: #69db7c;
+  }
+}
+
+.ad-flow-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 28px;
+  padding-top: 18px;
+  border-top: 1px solid #2d3339;
+}
+
+.ad-flow-step {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px;
+  color: #b9c2ca;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease;
+
+  &:hover,
+  &.active {
+    color: #f8fafc;
+    background: #22282e;
+    border-color: #3e4851;
+  }
+
+  small,
+  strong,
+  em {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    color: #89939d;
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  strong {
+    margin-top: 4px;
+    color: #f8fafc;
+    font-size: 13px;
+  }
+
+  em {
+    margin-top: 3px;
+    color: #89939d;
+    font-size: 11px;
+    font-style: normal;
+  }
+}
+
+.flow-step-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 6px;
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+}
+
+.flow-blue {
+  color: #74c0fc;
+  background: #1b3a54;
+}
+
+.flow-green {
+  color: #8ce99a;
+  background: #23452d;
+}
+
+.flow-amber {
+  color: #ffd43b;
+  background: #4b3d1b;
+}
+
+.flow-violet {
+  color: #d0bfff;
+  background: #3b3152;
+}
+
+.ad-readiness-panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 22px 20px;
+  color: #25313a;
+  background: #f8fafc;
+  border-left: 1px solid #2d3339;
+}
+
+.ad-readiness-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+
+  span {
+    color: #66727d;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  strong {
+    color: #1f2933;
+    font-size: 26px;
+    line-height: 1;
+  }
+}
+
+.ad-readiness-track {
+  height: 6px;
+  margin: 14px 0 18px;
+  overflow: hidden;
+  background: #e2e8ee;
+  border-radius: 99px;
+
+  span {
+    display: block;
+    height: 100%;
+    background: #37b24d;
+    border-radius: inherit;
+    transition: width 0.2s ease;
+  }
+}
+
+.ad-readiness-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    color: #89939d;
+    font-size: 12px;
+  }
+
+  li.ready {
+    color: #2f9e44;
+  }
+
+  b {
+    color: #25313a;
+    font-size: 13px;
+  }
+}
+
+.ad-readiness-footnote {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 18px;
+  color: #89939d;
+  font-size: 11px;
+  line-height: 1.4;
+  border-top: 1px solid #e2e8ee;
+}
+
+.ad-status-ribbon {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 1px;
+  margin-top: 12px;
+  overflow: hidden;
+  background: #dce2e7;
+  border: 1px solid #dce2e7;
+  border-radius: 6px;
+
+  > div {
+    min-width: 0;
+    padding: 12px 14px;
+    background: #fff;
+  }
+
+  span,
+  strong,
+  small {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: #75808a;
+    font-size: 11px;
+  }
+
+  strong {
+    margin-top: 4px;
+    color: #1f2933;
+    font-size: 17px;
+  }
+
+  small {
+    margin-top: 3px;
+    color: #9aa4ad;
+    font-size: 11px;
+  }
+}
+
+.group-policy-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  margin: -2px 0 12px;
+  padding: 9px 12px;
+  color: #6b7680;
+  font-size: 12px;
+  background: #f7f9fb;
+  border: 1px solid #e1e6eb;
+  border-radius: 6px;
+
+  span,
+  strong {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  strong {
+    margin-left: auto;
+    color: #1f2933;
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+.ad-workbench-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 4px 0 18px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.ad-workbench-heading {
+  min-width: 0;
+
+  h3 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0;
+  }
+
+  p {
+    margin: 6px 0 0;
+    color: #6b7280;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+}
+
+.ad-title-line,
+.ad-header-actions,
+.ad-toolbar-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.ad-header-actions {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
+}
+
+.ad-metrics-band {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  margin-top: 16px;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}
+
+.ad-metric-item {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  min-height: 104px;
+  padding: 16px;
+  border-right: 1px solid #e5e7eb;
+
+  &:last-child {
+    border-right: 0;
+  }
+
+  span,
+  small {
+    display: block;
+  }
+
+  span {
+    color: #6b7280;
+    font-size: 12px;
+  }
+
+  strong {
+    display: block;
+    margin: 3px 0;
+    color: #111827;
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.2;
+    overflow-wrap: anywhere;
+  }
+
+  small {
+    overflow: hidden;
+    color: #9ca3af;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.ad-metric-icon {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 6px;
+
+  svg {
+    width: 19px;
+    height: 19px;
+  }
+}
+
+.metric-green {
+  color: #087f5b;
+  background: #e6fcf5;
+}
+
+.metric-blue {
+  color: #1864ab;
+  background: #e7f5ff;
+}
+
+.metric-cyan {
+  color: #0b7285;
+  background: #e3fafc;
+}
+
+.metric-amber {
+  color: #a15c00;
+  background: #fff4e6;
+}
+
+.ad-alert-band {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  color: #8a4b08;
+  font-size: 13px;
+  line-height: 1.5;
+  background: #fff8e6;
+  border: 1px solid #f1d29a;
+  border-radius: 6px;
+
+  span {
+    min-width: 0;
+  }
+
+  .el-button {
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+}
+
+.ad-policy-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 1px;
+  margin-top: 12px;
+  overflow: hidden;
+  background: #e5e7eb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+
+  > div {
+    min-width: 0;
+    padding: 10px 12px;
+    background: #f8fafc;
+  }
+
+  span,
+  strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: #6b7280;
+    font-size: 11px;
+  }
+
+  strong {
+    margin-top: 3px;
+    color: #374151;
+    font-size: 13px;
+  }
+}
+
+.ad-workspace-tabs {
+  margin-top: 18px;
+
+  :deep(> .el-tabs__header) {
+    margin-bottom: 0;
+  }
+
+  :deep(> .el-tabs__content) {
+    overflow: visible;
+  }
+}
+
+.ad-tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  b {
+    min-width: 20px;
+    padding: 1px 6px;
+    color: #6b7280;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 18px;
+    text-align: center;
+    background: #f1f3f5;
+    border-radius: 10px;
+  }
+}
+
+.ad-data-section {
+  min-width: 0;
+  padding-top: 16px;
+}
+
+.ad-section-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+
+  h4 {
+    margin: 0;
+    color: #111827;
+    font-size: 15px;
+    font-weight: 700;
+  }
+
+  p {
+    margin: 4px 0 0;
+    color: #6b7280;
+    font-size: 12px;
+    line-height: 1.5;
+  }
+}
+
+.ad-toolbar-controls {
+  flex: 0 1 auto;
+  justify-content: flex-end;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
+}
+
+.ad-search-control {
+  width: 220px;
+}
+
+.ad-filter-control {
+  width: 180px;
+}
+
+.ad-status-control {
+  width: 130px;
+}
+
+.ad-primary-table {
+  width: 100%;
+  border-top: 1px solid #e5e7eb;
+
+  :deep(th.el-table__cell) {
+    height: 42px;
+    color: #6b7280;
+    font-size: 12px;
+    font-weight: 600;
+    background: #f8fafc;
+  }
+
+  :deep(td.el-table__cell) {
+    padding: 10px 0;
+  }
+
+  :deep(.el-table__expanded-cell) {
+    padding: 0 !important;
+    background: #f8fafc;
+  }
+}
+
+.primary-cell {
+  min-width: 0;
+
+  strong,
+  small {
+    display: block;
+  }
+
+  strong {
+    overflow: hidden;
+    color: #1f2937;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    margin-top: 3px;
+    overflow: hidden;
+    color: #9ca3af;
+    font-size: 11px;
+    line-height: 1.4;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.table-subline {
+  display: block;
+  margin-top: 3px;
+  color: #9ca3af;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.campaign-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  background: #e5e7eb;
+}
+
+.campaign-detail-block {
+  min-width: 0;
+  min-height: 96px;
+  padding: 14px 18px;
+  background: #f8fafc;
+
+  strong,
+  small {
+    display: block;
+  }
+
+  strong {
+    color: #374151;
+    font-size: 13px;
+  }
+
+  small {
+    margin-top: 6px;
+    color: #6b7280;
+    font-size: 11px;
+  }
+}
+
+.detail-label {
+  display: block;
+  margin-bottom: 8px;
+  color: #9ca3af;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.detail-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+
+  :deep(.el-tag) {
+    max-width: 100%;
+  }
+}
+
+.compact-tags {
+  max-height: 58px;
+  overflow: hidden;
+}
+
+.text-warning {
+  color: #a15c00 !important;
+}
+
+.binding-detail-list {
+  padding: 8px 18px;
+}
+
+.binding-detail-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) 72px 90px auto auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 48px;
+  padding: 6px 0;
+  border-bottom: 1px solid #e5e7eb;
+
+  &:last-child {
+    border-bottom: 0;
+  }
+
+  strong,
+  small {
+    display: block;
+  }
+
+  small {
+    margin-top: 2px;
+    overflow: hidden;
+    color: #6b7280;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.ad-drawer-form {
+  padding: 0 2px 20px;
+
+  :deep(.el-select),
+  :deep(.el-date-editor.el-input),
+  :deep(.el-date-editor.el-input__wrapper) {
+    width: 100%;
+  }
+}
+
+.drawer-section-title {
+  margin: 8px 0 14px;
+  padding-bottom: 8px;
+  color: #374151;
+  font-size: 13px;
+  font-weight: 700;
+  border-bottom: 1px solid #e5e7eb;
+
+  &:not(:first-child) {
+    margin-top: 24px;
+  }
+}
+
+.drawer-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 16px;
+}
+
+.input-suffix {
+  margin-left: 8px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.selected-target-summary {
+  padding: 9px 11px;
+  color: #0b7285;
+  font-size: 12px;
+  background: #e3fafc;
+  border: 1px solid #bee3e8;
+  border-radius: 6px;
+}
+
+.rich-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  width: 100%;
+
+  span,
+  small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    min-width: 0;
+  }
+
+  small {
+    flex: 0 1 auto;
+    color: #9ca3af;
+    font-size: 11px;
+    text-align: right;
+  }
+}
+
+.binding-pool-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 6px 0 16px;
+  overflow: hidden;
+  background: #dfe3e8;
+  border: 1px solid #dfe3e8;
+  border-radius: 6px;
+
+  > div {
+    padding: 12px;
+    background: #f8fafc;
+  }
+
+  span,
+  strong {
+    display: block;
+    text-align: center;
+  }
+
+  span {
+    color: #6b7280;
+    font-size: 11px;
+  }
+
+  strong {
+    margin-top: 4px;
+    color: #111827;
+    font-size: 18px;
+  }
+}
+
+.selected-creative-list {
+  margin-bottom: 16px;
+  border-top: 1px solid #e5e7eb;
+
+  > div {
+    display: grid;
+    grid-template-columns: 140px minmax(0, 1fr);
+    gap: 12px;
+    padding: 9px 0;
+    border-bottom: 1px solid #e5e7eb;
+  }
+
+  strong,
+  span {
+    overflow: hidden;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    color: #6b7280;
+  }
+}
+
+.drawer-secondary-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid #e5e7eb;
+
+  span {
+    color: #087f5b;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 1200px) {
+  .ad-command-deck {
+    grid-template-columns: 1fr;
+  }
+
+  .ad-readiness-panel {
+    border-top: 1px solid #2d3339;
+    border-left: 0;
+  }
+}
+@media (max-width: 1500px) {
+  .ad-metrics-band {
+    grid-template-columns: repeat(3, minmax(160px, 1fr));
+  }
+
+  .ad-metric-item:nth-child(3) {
+    border-right: 0;
+  }
+
+  .ad-metric-item:nth-child(n + 4) {
+    border-top: 1px solid #e5e7eb;
+  }
+}
+
+@media (max-width: 1100px) {
+  .ad-command-topline,
+  .ad-workbench-header,
+  .ad-section-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .ad-header-actions,
+  .ad-toolbar-controls {
+    justify-content: flex-start;
+  }
+
+  .ad-policy-strip {
+    grid-template-columns: repeat(3, minmax(120px, 1fr));
+  }
+
+  .ad-flow-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .ad-header-actions .el-button {
+    flex: 1 1 calc(50% - 8px);
+    margin: 0;
+  }
+
+  .ad-metrics-band {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ad-metric-item,
+  .ad-metric-item:nth-child(3) {
+    border-right: 1px solid #e5e7eb;
+  }
+
+  .ad-metric-item:nth-child(even) {
+    border-right: 0;
+  }
+
+  .ad-metric-item:nth-child(n + 3) {
+    border-top: 1px solid #e5e7eb;
+  }
+
+  .ad-command-main,  .ad-readiness-panel,  .ad-flow-grid,  .ad-policy-strip,
+  .campaign-detail-grid,
+  .drawer-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ad-toolbar-controls,
+  .ad-search-control,
+  .ad-filter-control,
+  .ad-status-control {
+    width: 100%;
+  }
+
+  .ad-toolbar-controls > * {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .binding-detail-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .binding-pool-summary {
+    grid-template-columns: repeat(3, minmax(80px, 1fr));
+  }
+
+  .rich-option small {
+    display: none;
+  }
+}
+
+@media (max-width: 480px) {
+  .ad-metrics-band {
+    grid-template-columns: 1fr;
+  }
+
+  .ad-metric-item,
+  .ad-metric-item:nth-child(3) {
+    min-height: 88px;
+    border-right: 0;
+    border-top: 1px solid #e5e7eb;
+  }
+
+  .ad-metric-item:first-child {
+    border-top: 0;
+  }
+
+  .ad-alert-band {
+    align-items: flex-start;
+    flex-wrap: wrap;
+
+    .el-button {
+      margin-left: 22px;
+    }
+  }
+
+  .binding-pool-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .selected-creative-list > div {
+    grid-template-columns: 1fr;
+    gap: 3px;
   }
 }
 </style>

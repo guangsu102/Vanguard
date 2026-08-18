@@ -1395,6 +1395,35 @@ def audit_group_ad_policies_task(limit: int = 5, dry_run: bool = False):
         return {"error": str(exc)}
 
 
+@celery_app.task
+def auto_probe_unknown_group_ad_policies_task(
+    limit: Optional[int] = None,
+    dry_run: bool = False,
+):
+    logger.info(
+        "auto_probe_unknown_group_ad_policies_task",
+        task="auto_probe_unknown_group_ad_policies_task",
+        limit=limit,
+    )
+    try:
+        from app.modules.acquisition.automation import run_auto_group_ad_policy_probe_with_db
+
+        result = _run_async(
+            run_auto_group_ad_policy_probe_with_db(limit=limit, dry_run=dry_run)
+        )
+        logger.info(
+            "auto_probe_unknown_group_ad_policies_completed",
+            processed=result.get("processed", 0),
+            succeeded=result.get("succeeded", 0),
+            skipped=result.get("skipped", 0),
+            failed=result.get("failed", 0),
+        )
+        return result
+    except Exception as exc:
+        logger.error("auto_probe_unknown_group_ad_policies_failed", error=str(exc))
+        return {"error": str(exc)}
+
+
 # =============================================================================
 # Second-level Precision Tasks
 # =============================================================================

@@ -561,6 +561,7 @@ class TestAutoJoinAudit:
         await test_db.commit()
 
         service = AcquisitionAutomationService(db=test_db)
+        service._leave_group = AsyncMock(return_value=None)
         audit = acquisition_automation.JoinedGroupAuditResult(
             passed=True,
             ad_allowed=False,
@@ -580,10 +581,15 @@ class TestAutoJoinAudit:
         ).scalar_one()
 
         assert group.status == "ad_blocked"
+        service._leave_group.assert_awaited_once()
+        assert service._leave_group.await_args.args[0] == account.id
+        assert service._leave_group.await_args.args[1].group_id == group.group_id
+        assert membership.status == "left"
+        assert membership.left_at is not None
         assert membership.warmup_status == "blocked"
         assert membership.probe_status == "skipped"
         assert membership.ad_status == "blocked"
-        assert "group_rules_ad_blocked" in (membership.note or "")
+        assert "group_rules_ad_blocked_and_left" in (membership.note or "")
         assert profile.ad_tier == GroupAdTier.BLOCKED.value
         assert profile.daily_capacity == 0
 
