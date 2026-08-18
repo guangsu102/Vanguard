@@ -154,7 +154,7 @@ const defaultRiskActions = (): AccountRiskGuardSettings['actions'] => ({
   join: { daily_limit: 6, cooldown_seconds: 7200 },
   private_message: { daily_limit: 20, cooldown_seconds: 300 },
   group_message: { daily_limit: 4, cooldown_seconds: 7200 },
-  ad_probe: { daily_limit: 1, cooldown_seconds: 86400 },
+  ad_probe: { daily_limit: 10, cooldown_seconds: 3600 },
   ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
   moderation: { daily_limit: 60, cooldown_seconds: 15 },
   ad_delivery: { daily_limit: 5, cooldown_seconds: 9000 },
@@ -418,6 +418,7 @@ const adCapacityForm = reactive<AdCapacitySettings>({
   ad_policy_ai_require_second_pass: true,
   ad_policy_auto_probe_enabled: false,
   ad_policy_auto_probe_daily_limit: 1,
+  ad_policy_auto_probe_daily_limit_per_account: 10,
   ad_policy_auto_probe_interval_hours: 24,
   ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30,
@@ -1705,8 +1706,8 @@ onMounted(() => {
               <el-form-item label="未知群自动检测">
                 <el-switch v-model="adCapacityForm.ad_policy_auto_probe_enabled" />
               </el-form-item>
-              <el-form-item label="自动检测每日上限">
-                <el-input-number v-model="adCapacityForm.ad_policy_auto_probe_daily_limit" :min="0" :max="20" />
+              <el-form-item label="每账号检测每日上限">
+                <el-input-number v-model="adCapacityForm.ad_policy_auto_probe_daily_limit_per_account" :min="0" :max="20" />
               </el-form-item>
               <el-form-item label="重复检测间隔小时">
                 <el-input-number v-model="adCapacityForm.ad_policy_auto_probe_interval_hours" :min="1" :max="168" />

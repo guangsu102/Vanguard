@@ -814,7 +814,7 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
     action_hard_limits = {
         "join": 6,
         "group_message": 4,
-        "ad_probe": 1,
+        "ad_probe": 10,
         "ai_warmup": 1,
         "ad_delivery": 5,
         "channel_create": 1,
@@ -822,7 +822,7 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
     action_min_cooldowns = {
         "join": 7200,
         "group_message": 7200,
-        "ad_probe": 86400,
+        "ad_probe": 3600,
         "ai_warmup": 21600,
         "ad_delivery": 9000,
         "channel_create": 86400,
@@ -1630,6 +1630,21 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
                 raw.get("adPolicyAutoProbeDailyLimit", defaults["ad_policy_auto_probe_daily_limit"]),
             ),
             defaults["ad_policy_auto_probe_daily_limit"],
+            min_value=0,
+            max_value=20,
+        ),
+        "ad_policy_auto_probe_daily_limit_per_account": _int_setting(
+            raw.get(
+                "ad_policy_auto_probe_daily_limit_per_account",
+                raw.get(
+                    "adPolicyAutoProbeDailyLimitPerAccount",
+                    raw.get(
+                        "ad_policy_auto_probe_daily_limit",
+                        raw.get("adPolicyAutoProbeDailyLimit", defaults["ad_policy_auto_probe_daily_limit_per_account"]),
+                    ),
+                ),
+            ),
+            defaults["ad_policy_auto_probe_daily_limit_per_account"],
             min_value=0,
             max_value=20,
         ),

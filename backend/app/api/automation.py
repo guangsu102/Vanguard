@@ -255,6 +255,7 @@ class AdCapacityUpdate(BaseModel):
     ad_policy_ai_require_second_pass: bool = True
     ad_policy_auto_probe_enabled: bool = False
     ad_policy_auto_probe_daily_limit: int = Field(default=1, ge=0, le=20)
+    ad_policy_auto_probe_daily_limit_per_account: int = Field(default=10, ge=0, le=20)
     ad_policy_auto_probe_interval_hours: int = Field(default=24, ge=1, le=168)
     ad_policy_auto_ttl_days: int = Field(default=7, ge=1, le=90)
     ad_policy_manual_ttl_days: int = Field(default=30, ge=1, le=365)
@@ -1105,6 +1106,7 @@ async def list_group_ad_policy_events(
         {
             "id": event.id,
             "group_id": event.group_id,
+            "account_id": event.account_id,
             "telegram_group_id": event.telegram_group_id,
             "previous_mode": event.previous_mode,
             "new_mode": event.new_mode,

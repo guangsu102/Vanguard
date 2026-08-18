@@ -30,6 +30,7 @@ DEFAULT_MIGRATIONS = [
     "027_add_qq_official.sql",
     "028_add_group_failover_tasks.sql",
     "029_add_account_operation_mode.sql",
+    "030_add_group_ad_policy_event_account.sql",
 ]
 
 

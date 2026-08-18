@@ -46,8 +46,8 @@ def test_normalize_account_risk_guard_settings_enforces_acquisition_hard_caps():
         "cooldown_seconds": 7200,
     }
     assert config["actions"]["ad_probe"] == {
-        "daily_limit": 1,
-        "cooldown_seconds": 86400,
+        "daily_limit": 10,
+        "cooldown_seconds": 3600,
     }
     assert config["actions"]["ai_warmup"] == {
         "daily_limit": 1,
@@ -77,6 +77,7 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["leave_on_deleted_ad"] is True
     assert config["ad_policy_auto_probe_enabled"] is False
     assert config["ad_policy_auto_probe_daily_limit"] == 1
+    assert config["ad_policy_auto_probe_daily_limit_per_account"] == 10
     assert config["ad_policy_auto_probe_interval_hours"] == 24
     assert config["warmup_days_before_ads"] == 15
     assert config["warmup_daily_interactions_min"] == 0
@@ -158,6 +159,7 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["warmup_days_before_ads"] == 20
     assert config["ad_policy_auto_probe_enabled"] is True
     assert config["ad_policy_auto_probe_daily_limit"] == 20
+    assert config["ad_policy_auto_probe_daily_limit_per_account"] == 20
     assert config["ad_policy_auto_probe_interval_hours"] == 1
     assert config["warmup_daily_interactions_min"] == 4
     assert config["warmup_daily_interactions_max"] == 9

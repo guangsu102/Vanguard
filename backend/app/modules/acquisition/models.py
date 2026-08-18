@@ -1104,6 +1104,9 @@ class GroupAdPolicyEvent(Base):
     group_id: Mapped[int] = mapped_column(
         ForeignKey("group.id", ondelete="CASCADE"), nullable=False
     )
+    account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"), nullable=True
+    )
     telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     previous_mode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     new_mode: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -1116,6 +1119,7 @@ class GroupAdPolicyEvent(Base):
 
     __table_args__ = (
         Index("idx_group_ad_policy_event_group", "group_id", "created_at"),
+        Index("idx_group_ad_policy_event_account", "account_id", "created_at"),
         Index("idx_group_ad_policy_event_mode", "new_mode", "created_at"),
     )
 

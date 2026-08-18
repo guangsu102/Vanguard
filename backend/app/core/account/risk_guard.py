@@ -75,7 +75,7 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.JOIN: RiskBudget(daily_limit=6, cooldown_seconds=7200),
     AccountRiskAction.PRIVATE_MESSAGE: RiskBudget(daily_limit=40, cooldown_seconds=45),
     AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=4, cooldown_seconds=7200),
-    AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
+    AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=10, cooldown_seconds=3600),
     AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=1, cooldown_seconds=21600),
     AccountRiskAction.MODERATION: RiskBudget(daily_limit=60, cooldown_seconds=15),
     AccountRiskAction.AD_DELIVERY: RiskBudget(daily_limit=5, cooldown_seconds=9000),

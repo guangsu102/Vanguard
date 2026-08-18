@@ -6099,6 +6099,7 @@ class AcquisitionAutomationService:
         self.db.add(
             GroupAdPolicyEvent(
                 group_id=group.id,
+                account_id=binding.account_id,
                 telegram_group_id=group.group_id,
                 previous_mode=previous_mode,
                 new_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
@@ -6167,6 +6168,7 @@ class AcquisitionAutomationService:
             self.db.add(
                 GroupAdPolicyEvent(
                     group_id=group.id,
+                    account_id=binding.account_id,
                     telegram_group_id=group.group_id,
                     previous_mode=previous_mode,
                     new_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
@@ -6188,6 +6190,7 @@ class AcquisitionAutomationService:
             }
         except Exception as exc:
             classified_error = self._classify_ad_delivery_error(exc)
+            group_control_rejection = self._is_group_control_ad_error(classified_error)
             if not telegram_send_completed:
                 await self._release_group_daily_delivery_slot(slot_key)
                 if delivery_log is not None:
@@ -6196,15 +6199,57 @@ class AcquisitionAutomationService:
                         DeliveryStatus.FAILED,
                         error=classified_error,
                     )
-                profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
-                profile.ad_tier = GroupAdTier.OBSERVING.value
+                profile.ad_policy_mode = (
+                    GroupAdPolicyMode.FORBIDDEN.value
+                    if group_control_rejection
+                    else GroupAdPolicyMode.UNKNOWN.value
+                )
+                profile.ad_policy_confidence = 100 if group_control_rejection else 0
+                profile.ad_policy_source = (
+                    "ad_policy_probe_group_control"
+                    if group_control_rejection
+                    else probe_source
+                )
+                profile.ad_policy_expires_at = None
+                profile.ad_tier = (
+                    GroupAdTier.BLOCKED.value
+                    if group_control_rejection
+                    else GroupAdTier.OBSERVING.value
+                )
                 profile.daily_capacity = 0
                 profile.ad_policy_probe_status = "failed"
+                if group_control_rejection:
+                    profile.blocked_at = _now()
+                    profile.blocked_reason = "unknown_group_probe_group_control"
             else:
                 profile.ad_policy_probe_status = "sent"
             profile.ad_policy_probe_error = classified_error[:1000]
             profile.updated_at = _now()
+            if group_control_rejection and not telegram_send_completed:
+                self.db.add(
+                    GroupAdPolicyEvent(
+                        group_id=group.id,
+                        account_id=binding.account_id,
+                        telegram_group_id=group.group_id,
+                        previous_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                        new_mode=GroupAdPolicyMode.FORBIDDEN.value,
+                        confidence=100,
+                        source=profile.ad_policy_source,
+                        reason=profile.blocked_reason,
+                        evidence=classified_error[:8000],
+                        changed_by_user_id=changed_by_user_id,
+                    )
+                )
             await self.db.commit()
+            if group_control_rejection and not telegram_send_completed:
+                await self._block_group_ads_and_leave(
+                    binding.account_id,
+                    group,
+                    reason="unknown_group_probe_group_control",
+                    error=classified_error,
+                    event="ad_policy_probe_group_control_leave",
+                )
+                await self._pause_account_if_group_control_looks_account_wide(binding.account_id)
             raise RuntimeError(classified_error) from exc
 
     async def _ad_warmup_skip_reason(
@@ -6520,26 +6565,17 @@ class AcquisitionAutomationService:
         if not capacity.get("ad_policy_auto_probe_enabled", False):
             return {**result.as_dict(), "reason": "ad_policy_auto_probe_disabled"}
 
-        configured_limit = int(capacity.get("ad_policy_auto_probe_daily_limit") or 0)
-        requested_limit = configured_limit if limit is None else min(int(limit), configured_limit)
-        if requested_limit <= 0:
-            return {**result.as_dict(), "reason": "ad_policy_auto_probe_daily_limit_zero"}
-
-        day_start = self._ad_operating_day_start(now, capacity)
-        attempted_today = int(
-            await self.db.scalar(
-                select(func.count(GroupAdPolicyEvent.id)).where(
-                    GroupAdPolicyEvent.source == AD_POLICY_PROBE_AUTO_SOURCE,
-                    GroupAdPolicyEvent.reason == AD_POLICY_PROBE_ATTEMPT_REASON,
-                    GroupAdPolicyEvent.created_at >= day_start,
-                )
+        per_account_limit = int(
+            capacity.get(
+                "ad_policy_auto_probe_daily_limit_per_account",
+                capacity.get("ad_policy_auto_probe_daily_limit", 0),
             )
             or 0
         )
-        remaining = max(0, requested_limit - attempted_today)
-        if remaining <= 0:
-            return {**result.as_dict(), "reason": "ad_policy_auto_probe_daily_limit_reached"}
+        if per_account_limit <= 0:
+            return {**result.as_dict(), "reason": "ad_policy_auto_probe_daily_limit_zero"}
 
+        day_start = self._ad_operating_day_start(now, capacity)
         interval_hours = max(1, int(capacity.get("ad_policy_auto_probe_interval_hours") or 24))
         probe_cutoff = now - timedelta(hours=interval_hours)
         rows = await self.db.execute(
@@ -6568,7 +6604,7 @@ class AcquisitionAutomationService:
                 ),
             )
             .order_by(GroupAdProfile.updated_at.asc(), GroupAdProfile.id.asc())
-            .limit(remaining * 4)
+            .limit(max(100, (int(limit) if limit is not None else per_account_limit) * 20))
         )
         candidates: list[tuple[GroupAdProfile, Group, GroupAccountMembership, TelegramAccount]] = []
         seen_group_ids: set[int] = set()
@@ -6582,10 +6618,47 @@ class AcquisitionAutomationService:
                 continue
             seen_group_ids.add(group.id)
             candidates.append((profile, group, membership, account))
-            if len(candidates) >= remaining:
-                break
 
+        account_ids = {membership.account_id for _, _, membership, _ in candidates}
+        attempted_by_account: dict[int, int] = {}
+        if account_ids:
+            attempted_rows = await self.db.execute(
+                select(GroupAdPolicyEvent.account_id, func.count(GroupAdPolicyEvent.id))
+                .where(
+                    GroupAdPolicyEvent.source == AD_POLICY_PROBE_AUTO_SOURCE,
+                    GroupAdPolicyEvent.reason == AD_POLICY_PROBE_ATTEMPT_REASON,
+                    GroupAdPolicyEvent.created_at >= day_start,
+                    GroupAdPolicyEvent.account_id.in_(account_ids),
+                )
+                .group_by(GroupAdPolicyEvent.account_id)
+            )
+            attempted_by_account = {
+                int(account_id): int(count)
+                for account_id, count in attempted_rows.all()
+                if account_id is not None
+            }
+        remaining_by_account = {
+            account_id: max(0, per_account_limit - attempted_by_account.get(account_id, 0))
+            for account_id in account_ids
+        }
+        total_remaining = sum(remaining_by_account.values())
+        requested_limit = total_remaining if limit is None else min(int(limit), total_remaining)
+        if requested_limit <= 0:
+            return {
+                **result.as_dict(),
+                "reason": "ad_policy_auto_probe_daily_limit_reached",
+                "daily_limit_per_account": per_account_limit,
+                "attempted_today_by_account": attempted_by_account,
+            }
+
+        selected_account_ids: set[int] = set()
         for profile, group, membership, account in candidates:
+            if len(selected_account_ids) >= requested_limit:
+                break
+            account_id = membership.account_id
+            if account_id in selected_account_ids or remaining_by_account.get(account_id, 0) <= 0:
+                continue
+            selected_account_ids.add(account_id)
             result.processed += 1
             if dry_run:
                 result.skipped += 1
@@ -6599,7 +6672,11 @@ class AcquisitionAutomationService:
                 )
                 continue
             try:
-                probe = await self.send_group_ad_policy_probe(group.id, source=AD_POLICY_PROBE_AUTO_SOURCE)
+                probe = await self.send_group_ad_policy_probe(
+                    group.id,
+                    account_id=account_id,
+                    source=AD_POLICY_PROBE_AUTO_SOURCE,
+                )
                 result.succeeded += 1
                 result.details.append({"action": "send_group_ad_policy_probe", **probe})
             except RuntimeError as exc:
@@ -6626,9 +6703,9 @@ class AcquisitionAutomationService:
                 )
         return {
             **result.as_dict(),
-            "daily_limit": requested_limit,
-            "attempted_today": attempted_today,
-            "remaining": max(0, remaining - result.succeeded),
+            "daily_limit_per_account": per_account_limit,
+            "attempted_today_by_account": attempted_by_account,
+            "remaining": max(0, total_remaining - result.processed),
         }
 
     async def _get_or_create_group_ad_profile(self, group: Group, capacity: Optional[dict[str, Any]] = None) -> GroupAdProfile:
@@ -7951,6 +8028,7 @@ class AcquisitionAutomationService:
                 self.db.add(
                     GroupAdPolicyEvent(
                         group_id=log.group.id,
+                        account_id=log.account_id,
                         telegram_group_id=log.group.group_id,
                         previous_mode=previous_mode,
                         new_mode=GroupAdPolicyMode.SOFT_AD_TRIAL.value,
@@ -8049,6 +8127,7 @@ class AcquisitionAutomationService:
                 self.db.add(
                     GroupAdPolicyEvent(
                         group_id=log.group.id,
+                        account_id=log.account_id,
                         telegram_group_id=log.group.group_id,
                         previous_mode=GroupAdPolicyMode.UNKNOWN_PROBE.value,
                         new_mode=GroupAdPolicyMode.FORBIDDEN.value,

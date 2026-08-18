@@ -309,6 +309,7 @@ export interface AdCapacitySettings {
   ad_policy_ai_require_second_pass: boolean
   ad_policy_auto_probe_enabled: boolean
   ad_policy_auto_probe_daily_limit: number
+  ad_policy_auto_probe_daily_limit_per_account: number
   ad_policy_auto_probe_interval_hours: number
   ad_policy_auto_ttl_days: number
   ad_policy_manual_ttl_days: number
