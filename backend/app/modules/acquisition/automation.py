@@ -6642,6 +6642,13 @@ class AcquisitionAutomationService:
             for account_id in account_ids
         }
         total_remaining = sum(remaining_by_account.values())
+        if not account_ids:
+            return {
+                **result.as_dict(),
+                "reason": "no_eligible_unknown_group",
+                "daily_limit_per_account": per_account_limit,
+                "attempted_today_by_account": {},
+            }
         requested_limit = total_remaining if limit is None else min(int(limit), total_remaining)
         if requested_limit <= 0:
             return {
