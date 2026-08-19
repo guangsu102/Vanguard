@@ -2,7 +2,9 @@
 import { ref, reactive, computed, watch } from 'vue'
 import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload, ElAlert } from 'element-plus'
 import type { FormInstance, FormRules, UploadRawFile } from 'element-plus'
+import type { AccountAssetTier } from '@/api/accounts'
 import { proxiesApi, type Proxy } from '@/api/proxies'
+import { accountAssetTierOptions } from '@/config/accountAssetTiers'
 
 interface Props {
   visible: boolean
@@ -66,6 +68,7 @@ const formData = reactive({
   apiConfigName: 'default',
   countryCode: 'US',
   countryName: '美国',
+  assetTier: 'unknown' as AccountAssetTier,
   profileBio: '',
   code: '',
   password: '',
@@ -82,6 +85,7 @@ const sessionImportData = reactive({
   apiConfigName: 'default',
   countryCode: 'US',
   countryName: '美国',
+  assetTier: 'unknown' as AccountAssetTier,
   profileBio: '',
   sessionFile: null as File | null,
   proxyMode: 'dynamic' as 'dynamic' | 'static' | 'none',
@@ -207,6 +211,7 @@ const resetForm = () => {
     apiConfigName: 'default',
     countryCode: 'US',
     countryName: '美国',
+    assetTier: 'unknown',
     profileBio: '',
     code: '',
     password: '',
@@ -221,6 +226,7 @@ const resetForm = () => {
     apiConfigName: 'default',
     countryCode: 'US',
     countryName: '美国',
+    assetTier: 'unknown',
     profileBio: '',
     sessionFile: null,
     proxyMode: 'dynamic',
@@ -401,6 +407,7 @@ const completeLogin = async () => {
         api_config_name: formData.apiConfigName,
         country_code: formData.countryCode,
         country_name: formData.countryName,
+        asset_tier: formData.assetTier,
         profile_bio: formData.profileBio.trim() || undefined,
         session_string: formData.sessionString,
         proxy_mode: formData.proxyMode,
@@ -451,6 +458,7 @@ const handleImportSession = async () => {
       if (sessionImportData.countryName) {
         formDataToSend.append('country_name', sessionImportData.countryName)
       }
+      formDataToSend.append('asset_tier', sessionImportData.assetTier)
       if (sessionImportData.profileBio.trim()) {
         formDataToSend.append('profile_bio', sessionImportData.profileBio.trim())
       }
@@ -564,6 +572,16 @@ const handleNext = () => {
           </el-form-item>
           <el-form-item label="国家名称" prop="countryName">
             <el-input v-model="formData.countryName" placeholder="自动填充，可手动调整" />
+          </el-form-item>
+          <el-form-item label="账号等级" prop="assetTier">
+            <el-select v-model="formData.assetTier" style="width: 100%">
+              <el-option
+                v-for="option in accountAssetTierOptions"
+                :key="option.value"
+                :label="option.label"
+                :value="option.value"
+              />
+            </el-select>
           </el-form-item>
           <el-form-item label="账号简介" prop="profileBio">
             <el-input
@@ -679,6 +697,16 @@ const handleNext = () => {
         </el-form-item>
         <el-form-item label="国家名称" prop="countryName">
           <el-input v-model="sessionImportData.countryName" placeholder="自动填充，可手动调整" />
+        </el-form-item>
+        <el-form-item label="账号等级" prop="assetTier">
+          <el-select v-model="sessionImportData.assetTier" style="width: 100%">
+            <el-option
+              v-for="option in accountAssetTierOptions"
+              :key="option.value"
+              :label="option.label"
+              :value="option.value"
+            />
+          </el-select>
         </el-form-item>
         <el-form-item label="账号简介" prop="profileBio">
           <el-input

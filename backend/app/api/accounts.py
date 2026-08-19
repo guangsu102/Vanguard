@@ -101,6 +101,18 @@ def _normalize_account_asset_tier(value: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail=f"asset_tier must be one of {valid}") from exc
 
 
+def _apply_auth_asset_tier(account: TelegramAccount, value: Optional[str]) -> None:
+    """Apply a known tier during login/import without clearing an existing tier by default."""
+    if value is None:
+        return
+    normalized = _normalize_account_asset_tier(value)
+    if normalized == AccountAssetTier.UNKNOWN.value:
+        return
+    if account.asset_tier != normalized:
+        account.asset_verified_at = datetime.utcnow()
+    account.asset_tier = normalized
+
+
 # =============================================================================
 # Request/Response Models
 # =============================================================================
@@ -112,6 +124,7 @@ class AccountCreate(BaseModel):
     display_name: Optional[str] = Field(None, description="Display name")
     profile_bio: Optional[str] = Field(None, max_length=70, description="Telegram public bio")
     account_type: str = Field(default="promoter", description="Account type: promoter/guardian_bot")
+    asset_tier: Optional[str] = Field(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus")
     registered_at: Optional[datetime] = Field(None, description="Known Telegram account registration time")
     asset_note: Optional[str] = Field(None, max_length=255, description="Asset source or batch note")
     managed_started_at: Optional[datetime] = Field(None, description="When Vanguard started managing this account")
@@ -623,12 +636,13 @@ async def create_account(
         )
         if proxy_mode == ProxyMode.STATIC:
             await _ensure_static_proxy_capacity(db, account.static_proxy_id)
+        asset_tier = _normalize_account_asset_tier(account.asset_tier)
         created = await manager.create_account(
             phone=account.phone,
             identifier=account.identifier,
             display_name=account.display_name,
             profile_bio=(account.profile_bio or "").strip() or None,
-            asset_tier=AccountAssetTier.UNKNOWN.value,
+            asset_tier=asset_tier,
             registered_at=account.registered_at,
             asset_note=(account.asset_note or "").strip()[:255] or None,
             managed_started_at=account.managed_started_at,
@@ -1216,7 +1230,7 @@ async def batch_import_accounts(
                 identifier=acc.identifier,
                 display_name=acc.display_name,
                 profile_bio=(acc.profile_bio or "").strip() or None,
-                asset_tier=AccountAssetTier.UNKNOWN.value,
+                asset_tier=_normalize_account_asset_tier(acc.asset_tier),
                 registered_at=acc.registered_at,
                 asset_note=(acc.asset_note or "").strip()[:255] or None,
                 managed_started_at=acc.managed_started_at,
@@ -1704,6 +1718,7 @@ async def complete_account_login(
                 account.registered_at = account_data.registered_at
             if "asset_note" in account_data.model_fields_set:
                 account.asset_note = (account_data.asset_note or "").strip()[:255] or None
+            _apply_auth_asset_tier(account, account_data.asset_tier)
             if "managed_started_at" in account_data.model_fields_set:
                 account.managed_started_at = account_data.managed_started_at
             elif account.managed_started_at is None:
@@ -1742,12 +1757,13 @@ async def complete_account_login(
             )
             if proxy_mode == ProxyMode.STATIC:
                 await _ensure_static_proxy_capacity(db, account_data.static_proxy_id)
+            asset_tier = _normalize_account_asset_tier(account_data.asset_tier)
             account = await manager.create_account(
                 phone=account_data.phone,
                 identifier=account_data.identifier,
                 display_name=account_data.display_name,
                 profile_bio=(account_data.profile_bio or "").strip() or None,
-                asset_tier=AccountAssetTier.UNKNOWN.value,
+                asset_tier=asset_tier,
                 registered_at=account_data.registered_at,
                 asset_note=(account_data.asset_note or "").strip()[:255] or None,
                 managed_started_at=account_data.managed_started_at,
@@ -1795,6 +1811,7 @@ async def import_session_file(
     api_config_name: str = Form(default="default", description="API config name"),
     country_code: str = Form(default="US", description="Country code"),
     country_name: Optional[str] = Form(None, description="Country name"),
+    asset_tier: Optional[str] = Form(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus"),
     profile_bio: Optional[str] = Form(None, description="Telegram public bio"),
     proxy_mode: str = Form(default="dynamic", description="Proxy mode: dynamic/static/none"),
     static_proxy_id: Optional[int] = Form(None, description="Static proxy ID"),
@@ -1872,6 +1889,7 @@ async def import_session_file(
             if profile_bio is not None:
                 existing.profile_bio = profile_bio.strip()[:70]
                 existing.profile_bio_synced_at = None
+            _apply_auth_asset_tier(existing, asset_tier)
             existing.proxy_mode = resolved_proxy_mode
             existing.static_proxy_id = static_proxy_id if resolved_proxy_mode == ProxyMode.STATIC else None
             await _ensure_account_proxy_available(existing, db)
@@ -1886,13 +1904,14 @@ async def import_session_file(
             account = existing
         else:
             # Create new account
+            normalized_asset_tier = _normalize_account_asset_tier(asset_tier)
             account = await manager.create_account(
                 phone=phone,
                 identifier=phone,
                 display_name=phone,
                 profile_bio=(profile_bio or "").strip()[:70] or None,
                 account_type=AccountType.PROMOTER,
-                asset_tier=AccountAssetTier.UNKNOWN.value,
+                asset_tier=normalized_asset_tier,
                 api_config_name=api_config_name,
                 country_code=country_code,
                 country_name=country_name,

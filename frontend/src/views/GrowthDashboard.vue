@@ -1750,7 +1750,7 @@ onBeforeUnmount(() => {
               <el-form-item label="双阶段复核">
                 <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
               </el-form-item>
-              <el-form-item label="未知群自动检测">
+              <el-form-item label="未知群自动广告探针">
                 <el-switch v-model="adCapacityForm.ad_policy_auto_probe_enabled" />
               </el-form-item>
               <el-form-item label="每账号检测每日上限">

@@ -20,6 +20,7 @@ import {
   type AccountWarmupStage,
 } from '@/api/accounts'
 import { useRouter } from 'vue-router'
+import { accountAssetTierOptions } from '@/config/accountAssetTiers'
 
 const router = useRouter()
 const accountStore = useAccountStore()
@@ -101,12 +102,7 @@ const searchFilters = [
     width: '130px',
     options: [
       { label: '全部', value: '' },
-      { label: '未标注', value: 'unknown' },
-      { label: '1月号', value: 'month_1' },
-      { label: '3-6月号', value: 'month_3_6' },
-      { label: '1年号', value: 'year_1' },
-      { label: '2年号', value: 'year_2' },
-      { label: '3年号+', value: 'year_3_plus' },
+      ...accountAssetTierOptions,
     ],
   },
   {
@@ -118,14 +114,7 @@ const searchFilters = [
   },
 ]
 
-const assetTierOptions: Array<{ label: string; value: AccountAssetTier }> = [
-  { label: '未标注', value: 'unknown' },
-  { label: '1月号', value: 'month_1' },
-  { label: '3-6月号', value: 'month_3_6' },
-  { label: '1年号', value: 'year_1' },
-  { label: '2年号', value: 'year_2' },
-  { label: '3年号+', value: 'year_3_plus' },
-]
+const assetTierOptions = accountAssetTierOptions
 
 const columns = [
   { prop: 'identifier', label: '账号标识', minWidth: '220', slot: 'identifier' },

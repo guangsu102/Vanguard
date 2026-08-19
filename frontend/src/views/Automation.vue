@@ -1688,7 +1688,7 @@ const triggerGroupAdPolicyProbe = async (profile: any) => {
     await ElMessageBox.confirm(
       "确认向「" + (profile.group_title || profile.telegram_group_id) + "」发送 1 条无链接广告检测？检测消息会观察 24 小时，若被删除将标记为禁止投放并退出该群。",
       "发送广告检测",
-      { type: "warning", confirmButtonText: "发送检测", cancelButtonText: "取消" },
+      { type: "warning", confirmButtonText: "发送广告探针", cancelButtonText: "取消" },
     )
   } catch (error) {
     if (error === "cancel" || error === "close") return
@@ -2254,7 +2254,7 @@ onBeforeUnmount(() => {
               <el-form-item label="自动加群">
                 <el-switch v-model="accountConfigForm.auto_join_enabled" :disabled="isAdOnlyAccount" />
               </el-form-item>
-              <el-form-item label="自动广告">
+              <el-form-item label="账号自动投放广告">
                 <el-switch v-model="accountConfigForm.auto_ads_enabled" />
               </el-form-item>
               <el-form-item label="每日最大加群数">
@@ -3119,7 +3119,7 @@ onBeforeUnmount(() => {
                         @click="triggerGroupAdPolicyProbe(row)"
                       >
                         <el-icon><VideoPlay /></el-icon>
-                        发送检测
+                        发送广告探针
                       </el-button>
                       <el-tag v-else-if="row.ad_policy_mode === 'unknown_probe'" type="warning" effect="plain">
                         检测中
