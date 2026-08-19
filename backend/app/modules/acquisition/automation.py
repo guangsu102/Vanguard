@@ -23,7 +23,7 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 import structlog
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -133,6 +133,7 @@ AD_PROBE_MESSAGES = (
 AD_POLICY_PROBE_MANUAL_SOURCE = "manual_ad_policy_probe"
 AD_POLICY_PROBE_AUTO_SOURCE = "auto_ad_policy_probe"
 AD_POLICY_PROBE_ATTEMPT_REASON = "unknown_group_probe_attempt"
+AD_POLICY_PROBE_SENDING_TIMEOUT_MINUTES = 30
 AD_POLICY_PROBE_MESSAGES = (
     "最近在整理 GPT 和 Claude 的使用成本，有需要可以一起交流。",
     "这边在做 AI 工具和 API 的低成本方案，有兴趣可以交流一下。",
@@ -5994,6 +5995,20 @@ class AcquisitionAutomationService:
 
         capacity = await get_ad_capacity_settings(self.db)
         profile = await self._get_or_create_group_ad_profile(group, capacity)
+        sending_cutoff = now - timedelta(minutes=AD_POLICY_PROBE_SENDING_TIMEOUT_MINUTES)
+        if profile.ad_policy_probe_status == "sending" and (
+            profile.ad_policy_probe_at is None or profile.ad_policy_probe_at <= sending_cutoff
+        ):
+            profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
+            profile.ad_policy_confidence = 0
+            profile.ad_policy_expires_at = None
+            profile.ad_tier = GroupAdTier.OBSERVING.value
+            profile.daily_capacity = 0
+            profile.ad_policy_probe_status = "not_started"
+            profile.ad_policy_probe_at = None
+            profile.ad_policy_probe_error = "stale_sending_recovered"
+            profile.updated_at = now
+            await self.db.commit()
         mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
         if mode == GroupAdPolicyMode.FORBIDDEN.value:
             raise RuntimeError("group_ad_forbidden")
@@ -6588,14 +6603,39 @@ class AcquisitionAutomationService:
             .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
             .where(
                 GroupAdProfile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value,
-                GroupAdProfile.ad_policy_probe_status.not_in(["sending", "sent"]),
+                or_(
+                    GroupAdProfile.ad_policy_probe_status.not_in(["sending", "sent"]),
+                    and_(
+                        GroupAdProfile.ad_policy_probe_status == "sending",
+                        or_(
+                            GroupAdProfile.ad_policy_probe_at.is_(None),
+                            GroupAdProfile.ad_policy_probe_at <= now - timedelta(
+                                minutes=AD_POLICY_PROBE_SENDING_TIMEOUT_MINUTES
+                            ),
+                        ),
+                    ),
+                ),
                 Group.status == "active",
                 GroupAccountMembership.status == "joined",
                 GroupAccountMembership.probe_status == "success",
                 TelegramAccount.is_active == True,
                 or_(
-                    GroupAdProfile.ad_policy_probe_at.is_(None),
-                    GroupAdProfile.ad_policy_probe_at <= probe_cutoff,
+                    and_(
+                        GroupAdProfile.ad_policy_probe_status == "sending",
+                        or_(
+                            GroupAdProfile.ad_policy_probe_at.is_(None),
+                            GroupAdProfile.ad_policy_probe_at <= now - timedelta(
+                                minutes=AD_POLICY_PROBE_SENDING_TIMEOUT_MINUTES
+                            ),
+                        ),
+                    ),
+                    and_(
+                        GroupAdProfile.ad_policy_probe_status != "sending",
+                        or_(
+                            GroupAdProfile.ad_policy_probe_at.is_(None),
+                            GroupAdProfile.ad_policy_probe_at <= probe_cutoff,
+                        ),
+                    ),
                 ),
                 or_(
                     GroupAccountMembership.first_ad_allowed_at.is_(None),

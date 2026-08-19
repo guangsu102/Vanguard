@@ -82,7 +82,7 @@ onMounted(loadBots)
       <el-table-column prop="sync_status" label="同步状态" width="120" />
       <el-table-column label="启用" width="100">
         <template #default="{ row }">
-          <el-switch :model-value="row.enabled" @change="toggleBot(row)" />
+          <el-switch :model-value="row.enabled" @change="toggleBot(row as GuardianBot)" />
         </template>
       </el-table-column>
     </el-table>

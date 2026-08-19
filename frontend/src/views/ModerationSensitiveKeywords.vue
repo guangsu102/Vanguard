@@ -148,7 +148,7 @@ onMounted(async () => {
       </el-table-column>
       <el-table-column label="启用" width="100">
         <template #default="{ row }">
-          <el-switch :model-value="row.enabled" @change="toggleKeyword(row)" />
+          <el-switch :model-value="row.enabled" @change="toggleKeyword(row as ModerationSensitiveKeyword)" />
         </template>
       </el-table-column>
     </el-table>

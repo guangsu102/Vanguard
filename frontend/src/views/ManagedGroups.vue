@@ -431,13 +431,13 @@ onMounted(loadData)
       <el-table-column label="操作" min-width="430">
         <template #default="{ row }">
           <template v-if="row.chat_type === 'channel'">
-            <el-button type="primary" link :disabled="row.binding_status !== 'active'" @click="openChannelMessage(row)">发送消息</el-button>
-            <el-button type="primary" link @click="openChannelUsername(row)">设置用户名</el-button>
+            <el-button type="primary" link :disabled="row.binding_status !== 'active'" @click="openChannelMessage(row as ManagedGroupBinding)">发送消息</el-button>
+            <el-button type="primary" link @click="openChannelUsername(row as ManagedGroupBinding)">设置用户名</el-button>
             <el-button
               type="warning"
               link
               :loading="refreshingChannelId === row.id"
-              @click="refreshChannelStatus(row)"
+              @click="refreshChannelStatus(row as ManagedGroupBinding)"
             >
               校验 Bot 权限
             </el-button>
@@ -447,17 +447,17 @@ onMounted(loadData)
               :type="row.all_members_muted ? 'success' : 'danger'"
               link
               :loading="mutingBindingId === row.id"
-              @click="toggleMuteAll(row)"
+              @click="toggleMuteAll(row as ManagedGroupBinding)"
             >
               {{ row.all_members_muted ? '解除全员禁言' : '全员禁言' }}
             </el-button>
-            <el-button type="primary" link @click="openPolicies(row)">治理策略</el-button>
-            <el-button type="success" link @click="openSensitiveKeywords(row)">群管敏感词</el-button>
-            <el-button type="info" link @click="openGroupCampaigns(row)">群内活动</el-button>
-            <el-button type="success" link @click="openPeriodicCoupons(row)">周期优惠券</el-button>
-            <el-button type="warning" link @click="openPinnedMessage(row)">群公告</el-button>
+            <el-button type="primary" link @click="openPolicies(row as ManagedGroupBinding)">治理策略</el-button>
+            <el-button type="success" link @click="openSensitiveKeywords(row as ManagedGroupBinding)">群管敏感词</el-button>
+            <el-button type="info" link @click="openGroupCampaigns(row as ManagedGroupBinding)">群内活动</el-button>
+            <el-button type="success" link @click="openPeriodicCoupons(row as ManagedGroupBinding)">周期优惠券</el-button>
+            <el-button type="warning" link @click="openPinnedMessage(row as ManagedGroupBinding)">群公告</el-button>
           </template>
-          <el-button v-if="row.chat_type !== 'channel'" type="primary" link @click="markDegraded(row)">
+          <el-button v-if="row.chat_type !== 'channel'" type="primary" link @click="markDegraded(row as ManagedGroupBinding)">
             {{ row.binding_status === 'active' ? '标记降级' : '恢复治理' }}
           </el-button>
         </template>

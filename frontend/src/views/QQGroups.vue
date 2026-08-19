@@ -279,7 +279,7 @@ onBeforeUnmount(() => {
           <template #default="{ row }">
             <div class="group-name">
               <span>{{ row.local_name || '未命名 QQ 群' }}</span>
-              <el-button :icon="Edit" link circle title="编辑群名称" @click="editGroupName(row)" />
+              <el-button :icon="Edit" link circle title="编辑群名称" @click="editGroupName(row as QQManagedGroup)" />
             </div>
           </template>
         </el-table-column>
@@ -293,7 +293,7 @@ onBeforeUnmount(() => {
             <el-switch
               v-model="row.monitoring_enabled"
               :disabled="row.status !== 'active'"
-              @change="updateSwitch(row, 'monitoring_enabled', !row.monitoring_enabled)"
+              @change="updateSwitch(row as QQManagedGroup, 'monitoring_enabled', !row.monitoring_enabled)"
             />
           </template>
         </el-table-column>
@@ -302,7 +302,7 @@ onBeforeUnmount(() => {
             <el-switch
               v-model="row.notifications_enabled"
               :disabled="row.status !== 'active'"
-              @change="updateSwitch(row, 'notifications_enabled', !row.notifications_enabled)"
+              @change="updateSwitch(row as QQManagedGroup, 'notifications_enabled', !row.notifications_enabled)"
             />
           </template>
         </el-table-column>
@@ -316,17 +316,17 @@ onBeforeUnmount(() => {
         </el-table-column>
         <el-table-column label="操作" fixed="right" min-width="245">
           <template #default="{ row }">
-            <el-button :icon="ChatLineSquare" link @click="openMessages(row)">消息</el-button>
+            <el-button :icon="ChatLineSquare" link @click="openMessages(row as QQManagedGroup)">消息</el-button>
             <el-button
               :icon="Bell"
               type="primary"
               link
               :disabled="row.status !== 'active' || !row.notifications_enabled"
-              @click="openNotification(row)"
+              @click="openNotification(row as QQManagedGroup)"
             >
               群通知
             </el-button>
-            <el-button type="warning" link @click="toggleGroupStatus(row)">
+            <el-button type="warning" link @click="toggleGroupStatus(row as QQManagedGroup)">
               {{ row.status === 'active' ? '停用治理' : '恢复治理' }}
             </el-button>
           </template>
@@ -393,7 +393,7 @@ onBeforeUnmount(() => {
           <template #default="{ row }">
             <div class="message-content">{{ row.content || '-' }}</div>
             <div v-if="row.attachments.length" class="attachments">
-              {{ attachmentNames(row) }}
+              {{ attachmentNames(row as QQGroupMessage) }}
             </div>
           </template>
         </el-table-column>
@@ -413,7 +413,7 @@ onBeforeUnmount(() => {
               type="danger"
               link
               title="撤回消息"
-              @click="recallMessage(row)"
+              @click="recallMessage(row as QQGroupMessage)"
             >
               撤回
             </el-button>

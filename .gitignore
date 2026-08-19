@@ -129,3 +129,6 @@ telegram-config.md
 DEPLOYMENT.md
 .codex*
 NUL
+
+# Curated production schema migrations are source files.
+!backend/migrations/*.sql

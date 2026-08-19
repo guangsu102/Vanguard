@@ -478,7 +478,7 @@ onMounted(() => {
         <el-table-column prop="accountPhone" label="推广账号" min-width="160" />
         <el-table-column prop="joinMethod" label="入群方式" width="130">
           <template #default="{ row }">
-            <el-tag size="small" effect="plain">{{ joinMethodLabel(row) }}</el-tag>
+            <el-tag size="small" effect="plain">{{ joinMethodLabel(row as GroupMember) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="sourceKeyword" label="来源词" min-width="120">
