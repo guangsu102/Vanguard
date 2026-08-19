@@ -184,7 +184,7 @@ async def _new_scheduler_redis_client():
 
     return redis.from_url(
         settings.REDIS_URL,
-        password=settings.REDIS_PASSWORD,
+        password=settings.effective_redis_password,
         encoding="utf-8",
         decode_responses=True,
     )

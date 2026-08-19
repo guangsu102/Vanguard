@@ -39,9 +39,9 @@ export interface SecuritySettings {
 
 export interface XBoardSettings {
   enabled: boolean
-  apiUrl: string
-  apiKey?: string
-  webhookUrl?: string
+  callbackEnabled: boolean
+  protocol: string
+  source: string
 }
 
 export interface AiReplySettings {

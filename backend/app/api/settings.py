@@ -69,9 +69,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "xboard": {
         "enabled": settings.VANGUARD_INTEGRATION_ENABLED,
-        "apiUrl": getattr(settings, "XBOARD_API_URL", ""),
-        "apiKey": "",
-        "webhookUrl": "",
+        "callbackEnabled": settings.VANGUARD_CALLBACK_ENABLED,
+        "protocol": "hmac",
+        "source": "environment",
     },
     "aiReply": {
         "enabled": False,
@@ -116,9 +116,19 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return base
 
 
+def _environment_xboard_settings() -> dict[str, Any]:
+    return {
+        "enabled": settings.VANGUARD_INTEGRATION_ENABLED,
+        "callbackEnabled": settings.VANGUARD_CALLBACK_ENABLED,
+        "protocol": "hmac",
+        "source": "environment",
+    }
+
+
 def _public_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_SETTINGS)
     _deep_merge(merged, raw or {})
+    merged["xboard"] = _environment_xboard_settings()
     merged.pop("_meta", None)
     return merged
 
@@ -153,6 +163,7 @@ async def update_settings(update: SettingsUpdate, db: AsyncSession = Depends(get
     raw = await get_app_runtime_settings(db)
     public = _public_settings(raw)
     patch = update.model_dump(exclude_none=True)
+    patch.pop("xboard", None)
     _deep_merge(public, patch)
 
     if raw.get("_meta"):

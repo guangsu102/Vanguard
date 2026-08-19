@@ -39,6 +39,7 @@ const environmentEvents = ref<AccountEnvironmentEvent[]>([])
 const formData = reactive({
   display_name: '',
   profile_bio: '',
+  asset_tier: 'unknown' as AccountAssetTier,
   registered_at: '',
   asset_note: '',
   managed_started_at: '',
@@ -238,6 +239,7 @@ const openEditDrawer = (row: Account) => {
   Object.assign(formData, {
     display_name: row.display_name || row.identifier,
     profile_bio: row.profile_bio || '',
+    asset_tier: row.asset_tier || 'unknown',
     registered_at: row.registered_at ? dayjs(row.registered_at).format('YYYY-MM-DD') : '',
     asset_note: row.asset_note || '',
     managed_started_at: row.managed_started_at ? dayjs(row.managed_started_at).format('YYYY-MM-DD') : '',
@@ -259,6 +261,7 @@ const handleSubmit = async () => {
     await accountStore.update(editingId.value, {
       display_name: formData.display_name.trim(),
       profile_bio: formData.profile_bio.trim(),
+      asset_tier: formData.asset_tier,
       registered_at: formData.registered_at || undefined,
       asset_note: formData.asset_note.trim(),
       managed_started_at: formData.managed_started_at || undefined,
@@ -763,6 +766,13 @@ onMounted(() => {
           type: 'date',
           placeholder: '可选，用于替代导入时间判断号龄',
           props: { clearable: true },
+        },
+        {
+          prop: 'asset_tier',
+          label: '资产等级',
+          type: 'select',
+          options: assetTierOptions,
+          props: { clearable: false },
         },
         {
           prop: 'asset_note',

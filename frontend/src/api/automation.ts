@@ -509,6 +509,32 @@ export interface AdDynamicStatus {
   }
 }
 
+export interface EffectiveLimitSource {
+  key: string
+  value: number
+  active: boolean
+}
+
+export interface EffectiveLimitItem {
+  key: string
+  value: number | null
+  unit: 'count_per_day' | 'count_per_run' | 'seconds' | string
+  formula: 'min' | 'max' | string
+  sources: EffectiveLimitSource[]
+  dynamicFactors: string[]
+}
+
+export interface EffectiveLimitSummary {
+  source: string
+  riskGuardEnabled: boolean
+  items: EffectiveLimitItem[]
+  accountDynamicFields: {
+    adDaily: string
+    adPerRun: string
+    joinDaily: string
+  }
+}
+
 export interface AccountAdBinding {
   id: number
   account_id: number
@@ -595,6 +621,10 @@ export const automationApi = {
 
   getAdCapacity: () => {
     return apiClient.get<{ data: AdCapacitySettings }>('/automation/ads/capacity')
+  },
+
+  getEffectiveLimits: () => {
+    return apiClient.get<{ data: EffectiveLimitSummary }>('/automation/effective-limits')
   },
 
   updateAdCapacity: (data: Partial<AdCapacitySettings>) => {

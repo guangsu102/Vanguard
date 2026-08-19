@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, VideoPause } from '@element-plus/icons-vue'
-import { useRoute } from 'vue-router'
+import { onBeforeRouteLeave, useRoute } from 'vue-router'
 import {
   automationApi,
   type AccountAssetPolicySettings,
@@ -13,14 +13,27 @@ import {
   type AdDeliveryThrottleSettings,
   type AdDynamicStatus,
   type AdFailurePolicy,
+  type EffectiveLimitItem,
+  type EffectiveLimitSummary,
   type GroupAdProfile,
   type AutoJoinSchedulerConfig,
   type AutoJoinVerificationLog,
 } from '@/api/automation'
 import { settingsApi, type GroupAiInteractionSettings } from '@/api/settings'
+import {
+  createDefaultAdCapacity,
+  createDefaultAdDeliveryExecution,
+  createDefaultAdDeliveryThrottle,
+  createDefaultAdFailurePolicy,
+  createDefaultAutoJoinScheduler,
+  createDefaultAssetPolicy,
+  createDefaultRiskGuard,
+  createDefaultWarmupPolicy,
+} from '@/config/automationDefaults'
 
 const loading = ref(false)
 const saving = ref('')
+const effectiveLimits = ref<EffectiveLimitSummary | null>(null)
 const activeConfigTab = ref('join')
 const activeEventTab = ref('attempts')
 const route = useRoute()
@@ -40,6 +53,7 @@ const autoJoinAttempts = ref<any[]>([])
 const verificationLogs = ref<AutoJoinVerificationLog[]>([])
 const deliveryLogs = ref<any[]>([])
 const groupAdProfiles = ref<GroupAdProfile[]>([])
+let groupProfilesRefreshTimer: number | null = null
 
 const riskActionOptions = [
   { label: '搜群', value: 'search' },
@@ -149,307 +163,23 @@ const groupAiToneOptions = [
   { label: '柔和', value: 'soft' },
 ]
 
-const defaultRiskActions = (): AccountRiskGuardSettings['actions'] => ({
-  search: { daily_limit: 100, cooldown_seconds: 30 },
-  join: { daily_limit: 6, cooldown_seconds: 7200 },
-  private_message: { daily_limit: 20, cooldown_seconds: 300 },
-  group_message: { daily_limit: 4, cooldown_seconds: 7200 },
-  ad_probe: { daily_limit: 10, cooldown_seconds: 3600 },
-  ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
-  moderation: { daily_limit: 60, cooldown_seconds: 15 },
-  ad_delivery: { daily_limit: 5, cooldown_seconds: 9000 },
-  profile_update: { daily_limit: 5, cooldown_seconds: 3600 },
-  reaction: { daily_limit: 120, cooldown_seconds: 10 },
-  forward: { daily_limit: 25, cooldown_seconds: 120 },
-  pin: { daily_limit: 20, cooldown_seconds: 120 },
-  bot_message: { daily_limit: 500, cooldown_seconds: 1 },
-  bot_pin: { daily_limit: 100, cooldown_seconds: 5 },
-  channel_create: { daily_limit: 1, cooldown_seconds: 86400 },
-})
+const schedulerForm = reactive<AutoJoinSchedulerConfig>(createDefaultAutoJoinScheduler())
 
-const defaultRiskLevelThresholds = (): Record<string, number> => ({
-  watch: 20,
-  limited: 45,
-  frozen: 70,
-  quarantined: 90,
-})
-
-const defaultRiskLevelMultipliers = (): Record<string, number> => ({
-  normal: 1,
-  watch: 0.7,
-  limited: 0.45,
-  frozen: 0,
-  quarantined: 0,
-})
-
-const defaultRiskScoreDeltas = (): Record<string, number> => ({
-  group_write_forbidden: 4,
-  platform_group_write_forbidden: 12,
-  flood_wait: 15,
-  peer_flood: 35,
-  account_banned: 50,
-  account_restricted: 50,
-  generic_failure: 5,
-  block: 1,
-})
-
-const defaultRiskLifecycle = (): Record<string, number> => ({
-  default_freeze_seconds: 3600,
-  flood_wait_buffer_seconds: 60,
-  peer_flood_freeze_seconds: 86400,
-  account_restricted_freeze_seconds: 86400,
-  group_write_forbidden_freeze_seconds: 43200,
-  recovery_seconds: 86400,
-  post_freeze_score_cap: 69,
-  manual_clear_score_cap: 44,
-  decay_interval_hours: 24,
-  decay_points_per_interval: 8,
-  new_account_days: 3,
-  new_account_multiplier: 0.3,
-  recovery_multiplier: 0.5,
-  healthy_account_days: 14,
-  healthy_account_multiplier: 1,
-  max_budget_multiplier: 1,
-})
-
-const defaultGroupWriteForbiddenPolicy = (): Record<string, number> => ({
-  freeze_window_hours: 2,
-  freeze_distinct_groups: 5,
-  quarantine_window_hours: 24,
-  quarantine_distinct_groups: 10,
-})
-
-const defaultRiskRetention = (): Record<string, number> => ({
-  low_value_detail_retention_days: 14,
-  high_value_detail_retention_days: 90,
-  daily_stat_retention_days: 370,
-})
-
-const defaultAssetTiers = (): AccountAssetPolicySettings['tiers'] => ({
-  unknown: { join_multiplier: 0.6, ad_multiplier: 0.5, run_multiplier: 0.5, probe_multiplier: 0.7, warmup_days: 18, age_floor_days: 0 },
-  month_1: { join_multiplier: 0.4, ad_multiplier: 0.25, run_multiplier: 0.25, probe_multiplier: 0.45, warmup_days: 25, age_floor_days: 30 },
-  month_3_6: { join_multiplier: 0.7, ad_multiplier: 0.6, run_multiplier: 0.6, probe_multiplier: 0.75, warmup_days: 18, age_floor_days: 120 },
-  year_1: { join_multiplier: 1, ad_multiplier: 1, run_multiplier: 1, probe_multiplier: 1, warmup_days: 12, age_floor_days: 365 },
-  year_2: { join_multiplier: 1.15, ad_multiplier: 1.2, run_multiplier: 1.15, probe_multiplier: 1.1, warmup_days: 9, age_floor_days: 730 },
-  year_3_plus: { join_multiplier: 1.3, ad_multiplier: 1.35, run_multiplier: 1.25, probe_multiplier: 1.15, warmup_days: 7, age_floor_days: 1095 },
-})
-
-const defaultWarmupTiers = (): AccountWarmupPolicySettings['tiers'] => ({
-  unknown: { warmup_days: 15 },
-  month_1: { warmup_days: 18 },
-  month_3_6: { warmup_days: 12 },
-  year_1: { warmup_days: 9 },
-  year_2: { warmup_days: 7 },
-  year_3_plus: { warmup_days: 7 },
-})
-
-const defaultWarmupStages = (): AccountWarmupPolicySettings['stages'] => ({
-  observe: {
-    limit_multiplier: 0.08,
-    join_multiplier: 0,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0.1,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0.05,
-    profile_update_multiplier: 0.2,
-    allow_proactive_private_message: false,
-  },
-  seed: {
-    limit_multiplier: 0.15,
-    join_multiplier: 0.15,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0.25,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0.15,
-    profile_update_multiplier: 0.5,
-    allow_proactive_private_message: false,
-  },
-  soft: {
-    limit_multiplier: 0.35,
-    join_multiplier: 0.35,
-    ad_multiplier: 0.25,
-    run_multiplier: 0.25,
-    probe_multiplier: 0.45,
-    private_message_multiplier: 0.1,
-    group_message_multiplier: 0.35,
-    profile_update_multiplier: 0.75,
-    allow_proactive_private_message: false,
-  },
-  ramp: {
-    limit_multiplier: 0.65,
-    join_multiplier: 0.65,
-    ad_multiplier: 0.65,
-    run_multiplier: 0.65,
-    probe_multiplier: 0.75,
-    private_message_multiplier: 0.25,
-    group_message_multiplier: 0.65,
-    profile_update_multiplier: 1,
-    allow_proactive_private_message: false,
-  },
-  normal: {
-    limit_multiplier: 1,
-    join_multiplier: 1,
-    ad_multiplier: 1,
-    run_multiplier: 1,
-    probe_multiplier: 1,
-    private_message_multiplier: 1,
-    group_message_multiplier: 1,
-    profile_update_multiplier: 1,
-    allow_proactive_private_message: true,
-  },
-  cooldown: {
-    limit_multiplier: 0,
-    join_multiplier: 0,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0,
-    profile_update_multiplier: 0,
-    allow_proactive_private_message: false,
-  },
-})
-
-const schedulerForm = reactive<AutoJoinSchedulerConfig>({
-  enabled: true,
-  scan_interval_minutes: 5,
-  search_filter: {
-    title_blacklist_enabled: true,
-    title_blacklist: [],
-  },
-  join_verification: {
-    enabled: true,
-    ai_enabled: true,
-    confidence_threshold: 0.72,
-    post_action_wait_seconds: 8,
-    post_action_recheck_attempts: 3,
-    post_action_extra_wait_seconds: 12,
-    message_limit: 20,
-    ai_timeout_seconds: 45,
-    action_timeout_seconds: 5,
-    pending_sync_min_age_seconds: 120,
-    pending_sync_limit: 5,
-    unknown_challenge_action: 'leave',
-    allow_button_clicks: true,
-    allow_text_answers: true,
-    answer_profile: '中文用户，主要为了学习交流、找资料、行业沟通。',
-  },
-  group_capacity_cleanup: {
-    enabled: false,
-    no_conversion_days: 30,
-    min_join_age_days: 30,
-    max_cleanup_per_run: 15,
-  },
-})
-
-const riskGuardForm = reactive<AccountRiskGuardSettings>({
-  enabled: true,
-  global_daily_limit: 30,
-  group_write_daily_limit: 8,
-  redis_fail_closed: null,
-  actions: defaultRiskActions(),
-  level_thresholds: defaultRiskLevelThresholds(),
-  level_budget_multipliers: defaultRiskLevelMultipliers(),
-  risk_score_deltas: defaultRiskScoreDeltas(),
-  lifecycle: defaultRiskLifecycle(),
-  group_write_forbidden: defaultGroupWriteForbiddenPolicy(),
-  retention: defaultRiskRetention(),
-})
+const riskGuardForm = reactive<AccountRiskGuardSettings>(createDefaultRiskGuard())
 
 const assetPolicyForm = reactive<AccountAssetPolicySettings>({
-  enabled: true,
-  tiers: defaultAssetTiers(),
+  ...createDefaultAssetPolicy(),
 })
 
-const warmupPolicyForm = reactive<AccountWarmupPolicySettings>({
-  enabled: true,
-  default_warmup_days: 15,
-  minimum_warmup_days: 5,
-  user_initiated_private_message_multiplier: 1,
-  tiers: defaultWarmupTiers(),
-  stages: defaultWarmupStages(),
-})
+const warmupPolicyForm = reactive<AccountWarmupPolicySettings>(createDefaultWarmupPolicy())
 
-const adExecutionForm = reactive<AdDeliveryExecutionSettings>({
-  enabled: true,
-  dispatcher_interval_seconds: 60,
-  max_deliveries_per_run: 1,
-  max_deliveries_per_account_per_run: 1,
-  group_campaign_cooldown_minutes: 1440,
-  stop_account_after_success: true,
-  stop_account_after_failure: true,
-})
+const adExecutionForm = reactive<AdDeliveryExecutionSettings>(createDefaultAdDeliveryExecution())
 
-const adThrottleForm = reactive<AdDeliveryThrottleSettings>({
-  enabled: true,
-  delivery_interval_seconds: 3600,
-  batch_window_seconds: 3600,
-  batch_size_min: 1,
-  batch_size_max: 1,
-  cooldown_min_seconds: 3600,
-  cooldown_max_seconds: 10800,
-})
+const adThrottleForm = reactive<AdDeliveryThrottleSettings>(createDefaultAdDeliveryThrottle())
 
-const adCapacityForm = reactive<AdCapacitySettings>({
-  enabled: true,
-  timezone_offset_hours: 8,
-  window_start_hour: 9,
-  window_end_hour: 2,
-  survival_check_delay_seconds: 120,
-  survival_one_hour_seconds: 3600,
-  survival_twenty_four_hour_seconds: 86400,
-  survival_check_batch_size: 50,
-  survival_retry_max_attempts: 3,
-  survival_retry_base_seconds: 300,
-  account_ad_daily_hard_cap: 5,
-  account_group_daily_cap_default: 3,
-  group_global_daily_hard_cap: 400,
-  group_min_interval_seconds: 3600,
-  max_groups_per_account: 400,
-  max_new_ad_groups_per_day: 3,
-  leave_on_deleted_ad: true,
-  block_group_on_probe_failure: true,
-  ad_policy_ai_enabled: true,
-  ad_policy_ai_model: 'gpt-5.6-terra',
-  ad_policy_ai_timeout_seconds: 45,
-  ad_policy_ai_min_confidence: 95,
-  ad_policy_ai_require_second_pass: true,
-  ad_policy_auto_probe_enabled: false,
-  ad_policy_auto_probe_daily_limit: 1,
-  ad_policy_auto_probe_daily_limit_per_account: 10,
-  ad_policy_auto_probe_interval_hours: 24,
-  ad_policy_auto_ttl_days: 7,
-  ad_policy_manual_ttl_days: 30,
-  premium_min_samples: 20,
-  premium_min_conversions: 1,
-  premium_survival_rate_percent: 95,
-  premium_clean_days_auto: 5,
-  premium_clean_days_verified: 3,
-  premium_growth_samples: 100,
-  premium_full_capacity_samples: 1000,
-  premium_entry_capacity: 20,
-  premium_growth_capacity: 50,
-  premium_conversion_capacity_step: 20,
-  deleted_ad_pause_hours: 72,
-  membership_delete_block_count: 2,
-  warmup_days_before_ads: 15,
-  warmup_daily_interactions_min: 0,
-  warmup_daily_interactions_max: 1,
-  mature_daily_interactions_min: 0,
-  mature_daily_interactions_max: 1,
-  tier_daily_capacities: { blocked: 0, observing: 0, trial: 1, validated: 3, stable: 10, low: 3, medium: 10, high: 20, premium: 400 },
-  hourly_weights: {},
-})
+const adCapacityForm = reactive<AdCapacitySettings>(createDefaultAdCapacity())
 
-const adFailurePolicyForm = reactive<AdFailurePolicy>({
-  enabled: true,
-  leave_on_group_control_failure: true,
-  group_control_failure_limit: 1,
-  group_control_failure_window_hours: 720,
-  levels: ['A', 'B', 'C', 'UNRATED'],
-})
+const adFailurePolicyForm = reactive<AdFailurePolicy>(createDefaultAdFailurePolicy())
 
 const groupAiForm = reactive<GroupAiInteractionSettings>({
   enabled: false,
@@ -498,6 +228,103 @@ const semanticBlockedIntentsText = ref(groupAiForm.semanticBlockedIntents.join('
 const proactiveWarmupTopicsText = ref(groupAiForm.proactiveWarmupTopics.join('\n'))
 const proactiveWarmupTemplatesText = ref(groupAiForm.proactiveWarmupTemplates.join('\n'))
 const proactiveWarmupGroupOverridesText = ref(JSON.stringify(groupAiForm.proactiveWarmupGroupOverrides, null, 2))
+
+const configSections = ['scheduler', 'warmup', 'asset', 'risk', 'ads', 'groupAi'] as const
+type ConfigSection = (typeof configSections)[number]
+
+const savedSnapshots = reactive<Record<ConfigSection, string>>({
+  scheduler: '',
+  warmup: '',
+  asset: '',
+  risk: '',
+  ads: '',
+  groupAi: '',
+})
+const saveErrors = reactive<Record<ConfigSection, string>>({
+  scheduler: '',
+  warmup: '',
+  asset: '',
+  risk: '',
+  ads: '',
+  groupAi: '',
+})
+const snapshotsReady = ref(false)
+
+const serializeConfig = (value: unknown) => JSON.stringify(value)
+
+const currentSectionState = (section: ConfigSection) => {
+  if (section === 'scheduler') return schedulerForm
+  if (section === 'warmup') return warmupPolicyForm
+  if (section === 'asset') return assetPolicyForm
+  if (section === 'risk') return riskGuardForm
+  if (section === 'ads') {
+    return {
+      execution: adExecutionForm,
+      throttle: adThrottleForm,
+      capacity: adCapacityForm,
+      failure: adFailurePolicyForm,
+    }
+  }
+  return {
+    form: groupAiForm,
+    semanticAllowedIntentsText: semanticAllowedIntentsText.value,
+    semanticBlockedIntentsText: semanticBlockedIntentsText.value,
+    proactiveWarmupTopicsText: proactiveWarmupTopicsText.value,
+    proactiveWarmupTemplatesText: proactiveWarmupTemplatesText.value,
+    proactiveWarmupGroupOverridesText: proactiveWarmupGroupOverridesText.value,
+  }
+}
+
+const captureSnapshot = (section: ConfigSection) => {
+  savedSnapshots[section] = serializeConfig(currentSectionState(section))
+  saveErrors[section] = ''
+}
+
+const captureAllSnapshots = () => {
+  for (const section of configSections) captureSnapshot(section)
+  snapshotsReady.value = true
+}
+
+const isSectionDirty = (section: ConfigSection) => snapshotsReady.value
+  && savedSnapshots[section] !== serializeConfig(currentSectionState(section))
+
+const unsavedCount = computed(() => configSections.filter(isSectionDirty).length)
+const saveErrorCount = computed(() => configSections.filter((section) => Boolean(saveErrors[section])).length)
+const hasUnsavedChanges = computed(() => unsavedCount.value > 0)
+
+const requestDiscardChanges = async () => {
+  if (!hasUnsavedChanges.value) return true
+  try {
+    await ElMessageBox.confirm('当前有未保存的配置，继续将丢失这些修改。', '未保存的配置', {
+      confirmButtonText: '放弃修改',
+      cancelButtonText: '继续编辑',
+      type: 'warning',
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+const beforeWindowUnload = (event: BeforeUnloadEvent) => {
+  if (!hasUnsavedChanges.value) return
+  event.preventDefault()
+  event.returnValue = ''
+}
+
+const errorDetail = (error: unknown) => {
+  const candidate = error as {
+    message?: string
+    response?: { data?: { detail?: string; message?: string } }
+  }
+  return candidate.response?.data?.detail || candidate.response?.data?.message || candidate.message || '未知错误'
+}
+
+const recordSaveError = (section: ConfigSection, label: string, error: unknown) => {
+  const detail = errorDetail(error)
+  saveErrors[section] = `${label}：${detail}`
+  ElMessage.error(saveErrors[section])
+}
 
 const linesToList = (value: string) => value
   .split(/\r?\n/)
@@ -626,6 +453,75 @@ const flowSteps = computed(() => [
   },
 ])
 
+const effectiveLimitLabels: Record<string, string> = {
+  account_join_daily: '单号加群日上限',
+  account_group_message_daily: '单号群消息日上限',
+  account_ad_daily: '单号广告日上限',
+  account_ad_per_run: '单号单轮广告上限',
+  account_group_ad_daily: '单号单群广告日上限',
+  group_global_ad_daily: '单群全局广告日上限',
+  account_ad_min_interval: '单号广告最小间隔',
+  group_ad_min_interval: '单群广告最小间隔',
+}
+
+const effectiveSourceLabels: Record<string, string> = {
+  'risk.global_daily_limit': '风控单号总日额度',
+  'risk.group_write_daily_limit': '风控群写共享日额度',
+  'risk.actions.join.daily_limit': '风控加群日额度',
+  'risk.actions.group_message.daily_limit': '风控群消息日额度',
+  'risk.actions.ad_delivery.daily_limit': '风控广告日额度',
+  'ads.capacity.account_ad_daily_hard_cap': '广告单号日硬上限',
+  'ads.execution.max_deliveries_per_run': '广告单轮总上限',
+  'ads.execution.max_deliveries_per_account_per_run': '广告单号单轮上限',
+  'ads.capacity.account_group_daily_cap_default': '单号单群默认日上限',
+  'ads.capacity.group_global_daily_hard_cap': '单群全局日硬上限',
+  'ads.throttle.delivery_interval_seconds': '投放间隔',
+  'ads.throttle.cooldown_min_seconds': '投放最小冷却',
+  'ads.capacity.group_min_interval_seconds': '单群投放间隔',
+  'ads.execution.group_campaign_cooldown_minutes': '群活动冷却',
+}
+
+const dynamicFactorLabels: Record<string, string> = {
+  'account.max_groups_per_day': '账号加群额度',
+  'account.max_messages_per_day': '账号消息额度',
+  'asset.join_multiplier': '账号等级加群倍率',
+  'asset.action_multiplier': '账号等级动作倍率',
+  'asset.ad_multiplier': '账号等级广告倍率',
+  'warmup.join_multiplier': '暖号加群倍率',
+  'warmup.group_message_multiplier': '暖号群消息倍率',
+  'warmup.ad_multiplier': '暖号广告倍率',
+  'warmup.run_multiplier': '暖号单轮倍率',
+  'risk.level_multiplier': '风险等级倍率',
+  'account.health_score': '账号健康度',
+  'probe.quality_multiplier': '探针质量',
+  'time_window.join_multiplier': '加群时段倍率',
+  'time_window.ad_multiplier': '广告时段倍率',
+  'campaign.max_sends_per_account_per_day': '活动单号日上限',
+  'campaign.max_sends_per_group_per_day': '活动单群日上限',
+  'campaign.interval_minutes': '活动投放间隔',
+  'group.ad_tier': '群广告档位',
+  'group.tier_daily_capacity': '群档位容量',
+  'group.evidence_capacity': '群证据容量',
+  'group.ad_policy': '群广告许可',
+  'group.last_ad_at': '群最近投放时间',
+}
+
+const effectiveLimitRows = computed(() => effectiveLimits.value?.items || [])
+const groupGlobalAdDailyLimit = computed(() => effectiveLimitRows.value
+  .find((item) => item.key === 'group_global_ad_daily')?.value)
+
+const effectiveLimitLabel = (key: string) => effectiveLimitLabels[key] || key
+const effectiveSourceLabel = (key: string) => effectiveSourceLabels[key] || key
+const dynamicFactorLabel = (key: string) => dynamicFactorLabels[key] || key
+const formulaLabel = (formula: string) => formula === 'max' ? '取最大值' : '取最小值'
+
+const formatEffectiveValue = (value: number | null, unit: EffectiveLimitItem['unit']) => {
+  if (value === null) return '未设置'
+  if (unit === 'seconds') return formatDuration(value)
+  if (unit === 'count_per_run') return `${value} 次/轮`
+  return `${value} 次/天`
+}
+
 const fillSchedulerForm = (config: AutoJoinSchedulerConfig) => {
   Object.assign(schedulerForm, {
     ...config,
@@ -650,7 +546,7 @@ const fillRiskGuardForm = (config: AccountRiskGuardSettings) => {
   riskGuardForm.global_daily_limit = config.global_daily_limit
   riskGuardForm.group_write_daily_limit = config.group_write_daily_limit
   riskGuardForm.redis_fail_closed = config.redis_fail_closed
-  const actions = defaultRiskActions()
+  const actions = { ...createDefaultRiskGuard().actions }
   for (const item of riskActionOptions) {
     actions[item.value] = {
       ...actions[item.value],
@@ -659,34 +555,34 @@ const fillRiskGuardForm = (config: AccountRiskGuardSettings) => {
   }
   riskGuardForm.actions = actions
   riskGuardForm.level_thresholds = {
-    ...defaultRiskLevelThresholds(),
+    ...createDefaultRiskGuard().level_thresholds,
     ...(config.level_thresholds || {}),
   }
   riskGuardForm.level_budget_multipliers = {
-    ...defaultRiskLevelMultipliers(),
+    ...createDefaultRiskGuard().level_budget_multipliers,
     ...(config.level_budget_multipliers || {}),
   }
   riskGuardForm.risk_score_deltas = {
-    ...defaultRiskScoreDeltas(),
+    ...createDefaultRiskGuard().risk_score_deltas,
     ...(config.risk_score_deltas || {}),
   }
   riskGuardForm.lifecycle = {
-    ...defaultRiskLifecycle(),
+    ...createDefaultRiskGuard().lifecycle,
     ...(config.lifecycle || {}),
   }
   riskGuardForm.group_write_forbidden = {
-    ...defaultGroupWriteForbiddenPolicy(),
+    ...createDefaultRiskGuard().group_write_forbidden,
     ...(config.group_write_forbidden || {}),
   }
   riskGuardForm.retention = {
-    ...defaultRiskRetention(),
+    ...createDefaultRiskGuard().retention,
     ...(config.retention || {}),
   }
 }
 
 const fillAssetPolicyForm = (config: AccountAssetPolicySettings) => {
   assetPolicyForm.enabled = config.enabled
-  const tiers = defaultAssetTiers()
+  const tiers = createDefaultAssetPolicy().tiers
   for (const item of assetTierOptions) {
     tiers[item.value] = {
       ...tiers[item.value],
@@ -701,7 +597,7 @@ const fillWarmupPolicyForm = (config: AccountWarmupPolicySettings) => {
   warmupPolicyForm.default_warmup_days = config.default_warmup_days
   warmupPolicyForm.minimum_warmup_days = config.minimum_warmup_days
   warmupPolicyForm.user_initiated_private_message_multiplier = config.user_initiated_private_message_multiplier
-  const tiers = defaultWarmupTiers()
+  const tiers = createDefaultWarmupPolicy().tiers
   for (const item of assetTierOptions) {
     tiers[item.value] = {
       ...tiers[item.value],
@@ -709,7 +605,7 @@ const fillWarmupPolicyForm = (config: AccountWarmupPolicySettings) => {
     }
   }
   warmupPolicyForm.tiers = tiers
-  const stages = defaultWarmupStages()
+  const stages = createDefaultWarmupPolicy().stages
   for (const item of warmupStageOptions) {
     stages[item.value] = {
       ...stages[item.value],
@@ -732,6 +628,7 @@ const loadAll = async () => {
       throttleRes,
       capacityRes,
       failureRes,
+      effectiveLimitsRes,
       settingsRes,
       attemptsRes,
       verificationRes,
@@ -747,6 +644,7 @@ const loadAll = async () => {
       automationApi.getAdDeliveryThrottle(),
       automationApi.getAdCapacity(),
       automationApi.getAdFailurePolicy(),
+      automationApi.getEffectiveLimits(),
       settingsApi.get(),
       automationApi.getAutoJoinAttempts({ limit: 20 }),
       automationApi.getAutoJoinVerificationLogs({ limit: 20 }),
@@ -769,17 +667,46 @@ const loadAll = async () => {
     verificationLogs.value = verificationRes.data.data
     deliveryLogs.value = deliveryRes.data.data
     groupAdProfiles.value = groupProfilesRes.data.data
+    effectiveLimits.value = effectiveLimitsRes.data.data
+    captureAllSnapshots()
   } finally {
     loading.value = false
   }
 }
 
+const refreshGroupAdProfiles = async () => {
+  if (loading.value || document.visibilityState === 'hidden') return
+  try {
+    const response = await automationApi.getGroupAdProfiles()
+    groupAdProfiles.value = response.data.data
+  } catch (error) {
+    console.error('Failed to refresh group advertisement profiles:', error)
+  }
+}
+
+const refreshAll = async () => {
+  if (await requestDiscardChanges()) await loadAll()
+}
+
+const refreshEffectiveLimits = async () => {
+  try {
+    const res = await automationApi.getEffectiveLimits()
+    effectiveLimits.value = res.data.data
+  } catch {
+    ElMessage.warning('配置已保存，但最终生效上限刷新失败')
+  }
+}
+
 const saveScheduler = async () => {
   saving.value = 'scheduler'
+  saveErrors.scheduler = ''
   try {
     const res = await automationApi.updateAutoJoinSchedulerConfig(schedulerForm)
     fillSchedulerForm(res.data.data)
+    captureSnapshot('scheduler')
     ElMessage.success('已保存入群与群检测配置')
+  } catch (error) {
+    recordSaveError('scheduler', '入群与群检测保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -787,10 +714,15 @@ const saveScheduler = async () => {
 
 const saveRiskGuard = async () => {
   saving.value = 'risk'
+  saveErrors.risk = ''
   try {
     const res = await automationApi.updateAccountRiskGuard(riskGuardForm)
     fillRiskGuardForm(res.data.data)
+    captureSnapshot('risk')
+    await refreshEffectiveLimits()
     ElMessage.success('已保存账号风控配置')
+  } catch (error) {
+    recordSaveError('risk', '账号风控保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -798,10 +730,14 @@ const saveRiskGuard = async () => {
 
 const saveAssetPolicy = async () => {
   saving.value = 'asset'
+  saveErrors.asset = ''
   try {
     const res = await automationApi.updateAccountAssetPolicy(assetPolicyForm)
     fillAssetPolicyForm(res.data.data)
+    captureSnapshot('asset')
     ElMessage.success('已保存账号等级策略')
+  } catch (error) {
+    recordSaveError('asset', '账号等级保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -809,10 +745,14 @@ const saveAssetPolicy = async () => {
 
 const saveWarmupPolicy = async () => {
   saving.value = 'warmup'
+  saveErrors.warmup = ''
   try {
     const res = await automationApi.updateAccountWarmupPolicy(warmupPolicyForm)
     fillWarmupPolicyForm(res.data.data)
+    captureSnapshot('warmup')
     ElMessage.success('已保存暖号配置')
+  } catch (error) {
+    recordSaveError('warmup', '暖号配置保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -820,18 +760,36 @@ const saveWarmupPolicy = async () => {
 
 const saveAdsPolicy = async () => {
   saving.value = 'ads'
+  saveErrors.ads = ''
   try {
-    const [executionRes, throttleRes, capacityRes, failureRes] = await Promise.all([
+    const [executionResult, throttleResult, capacityResult, failureResult] = await Promise.allSettled([
       automationApi.updateAdDeliveryExecution(adExecutionForm),
       automationApi.updateAdDeliveryThrottle(adThrottleForm),
       automationApi.updateAdCapacity(adCapacityForm),
       automationApi.updateAdFailurePolicy(adFailurePolicyForm),
     ])
-    Object.assign(adExecutionForm, executionRes.data.data)
-    Object.assign(adThrottleForm, throttleRes.data.data)
-    Object.assign(adCapacityForm, capacityRes.data.data)
-    Object.assign(adFailurePolicyForm, failureRes.data.data)
+
+    const failures: string[] = []
+    if (executionResult.status === 'fulfilled') Object.assign(adExecutionForm, executionResult.value.data.data)
+    else failures.push(`执行策略（${errorDetail(executionResult.reason)}）`)
+    if (throttleResult.status === 'fulfilled') Object.assign(adThrottleForm, throttleResult.value.data.data)
+    else failures.push(`节流策略（${errorDetail(throttleResult.reason)}）`)
+    if (capacityResult.status === 'fulfilled') Object.assign(adCapacityForm, capacityResult.value.data.data)
+    else failures.push(`容量策略（${errorDetail(capacityResult.reason)}）`)
+    if (failureResult.status === 'fulfilled') Object.assign(adFailurePolicyForm, failureResult.value.data.data)
+    else failures.push(`失败策略（${errorDetail(failureResult.reason)}）`)
+
+    if (failures.length) {
+      saveErrors.ads = `部分保存失败：${failures.join('；')}`
+      ElMessage.error(saveErrors.ads)
+      return
+    }
+
+    captureSnapshot('ads')
+    await refreshEffectiveLimits()
     ElMessage.success('已保存广告投放配置')
+  } catch (error) {
+    recordSaveError('ads', '广告投放配置保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -839,13 +797,20 @@ const saveAdsPolicy = async () => {
 
 const saveGroupAi = async () => {
   saving.value = 'groupAi'
+  saveErrors.groupAi = ''
   try {
     const payload = buildGroupAiPayload()
-    if (!payload) return
+    if (!payload) {
+      saveErrors.groupAi = '按群暖场覆盖 JSON 格式错误'
+      return
+    }
     const res = await settingsApi.update({ groupAiInteraction: payload })
     Object.assign(groupAiForm, (res as any).data?.data?.groupAiInteraction || groupAiForm)
     syncGroupAiTextFields()
+    captureSnapshot('groupAi')
     ElMessage.success('已保存群AI互动配置')
+  } catch (error) {
+    recordSaveError('groupAi', '群AI互动保存失败', error)
   } finally {
     saving.value = ''
   }
@@ -883,16 +848,16 @@ function groupAiModeLabel(value: string) {
   return groupAiModeOptions.find((item) => item.value === value)?.label || value
 }
 
-function accountLabel(row: AdDynamicStatus) {
+function accountLabel(row: any) {
   return row.account_label || `#${row.account_id}`
 }
 
-function compactError(row: AdDynamicStatus) {
+function compactError(row: any) {
   const error = row.recent_errors?.[0]
   return error ? `${error.error || '-'} (${error.count})` : '-'
 }
 
-const saveGroupAdPolicy = async (row: GroupAdProfile) => {
+const saveGroupAdPolicy = async (row: any) => {
   let note = ''
   try {
     const result = await ElMessageBox.prompt('请填写许可依据、管理员确认或禁止原因', '确认群广告策略', {
@@ -926,19 +891,19 @@ function severityTagType(severity?: string) {
   return 'info'
 }
 
-function diagnosticTagType(row: AdDynamicStatus) {
+function diagnosticTagType(row: any) {
   return severityTagType(row.delivery_diagnostic?.primary_block_severity)
 }
 
-function diagnosticLabel(row: AdDynamicStatus) {
+function diagnosticLabel(row: any) {
   return row.delivery_diagnostic?.primary_block_label || '-'
 }
 
-function dynamicHealthTagType(row: AdDynamicStatus) {
+function dynamicHealthTagType(row: any) {
   return severityTagType(row.dynamic_health_diagnostic?.primary_severity)
 }
 
-function dynamicHealthText(row: AdDynamicStatus) {
+function dynamicHealthText(row: any) {
   const diagnostic = row.dynamic_health_diagnostic
   if (!diagnostic) return '-'
   const main = diagnostic.primary_label
@@ -946,7 +911,7 @@ function dynamicHealthText(row: AdDynamicStatus) {
   return top ? `${main} · ${top.label} ${top.delta}` : main
 }
 
-function nextActionText(row: AdDynamicStatus) {
+function nextActionText(row: any) {
   const diagnostic = row.delivery_diagnostic
   if (!diagnostic) return '-'
   return diagnostic.next_action_at
@@ -954,7 +919,7 @@ function nextActionText(row: AdDynamicStatus) {
     : diagnostic.next_action_label
 }
 
-function groupDiagnosticText(row: AdDynamicStatus) {
+function groupDiagnosticText(row: any) {
   const item = row.delivery_diagnostic?.group_diagnostics
   if (!item) return '-'
   const probeState = row.delivery_diagnostic?.probe_execution_allowed ? '探针可运行' : '探针阻断'
@@ -967,9 +932,21 @@ watch(
   (config) => applyConfigQuery(config),
 )
 
+onBeforeRouteLeave(() => requestDiscardChanges())
+
 onMounted(() => {
+  window.addEventListener('beforeunload', beforeWindowUnload)
   applyConfigQuery(route.query.config)
   loadAll()
+  groupProfilesRefreshTimer = window.setInterval(refreshGroupAdProfiles, 30_000)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', beforeWindowUnload)
+  if (groupProfilesRefreshTimer !== null) {
+    window.clearInterval(groupProfilesRefreshTimer)
+    groupProfilesRefreshTimer = null
+  }
 })
 </script>
 
@@ -982,7 +959,7 @@ onMounted(() => {
           账号 {{ metrics.total }} 个 · 加群 {{ metrics.activeJoin }} 个 · 广告 {{ metrics.activeAds }} 个 · 风控 {{ metrics.paused }} 个
         </div>
       </div>
-      <el-button :icon="Refresh" :loading="loading" @click="loadAll">刷新</el-button>
+      <el-button :icon="Refresh" :loading="loading" @click="refreshAll">刷新</el-button>
     </div>
 
     <div class="metric-grid">
@@ -1021,6 +998,56 @@ onMounted(() => {
             <div class="flow-detail">{{ step.detail }}</div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>最终生效上限</h3>
+          <div class="panel-subtitle">重复作用参数已归一化，日额度取最小值，安全间隔取最大值。</div>
+        </div>
+        <el-tag :type="effectiveLimits?.riskGuardEnabled ? 'success' : 'info'" effect="plain">
+          {{ effectiveLimits?.riskGuardEnabled ? '账号风控参与计算' : '账号风控未参与' }}
+        </el-tag>
+      </div>
+      <el-table :data="effectiveLimitRows" size="small" border empty-text="暂无生效上限数据">
+        <el-table-column label="限制项" min-width="190" fixed>
+          <template #default="{ row }">
+            <strong class="limit-name">{{ effectiveLimitLabel(row.key) }}</strong>
+          </template>
+        </el-table-column>
+        <el-table-column label="最终值" min-width="130">
+          <template #default="{ row }">
+            <span class="limit-value">{{ formatEffectiveValue(row.value, row.unit) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="规则" width="100">
+          <template #default="{ row }">{{ formulaLabel(row.formula) }}</template>
+        </el-table-column>
+        <el-table-column label="静态来源" min-width="340">
+          <template #default="{ row }">
+            <div class="source-list">
+              <span v-for="source in row.sources" :key="source.key" class="source-item">
+                {{ effectiveSourceLabel(source.key) }}：{{ formatEffectiveValue(source.value, row.unit) }}
+                <el-tag v-if="!source.active" type="info" size="small" effect="plain">未参与</el-tag>
+              </span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="运行时还会降低" min-width="300">
+          <template #default="{ row }">
+            <div v-if="row.dynamicFactors.length" class="factor-list">
+              <el-tag v-for="factor in row.dynamicFactors" :key="factor" size="small" effect="plain">
+                {{ dynamicFactorLabel(factor) }}
+              </el-tag>
+            </div>
+            <span v-else class="muted-text">无</span>
+          </template>
+        </el-table-column>
+      </el-table>
+      <div class="limit-note">
+        此处是全局硬上限。账号运营态中的实时额度还会受账号等级、暖号阶段、风险、健康度、探针质量和活动策略动态降低。
       </div>
     </section>
 
@@ -1067,7 +1094,7 @@ onMounted(() => {
           </template>
         </el-table-column>
         <el-table-column prop="ad_eligible_groups" label="可投放群" width="100" />
-        <el-table-column label="额度" min-width="130">
+        <el-table-column label="实时广告额度（日 / 轮）" min-width="190">
           <template #default="{ row }">
             {{ row.dynamic_daily_limit }} / {{ row.dynamic_run_limit }}
           </template>
@@ -1092,7 +1119,9 @@ onMounted(() => {
     <section class="panel">
       <div class="panel-header">
         <h3>群广告许可与档位</h3>
-        <el-tag type="info" effect="plain">群级上限 400/天</el-tag>
+        <el-tag type="info" effect="plain">
+          单群全局硬上限 {{ groupGlobalAdDailyLimit ?? '-' }}/天
+        </el-tag>
       </div>
       <el-table :data="groupAdProfiles" size="small" border height="360">
         <el-table-column label="群" min-width="180" show-overflow-tooltip>
@@ -1204,6 +1233,14 @@ onMounted(() => {
     <section class="panel">
       <div class="panel-header">
         <h3>配置中心</h3>
+        <div class="config-summary">
+          <el-tag v-if="unsavedCount" type="warning" effect="plain">
+            {{ unsavedCount }} 项未保存
+          </el-tag>
+          <el-tag v-if="saveErrorCount" type="danger" effect="plain">
+            {{ saveErrorCount }} 项保存失败
+          </el-tag>
+        </div>
       </div>
       <el-tabs v-model="activeConfigTab" class="config-tabs">
         <el-tab-pane label="入群与群检测" name="join">
@@ -1299,7 +1336,11 @@ onMounted(() => {
                 <el-input-number v-model="schedulerForm.group_capacity_cleanup!.max_cleanup_per_run" :min="1" :max="15" />
               </el-form-item>
               <el-form-item>
-                <el-button type="primary" :icon="Check" :loading="saving === 'scheduler'" @click="saveScheduler">保存</el-button>
+                <div class="config-save-row">
+                  <span v-if="saveErrors.scheduler" class="config-save-error">{{ saveErrors.scheduler }}</span>
+                  <el-tag v-else-if="isSectionDirty('scheduler')" type="warning" effect="plain">未保存</el-tag>
+                  <el-button type="primary" :icon="Check" :loading="saving === 'scheduler'" @click="saveScheduler">保存</el-button>
+                </div>
               </el-form-item>
             </el-form>
           </div>
@@ -1312,10 +1353,10 @@ onMounted(() => {
                 <el-switch v-model="warmupPolicyForm.enabled" />
               </el-form-item>
               <el-form-item label="默认天数">
-                <el-input-number v-model="warmupPolicyForm.default_warmup_days" :min="0" :max="120" />
+                <el-input-number v-model="warmupPolicyForm.default_warmup_days" :min="7" :max="120" />
               </el-form-item>
-              <el-form-item label="最低天数">
-                <el-input-number v-model="warmupPolicyForm.minimum_warmup_days" :min="0" :max="120" />
+              <el-form-item label="账号生命周期最短暖号天数">
+                <el-input-number v-model="warmupPolicyForm.minimum_warmup_days" :min="7" :max="120" />
               </el-form-item>
               <el-form-item label="用户私聊倍率">
                 <el-input-number v-model="warmupPolicyForm.user_initiated_private_message_multiplier" :min="0" :max="2" :step="0.05" />
@@ -1327,7 +1368,7 @@ onMounted(() => {
               </el-table-column>
               <el-table-column label="暖号天数" min-width="140">
                 <template #default="{ row }">
-                  <el-input-number v-model="warmupPolicyForm.tiers[row.value].warmup_days" :min="0" :max="120" size="small" />
+                  <el-input-number v-model="warmupPolicyForm.tiers[row.value].warmup_days" :min="7" :max="120" size="small" />
                 </template>
               </el-table-column>
             </el-table>
@@ -1383,6 +1424,8 @@ onMounted(() => {
             </el-table>
           </div>
           <div class="form-actions">
+            <span v-if="saveErrors.warmup" class="config-save-error">{{ saveErrors.warmup }}</span>
+            <el-tag v-else-if="isSectionDirty('warmup')" type="warning" effect="plain">未保存</el-tag>
             <el-button type="primary" :icon="Check" :loading="saving === 'warmup'" @click="saveWarmupPolicy">保存</el-button>
           </div>
         </el-tab-pane>
@@ -1419,7 +1462,7 @@ onMounted(() => {
             </el-table-column>
             <el-table-column label="暖号天数">
               <template #default="{ row }">
-                <el-input-number v-model="assetPolicyForm.tiers[row.value].warmup_days" :min="0" :max="120" size="small" />
+                <el-input-number v-model="assetPolicyForm.tiers[row.value].warmup_days" :min="7" :max="120" size="small" />
               </template>
             </el-table-column>
             <el-table-column label="年龄门槛天">
@@ -1429,6 +1472,8 @@ onMounted(() => {
             </el-table-column>
           </el-table>
           <div class="form-actions">
+            <span v-if="saveErrors.asset" class="config-save-error">{{ saveErrors.asset }}</span>
+            <el-tag v-else-if="isSectionDirty('asset')" type="warning" effect="plain">未保存</el-tag>
             <el-button type="primary" :icon="Check" :loading="saving === 'asset'" @click="saveAssetPolicy">保存</el-button>
           </div>
         </el-tab-pane>
@@ -1583,6 +1628,8 @@ onMounted(() => {
             </el-form>
           </div>
           <div class="form-actions">
+            <span v-if="saveErrors.risk" class="config-save-error">{{ saveErrors.risk }}</span>
+            <el-tag v-else-if="isSectionDirty('risk')" type="warning" effect="plain">未保存</el-tag>
             <el-button type="primary" :icon="Check" :loading="saving === 'risk'" @click="saveRiskGuard">保存</el-button>
           </div>
         </el-tab-pane>
@@ -1597,13 +1644,13 @@ onMounted(() => {
                 <el-input-number v-model="adExecutionForm.dispatcher_interval_seconds" :min="1" :max="86400" />
               </el-form-item>
               <el-form-item label="单轮上限">
-                <el-input-number v-model="adExecutionForm.max_deliveries_per_run" :min="1" :max="20" />
+                <el-input-number v-model="adExecutionForm.max_deliveries_per_run" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="单号单轮上限">
-                <el-input-number v-model="adExecutionForm.max_deliveries_per_account_per_run" :min="1" :max="5" />
+                <el-input-number v-model="adExecutionForm.max_deliveries_per_account_per_run" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="群广告冷却">
-                <el-input-number v-model="adExecutionForm.group_campaign_cooldown_minutes" :min="0" :max="10080" />
+                <el-input-number v-model="adExecutionForm.group_campaign_cooldown_minutes" :min="4320" :max="10080" />
               </el-form-item>
               <el-form-item label="成功后停号">
                 <el-switch v-model="adExecutionForm.stop_account_after_success" />
@@ -1615,22 +1662,22 @@ onMounted(() => {
                 <el-switch v-model="adThrottleForm.enabled" />
               </el-form-item>
               <el-form-item label="投放间隔">
-                <el-input-number v-model="adThrottleForm.delivery_interval_seconds" :min="0" :max="3600" />
+                <el-input-number v-model="adThrottleForm.delivery_interval_seconds" :min="9000" :max="86400" />
               </el-form-item>
               <el-form-item label="批次窗口">
                 <el-input-number v-model="adThrottleForm.batch_window_seconds" :min="1" :max="3600" />
               </el-form-item>
               <el-form-item label="批次最小量">
-                <el-input-number v-model="adThrottleForm.batch_size_min" :min="1" :max="10000" />
+                <el-input-number v-model="adThrottleForm.batch_size_min" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="批次最大量">
-                <el-input-number v-model="adThrottleForm.batch_size_max" :min="1" :max="10000" />
+                <el-input-number v-model="adThrottleForm.batch_size_max" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="冷却最小秒">
-                <el-input-number v-model="adThrottleForm.cooldown_min_seconds" :min="0" :max="86400" />
+                <el-input-number v-model="adThrottleForm.cooldown_min_seconds" :min="9000" :max="86400" />
               </el-form-item>
               <el-form-item label="冷却最大秒">
-                <el-input-number v-model="adThrottleForm.cooldown_max_seconds" :min="0" :max="86400" />
+                <el-input-number v-model="adThrottleForm.cooldown_max_seconds" :min="9000" :max="86400" />
               </el-form-item>
             </el-form>
             <el-form label-width="150px" size="small">
@@ -1646,23 +1693,23 @@ onMounted(() => {
               <el-form-item label="窗口结束小时">
                 <el-input-number v-model="adCapacityForm.window_end_hour" :min="0" :max="23" />
               </el-form-item>
-              <el-form-item label="账号广告日硬上限">
-                <el-input-number v-model="adCapacityForm.account_ad_daily_hard_cap" :min="1" :max="500" />
+              <el-form-item label="账号广告每日硬上限（系统）">
+                <el-input-number v-model="adCapacityForm.account_ad_daily_hard_cap" :min="1" :max="5" />
               </el-form-item>
-              <el-form-item label="账号群日容量">
-                <el-input-number v-model="adCapacityForm.account_group_daily_cap_default" :min="1" :max="500" />
+              <el-form-item label="单账号单群每日硬上限（系统）">
+                <el-input-number v-model="adCapacityForm.account_group_daily_cap_default" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="群全局日硬上限">
                 <el-input-number v-model="adCapacityForm.group_global_daily_hard_cap" :min="1" :max="400" />
               </el-form-item>
               <el-form-item label="群广告最小间隔秒">
-                <el-input-number v-model="adCapacityForm.group_min_interval_seconds" :min="60" :max="3600" />
+                <el-input-number v-model="adCapacityForm.group_min_interval_seconds" :min="259200" :max="604800" />
               </el-form-item>
               <el-form-item label="单号最大群数">
                 <el-input-number v-model="adCapacityForm.max_groups_per_account" :min="1" :max="1000" />
               </el-form-item>
               <el-form-item label="新广告群/天">
-                <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="500" />
+                <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="2" />
               </el-form-item>
               <el-form-item label="删帖检测延迟">
                 <el-input-number v-model="adCapacityForm.survival_check_delay_seconds" :min="30" :max="3600" :step="10" />
@@ -1734,25 +1781,25 @@ onMounted(() => {
                 <el-input-number v-model="adCapacityForm.premium_full_capacity_samples" :min="20" :max="5000" />
               </el-form-item>
               <el-form-item label="Premium入场容量">
-                <el-input-number v-model="adCapacityForm.premium_entry_capacity" :min="1" :max="400" />
+                <el-input-number v-model="adCapacityForm.premium_entry_capacity" :min="1" :max="20" />
               </el-form-item>
               <el-form-item label="Premium增长容量">
-                <el-input-number v-model="adCapacityForm.premium_growth_capacity" :min="1" :max="400" />
+                <el-input-number v-model="adCapacityForm.premium_growth_capacity" :min="1" :max="50" />
               </el-form-item>
-              <el-form-item label="广告前暖群天数">
-                <el-input-number v-model="adCapacityForm.warmup_days_before_ads" :min="0" :max="90" />
+              <el-form-item label="广告首次投放等待天数">
+                <el-input-number v-model="adCapacityForm.warmup_days_before_ads" :min="7" :max="90" />
               </el-form-item>
               <el-form-item label="暖群互动最小">
-                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_min" :min="0" :max="100" />
+                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_min" :min="0" :max="20" />
               </el-form-item>
               <el-form-item label="暖群互动最大">
-                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_max" :min="0" :max="100" />
+                <el-input-number v-model="adCapacityForm.warmup_daily_interactions_max" :min="0" :max="20" />
               </el-form-item>
               <el-form-item label="成熟互动最小">
-                <el-input-number v-model="adCapacityForm.mature_daily_interactions_min" :min="0" :max="100" />
+                <el-input-number v-model="adCapacityForm.mature_daily_interactions_min" :min="0" :max="20" />
               </el-form-item>
               <el-form-item label="成熟互动最大">
-                <el-input-number v-model="adCapacityForm.mature_daily_interactions_max" :min="0" :max="100" />
+                <el-input-number v-model="adCapacityForm.mature_daily_interactions_max" :min="0" :max="20" />
               </el-form-item>
               <el-form-item label="失败策略">
                 <el-switch v-model="adFailurePolicyForm.enabled" />
@@ -1796,6 +1843,8 @@ onMounted(() => {
             </el-table>
           </div>
           <div class="form-actions">
+            <span v-if="saveErrors.ads" class="config-save-error">{{ saveErrors.ads }}</span>
+            <el-tag v-else-if="isSectionDirty('ads')" type="warning" effect="plain">未保存</el-tag>
             <el-button type="primary" :icon="Check" :loading="saving === 'ads'" @click="saveAdsPolicy">保存</el-button>
           </div>
         </el-tab-pane>
@@ -1830,7 +1879,7 @@ onMounted(() => {
               </el-form-item>
             </el-form>
             <el-form label-width="160px" size="small">
-              <el-form-item label="每日Token预算">
+              <el-form-item label="群聊每日Token预算">
                 <el-input-number v-model="groupAiForm.dailyTokenBudget" :min="0" :max="10000000" :step="1000" />
               </el-form-item>
               <el-form-item label="单群回复/天">
@@ -1913,6 +1962,8 @@ onMounted(() => {
             </el-form-item>
           </el-form>
           <div class="form-actions">
+            <span v-if="saveErrors.groupAi" class="config-save-error">{{ saveErrors.groupAi }}</span>
+            <el-tag v-else-if="isSectionDirty('groupAi')" type="warning" effect="plain">未保存</el-tag>
             <el-button type="primary" :icon="Check" :loading="saving === 'groupAi'" @click="saveGroupAi">保存</el-button>
           </div>
         </el-tab-pane>
@@ -2055,6 +2106,12 @@ onMounted(() => {
   }
 }
 
+.panel-subtitle {
+  margin-top: 5px;
+  color: #6b7280;
+  font-size: 12px;
+}
+
 .flow-grid {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -2142,6 +2199,13 @@ onMounted(() => {
   }
 }
 
+.config-summary {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
 .single-entry-note {
   margin-bottom: 12px;
   padding: 10px 12px;
@@ -2168,7 +2232,61 @@ onMounted(() => {
 .form-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 14px;
+}
+
+.config-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+}
+
+.config-save-error {
+  max-width: min(620px, 100%);
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.limit-name,
+.limit-value {
+  color: #111827;
+}
+
+.limit-value {
+  font-weight: 700;
+}
+
+.source-list,
+.factor-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.5;
+}
+
+.source-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #4b5563;
+  white-space: nowrap;
+}
+
+.limit-note {
+  margin-top: 10px;
+  color: #6b7280;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 :deep(.el-input-number) {

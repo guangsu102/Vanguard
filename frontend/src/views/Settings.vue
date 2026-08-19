@@ -51,9 +51,9 @@ const securityForm = reactive({
 
 const xboardForm = reactive({
   enabled: false,
-  apiUrl: '',
-  apiKey: '',
-  webhookUrl: '',
+  callbackEnabled: false,
+  protocol: 'hmac',
+  source: 'environment',
 })
 
 const aiReplyForm = reactive({
@@ -231,15 +231,6 @@ const handleSaveSecurity = async () => {
   }
 }
 
-const handleSaveXBoard = async () => {
-  try {
-    await settingsStore.updateSettings({ xboard: xboardForm })
-    ElMessage.success('保存成功')
-  } catch (error) {
-    ElMessage.error('保存失败')
-  }
-}
-
 const handleSaveAiReply = async () => {
   try {
     await settingsStore.updateSettings({
@@ -374,8 +365,9 @@ onMounted(() => {
 
             <el-divider />
 
-            <el-form-item label="Telegram通知">
+            <el-form-item label="Sub2API Telegram通知">
               <el-switch v-model="notificationForm.telegramEnabled" />
+              <span class="form-tip">仅用于签名验证后的 Sub2API 告警；系统任务告警使用服务器告警配置</span>
             </el-form-item>
 
             <el-form-item v-if="notificationForm.telegramEnabled" label="Telegram Chat ID">
@@ -498,36 +490,28 @@ onMounted(() => {
       <el-tab-pane label="API设置" name="api">
         <el-card shadow="never">
           <el-alert
-            title="XBoard API配置"
+            title="XBoard 配置由服务器环境变量统一管理"
             type="info"
             :closable="false"
             style="margin-bottom: 20px;"
           />
 
-          <el-form :model="xboardForm" label-width="140px">
-            <el-form-item label="启用XBoard">
-              <el-switch v-model="xboardForm.enabled" />
-            </el-form-item>
-
-            <el-form-item v-if="xboardForm.enabled" label="API URL">
-              <el-input v-model="xboardForm.apiUrl" placeholder="XBoard API地址" style="width: 400px;" />
-            </el-form-item>
-
-            <el-form-item v-if="xboardForm.enabled" label="API Key">
-              <el-input v-model="xboardForm.apiKey" placeholder="API Key" style="width: 400px;" show-password />
-            </el-form-item>
-
-            <el-form-item v-if="xboardForm.enabled" label="Webhook URL">
-              <el-input v-model="xboardForm.webhookUrl" placeholder="Webhook回调地址" style="width: 400px;" />
-            </el-form-item>
-
-            <el-form-item>
-              <el-button type="primary" @click="handleSaveXBoard">
-                <el-icon><Select /></el-icon>
-                保存设置
-              </el-button>
-            </el-form-item>
-          </el-form>
+          <el-descriptions :column="1" border>
+            <el-descriptions-item label="集成状态">
+              <el-tag :type="xboardForm.enabled ? 'success' : 'info'">
+                {{ xboardForm.enabled ? '已启用' : '未启用' }}
+              </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="接口协议">
+              {{ xboardForm.protocol === 'hmac' ? 'HMAC 签名 API' : xboardForm.protocol }}
+            </el-descriptions-item>
+            <el-descriptions-item label="回调接口">
+              {{ xboardForm.callbackEnabled ? '已启用' : '未启用' }}
+            </el-descriptions-item>
+            <el-descriptions-item label="配置来源">
+              {{ xboardForm.source === 'environment' ? '服务器环境变量' : xboardForm.source }}
+            </el-descriptions-item>
+          </el-descriptions>
         </el-card>
       </el-tab-pane>
 

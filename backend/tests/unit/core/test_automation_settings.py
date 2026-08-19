@@ -169,6 +169,20 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["hourly_weights"]["2"] == 18
 
 
+def test_normalize_ad_capacity_settings_keeps_premium_safety_ranges_canonical():
+    config = normalize_ad_capacity_settings(
+        {
+            "premiumEntryCapacity": 400,
+            "premiumGrowthCapacity": 400,
+            "premiumConversionCapacityStep": 100,
+        }
+    )
+
+    assert config["premium_entry_capacity"] == 20
+    assert config["premium_growth_capacity"] == 50
+    assert config["premium_conversion_capacity_step"] == 20
+
+
 def test_normalize_ad_delivery_throttle_settings_enforces_single_slow_delivery():
     config = normalize_ad_delivery_throttle_settings(
         {

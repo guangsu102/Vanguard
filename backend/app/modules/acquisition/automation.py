@@ -48,6 +48,10 @@ from app.core.automation_settings import (
     get_ad_failure_policy_settings,
     get_group_ai_interaction_settings,
 )
+from app.core.runtime_settings import (
+    DEFAULT_AD_CAPACITY_SETTINGS,
+    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
+)
 from app.core.ai.keyword_generator import (
     KeywordGenerator,
     normalize_keyword_text,
@@ -102,7 +106,6 @@ from app.modules.acquisition.search_keyword_registry import (
 logger = structlog.get_logger()
 
 AD_DELIVERY_THROTTLE_KEY_PREFIX = "vanguard:ad_delivery:account"
-AD_DELIVERY_GROUP_COOLDOWN_MINUTES = 180
 AD_CREATIVE_TARGET_DEDUP_DAYS = 3
 AD_CREATIVE_MIN_POOL_SIZE = 3
 AD_CREATIVE_AI_BATCH_SIZE = 3
@@ -1588,8 +1591,8 @@ class AcquisitionAutomationService:
         total_groups = membership_count.scalar() or 0
         capacity = await get_ad_capacity_settings(self.db)
         max_groups_total = min(
-            int(config.max_groups_total or capacity.get("max_groups_per_account") or 100),
-            int(capacity.get("max_groups_per_account") or config.max_groups_total or 100),
+            int(config.max_groups_total or capacity.get("max_groups_per_account") or DEFAULT_AD_CAPACITY_SETTINGS["max_groups_per_account"]),
+            int(capacity.get("max_groups_per_account") or config.max_groups_total or DEFAULT_AD_CAPACITY_SETTINGS["max_groups_per_account"]),
         )
         if total_groups >= max_groups_total:
             cleanup_result = await self._cleanup_account_group_capacity(
@@ -4480,7 +4483,7 @@ class AcquisitionAutomationService:
                 warmup_status="joined_pending_test" if status == "joined" else "blocked",
                 probe_status="not_started" if status == "joined" else "skipped",
                 ad_status=MEMBERSHIP_AD_STATUS_WARMING if status == "joined" else MEMBERSHIP_AD_STATUS_BLOCKED,
-                account_group_daily_cap=int(capacity.get("account_group_daily_cap_default") or 400),
+                account_group_daily_cap=int(capacity.get("account_group_daily_cap_default") or DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"]),
                 interaction_started_at=now if status == "joined" else None,
                 first_ad_allowed_at=first_ad_allowed_at,
                 note=note,
@@ -6823,16 +6826,16 @@ class AcquisitionAutomationService:
         if tier_cap <= 0:
             return 0
 
-        min_samples = max(1, int(capacity.get("premium_min_samples") or 20))
-        growth_samples = max(min_samples + 1, int(capacity.get("premium_growth_samples") or 100))
-        full_samples = max(growth_samples + 1, int(capacity.get("premium_full_capacity_samples") or 1000))
+        min_samples = max(1, int(capacity.get("premium_min_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_min_samples"]))
+        growth_samples = max(min_samples + 1, int(capacity.get("premium_growth_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_samples"]))
+        full_samples = max(growth_samples + 1, int(capacity.get("premium_full_capacity_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_full_capacity_samples"]))
 
         # These ceilings are safety boundaries even when runtime settings are too aggressive.
-        entry_capacity = min(tier_cap, 20, max(1, int(capacity.get("premium_entry_capacity") or 20)))
+        entry_capacity = min(tier_cap, DEFAULT_AD_CAPACITY_SETTINGS["premium_entry_capacity"], max(1, int(capacity.get("premium_entry_capacity") or DEFAULT_AD_CAPACITY_SETTINGS["premium_entry_capacity"])))
         growth_capacity = min(
             tier_cap,
-            50,
-            max(entry_capacity, int(capacity.get("premium_growth_capacity") or 50)),
+            DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_capacity"],
+            max(entry_capacity, int(capacity.get("premium_growth_capacity") or DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_capacity"])),
         )
 
         if completed_samples <= min_samples:
@@ -6846,7 +6849,7 @@ class AcquisitionAutomationService:
         else:
             sample_capacity = tier_cap
 
-        conversion_step = min(20, max(1, int(capacity.get("premium_conversion_capacity_step") or 20)))
+        conversion_step = min(DEFAULT_AD_CAPACITY_SETTINGS["premium_conversion_capacity_step"], max(1, int(capacity.get("premium_conversion_capacity_step") or DEFAULT_AD_CAPACITY_SETTINGS["premium_conversion_capacity_step"])))
         conversion_capacity = max(entry_capacity, max(0, conversions) * conversion_step)
         return max(1, min(tier_cap, sample_capacity, conversion_capacity))
 
@@ -6923,7 +6926,7 @@ class AcquisitionAutomationService:
                 or 5
             )
             premium_ready = (
-                completed >= int(capacity.get("premium_min_samples") or 20)
+                completed >= int(capacity.get("premium_min_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_min_samples"])
                 and clean_days >= premium_clean_days
                 and survival_rate >= float(capacity.get("premium_survival_rate_percent") or 95) / 100.0
                 and conversions >= int(capacity.get("premium_min_conversions") or 1)
@@ -6980,9 +6983,9 @@ class AcquisitionAutomationService:
             }
 
         tier_caps = capacity.get("tier_daily_capacities") or {}
+        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
         target_capacity = min(
-            400,
-            int(capacity.get("group_global_daily_hard_cap") or 400),
+            hard_cap,
             int(tier_caps.get(target_tier, 0) or 0),
         )
         if target_tier == GroupAdTier.PREMIUM.value:
@@ -7025,7 +7028,8 @@ class AcquisitionAutomationService:
         if int(profile.ad_policy_confidence or 0) < confidence_floor:
             return 0
         configured = int(profile.daily_capacity or tier_cap or 0)
-        result = max(0, min(configured, tier_cap or configured, int(capacity.get("group_global_daily_hard_cap") or 400), 400))
+        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
+        result = max(0, min(configured, tier_cap or configured, hard_cap))
         if policy_mode in {
             GroupAdPolicyMode.UNKNOWN_PROBE.value,
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,
@@ -7039,7 +7043,7 @@ class AcquisitionAutomationService:
         membership: GroupAccountMembership,
         capacity: dict[str, Any],
     ) -> int:
-        configured_cap = int(capacity.get("account_group_daily_cap_default") or 20)
+        configured_cap = int(capacity.get("account_group_daily_cap_default") or DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"])
         membership_cap = int(membership.account_group_daily_cap or configured_cap)
         base_cap = min(configured_cap, membership_cap)
         if base_cap <= 0:
@@ -7156,7 +7160,7 @@ class AcquisitionAutomationService:
             )
         )
         group_last_sent_at = group_last_sent_row.scalar()
-        group_min_interval = int(capacity.get("group_min_interval_seconds") or 120)
+        group_min_interval = int(capacity.get("group_min_interval_seconds") or DEFAULT_AD_CAPACITY_SETTINGS["group_min_interval_seconds"])
         if group_last_sent_at and now < group_last_sent_at + timedelta(seconds=group_min_interval):
             return "group_ad_delivery_interval"
         group_day_sent = await self._count_successful_ads(since=day_start, telegram_group_id=membership.telegram_group_id)
@@ -7353,7 +7357,7 @@ class AcquisitionAutomationService:
             return capacity_reason
 
         execution = await get_ad_delivery_execution_settings(self.db)
-        group_cooldown_minutes = int(execution.get("group_campaign_cooldown_minutes", AD_DELIVERY_GROUP_COOLDOWN_MINUTES))
+        group_cooldown_minutes = int(execution.get("group_campaign_cooldown_minutes") or DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS["group_campaign_cooldown_minutes"])
         if (
             not capacity_settings.get("enabled", True)
             and group_cooldown_minutes > 0
@@ -7510,7 +7514,7 @@ class AcquisitionAutomationService:
 
         return redis.from_url(
             settings.REDIS_URL,
-            password=settings.REDIS_PASSWORD,
+            password=settings.effective_redis_password,
             encoding="utf-8",
             decode_responses=True,
         )
@@ -8304,7 +8308,7 @@ class AcquisitionAutomationService:
             log.survival_status = AdSurvivalStatus.PENDING.value
             log.survival_stage = "two_minute"
             log.survival_check_due_at = delivery_sent_at + timedelta(
-                seconds=int(capacity.get("survival_check_delay_seconds") or 120)
+                seconds=int(capacity.get("survival_check_delay_seconds") or DEFAULT_AD_CAPACITY_SETTINGS["survival_check_delay_seconds"])
             )
         else:
             log.survival_status = AdSurvivalStatus.NOT_REQUIRED.value
@@ -8334,7 +8338,7 @@ class AcquisitionAutomationService:
         if survival_required and telegram_message_id is not None:
             survival_status = AdSurvivalStatus.PENDING.value
             survival_check_due_at = delivery_sent_at + timedelta(
-                seconds=int(capacity.get("survival_check_delay_seconds") or 120)
+                seconds=int(capacity.get("survival_check_delay_seconds") or DEFAULT_AD_CAPACITY_SETTINGS["survival_check_delay_seconds"])
             )
         log = AdDeliveryLog(
             account_id=account_id,

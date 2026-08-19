@@ -134,6 +134,7 @@ class AccountUpdate(BaseModel):
     """Account update request."""
     display_name: Optional[str] = Field(None, description="Display name")
     profile_bio: Optional[str] = Field(None, max_length=70, description="Telegram public bio")
+    asset_tier: Optional[str] = Field(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus")
     registered_at: Optional[datetime] = Field(None, description="Known Telegram account registration time")
     asset_note: Optional[str] = Field(None, max_length=255, description="Asset source or batch note")
     managed_started_at: Optional[datetime] = Field(None, description="When Vanguard started managing this account")
@@ -695,6 +696,8 @@ async def update_account(
             update_kwargs["profile_bio"] = (update_kwargs["profile_bio"] or "").strip()
         if "asset_note" in update_kwargs:
             update_kwargs["asset_note"] = (update_kwargs["asset_note"] or "").strip()[:255]
+        if "asset_tier" in update_kwargs:
+            update_kwargs["asset_tier"] = _normalize_account_asset_tier(update_kwargs["asset_tier"])
         if "warmup_note" in update_kwargs:
             update_kwargs["warmup_note"] = (update_kwargs["warmup_note"] or "").strip()[:255]
 

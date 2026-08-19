@@ -22,7 +22,7 @@ async def init_redis() -> None:
     
     redis_client = redis.from_url(
         settings.REDIS_URL,
-        password=settings.REDIS_PASSWORD,
+        password=settings.effective_redis_password,
         encoding="utf-8",
         decode_responses=True,
         max_connections=50,

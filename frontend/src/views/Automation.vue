@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   CircleCheck,
@@ -38,6 +38,7 @@ import {
   type GroupAdProfile,
   type AutomationRunResult,
 } from '@/api/automation'
+import { createDefaultAdDeliveryExecution, createDefaultAdDeliveryThrottle, createDefaultAdFailurePolicy, createDefaultAutoJoinScheduler, createDefaultRiskGuard, createDefaultWarmupPolicy } from '@/config/automationDefaults'
 import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS } from '@/api/keywords'
 
 type AccountOption = {
@@ -97,6 +98,7 @@ const creatives = ref<AdCreative[]>([])
 const campaigns = ref<AdCampaign[]>([])
 const bindings = ref<AccountAdBinding[]>([])
 const targetGroups = ref<Group[]>([])
+let groupProfilesRefreshTimer: number | null = null
 const groupAdProfiles = ref<GroupAdProfile[]>([])
 const groupPolicyProbeRunning = ref<number | null>(null)
 const dynamicStatuses = ref<AdDynamicStatus[]>([])
@@ -165,50 +167,14 @@ const groupFailoverStatusOptions: Array<{ label: string; value: GroupFailoverSta
   { label: '\u5df2\u53d6\u6d88', value: 'cancelled' },
 ]
 
-const schedulerConfigForm = reactive({
-  enabled: true,
-  scan_interval_minutes: 1,
-  search_filter: {
-    title_blacklist_enabled: true,
-    title_blacklist: [] as string[],
-  },
-  join_verification: {
-    enabled: true,
-    ai_enabled: true,
-    confidence_threshold: 0.72,
-    post_action_wait_seconds: 8,
-    post_action_recheck_attempts: 3,
-    post_action_extra_wait_seconds: 12,
-    message_limit: 20,
-    ai_timeout_seconds: 45,
-    action_timeout_seconds: 5,
-    pending_sync_min_age_seconds: 120,
-    pending_sync_limit: 5,
-    unknown_challenge_action: 'leave' as 'leave' | 'manual' | 'wait' | 'skip',
-    allow_button_clicks: true,
-    allow_text_answers: true,
-    answer_profile: '中文用户，主要为了学习交流、找资料、行业沟通。',
-  },
-  group_capacity_cleanup: {
-    enabled: false,
-    no_conversion_days: 30,
-    min_join_age_days: 30,
-    max_cleanup_per_run: 15,
-  },
-})
+const schedulerConfigForm = reactive(createDefaultAutoJoinScheduler())
 
 const adRunForm = reactive({
   max_deliveries: 20,
   dry_run: true,
 })
 
-const adFailurePolicyForm = reactive<AdFailurePolicy>({
-  enabled: true,
-  leave_on_group_control_failure: true,
-  group_control_failure_limit: 3,
-  group_control_failure_window_hours: 24,
-  levels: ['B'],
-})
+const adFailurePolicyForm = reactive(createDefaultAdFailurePolicy())
 
 const riskActionOptions = [
   { label: '搜群', value: 'search' },
@@ -226,85 +192,9 @@ const riskActionOptions = [
   { label: '创建频道', value: 'channel_create' },
 ]
 
-const defaultRiskActions = () =>
-  Object.fromEntries(
-    riskActionOptions.map((item) => [
-      item.value,
-      {
-        daily_limit:
-          item.value === 'search'
-            ? 100
-            : item.value === 'join'
-              ? 6
-              : item.value === 'group_message'
-                ? 4
-                : item.value === 'ad_delivery'
-                  ? 5
-                  : 1,
-        cooldown_seconds:
-          item.value === 'search'
-            ? 30
-            : item.value === 'join' || item.value === 'group_message'
-              ? 7200
-              : item.value === 'ad_probe' || item.value === 'channel_create'
-                ? 86400
-                : item.value === 'ai_warmup'
-                  ? 21600
-                  : item.value === 'ad_delivery'
-                    ? 9000
-                    : 0,
-      },
-    ]),
-  )
+const defaultRiskActions = () => createDefaultRiskGuard().actions
 
-const accountRiskGuardForm = reactive<AccountRiskGuardSettings>({
-  enabled: true,
-  global_daily_limit: 30,
-  group_write_daily_limit: 8,
-  redis_fail_closed: null,
-  actions: defaultRiskActions(),
-  level_thresholds: { watch: 20, limited: 45, frozen: 70, quarantined: 90 },
-  level_budget_multipliers: { normal: 1, watch: 0.7, limited: 0.45, frozen: 0, quarantined: 0 },
-  risk_score_deltas: {
-    group_write_forbidden: 4,
-    platform_group_write_forbidden: 12,
-    flood_wait: 15,
-    peer_flood: 35,
-    account_banned: 50,
-    account_restricted: 50,
-    generic_failure: 5,
-    block: 1,
-  },
-  lifecycle: {
-    default_freeze_seconds: 3600,
-    flood_wait_buffer_seconds: 60,
-    peer_flood_freeze_seconds: 86400,
-    account_restricted_freeze_seconds: 86400,
-    group_write_forbidden_freeze_seconds: 43200,
-    recovery_seconds: 86400,
-    post_freeze_score_cap: 69,
-    manual_clear_score_cap: 44,
-    decay_interval_hours: 24,
-    decay_points_per_interval: 8,
-    new_account_days: 3,
-    new_account_multiplier: 0.3,
-    recovery_multiplier: 0.5,
-    healthy_account_days: 14,
-    healthy_account_multiplier: 1,
-    max_budget_multiplier: 1,
-  },
-  group_write_forbidden: {
-    freeze_window_hours: 2,
-    freeze_distinct_groups: 5,
-    quarantine_window_hours: 24,
-    quarantine_distinct_groups: 10,
-  },
-  retention: {
-    low_value_detail_retention_days: 14,
-    high_value_detail_retention_days: 90,
-    daily_stat_retention_days: 370,
-  },
-})
+const accountRiskGuardForm = reactive(createDefaultRiskGuard())
 
 const warmupTierOptions = [
   { label: '未知', value: 'unknown' },
@@ -324,112 +214,15 @@ const warmupStageOptions = [
   { label: '冷却', value: 'cooldown' },
 ]
 
-const defaultWarmupTiers = (): AccountWarmupPolicySettings['tiers'] => ({
-  unknown: { warmup_days: 15 },
-  month_1: { warmup_days: 18 },
-  month_3_6: { warmup_days: 12 },
-  year_1: { warmup_days: 9 },
-  year_2: { warmup_days: 7 },
-  year_3_plus: { warmup_days: 7 },
-})
+const defaultWarmupTiers = (): AccountWarmupPolicySettings['tiers'] => createDefaultWarmupPolicy().tiers
 
-const defaultWarmupStages = (): AccountWarmupPolicySettings['stages'] => ({
-  observe: {
-    limit_multiplier: 0.08,
-    join_multiplier: 0,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0.1,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0.05,
-    profile_update_multiplier: 0.2,
-    allow_proactive_private_message: false,
-  },
-  seed: {
-    limit_multiplier: 0.15,
-    join_multiplier: 0.15,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0.25,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0.15,
-    profile_update_multiplier: 0.5,
-    allow_proactive_private_message: false,
-  },
-  soft: {
-    limit_multiplier: 0.35,
-    join_multiplier: 0.35,
-    ad_multiplier: 0.25,
-    run_multiplier: 0.25,
-    probe_multiplier: 0.45,
-    private_message_multiplier: 0.1,
-    group_message_multiplier: 0.35,
-    profile_update_multiplier: 0.75,
-    allow_proactive_private_message: false,
-  },
-  ramp: {
-    limit_multiplier: 0.65,
-    join_multiplier: 0.65,
-    ad_multiplier: 0.65,
-    run_multiplier: 0.65,
-    probe_multiplier: 0.75,
-    private_message_multiplier: 0.25,
-    group_message_multiplier: 0.65,
-    profile_update_multiplier: 1,
-    allow_proactive_private_message: false,
-  },
-  normal: {
-    limit_multiplier: 1,
-    join_multiplier: 1,
-    ad_multiplier: 1,
-    run_multiplier: 1,
-    probe_multiplier: 1,
-    private_message_multiplier: 1,
-    group_message_multiplier: 1,
-    profile_update_multiplier: 1,
-    allow_proactive_private_message: true,
-  },
-  cooldown: {
-    limit_multiplier: 0,
-    join_multiplier: 0,
-    ad_multiplier: 0,
-    run_multiplier: 0,
-    probe_multiplier: 0,
-    private_message_multiplier: 0,
-    group_message_multiplier: 0,
-    profile_update_multiplier: 0,
-    allow_proactive_private_message: false,
-  },
-})
+const defaultWarmupStages = (): AccountWarmupPolicySettings['stages'] => createDefaultWarmupPolicy().stages
 
-const accountWarmupPolicyForm = reactive<AccountWarmupPolicySettings>({
-  enabled: true,
-  default_warmup_days: 15,
-  minimum_warmup_days: 5,
-  user_initiated_private_message_multiplier: 1,
-  tiers: defaultWarmupTiers(),
-  stages: defaultWarmupStages(),
-})
+const accountWarmupPolicyForm = reactive(createDefaultWarmupPolicy())
 
-const adDeliveryExecutionForm = reactive<AdDeliveryExecutionSettings>({
-  enabled: true,
-  dispatcher_interval_seconds: 60,
-  max_deliveries_per_run: 20,
-  max_deliveries_per_account_per_run: 5,
-  group_campaign_cooldown_minutes: 180,
-  stop_account_after_success: false,
-  stop_account_after_failure: true,
-})
+const adDeliveryExecutionForm = reactive(createDefaultAdDeliveryExecution())
 
-const adDeliveryThrottleForm = reactive<AdDeliveryThrottleSettings>({
-  enabled: true,
-  delivery_interval_seconds: 0,
-  batch_window_seconds: 180,
-  batch_size_min: 200,
-  batch_size_max: 200,
-  cooldown_min_seconds: 0,
-  cooldown_max_seconds: 0,
-})
+const adDeliveryThrottleForm = reactive(createDefaultAdDeliveryThrottle())
 
 const keywordReplenishForm = reactive({
   auto_approve: true,
@@ -1427,6 +1220,16 @@ const refreshData = async () => {
   }
 }
 
+const refreshGroupAdProfiles = async () => {
+  if (loading.value || document.visibilityState === 'hidden') return
+  try {
+    const response = await automationApi.getGroupAdProfiles()
+    groupAdProfiles.value = response.data.data
+  } catch (error) {
+    console.error('Failed to refresh group advertisement profiles:', error)
+  }
+}
+
 const refreshPage = async () => {
   loading.value = true;
   try {
@@ -2023,6 +1826,17 @@ watch(selectedAccountId, async (accountId) => {
 })
 
 onMounted(refreshPage)
+
+onMounted(() => {
+  groupProfilesRefreshTimer = window.setInterval(refreshGroupAdProfiles, 30_000)
+})
+
+onBeforeUnmount(() => {
+  if (groupProfilesRefreshTimer !== null) {
+    window.clearInterval(groupProfilesRefreshTimer)
+    groupProfilesRefreshTimer = null
+  }
+})
 </script>
 
 <template>

@@ -75,6 +75,7 @@ export interface AccountFormData {
 export interface AccountUpdateData {
   display_name?: string
   profile_bio?: string
+  asset_tier?: AccountAssetTier
   registered_at?: string
   asset_note?: string
   managed_started_at?: string

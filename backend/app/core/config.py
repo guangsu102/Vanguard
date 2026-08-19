@@ -6,6 +6,8 @@ Application configuration using Pydantic Settings with environment variable supp
 
 from functools import lru_cache
 
+from urllib.parse import urlsplit
+
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -60,7 +62,7 @@ class Settings(BaseSettings):
 
     # Redis
     REDIS_URL: str = Field(default="redis://localhost:6379/0", description="Redis connection URL")
-    REDIS_PASSWORD: str | None = Field(default=None, description="Redis password")
+    REDIS_PASSWORD: str | None = Field(default=None, description="Legacy fallback; prefer the password embedded in REDIS_URL")
 
     # Telegram
     TELEGRAM_API_ID: str | None = Field(default=None, description="Telegram API ID")
@@ -126,14 +128,14 @@ class Settings(BaseSettings):
     DECODO_API_KEY: str | None = Field(default=None, description="Decodo API key for proxy services")
     DECODO_SESSION_DURATION: int = Field(default=10, description="Default proxy session duration in minutes")
 
-    # XBoard Database (for direct integration)
-    XBOARD_DB_HOST: str = Field(default="localhost", description="XBoard database host")
-    XBOARD_DB_PORT: int = Field(default=3306, description="XBoard database port")
-    XBOARD_DB_NAME: str = Field(default="xboard", description="XBoard database name")
-    XBOARD_DB_USER: str = Field(default="root", description="XBoard database user")
-    XBOARD_DB_PASSWORD: str = Field(default="password", description="XBoard database password")
-    XBOARD_API_URL: str = Field(default="", description="XBoard API base URL")
-    XBOARD_API_KEY: str | None = Field(default=None, description="XBoard API key")
+    # XBoard direct database fields are retained for compatibility only; Vanguard does not read them.
+    XBOARD_DB_HOST: str = Field(default="localhost", description="Deprecated XBoard database host")
+    XBOARD_DB_PORT: int = Field(default=3306, description="Deprecated XBoard database port")
+    XBOARD_DB_NAME: str = Field(default="xboard", description="Deprecated XBoard database name")
+    XBOARD_DB_USER: str = Field(default="root", description="Deprecated XBoard database user")
+    XBOARD_DB_PASSWORD: str = Field(default="password", description="Deprecated XBoard database password")
+    XBOARD_API_URL: str = Field(default="", description="Deprecated outbound XBoard API URL; signed HMAC integration is authoritative")
+    XBOARD_API_KEY: str | None = Field(default=None, description="Deprecated XBoard API key; signed HMAC integration is authoritative")
 
     # Vanguard <-> XBoard API integration
     VANGUARD_INTEGRATION_ENABLED: bool = Field(default=True, description="Enable Vanguard XBoard integration")
@@ -174,7 +176,7 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str | None = Field(default=None, description="Anthropic API Key")
     LLM_PROVIDER: str = Field(default="openai", description="LLM provider: openai/anthropic/local")
     LLM_MODEL: str = Field(default="gpt-5.6-terra", description="Default LLM model")
-    LLM_FAST_MODEL: str = Field(default="gpt-5.6-terra", description="Low-latency LLM model")
+    LLM_FAST_MODEL: str = Field(default="", description="Low-latency LLM model; falls back to LLM_MODEL when empty")
 
     # CORS
     CORS_ORIGINS: str = Field(
@@ -195,6 +197,7 @@ class Settings(BaseSettings):
 
     # Alert
     ALERT_CHAT_ID: str | None = Field(default=None, description="Telegram chat ID for alerts")
+    TELEGRAM_ALERT_CHAT_ID: str | None = Field(default=None, description="Deprecated alias for ALERT_CHAT_ID")
 
     # Logging
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
@@ -213,6 +216,12 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_defaults(self):
         """Fail fast if production is started with development secrets."""
+        if not self.LLM_FAST_MODEL.strip():
+            self.LLM_FAST_MODEL = self.LLM_MODEL
+
+        if not self.ALERT_CHAT_ID and self.TELEGRAM_ALERT_CHAT_ID:
+            self.ALERT_CHAT_ID = self.TELEGRAM_ALERT_CHAT_ID
+
         if self.SECRET_KEY == DEFAULT_DEV_SECRET and self.JWT_SECRET != DEFAULT_DEV_SECRET:
             self.SECRET_KEY = self.JWT_SECRET
         elif self.JWT_SECRET == DEFAULT_DEV_SECRET and self.SECRET_KEY != DEFAULT_DEV_SECRET:
@@ -246,6 +255,14 @@ class Settings(BaseSettings):
         if errors:
             raise ValueError("; ".join(errors))
         return self
+
+    @property
+    def effective_redis_password(self) -> str | None:
+        """Use the URL credential first; REDIS_PASSWORD remains a legacy fallback."""
+        try:
+            return None if urlsplit(self.REDIS_URL).password is not None else self.REDIS_PASSWORD
+        except ValueError:
+            return self.REDIS_PASSWORD
 
 
 @lru_cache

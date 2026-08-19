@@ -41,7 +41,9 @@ from app.core.automation_settings import (
     save_auto_join_scheduler_settings,
 )
 from app.core.database import get_db
+from app.core.effective_limits import build_effective_limit_summary
 from app.core.group.models import Group, GroupAccountMembership
+from app.core.runtime_settings import DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS
 from app.core.scheduler.tasks import (
     auto_join_groups_task,
     auto_probe_unknown_group_ad_policies_task,
@@ -264,9 +266,9 @@ class AdCapacityUpdate(BaseModel):
     premium_survival_rate_percent: int = Field(default=95, ge=50, le=100)
     premium_growth_samples: int = Field(default=100, ge=20, le=1000)
     premium_full_capacity_samples: int = Field(default=1000, ge=20, le=5000)
-    premium_entry_capacity: int = Field(default=20, ge=1, le=400)
-    premium_growth_capacity: int = Field(default=50, ge=1, le=400)
-    premium_conversion_capacity_step: int = Field(default=20, ge=0, le=400)
+    premium_entry_capacity: int = Field(default=20, ge=1, le=20)
+    premium_growth_capacity: int = Field(default=50, ge=1, le=50)
+    premium_conversion_capacity_step: int = Field(default=20, ge=1, le=20)
     premium_clean_days_auto: int = Field(default=5, ge=3, le=30)
     premium_clean_days_verified: int = Field(default=3, ge=3, le=30)
     deleted_ad_pause_hours: int = Field(default=72, ge=1, le=720)
@@ -1026,6 +1028,18 @@ async def update_ad_capacity_config(
     return {"code": 0, "message": "success", "data": config}
 
 
+@router.get("/effective-limits")
+async def get_effective_limits(db: AsyncSession = Depends(get_db)) -> dict:
+    """Return the normalized hard caps and their runtime reduction factors."""
+    summary = build_effective_limit_summary(
+        risk_guard=await get_account_risk_guard_settings(db),
+        ad_execution=await get_ad_delivery_execution_settings(db),
+        ad_throttle=await get_ad_delivery_throttle_settings(db),
+        ad_capacity=await get_ad_capacity_settings(db),
+    )
+    return {"code": 0, "message": "success", "data": summary}
+
+
 def _group_ad_profile_payload(
     profile: GroupAdProfile, metrics: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
@@ -1304,7 +1318,7 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
         warmup_context = account_warmup_context(warmup_policy, account, now, action="ad_delivery")
         run_limit = await service._ad_dynamic_run_limit(
             account.id,
-            int(execution.get("max_deliveries_per_account_per_run") or 10),
+            int(execution.get("max_deliveries_per_account_per_run") or DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS["max_deliveries_per_account_per_run"]),
             now,
         )
 

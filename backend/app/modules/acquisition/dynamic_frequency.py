@@ -356,8 +356,8 @@ class AccountDynamicFrequencyService:
             configured = int(profile.daily_capacity or tier_cap or 0)
         else:
             configured = int(tier_cap or 0)
-        hard_cap = int(capacity.get("group_global_daily_hard_cap") or 400)
-        result = max(0, min(configured, tier_cap or configured, hard_cap, 400))
+        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
+        result = max(0, min(configured, tier_cap or configured, hard_cap))
         if policy_mode in {
             GroupAdPolicyMode.UNKNOWN_PROBE.value,
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,

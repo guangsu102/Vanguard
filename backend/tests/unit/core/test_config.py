@@ -67,3 +67,39 @@ def test_onebot_accepts_numeric_account_and_strong_token():
     )
 
     assert configured.QQ_ONEBOT_ENABLED is True
+
+
+def test_legacy_telegram_alert_chat_id_alias_is_normalized():
+    configured = Settings(_env_file=None, TELEGRAM_ALERT_CHAT_ID='-1001234567890')
+
+    assert configured.ALERT_CHAT_ID == '-1001234567890'
+
+
+def test_fast_llm_model_falls_back_to_primary_model_when_empty():
+    configured = Settings(
+        _env_file=None,
+        LLM_MODEL='primary-model',
+        LLM_FAST_MODEL='',
+    )
+
+    assert configured.LLM_FAST_MODEL == 'primary-model'
+
+
+def test_redis_url_password_takes_precedence_over_legacy_password():
+    configured = Settings(
+        _env_file=None,
+        REDIS_URL="redis://:url-secret@redis.example:6379/0",
+        REDIS_PASSWORD="legacy-secret",
+    )
+
+    assert configured.effective_redis_password is None
+
+
+def test_redis_password_is_used_when_url_has_no_password():
+    configured = Settings(
+        _env_file=None,
+        REDIS_URL="redis://redis.example:6379/0",
+        REDIS_PASSWORD="legacy-secret",
+    )
+
+    assert configured.effective_redis_password == "legacy-secret"
