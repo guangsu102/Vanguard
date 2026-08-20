@@ -21,7 +21,12 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.automation_settings import get_app_runtime_settings, save_app_runtime_settings
+from app.core.automation_settings import (
+    DEFAULT_AI_REPLY_SETTINGS,
+    DEFAULT_NOTIFICATION_SETTINGS,
+    get_app_runtime_settings,
+    save_app_runtime_settings,
+)
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.redis import get_redis
@@ -33,53 +38,14 @@ from app.core.runtime_settings import (
 router = APIRouter()
 STARTED_AT = time.time()
 DEFAULT_SETTINGS: dict[str, Any] = {
-    "site": {
-        "siteName": "Vanguard",
-        "siteLogo": "",
-        "timezone": "Asia/Shanghai",
-        "language": "zh-CN",
-        "maintenanceMode": False,
-        "maintenanceMessage": "",
-    },
-    "notification": {
-        "sub2apiAlertsEnabled": False,
-        "sub2apiNotifyResolved": True,
-        "sub2apiAnnouncementsEnabled": False,
-        "telegramEnabled": bool(settings.ALERT_CHAT_ID),
-        "telegramChatId": settings.ALERT_CHAT_ID or "",
-        "telegramAnnouncementsEnabled": False,
-        "telegramAnnouncementChatId": "",
-        "telegramAnnouncementPin": True,
-        "telegramAnnouncementPinSilent": True,
-        "qqEnabled": False,
-        "qqAnnouncementsEnabled": False,
-        "emailEnabled": False,
-        "emailRecipients": [],
-        "webhookEnabled": False,
-        "webhookUrl": "",
-        "alertOnError": True,
-        "alertOnWarning": False,
-    },
-    "security": {
-        "loginAttempts": 5,
-        "lockoutDuration": 30,
-        "sessionTimeout": settings.JWT_EXPIRATION_HOURS * 60,
-        "allowedIpList": [],
-        "require2FA": False,
-    },
+    "notification": DEFAULT_NOTIFICATION_SETTINGS,
     "xboard": {
         "enabled": settings.VANGUARD_INTEGRATION_ENABLED,
         "callbackEnabled": settings.VANGUARD_CALLBACK_ENABLED,
         "protocol": "hmac",
         "source": "environment",
     },
-    "aiReply": {
-        "enabled": False,
-        "privateOnly": True,
-        "dailyTokenBudget": 0,
-        "maxRepliesPerUserPerDay": 2,
-        "cooldownSeconds": 1800,
-    },
+    "aiReply": DEFAULT_AI_REPLY_SETTINGS,
     "groupAiInteraction": DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
     "keywordPrivateReply": {
         "enabled": False,
@@ -95,11 +61,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 class SettingsUpdate(BaseModel):
     """Partial settings update from the frontend."""
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
-    site: dict[str, Any] | None = None
     notification: dict[str, Any] | None = None
-    security: dict[str, Any] | None = None
     xboard: dict[str, Any] | None = None
     aiReply: dict[str, Any] | None = None
     groupAiInteraction: dict[str, Any] | None = None

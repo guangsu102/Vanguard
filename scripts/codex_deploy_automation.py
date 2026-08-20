@@ -299,7 +299,6 @@ def env_check_command() -> str:
         "    'VANGUARD_SIGNING_SECRET': getattr(settings, 'VANGUARD_SIGNING_SECRET', ''),\n"
         "    'VANGUARD_CALLBACK_APP_ID': getattr(settings, 'VANGUARD_CALLBACK_APP_ID', ''),\n"
         "    'VANGUARD_CALLBACK_SIGNING_SECRET': getattr(settings, 'VANGUARD_CALLBACK_SIGNING_SECRET', ''),\n"
-        "    'XBOARD_API_URL': getattr(settings, 'XBOARD_API_URL', ''),\n"
         "}\n"
         "defaults = {'', 'replace-with-shared-secret', 'replace-with-callback-secret'}\n"
         "for key, value in checks.items():\n"

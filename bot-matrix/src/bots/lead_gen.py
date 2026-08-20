@@ -482,15 +482,16 @@ class LeadGenBot:
         # 处理器映射
         self.handlers: Dict[str, LeadGenHandler] = {}
 
-        # 加载配置
+        # BotMatrix passes the root config; anti-ban values live under lead_gen.
+        anti_ban_config = config.get("lead_gen", {}).get("anti_ban", {})
         self.lead_config = LeadGenConfig(
-            message_interval=config.get("message_interval", 30),
-            max_messages_per_day=config.get("max_messages_per_day", 30),
-            max_groups_per_day=config.get("max_groups_per_day", 10),
-            typing_delay=tuple(config.get("typing_delay", [2000, 8000])),
-            random_timing=config.get("random_timing", True),
-            min_messages_before_promo=config.get("min_messages_before_promo", 5),
-            min_wait_hours=config.get("min_wait_hours", 24)
+            message_interval=anti_ban_config.get("message_interval", 30),
+            max_messages_per_day=anti_ban_config.get("max_messages_per_day", 30),
+            max_groups_per_day=anti_ban_config.get("max_groups_per_day", 10),
+            typing_delay=tuple(anti_ban_config.get("typing_delay", [2000, 8000])),
+            random_timing=anti_ban_config.get("random_timing", True),
+            min_messages_before_promo=5,
+            min_wait_hours=24,
         )
 
     async def start(self):

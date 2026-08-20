@@ -53,7 +53,6 @@ from app.modules.acquisition.config import (
     SearchConfig,
     SpeakerConfig,
     TriggerConfig,
-    GuideConfig,
     TrackingConfig,
     get_acquisition_config,
 )
@@ -193,7 +192,6 @@ __all__ = [
     "SearchConfig",
     "SpeakerConfig",
     "TriggerConfig",
-    "GuideConfig",
     "TrackingConfig",
     "get_acquisition_config",
 

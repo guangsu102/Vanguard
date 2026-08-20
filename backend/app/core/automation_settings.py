@@ -8,20 +8,21 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.settings_models import SystemSetting
+from app.core.config import settings
 from app.core.runtime_settings import (
     DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS,
     DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS,
     DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS,
+    DEFAULT_AD_CAPACITY_SETTINGS,
+    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
+    DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS,
     DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS,
     DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
     DEFAULT_KEYWORD_PRIVATE_REPLY_SETTINGS,
     DEFAULT_PRIVATE_MESSAGING_SETTINGS,
     DEFAULT_PRIVATE_REPLY_TEMPLATES,
-    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
-    DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS,
-    DEFAULT_AD_CAPACITY_SETTINGS,
 )
+from app.core.settings_models import SystemSetting
 
 AD_FAILURE_POLICY_SETTING_KEY = "automation.ad_failure_policy"
 AUTO_JOIN_SCHEDULER_SETTING_KEY = "automation.auto_join_scheduler"
@@ -32,6 +33,20 @@ AD_DELIVERY_THROTTLE_SETTING_KEY = "automation.ad_delivery_throttle"
 AD_DELIVERY_EXECUTION_SETTING_KEY = "automation.ad_delivery_execution"
 AD_CAPACITY_SETTING_KEY = "automation.ad_capacity"
 APP_SETTINGS_SETTING_KEY = "app.runtime_settings"
+DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
+    "sub2apiAlertsEnabled": False,
+    "sub2apiNotifyResolved": True,
+    "sub2apiAnnouncementsEnabled": False,
+    "telegramEnabled": bool(settings.ALERT_CHAT_ID),
+    "telegramChatId": settings.ALERT_CHAT_ID or "",
+    "telegramAnnouncementsEnabled": False,
+    "telegramAnnouncementChatId": "",
+    "telegramAnnouncementPin": True,
+    "telegramAnnouncementPinSilent": True,
+    "qqEnabled": False,
+    "qqAnnouncementsEnabled": False,
+}
+DEFAULT_AI_REPLY_SETTINGS: dict[str, Any] = {"enabled": False}
 DEFAULT_AD_FAILURE_POLICY: dict[str, Any] = {
     "enabled": True,
     "leave_on_group_control_failure": True,
@@ -376,12 +391,13 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
     if not system_prompt:
         system_prompt = defaults["systemPrompt"]
 
+    enabled = _bool_setting(raw.get("enabled"), defaults["enabled"])
+    legacy_ai_enabled = raw.get("aiEnabled", raw.get("ai_enabled"))
+    if legacy_ai_enabled is not None:
+        enabled = enabled and _bool_setting(legacy_ai_enabled, False)
+
     return {
-        "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
-        "aiEnabled": _bool_setting(
-            raw.get("aiEnabled", raw.get("ai_enabled", defaults["aiEnabled"])),
-            defaults["aiEnabled"],
-        ),
+        "enabled": enabled,
         "dailyTokenBudget": _int_setting(
             raw.get("dailyTokenBudget", raw.get("daily_token_budget", defaults["dailyTokenBudget"])),
             defaults["dailyTokenBudget"],
@@ -612,6 +628,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
 
 def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
+    notification = raw.get("notification", {})
+    if not isinstance(notification, dict):
+        notification = {}
     ai_reply = raw.get("aiReply", {})
     if not isinstance(ai_reply, dict):
         ai_reply = {}
@@ -636,21 +655,59 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
 
     return {
         "_meta": raw.get("_meta", {}) if isinstance(raw.get("_meta", {}), dict) else {},
-        "site": raw.get("site", {}) if isinstance(raw.get("site", {}), dict) else {},
-        "notification": raw.get("notification", {}) if isinstance(raw.get("notification", {}), dict) else {},
-        "security": raw.get("security", {}) if isinstance(raw.get("security", {}), dict) else {},
-        "xboard": raw.get("xboard", {}) if isinstance(raw.get("xboard", {}), dict) else {},
-        "aiReply": {
-            "enabled": _bool_setting(ai_reply.get("enabled", False), False),
-            "privateOnly": _bool_setting(ai_reply.get("privateOnly", True), True),
-            "dailyTokenBudget": _int_setting(ai_reply.get("dailyTokenBudget", 0), 0, min_value=0, max_value=10000000),
-            "maxRepliesPerUserPerDay": _int_setting(
-                ai_reply.get("maxRepliesPerUserPerDay", 2),
-                2,
-                min_value=0,
-                max_value=10000,
+        "notification": {
+            "sub2apiAlertsEnabled": _bool_setting(
+                notification.get("sub2apiAlertsEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["sub2apiAlertsEnabled"],
             ),
-            "cooldownSeconds": _int_setting(ai_reply.get("cooldownSeconds", 1800), 1800, min_value=0, max_value=86400),
+            "sub2apiNotifyResolved": _bool_setting(
+                notification.get("sub2apiNotifyResolved"),
+                DEFAULT_NOTIFICATION_SETTINGS["sub2apiNotifyResolved"],
+            ),
+            "sub2apiAnnouncementsEnabled": _bool_setting(
+                notification.get("sub2apiAnnouncementsEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["sub2apiAnnouncementsEnabled"],
+            ),
+            "telegramEnabled": _bool_setting(
+                notification.get("telegramEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["telegramEnabled"],
+            ),
+            "telegramChatId": str(
+                notification.get(
+                    "telegramChatId",
+                    DEFAULT_NOTIFICATION_SETTINGS["telegramChatId"],
+                )
+                or ""
+            ).strip()[:1000],
+            "telegramAnnouncementsEnabled": _bool_setting(
+                notification.get("telegramAnnouncementsEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["telegramAnnouncementsEnabled"],
+            ),
+            "telegramAnnouncementChatId": str(
+                notification.get("telegramAnnouncementChatId") or ""
+            ).strip()[:1000],
+            "telegramAnnouncementPin": _bool_setting(
+                notification.get("telegramAnnouncementPin"),
+                DEFAULT_NOTIFICATION_SETTINGS["telegramAnnouncementPin"],
+            ),
+            "telegramAnnouncementPinSilent": _bool_setting(
+                notification.get("telegramAnnouncementPinSilent"),
+                DEFAULT_NOTIFICATION_SETTINGS["telegramAnnouncementPinSilent"],
+            ),
+            "qqEnabled": _bool_setting(
+                notification.get("qqEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["qqEnabled"],
+            ),
+            "qqAnnouncementsEnabled": _bool_setting(
+                notification.get("qqAnnouncementsEnabled"),
+                DEFAULT_NOTIFICATION_SETTINGS["qqAnnouncementsEnabled"],
+            ),
+        },
+        "aiReply": {
+            "enabled": _bool_setting(
+                ai_reply.get("enabled"),
+                DEFAULT_AI_REPLY_SETTINGS["enabled"],
+            ),
         },
         "groupAiInteraction": normalize_group_ai_interaction_settings(group_ai),
         "keywordPrivateReply": {
@@ -698,8 +755,7 @@ async def get_group_ai_interaction_settings(db: AsyncSession) -> dict[str, Any]:
 
 
 async def is_group_ai_interaction_enabled(db: AsyncSession) -> bool:
-    settings = await get_group_ai_interaction_settings(db)
-    return bool(settings["enabled"] and settings["aiEnabled"])
+    return bool((await get_group_ai_interaction_settings(db))["enabled"])
 
 
 async def is_keyword_private_reply_enabled(db: AsyncSession) -> bool:
@@ -1154,12 +1210,6 @@ def normalize_account_asset_policy_settings(payload: dict[str, Any] | None) -> d
                 min_value=0.0,
                 max_value=3.0,
             ),
-            "warmup_days": _int_setting(
-                item.get("warmup_days", item.get("warmupDays", default_policy["warmup_days"])),
-                int(default_policy["warmup_days"]),
-                min_value=7,
-                max_value=120,
-            ),
             "age_floor_days": _int_setting(
                 item.get("age_floor_days", item.get("ageFloorDays", default_policy["age_floor_days"])),
                 int(default_policy["age_floor_days"]),
@@ -1336,21 +1386,6 @@ async def save_account_warmup_policy_settings(db: AsyncSession, payload: dict[st
 def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS
-    batch_size_min = _int_setting(
-        raw.get("batch_size_min", raw.get("batchSizeMin", defaults["batch_size_min"])),
-        defaults["batch_size_min"],
-        min_value=1,
-        max_value=10000,
-    )
-    batch_size_max = _int_setting(
-        raw.get("batch_size_max", raw.get("batchSizeMax", defaults["batch_size_max"])),
-        defaults["batch_size_max"],
-        min_value=1,
-        max_value=1,
-    )
-    batch_size_min = 1
-    batch_size_max = 1
-
     cooldown_min_seconds = _int_setting(
         raw.get("cooldown_min_seconds", raw.get("cooldownMinSeconds", defaults["cooldown_min_seconds"])),
         defaults["cooldown_min_seconds"],
@@ -1380,8 +1415,6 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
             min_value=1,
             max_value=3600,
         ),
-        "batch_size_min": batch_size_min,
-        "batch_size_max": batch_size_max,
         "cooldown_min_seconds": cooldown_min_seconds,
         "cooldown_max_seconds": cooldown_max_seconds,
     }
@@ -1412,21 +1445,6 @@ def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> 
             defaults["dispatcher_interval_seconds"],
             min_value=1,
             max_value=86400,
-        ),
-        "max_deliveries_per_run": _int_setting(
-            raw.get("max_deliveries_per_run", raw.get("maxDeliveriesPerRun", defaults["max_deliveries_per_run"])),
-            defaults["max_deliveries_per_run"],
-            min_value=1,
-            max_value=1,
-        ),
-        "max_deliveries_per_account_per_run": _int_setting(
-            raw.get(
-                "max_deliveries_per_account_per_run",
-                raw.get("maxDeliveriesPerAccountPerRun", defaults["max_deliveries_per_account_per_run"]),
-            ),
-            defaults["max_deliveries_per_account_per_run"],
-            min_value=1,
-            max_value=1,
         ),
         "group_campaign_cooldown_minutes": _int_setting(
             raw.get("group_campaign_cooldown_minutes", raw.get("groupCampaignCooldownMinutes", defaults["group_campaign_cooldown_minutes"])),
@@ -1515,12 +1533,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             defaults["survival_check_batch_size"],
             min_value=1,
             max_value=500,
-        ),
-        "account_group_daily_cap_default": _int_setting(
-            raw.get("account_group_daily_cap_default", raw.get("accountGroupDailyCapDefault", defaults["account_group_daily_cap_default"])),
-            defaults["account_group_daily_cap_default"],
-            min_value=1,
-            max_value=1,
         ),
         "survival_retry_max_attempts": _int_setting(
             raw.get(
@@ -1755,12 +1767,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             defaults["membership_delete_block_count"],
             min_value=1,
             max_value=20,
-        ),
-        "warmup_days_before_ads": _int_setting(
-            raw.get("warmup_days_before_ads", raw.get("warmupDaysBeforeAds", defaults["warmup_days_before_ads"])),
-            defaults["warmup_days_before_ads"],
-            min_value=7,
-            max_value=90,
         ),
         "warmup_daily_interactions_min": _int_setting(
             raw.get(

@@ -199,7 +199,6 @@ class SemanticGroupReplyEngine:
     def _enabled(self, settings: dict[str, Any]) -> bool:
         return bool(
             settings.get("enabled")
-            and settings.get("aiEnabled")
             and settings.get("allowSemanticTriggeredReply")
             and settings.get("mode") != "off"
         )

@@ -2466,7 +2466,7 @@ onBeforeUnmount(() => {
             <div>
               <span>调度间隔</span>
               <strong>{{ adDeliveryExecutionForm.dispatcher_interval_seconds }} 秒</strong>
-              <small>单轮上限 {{ adDeliveryExecutionForm.max_deliveries_per_run }}</small>
+              <small>串行投放</small>
             </div>
             <div>
               <span>同群计划冷却</span>

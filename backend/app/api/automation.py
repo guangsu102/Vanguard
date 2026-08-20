@@ -22,6 +22,7 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.account.warmup import account_warmup_context
+from app.core.automation_constants import AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
     get_account_risk_guard_settings,
@@ -43,13 +44,12 @@ from app.core.automation_settings import (
 from app.core.database import get_db
 from app.core.effective_limits import build_effective_limit_summary
 from app.core.group.models import Group, GroupAccountMembership
-from app.core.runtime_settings import DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS
 from app.core.scheduler.tasks import (
     auto_join_groups_task,
     auto_probe_unknown_group_ad_policies_task,
-    recover_orphaned_groups_task,
     check_ad_survival_task,
     deliver_ads_task,
+    recover_orphaned_groups_task,
     replenish_keywords_task,
 )
 from app.core.security import require_admin
@@ -67,11 +67,11 @@ from app.modules.acquisition.models import (
     AdDeliveryLog,
     AdSendMode,
     AutoJoinAttempt,
+    GroupAdPolicyEvent,
+    GroupAdPolicyMode,
+    GroupAdProfile,
     GroupFailoverStatus,
     GroupFailoverTask,
-    GroupAdPolicyMode,
-    GroupAdPolicyEvent,
-    GroupAdProfile,
 )
 
 router = APIRouter()
@@ -179,7 +179,6 @@ class AccountAssetTierPolicyUpdate(BaseModel):
     ad_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
     run_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
     probe_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
-    warmup_days: int = Field(default=15, ge=7, le=120)
     age_floor_days: int = Field(default=0, ge=0, le=3650)
 
 
@@ -217,8 +216,6 @@ class AdDeliveryThrottleUpdate(BaseModel):
     enabled: bool = True
     delivery_interval_seconds: int = Field(default=9000, ge=9000, le=86400)
     batch_window_seconds: int = Field(default=3600, ge=1, le=3600)
-    batch_size_min: int = Field(default=1, ge=1, le=1)
-    batch_size_max: int = Field(default=1, ge=1, le=1)
     cooldown_min_seconds: int = Field(default=9000, ge=9000, le=86400)
     cooldown_max_seconds: int = Field(default=10800, ge=9000, le=86400)
 
@@ -226,8 +223,6 @@ class AdDeliveryThrottleUpdate(BaseModel):
 class AdDeliveryExecutionUpdate(BaseModel):
     enabled: bool = True
     dispatcher_interval_seconds: int = Field(default=60, ge=1, le=86400)
-    max_deliveries_per_run: int = Field(default=1, ge=1, le=1)
-    max_deliveries_per_account_per_run: int = Field(default=1, ge=1, le=1)
     group_campaign_cooldown_minutes: int = Field(default=4320, ge=4320, le=10080)
     stop_account_after_success: bool = True
     stop_account_after_failure: bool = True
@@ -243,7 +238,6 @@ class AdCapacityUpdate(BaseModel):
     survival_twenty_four_hour_seconds: int = Field(default=86400, ge=3600, le=172800)
     survival_check_batch_size: int = Field(default=50, ge=1, le=500)
     account_ad_daily_hard_cap: int = Field(default=5, ge=1, le=5)
-    account_group_daily_cap_default: int = Field(default=1, ge=1, le=1)
     group_global_daily_hard_cap: int = Field(default=400, ge=1, le=400)
     group_min_interval_seconds: int = Field(default=259200, ge=259200, le=604800)
     max_groups_per_account: int = Field(default=400, ge=1, le=1000)
@@ -273,7 +267,6 @@ class AdCapacityUpdate(BaseModel):
     premium_clean_days_verified: int = Field(default=3, ge=3, le=30)
     deleted_ad_pause_hours: int = Field(default=72, ge=1, le=720)
     membership_delete_block_count: int = Field(default=2, ge=1, le=20)
-    warmup_days_before_ads: int = Field(default=15, ge=7, le=90)
     warmup_daily_interactions_min: int = Field(default=0, ge=0, le=20)
     warmup_daily_interactions_max: int = Field(default=1, ge=0, le=20)
     mature_daily_interactions_min: int = Field(default=0, ge=0, le=20)
@@ -1318,7 +1311,7 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
         warmup_context = account_warmup_context(warmup_policy, account, now, action="ad_delivery")
         run_limit = await service._ad_dynamic_run_limit(
             account.id,
-            int(execution.get("max_deliveries_per_account_per_run") or DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS["max_deliveries_per_account_per_run"]),
+            AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN,
             now,
         )
 

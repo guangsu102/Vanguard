@@ -232,8 +232,8 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `TELEGRAM_API_HASH` - Telegram API hash
 - `BOT_TOKEN` - Telegram bot token from @BotFather
 - `CORS_ORIGINS` - Comma-separated list of allowed origins
-- `XBOARD_API_URL` - XBoard API base URL
-- `XBOARD_API_KEY` - XBoard API key
+- `VANGUARD_SIGNING_SECRET` - Shared HMAC secret for inbound XBoard requests
+- `VANGUARD_CALLBACK_SIGNING_SECRET` - Shared HMAC secret for XBoard callbacks
 
 **Frontend (.env.development, .env.production)**:
 - `VITE_API_BASE_URL` - Backend API base URL. Production should use same-origin `/api` so both `https://www.dh113.xyz` and `https://dh113.xyz` work.

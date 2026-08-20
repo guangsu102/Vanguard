@@ -1,0 +1,7 @@
+"""Non-configurable safety limits for automation execution."""
+
+AD_DELIVERY_BATCH_SIZE = 1
+AD_MAX_DELIVERIES_PER_RUN = 1
+AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN = 1
+AD_ACCOUNT_GROUP_DAILY_CAP = 1
+AD_MIN_WARMUP_DAYS = 7

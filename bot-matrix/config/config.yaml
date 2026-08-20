@@ -2,9 +2,6 @@
 # 所有配置项可通过环境变量覆盖
 
 app:
-  name: "XBoard Bot Matrix"
-  env: "development"
-  debug: true
   log_level: "DEBUG"
 
 # Telegram 用户账号矩阵
@@ -68,66 +65,9 @@ redis:
   port: ${REDIS_PORT:6379}
   password: "${REDIS_PASSWORD:}"
   db: 0
-  ssl: false
 
 # ============ 模块 A: 引流空投配置 ============
 lead_gen:
-  # 账号矩阵配置
-  account_matrix:
-    max_per_group: 3        # 每群最多3个账号
-    roles:
-      main:
-        priority: 1
-        behavior: "marketing"      # 主动营销
-      aux1:
-        priority: 2
-        behavior: "integration"   # 融入互动
-      aux2:
-        priority: 3
-        behavior: "monitor"       # 监控
-
-  # 试用账号配置
-  trial:
-    enabled: true
-    validity_hours: 24
-    traffic_gb: 50
-    enable_duplicate_check: true
-
-  # 风控配置
-  risk_control:
-    max_requests_per_ip_per_hour: 10
-    max_trials_per_uid_per_day: 1
-    block_duration_minutes: 30
-
-  # 群组管理
-  group_management:
-    # 自动加入配置
-    auto_join:
-      enabled: true
-      max_groups_per_day: 10       # 每天最多加群数
-      min_group_members: 100       # 最小群人数
-      max_group_members: 5000      # 最大群人数
-
-    # 群组分群
-    grade_a:
-      description: "可直接营销"
-      can_post: true
-      can_send_links: true
-      max_posts_per_day: 10
-    grade_b:
-      description: "先融入再营销"
-      can_post: false
-      integration_required: true
-      min_wait_hours: 24
-    grade_c:
-      description: "仅监控"
-      can_post: false
-      monitor_enabled: true
-      collect_users: true
-    grade_d:
-      description: "黑名单"
-      auto_join: false
-
   # 防封号配置
   anti_ban:
     message_interval: 30           # 发消息间隔（秒）
@@ -135,41 +75,6 @@ lead_gen:
     max_groups_per_day: 10        # 每天最大加群数
     typing_delay: [2000, 8000]    # 打字延迟（毫秒）
     random_timing: true
-
-  # 动态关键词管理
-  keywords:
-    # 可通过 Bot 命令动态增删
-    # /keyword add target <词>
-    # /keyword add trigger <词>
-    # /keyword add exclude <词>
-
-    defaults:
-      target:
-        - "翻墙"
-        - "机场"
-        - "VPN"
-        - "节点"
-        - "梯子"
-        - "代理"
-        - "科学上网"
-        - "加速器"
-      trigger:
-        - "哪里买"
-        - "怎么购买"
-        - "多少钱"
-        - "价格"
-        - "怎么用"
-        - "如何使用"
-        - "教程"
-        - "怎么连接"
-        - "试用"
-        - "免费"
-        - "优惠"
-      exclude:
-        - "菠菜"
-        - "赌博"
-        - "色情"
-        - "诈骗"
 
 # ============ 模块 B: 核心运营配置 ============
 service:
@@ -186,7 +91,6 @@ service:
     coupon_validity_hours: 2
 
   poster:
-    enabled: true
     width: 800
     height: 1200
     qr_size: 200
@@ -207,9 +111,8 @@ group_ops:
   node_report:
     enabled: true
     schedule: "20:30"
-    timezone: "Asia/Shanghai"
 
 # 监控与告警
 monitoring:
-  sentry_dsn: "${SENTRY_DSN:}"
   admin_chat_id: "${ADMIN_CHAT_ID:}"
+  node_report_chat_id: "${NODE_REPORT_CHAT_ID:}"

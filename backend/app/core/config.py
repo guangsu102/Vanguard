@@ -5,7 +5,6 @@ Application configuration using Pydantic Settings with environment variable supp
 """
 
 from functools import lru_cache
-
 from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
@@ -29,12 +28,11 @@ class Settings(BaseSettings):
     # Application
     APP_ENV: str = Field(default="development", description="Application environment")
     DEBUG: bool = Field(default=True, description="Debug mode")
-    SECRET_KEY: str = Field(default=DEFAULT_DEV_SECRET, description="Secret key for JWT (minimum 64 characters)")
     JWT_SECRET: str = Field(default=DEFAULT_DEV_SECRET, description="JWT secret key (minimum 64 characters for HS256)")
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT algorithm")
-    JWT_EXPIRATION_HOURS: int = Field(default=24, description="JWT expiration in hours")
+    JWT_EXPIRATION_HOURS: int = Field(default=24, ge=1, le=720, description="JWT expiration in hours")
 
-    @field_validator("JWT_SECRET", "SECRET_KEY")
+    @field_validator("JWT_SECRET")
     @classmethod
     def validate_secret_length(cls, v: str) -> str:
         if len(v) < 64:
@@ -47,10 +45,6 @@ class Settings(BaseSettings):
         if value is not None and value.strip() and len(value.strip()) < 32:
             raise ValueError("SUB2API_ALERT_WEBHOOK_SECRET must contain at least 32 characters")
         return value
-
-    # Server
-    HOST: str = Field(default="0.0.0.0", description="Server host")
-    PORT: int = Field(default=8000, description="Server port")
 
     # Database
     DATABASE_URL: str = Field(
@@ -126,16 +120,6 @@ class Settings(BaseSettings):
 
     # Decodo Proxy Service (legacy fallback)
     DECODO_API_KEY: str | None = Field(default=None, description="Decodo API key for proxy services")
-    DECODO_SESSION_DURATION: int = Field(default=10, description="Default proxy session duration in minutes")
-
-    # XBoard direct database fields are retained for compatibility only; Vanguard does not read them.
-    XBOARD_DB_HOST: str = Field(default="localhost", description="Deprecated XBoard database host")
-    XBOARD_DB_PORT: int = Field(default=3306, description="Deprecated XBoard database port")
-    XBOARD_DB_NAME: str = Field(default="xboard", description="Deprecated XBoard database name")
-    XBOARD_DB_USER: str = Field(default="root", description="Deprecated XBoard database user")
-    XBOARD_DB_PASSWORD: str = Field(default="password", description="Deprecated XBoard database password")
-    XBOARD_API_URL: str = Field(default="", description="Deprecated outbound XBoard API URL; signed HMAC integration is authoritative")
-    XBOARD_API_KEY: str | None = Field(default=None, description="Deprecated XBoard API key; signed HMAC integration is authoritative")
 
     # Vanguard <-> XBoard API integration
     VANGUARD_INTEGRATION_ENABLED: bool = Field(default=True, description="Enable Vanguard XBoard integration")
@@ -145,8 +129,6 @@ class Settings(BaseSettings):
     VANGUARD_CALLBACK_ENABLED: bool = Field(default=True, description="Enable Vanguard callback endpoint")
     VANGUARD_CALLBACK_APP_ID: str = Field(default="xboard", description="Callback app id")
     VANGUARD_CALLBACK_SIGNING_SECRET: str = Field(default=PLACEHOLDER_VANGUARD_CALLBACK_SECRET, description="Callback signing secret")
-    VANGUARD_CALLBACK_TIMEOUT: int = Field(default=5, description="Callback timeout in seconds")
-    VANGUARD_CALLBACK_QUEUE: str = Field(default="vanguard_callback", description="Callback queue name")
 
     # Sub2API Admin integration for campaign redeem-code coupons
     SUB2API_ENABLED: bool = Field(default=False, description="Enable Sub2API redeem-code coupon generation")
@@ -197,11 +179,9 @@ class Settings(BaseSettings):
 
     # Alert
     ALERT_CHAT_ID: str | None = Field(default=None, description="Telegram chat ID for alerts")
-    TELEGRAM_ALERT_CHAT_ID: str | None = Field(default=None, description="Deprecated alias for ALERT_CHAT_ID")
 
     # Logging
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
-    SENTRY_DSN: str | None = Field(default=None, description="Sentry DSN for error tracking")
 
     @property
     def is_production(self) -> bool:
@@ -219,14 +199,6 @@ class Settings(BaseSettings):
         if not self.LLM_FAST_MODEL.strip():
             self.LLM_FAST_MODEL = self.LLM_MODEL
 
-        if not self.ALERT_CHAT_ID and self.TELEGRAM_ALERT_CHAT_ID:
-            self.ALERT_CHAT_ID = self.TELEGRAM_ALERT_CHAT_ID
-
-        if self.SECRET_KEY == DEFAULT_DEV_SECRET and self.JWT_SECRET != DEFAULT_DEV_SECRET:
-            self.SECRET_KEY = self.JWT_SECRET
-        elif self.JWT_SECRET == DEFAULT_DEV_SECRET and self.SECRET_KEY != DEFAULT_DEV_SECRET:
-            self.JWT_SECRET = self.SECRET_KEY
-
         if self.QQ_ONEBOT_ENABLED:
             account_id = (self.QQ_ONEBOT_ACCOUNT_ID or "").strip()
             if not account_id or not account_id.isdigit():
@@ -242,8 +214,6 @@ class Settings(BaseSettings):
             return self
 
         errors: list[str] = []
-        if self.SECRET_KEY == DEFAULT_DEV_SECRET:
-            errors.append("SECRET_KEY must be set explicitly in production")
         if self.JWT_SECRET == DEFAULT_DEV_SECRET:
             errors.append("JWT_SECRET must be set explicitly in production")
         if "change_me_in_production" in self.DATABASE_URL:

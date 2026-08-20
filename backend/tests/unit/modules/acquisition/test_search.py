@@ -1540,7 +1540,7 @@ class TestAdDeliveryFailureHandling:
         service._leave_group.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_account_group_ad_daily_capacity_uses_asset_multiplier(self, test_db, monkeypatch):
+    async def test_account_group_ad_daily_capacity_cannot_exceed_internal_cap(self, test_db, monkeypatch):
         account = TelegramAccount(
             phone="+15550000002",
             identifier="+15550000002",
@@ -1578,7 +1578,7 @@ class TestAdDeliveryFailureHandling:
             {"account_group_daily_cap_default": 20},
         )
 
-        assert cap == 14
+        assert cap == 1
 
     @pytest.mark.asyncio
     async def test_ad_daily_limit_uses_recent_probe_formula_and_business_stage(self, test_db):
@@ -2404,7 +2404,7 @@ class TestAdDeliveryFailureHandling:
 
 
 @pytest.mark.asyncio
-async def test_account_asset_warmup_days_never_bypasses_seven_day_floor(monkeypatch):
+async def test_account_ad_warmup_days_uses_warmup_policy_with_seven_day_floor(monkeypatch):
     service = AcquisitionAutomationService.__new__(AcquisitionAutomationService)
     service.db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(asset_tier="year_2")))
 
@@ -2418,9 +2418,8 @@ async def test_account_asset_warmup_days_never_bypasses_seven_day_floor(monkeypa
 
     monkeypatch.setattr(
         acquisition_automation,
-        "get_account_asset_policy_settings",
+        "get_account_warmup_policy_settings",
         low_warmup_policy,
     )
 
-    assert await service._account_asset_warmup_days(1, 0) == 7
-    assert await service._account_asset_warmup_days(1, 15) == 15
+    assert await service._account_ad_warmup_days(1) == 7

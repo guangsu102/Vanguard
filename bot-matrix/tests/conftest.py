@@ -94,8 +94,6 @@ def sample_config():
     """测试配置"""
     return {
         "app": {
-            "name": "XBoard Bot Matrix",
-            "env": "testing",
             "log_level": "DEBUG"
         },
         "telegram": {
@@ -124,17 +122,13 @@ def sample_config():
             "db": 0
         },
         "lead_gen": {
-            "trial": {
-                "enabled": True,
-                "validity_hours": 24,
-                "traffic_gb": 50,
-                "enable_duplicate_check": True
+            "anti_ban": {
+                "message_interval": 30,
+                "max_messages_per_day": 30,
+                "max_groups_per_day": 10,
+                "typing_delay": [2000, 8000],
+                "random_timing": True
             },
-            "risk_control": {
-                "max_requests_per_ip_per_hour": 10,
-                "max_trials_per_uid_per_day": 1,
-                "block_duration_minutes": 30
-            }
         },
         "service": {
             "checkin": {
@@ -150,7 +144,6 @@ def sample_config():
                 "coupon_validity_hours": 2
             },
             "poster": {
-                "enabled": True,
                 "width": 800,
                 "height": 1200,
                 "qr_size": 200,
@@ -169,12 +162,11 @@ def sample_config():
             },
             "node_report": {
                 "enabled": True,
-                "schedule": "20:30",
-                "timezone": "Asia/Shanghai"
+                "schedule": "20:30"
             }
         },
         "monitoring": {
-            "sentry_dsn": "",
-            "admin_chat_id": 123456
+            "admin_chat_id": 123456,
+            "node_report_chat_id": 654321
         }
     }

@@ -41,6 +41,7 @@ class BotMatrix:
         self.group_ops_bot: GroupOpsBot = None
 
         self._shutdown_event = asyncio.Event()
+        self._last_node_report_date: str | None = None
 
     def _load_config(self, config_path: str) -> dict:
         """加载配置文件"""
@@ -273,7 +274,7 @@ class BotMatrix:
 
     async def _check_node_report(self):
         """检查是否需要发送节点状态播报"""
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
         report_config = self.config["group_ops"]["node_report"]
         if not report_config.get("enabled"):
@@ -281,11 +282,29 @@ class BotMatrix:
 
         now = datetime.now()
         schedule_time = report_config.get("schedule", "20:30")
+        try:
+            report_hour, report_minute = (int(part) for part in schedule_time.split(":", 1))
+            scheduled_at = now.replace(
+                hour=report_hour,
+                minute=report_minute,
+                second=0,
+                microsecond=0,
+            )
+        except (TypeError, ValueError):
+            logger.warning(f"无效的节点播报时间配置: {schedule_time!r}")
+            return
 
-        if now.hour == 20 and 25 <= now.minute <= 35:
-            group_id = self.config["monitoring"].get("node_report_chat_id")
-            if group_id:
-                await self.group_ops_bot.send_node_report(group_id)
+        if not scheduled_at <= now < scheduled_at + timedelta(minutes=10):
+            return
+
+        report_date = now.date().isoformat()
+        if self._last_node_report_date == report_date:
+            return
+
+        group_id = self.config["monitoring"].get("node_report_chat_id")
+        if group_id:
+            await self.group_ops_bot.send_node_report(group_id)
+            self._last_node_report_date = report_date
 
     async def stop(self):
         """停止所有 Bot"""

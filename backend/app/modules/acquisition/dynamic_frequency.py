@@ -20,6 +20,7 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.account.warmup import account_warmup_context
+from app.core.automation_constants import AD_ACCOUNT_GROUP_DAILY_CAP
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
     get_account_warmup_policy_settings,
@@ -42,7 +43,6 @@ ACCOUNT_STABLE_MIN_DAYS = 7
 AD_DYNAMIC_PROBE_WINDOW_HOURS = 6
 AD_GROUP_CONTROL_ERROR_PREFIX = "group_control:"
 AD_GROUP_LEFT_ERROR_PREFIX = "group_control_left:"
-AD_ACCOUNT_GROUP_DEFAULT_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"])
 AD_DELIVERY_DEFAULT_ACCOUNT_DAILY_LIMIT = int(DEFAULT_AD_CAPACITY_SETTINGS["account_ad_daily_hard_cap"])
 AD_GROUP_ABSOLUTE_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
 
@@ -1052,7 +1052,7 @@ class AccountDynamicFrequencyService:
 
         quality_scores: list[float] = []
         eligible_capacity_limit = 0
-        account_group_default_cap = int(capacity.get("account_group_daily_cap_default") or AD_ACCOUNT_GROUP_DEFAULT_DAILY_CAP)
+        account_group_default_cap = AD_ACCOUNT_GROUP_DAILY_CAP
         account_ad_multiplier = self.account_asset_multiplier(asset_policy, account, "ad_multiplier")
         for membership in eligible_memberships:
             group = membership.group

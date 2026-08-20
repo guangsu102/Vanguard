@@ -1,14 +1,5 @@
 import apiClient from './client'
 
-export interface SystemSettings {
-  siteName: string
-  siteLogo?: string
-  timezone: string
-  language: string
-  maintenanceMode: boolean
-  maintenanceMessage?: string
-}
-
 export interface NotificationSettings {
   sub2apiAlertsEnabled: boolean
   sub2apiNotifyResolved: boolean
@@ -21,20 +12,6 @@ export interface NotificationSettings {
   telegramAnnouncementPinSilent: boolean
   qqEnabled: boolean
   qqAnnouncementsEnabled: boolean
-  emailEnabled: boolean
-  emailRecipients?: string[]
-  webhookEnabled: boolean
-  webhookUrl?: string
-  alertOnError: boolean
-  alertOnWarning: boolean
-}
-
-export interface SecuritySettings {
-  loginAttempts: number
-  lockoutDuration: number
-  sessionTimeout: number
-  allowedIpList?: string[]
-  require2FA: boolean
 }
 
 export interface XBoardSettings {
@@ -46,15 +23,10 @@ export interface XBoardSettings {
 
 export interface AiReplySettings {
   enabled: boolean
-  privateOnly: boolean
-  dailyTokenBudget: number
-  maxRepliesPerUserPerDay: number
-  cooldownSeconds: number
 }
 
 export interface GroupAiInteractionSettings {
   enabled: boolean
-  aiEnabled: boolean
   dailyTokenBudget: number
   maxRepliesPerGroupPerDay: number
   maxRepliesPerAccountPerDay: number
@@ -129,9 +101,7 @@ export interface PrivateMessagingSettings {
 }
 
 export interface SettingsFormData {
-  site?: Partial<SystemSettings>
   notification?: Partial<NotificationSettings>
-  security?: Partial<SecuritySettings>
   xboard?: Partial<XBoardSettings>
   aiReply?: Partial<AiReplySettings>
   groupAiInteraction?: Partial<GroupAiInteractionSettings>

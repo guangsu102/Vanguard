@@ -183,7 +183,6 @@ const adFailurePolicyForm = reactive<AdFailurePolicy>(createDefaultAdFailurePoli
 
 const groupAiForm = reactive<GroupAiInteractionSettings>({
   enabled: false,
-  aiEnabled: false,
   dailyTokenBudget: 0,
   maxRepliesPerGroupPerDay: 3,
   maxRepliesPerAccountPerDay: 20,
@@ -428,12 +427,12 @@ const flowSteps = computed(() => [
     title: '暖号',
     enabled: warmupPolicyForm.enabled,
     status: `${warmupPolicyForm.default_warmup_days} 天`,
-    detail: `最低 ${warmupPolicyForm.minimum_warmup_days} 天，广告等待 ${adCapacityForm.warmup_days_before_ads} 天`,
+    detail: `最低 ${warmupPolicyForm.minimum_warmup_days} 天，按账号年龄分层`,
   },
   {
     key: 'interaction',
     title: '群AI互动',
-    enabled: Boolean(groupAiForm.enabled && groupAiForm.aiEnabled),
+    enabled: groupAiForm.enabled,
     status: groupAiForm.enabled ? groupAiModeLabel(groupAiForm.mode) : '关闭',
     detail: `${groupAiForm.maxRepliesPerGroupPerDay}/群/天，冷却 ${formatDuration(groupAiForm.cooldownSeconds)}`,
   },
@@ -441,8 +440,8 @@ const flowSteps = computed(() => [
     key: 'ad',
     title: '广告',
     enabled: adExecutionForm.enabled,
-    status: `${adExecutionForm.max_deliveries_per_run}/轮`,
-    detail: `账号 ${adExecutionForm.max_deliveries_per_account_per_run}/轮，删帖检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
+    status: '串行投放',
+    detail: `删帖检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
   },
   {
     key: 'risk',
@@ -471,9 +470,9 @@ const effectiveSourceLabels: Record<string, string> = {
   'risk.actions.group_message.daily_limit': '风控群消息日额度',
   'risk.actions.ad_delivery.daily_limit': '风控广告日额度',
   'ads.capacity.account_ad_daily_hard_cap': '广告单号日硬上限',
-  'ads.execution.max_deliveries_per_run': '广告单轮总上限',
-  'ads.execution.max_deliveries_per_account_per_run': '广告单号单轮上限',
-  'ads.capacity.account_group_daily_cap_default': '单号单群默认日上限',
+  'system.ads.max_deliveries_per_run': '广告单轮系统上限',
+  'system.ads.max_deliveries_per_account_per_run': '广告单号单轮系统上限',
+  'system.ads.account_group_daily_cap': '单号单群系统日上限',
   'ads.capacity.group_global_daily_hard_cap': '单群全局日硬上限',
   'ads.throttle.delivery_interval_seconds': '投放间隔',
   'ads.throttle.cooldown_min_seconds': '投放最小冷却',
@@ -1460,11 +1459,6 @@ onBeforeUnmount(() => {
                 <el-input-number v-model="assetPolicyForm.tiers[row.value].probe_multiplier" :min="0" :max="3" :step="0.05" size="small" />
               </template>
             </el-table-column>
-            <el-table-column label="暖号天数">
-              <template #default="{ row }">
-                <el-input-number v-model="assetPolicyForm.tiers[row.value].warmup_days" :min="7" :max="120" size="small" />
-              </template>
-            </el-table-column>
             <el-table-column label="年龄门槛天">
               <template #default="{ row }">
                 <el-input-number v-model="assetPolicyForm.tiers[row.value].age_floor_days" :min="0" :max="3650" size="small" />
@@ -1643,12 +1637,6 @@ onBeforeUnmount(() => {
               <el-form-item label="执行间隔">
                 <el-input-number v-model="adExecutionForm.dispatcher_interval_seconds" :min="1" :max="86400" />
               </el-form-item>
-              <el-form-item label="单轮上限">
-                <el-input-number v-model="adExecutionForm.max_deliveries_per_run" :min="1" :max="1" />
-              </el-form-item>
-              <el-form-item label="单号单轮上限">
-                <el-input-number v-model="adExecutionForm.max_deliveries_per_account_per_run" :min="1" :max="1" />
-              </el-form-item>
               <el-form-item label="群广告冷却">
                 <el-input-number v-model="adExecutionForm.group_campaign_cooldown_minutes" :min="4320" :max="10080" />
               </el-form-item>
@@ -1666,12 +1654,6 @@ onBeforeUnmount(() => {
               </el-form-item>
               <el-form-item label="批次窗口">
                 <el-input-number v-model="adThrottleForm.batch_window_seconds" :min="1" :max="3600" />
-              </el-form-item>
-              <el-form-item label="批次最小量">
-                <el-input-number v-model="adThrottleForm.batch_size_min" :min="1" :max="1" />
-              </el-form-item>
-              <el-form-item label="批次最大量">
-                <el-input-number v-model="adThrottleForm.batch_size_max" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="冷却最小秒">
                 <el-input-number v-model="adThrottleForm.cooldown_min_seconds" :min="9000" :max="86400" />
@@ -1695,9 +1677,6 @@ onBeforeUnmount(() => {
               </el-form-item>
               <el-form-item label="账号广告每日硬上限（系统）">
                 <el-input-number v-model="adCapacityForm.account_ad_daily_hard_cap" :min="1" :max="5" />
-              </el-form-item>
-              <el-form-item label="单账号单群每日硬上限（系统）">
-                <el-input-number v-model="adCapacityForm.account_group_daily_cap_default" :min="1" :max="1" />
               </el-form-item>
               <el-form-item label="群全局日硬上限">
                 <el-input-number v-model="adCapacityForm.group_global_daily_hard_cap" :min="1" :max="400" />
@@ -1786,9 +1765,6 @@ onBeforeUnmount(() => {
               <el-form-item label="Premium增长容量">
                 <el-input-number v-model="adCapacityForm.premium_growth_capacity" :min="1" :max="50" />
               </el-form-item>
-              <el-form-item label="广告首次投放等待天数">
-                <el-input-number v-model="adCapacityForm.warmup_days_before_ads" :min="7" :max="90" />
-              </el-form-item>
               <el-form-item label="暖群互动最小">
                 <el-input-number v-model="adCapacityForm.warmup_daily_interactions_min" :min="0" :max="20" />
               </el-form-item>
@@ -1854,9 +1830,6 @@ onBeforeUnmount(() => {
             <el-form label-width="160px" size="small">
               <el-form-item label="互动模块">
                 <el-switch v-model="groupAiForm.enabled" />
-              </el-form-item>
-              <el-form-item label="AI生成">
-                <el-switch v-model="groupAiForm.aiEnabled" />
               </el-form-item>
               <el-form-item label="模式">
                 <el-select v-model="groupAiForm.mode">

@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.core.automation_constants import (
+    AD_ACCOUNT_GROUP_DAILY_CAP,
+    AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN,
+    AD_MAX_DELIVERIES_PER_RUN,
+)
+
 
 def _int_value(value: Any, default: int = 0) -> int:
     try:
@@ -118,12 +124,12 @@ def build_effective_limit_summary(
             "min",
             [
                 _source(
-                    "ads.execution.max_deliveries_per_run",
-                    _int_value(ad_execution.get("max_deliveries_per_run")),
+                    "system.ads.max_deliveries_per_run",
+                    AD_MAX_DELIVERIES_PER_RUN,
                 ),
                 _source(
-                    "ads.execution.max_deliveries_per_account_per_run",
-                    _int_value(ad_execution.get("max_deliveries_per_account_per_run")),
+                    "system.ads.max_deliveries_per_account_per_run",
+                    AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN,
                 ),
             ],
             ["account.health_score", "warmup.run_multiplier", "risk.level_multiplier"],
@@ -134,8 +140,8 @@ def build_effective_limit_summary(
             "min",
             [
                 _source(
-                    "ads.capacity.account_group_daily_cap_default",
-                    _int_value(ad_capacity.get("account_group_daily_cap_default")),
+                    "system.ads.account_group_daily_cap",
+                    AD_ACCOUNT_GROUP_DAILY_CAP,
                 )
             ],
             ["campaign.max_sends_per_group_per_day", "group.ad_tier", "group.ad_policy"],

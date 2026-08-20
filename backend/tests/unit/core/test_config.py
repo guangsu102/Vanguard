@@ -9,7 +9,6 @@ def _production_settings(**overrides):
         "APP_ENV": "production",
         "DATABASE_URL": "postgresql+asyncpg://vanguard:secure@postgres:5432/vanguard",
         "JWT_SECRET": secret,
-        "SECRET_KEY": secret,
         "VANGUARD_SIGNING_SECRET": "shared-secret",
         "VANGUARD_CALLBACK_SIGNING_SECRET": "callback-secret",
     }
@@ -17,27 +16,9 @@ def _production_settings(**overrides):
     return Settings(_env_file=None, **values)
 
 
-def test_secret_key_falls_back_to_jwt_secret_in_production():
-    secret = "j" * 64
-
-    settings = _production_settings(JWT_SECRET=secret, SECRET_KEY=DEFAULT_DEV_SECRET)
-
-    assert settings.SECRET_KEY == secret
-    assert settings.JWT_SECRET == secret
-
-
-def test_jwt_secret_falls_back_to_secret_key_in_production():
-    secret = "s" * 64
-
-    settings = _production_settings(SECRET_KEY=secret, JWT_SECRET=DEFAULT_DEV_SECRET)
-
-    assert settings.SECRET_KEY == secret
-    assert settings.JWT_SECRET == secret
-
-
 def test_production_still_rejects_missing_secret():
-    with pytest.raises(ValueError, match="SECRET_KEY must be set explicitly"):
-        _production_settings(SECRET_KEY=DEFAULT_DEV_SECRET, JWT_SECRET=DEFAULT_DEV_SECRET)
+    with pytest.raises(ValueError, match="JWT_SECRET must be set explicitly"):
+        _production_settings(JWT_SECRET=DEFAULT_DEV_SECRET)
 
 
 def test_onebot_requires_numeric_account_and_strong_token():
@@ -69,8 +50,8 @@ def test_onebot_accepts_numeric_account_and_strong_token():
     assert configured.QQ_ONEBOT_ENABLED is True
 
 
-def test_legacy_telegram_alert_chat_id_alias_is_normalized():
-    configured = Settings(_env_file=None, TELEGRAM_ALERT_CHAT_ID='-1001234567890')
+def test_alert_chat_id_is_loaded_from_canonical_setting():
+    configured = Settings(_env_file=None, ALERT_CHAT_ID='-1001234567890')
 
     assert configured.ALERT_CHAT_ID == '-1001234567890'
 

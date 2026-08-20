@@ -844,15 +844,9 @@ async def test_risk_guard_fail_closed_blocks_when_redis_unavailable(test_db, mon
     assert events[-1].reason == "risk_budget_unavailable"
 
 
-def test_runtime_risk_guard_parses_redis_fail_closed_string(monkeypatch):
-    from app.core import runtime_settings
+def test_runtime_risk_guard_parses_redis_fail_closed_string():
+    from app.core.automation_settings import normalize_account_risk_guard_settings
 
-    monkeypatch.setattr(
-        runtime_settings,
-        "load_runtime_settings",
-        lambda: {"accountRiskGuard": {"redisFailClosed": "false"}},
-    )
-
-    settings = runtime_settings.get_account_risk_guard_settings()
+    settings = normalize_account_risk_guard_settings({"redisFailClosed": "false"})
 
     assert settings["redis_fail_closed"] is False

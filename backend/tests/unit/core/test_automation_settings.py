@@ -1,10 +1,12 @@
 from app.core.automation_settings import (
+    DEFAULT_NOTIFICATION_SETTINGS,
     normalize_account_asset_policy_settings,
     normalize_account_risk_guard_settings,
     normalize_account_warmup_policy_settings,
     normalize_ad_capacity_settings,
     normalize_ad_delivery_execution_settings,
     normalize_ad_delivery_throttle_settings,
+    normalize_app_runtime_settings,
     normalize_group_ai_interaction_settings,
 )
 
@@ -69,7 +71,7 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["survival_one_hour_seconds"] == 3600
     assert config["survival_twenty_four_hour_seconds"] == 86400
     assert config["account_ad_daily_hard_cap"] == 5
-    assert config["account_group_daily_cap_default"] == 1
+    assert "account_group_daily_cap_default" not in config
     assert config["group_global_daily_hard_cap"] == 400
     assert config["group_min_interval_seconds"] == 259200
     assert config["max_groups_per_account"] == 400
@@ -79,7 +81,7 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["ad_policy_auto_probe_daily_limit"] == 1
     assert config["ad_policy_auto_probe_daily_limit_per_account"] == 10
     assert config["ad_policy_auto_probe_interval_hours"] == 24
-    assert config["warmup_days_before_ads"] == 15
+    assert "warmup_days_before_ads" not in config
     assert config["warmup_daily_interactions_min"] == 0
     assert config["warmup_daily_interactions_max"] == 1
     assert config["mature_daily_interactions_min"] == 0
@@ -153,10 +155,10 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     )
 
     assert config["survival_check_delay_seconds"] == 30
-    assert config["account_group_daily_cap_default"] == 1
+    assert "account_group_daily_cap_default" not in config
     assert config["max_groups_per_account"] == 150
     assert config["max_new_ad_groups_per_day"] == 2
-    assert config["warmup_days_before_ads"] == 20
+    assert "warmup_days_before_ads" not in config
     assert config["ad_policy_auto_probe_enabled"] is True
     assert config["ad_policy_auto_probe_daily_limit"] == 20
     assert config["ad_policy_auto_probe_daily_limit_per_account"] == 20
@@ -183,7 +185,7 @@ def test_normalize_ad_capacity_settings_keeps_premium_safety_ranges_canonical():
     assert config["premium_conversion_capacity_step"] == 20
 
 
-def test_normalize_ad_delivery_throttle_settings_enforces_single_slow_delivery():
+def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
     config = normalize_ad_delivery_throttle_settings(
         {
             "deliveryIntervalSeconds": 0,
@@ -195,12 +197,12 @@ def test_normalize_ad_delivery_throttle_settings_enforces_single_slow_delivery()
     )
 
     assert config["delivery_interval_seconds"] == 9000
-    assert config["batch_size_min"] == 1
-    assert config["batch_size_max"] == 1
+    assert "batch_size_min" not in config
+    assert "batch_size_max" not in config
     assert config["cooldown_min_seconds"] == 9000
     assert config["cooldown_max_seconds"] == 9000
 
-def test_normalize_ad_delivery_execution_settings_enforces_hard_run_caps():
+def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():
     config = normalize_ad_delivery_execution_settings(
         {
             "maxDeliveriesPerRun": 10000,
@@ -208,11 +210,11 @@ def test_normalize_ad_delivery_execution_settings_enforces_hard_run_caps():
         }
     )
 
-    assert config["max_deliveries_per_run"] == 1
-    assert config["max_deliveries_per_account_per_run"] == 1
+    assert "max_deliveries_per_run" not in config
+    assert "max_deliveries_per_account_per_run" not in config
 
 
-def test_normalize_account_asset_policy_enforces_seven_day_ad_warmup():
+def test_normalize_account_asset_policy_ignores_legacy_warmup_days():
     config = normalize_account_asset_policy_settings(
         {
             "tiers": {
@@ -222,8 +224,8 @@ def test_normalize_account_asset_policy_enforces_seven_day_ad_warmup():
         }
     )
 
-    assert config["tiers"]["year_2"]["warmup_days"] == 7
-    assert config["tiers"]["year_3_plus"]["warmup_days"] == 7
+    assert "warmup_days" not in config["tiers"]["year_2"]
+    assert "warmup_days" not in config["tiers"]["year_3_plus"]
 
 def test_normalize_account_warmup_policy_settings_defaults_and_camel_case():
     config = normalize_account_warmup_policy_settings(
@@ -280,7 +282,7 @@ def test_normalize_group_ai_interaction_settings_defaults_and_clamps():
     )
 
     assert config["enabled"] is True
-    assert config["aiEnabled"] is True
+    assert "aiEnabled" not in config
     assert config["mode"] == "assistive"
     assert config["tone"] == "friendly"
     assert config["temperature"] == 2.0
@@ -298,3 +300,57 @@ def test_normalize_group_ai_interaction_settings_defaults_and_clamps():
     assert config["proactiveWarmupWindowStartHour"] == 0
     assert config["proactiveWarmupWindowEndHour"] == 23
     assert config["systemPrompt"] == "自然一点"
+
+
+def test_group_ai_legacy_double_switch_is_migrated_to_one_switch():
+    disabled = normalize_group_ai_interaction_settings(
+        {"enabled": True, "aiEnabled": False}
+    )
+    enabled = normalize_group_ai_interaction_settings({"enabled": True})
+
+    assert disabled["enabled"] is False
+    assert enabled["enabled"] is True
+    assert "aiEnabled" not in disabled
+
+
+def test_app_runtime_settings_drop_fields_without_runtime_consumers():
+    config = normalize_app_runtime_settings(
+        {
+            "site": {"siteName": "unused"},
+            "security": {"require2FA": True},
+            "xboard": {"enabled": False},
+            "notification": {
+                "telegramEnabled": True,
+                "emailEnabled": True,
+                "webhookUrl": "https://unused.example",
+            },
+            "aiReply": {
+                "enabled": True,
+                "privateOnly": True,
+                "dailyTokenBudget": 1000,
+            },
+        }
+    )
+
+    assert "site" not in config
+    assert "security" not in config
+    assert "xboard" not in config
+    assert "emailEnabled" not in config["notification"]
+    assert "webhookUrl" not in config["notification"]
+    assert config["aiReply"] == {"enabled": True}
+
+
+def test_app_runtime_settings_inherit_environment_telegram_chat_id(monkeypatch):
+    monkeypatch.setitem(
+        DEFAULT_NOTIFICATION_SETTINGS,
+        "telegramChatId",
+        "-1001234567890",
+    )
+
+    inherited = normalize_app_runtime_settings({})
+    explicitly_cleared = normalize_app_runtime_settings(
+        {"notification": {"telegramChatId": ""}}
+    )
+
+    assert inherited["notification"]["telegramChatId"] == "-1001234567890"
+    assert explicitly_cleared["notification"]["telegramChatId"] == ""

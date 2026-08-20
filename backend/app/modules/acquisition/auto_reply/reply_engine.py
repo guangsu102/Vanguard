@@ -94,7 +94,6 @@ class ReplyEngine:
         settings = await self._group_ai_settings()
         return bool(
             settings.get("enabled")
-            and settings.get("aiEnabled")
             and settings.get("allowKeywordTriggeredReply", True)
         )
 
@@ -142,7 +141,6 @@ class ReplyEngine:
             ai_settings = await self._group_ai_settings()
             ai_enabled = bool(
                 ai_settings.get("enabled")
-                and ai_settings.get("aiEnabled")
                 and ai_settings.get("allowKeywordTriggeredReply", True)
             )
 

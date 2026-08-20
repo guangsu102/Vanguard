@@ -289,7 +289,7 @@ class Speaker:
         if not fallback:
             fallback = await self._generate_message_content(MessageType.INTERACTION)
         fallback = sanitize_natural_group_reply(fallback, ai_settings)
-        if not (ai_settings.get("enabled") and ai_settings.get("aiEnabled")):
+        if not ai_settings.get("enabled"):
             return fallback
 
         llm_client = self._get_llm_client()

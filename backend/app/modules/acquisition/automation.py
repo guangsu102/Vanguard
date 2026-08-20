@@ -39,14 +39,23 @@ from app.core.account.models import (
 from app.core.account.pool import AccountPool, get_account_pool
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.telegram_execution import TelegramExecutionService
+from app.core.account.warmup import account_warmup_days
 from app.core.ai.keyword_generator import (
     KeywordGenerator,
     normalize_keyword_text,
     validate_search_keyword_text,
 )
 from app.core.ai.llm_client import LLMClient, LLMProvider
+from app.core.automation_constants import (
+    AD_ACCOUNT_GROUP_DAILY_CAP,
+    AD_DELIVERY_BATCH_SIZE,
+    AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN,
+    AD_MAX_DELIVERIES_PER_RUN,
+    AD_MIN_WARMUP_DAYS,
+)
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
+    get_account_warmup_policy_settings,
     get_ad_capacity_settings,
     get_ad_delivery_execution_settings,
     get_ad_delivery_throttle_settings,
@@ -4458,11 +4467,7 @@ class AcquisitionAutomationService:
         note: Optional[str] = None,
     ) -> GroupAccountMembership:
         now = _now()
-        capacity = await get_ad_capacity_settings(self.db)
-        warmup_days = await self._account_asset_warmup_days(
-            account_id,
-            max(0, int(capacity.get("warmup_days_before_ads") or 0)),
-        )
+        warmup_days = await self._account_ad_warmup_days(account_id)
         first_ad_allowed_at = now + timedelta(days=warmup_days) if status == "joined" else None
         row = await self.db.execute(
             select(GroupAccountMembership).where(
@@ -4485,7 +4490,7 @@ class AcquisitionAutomationService:
                 warmup_status="joined_pending_test" if status == "joined" else "blocked",
                 probe_status="not_started" if status == "joined" else "skipped",
                 ad_status=MEMBERSHIP_AD_STATUS_WARMING if status == "joined" else MEMBERSHIP_AD_STATUS_BLOCKED,
-                account_group_daily_cap=int(capacity.get("account_group_daily_cap_default") or DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"]),
+                account_group_daily_cap=AD_ACCOUNT_GROUP_DAILY_CAP,
                 interaction_started_at=now if status == "joined" else None,
                 first_ad_allowed_at=first_ad_allowed_at,
                 note=note,
@@ -4669,17 +4674,10 @@ class AcquisitionAutomationService:
         interval_seconds = max(60, int(random.randint(min_seconds, max_seconds) / multiplier))
         config.next_join_after = now + timedelta(seconds=interval_seconds)
 
-    async def _account_asset_warmup_days(self, account_id: int, default_days: int) -> int:
-        minimum_days = max(7, int(default_days or 0))
-        policy = await get_account_asset_policy_settings(self.db)
-        if not policy.get("enabled", True):
-            return minimum_days
+    async def _account_ad_warmup_days(self, account_id: int) -> int:
+        policy = await get_account_warmup_policy_settings(self.db)
         account = await self.db.get(TelegramAccount, account_id)
-        tier_policy = AccountDynamicFrequencyService.account_asset_tier_policy(policy, account)
-        try:
-            return max(minimum_days, int(tier_policy.get("warmup_days", minimum_days) or 0))
-        except (TypeError, ValueError):
-            return minimum_days
+        return max(AD_MIN_WARMUP_DAYS, account_warmup_days(policy, account))
     # ------------------------------------------------------------------
     # Advertisement delivery
     # ------------------------------------------------------------------
@@ -4691,11 +4689,8 @@ class AcquisitionAutomationService:
         if not execution["enabled"]:
             result.details.append({"action": "skip", "reason": "ad_delivery_execution_disabled"})
             return result.as_dict()
-        max_deliveries = min(
-            max(1, int(max_deliveries or execution["max_deliveries_per_run"])),
-            int(execution["max_deliveries_per_run"]),
-        )
-        max_per_account = max(1, int(execution["max_deliveries_per_account_per_run"]))
+        max_deliveries = AD_MAX_DELIVERIES_PER_RUN
+        max_per_account = AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN
         bindings = await self._list_enabled_ad_bindings()
         if not bindings:
             return result.as_dict()
@@ -6303,10 +6298,7 @@ class AcquisitionAutomationService:
                 membership.interaction_started_at = interaction_started_at
                 changed = True
             if membership.first_ad_allowed_at is None:
-                warmup_days = await self._account_asset_warmup_days(
-                    account_id,
-                    max(0, int(capacity.get("warmup_days_before_ads") or 0)),
-                )
+                warmup_days = await self._account_ad_warmup_days(account_id)
                 membership.first_ad_allowed_at = interaction_started_at + timedelta(days=warmup_days)
                 changed = True
             if changed:
@@ -7095,7 +7087,7 @@ class AcquisitionAutomationService:
         membership: GroupAccountMembership,
         capacity: dict[str, Any],
     ) -> int:
-        configured_cap = int(capacity.get("account_group_daily_cap_default") or DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"])
+        configured_cap = AD_ACCOUNT_GROUP_DAILY_CAP
         membership_cap = int(membership.account_group_daily_cap or configured_cap)
         base_cap = min(configured_cap, membership_cap)
         if base_cap <= 0:
@@ -7479,7 +7471,7 @@ class AcquisitionAutomationService:
                 AdDeliveryLog.sent_at >= window_start,
             )
         )
-        if (batch_sent.scalar() or 0) >= throttle["batch_size_max"]:
+        if (batch_sent.scalar() or 0) >= AD_DELIVERY_BATCH_SIZE:
             return "account_ad_batch_window_quota"
         return None
 
@@ -7638,7 +7630,7 @@ class AcquisitionAutomationService:
                     return int(raw)
                 except (TypeError, ValueError):
                     pass
-            batch_target = random.randint(throttle["batch_size_min"], throttle["batch_size_max"])
+            batch_target = AD_DELIVERY_BATCH_SIZE
             await client.setex(key, max(1, int(throttle["batch_window_seconds"])), str(batch_target))
             return batch_target
         finally:

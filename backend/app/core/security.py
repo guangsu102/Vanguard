@@ -6,7 +6,7 @@ Centralized authentication dependencies for Vanguard API endpoints.
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,18 +16,16 @@ from app.core.database import get_db
 security = HTTPBearer()
 
 
-def _jwt_secret() -> str:
-    return settings.JWT_SECRET or settings.SECRET_KEY
-
-
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
     """Create a JWT access token using the central signing configuration."""
     import jwt
 
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=7))
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(hours=settings.JWT_EXPIRATION_HOURS)
+    )
     to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, _jwt_secret(), algorithm=settings.JWT_ALGORITHM)
+    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_token(token: str) -> dict:
@@ -36,7 +34,7 @@ def decode_token(token: str) -> dict:
     try:
         payload = jwt.decode(
             token,
-            _jwt_secret(),
+            settings.JWT_SECRET,
             algorithms=[settings.JWT_ALGORITHM]
         )
         return payload

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.celery import celery_app
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
+from app.core.automation_constants import AD_MAX_DELIVERIES_PER_RUN
 from app.core.scheduler.alerts import AlertSeverity, TaskAlertManager
 
 logger = structlog.get_logger()
@@ -1334,10 +1335,7 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
     try:
         from app.modules.acquisition.automation import run_ad_delivery_with_db
 
-        execution = reservation.get("execution") or {}
-        resolved_max_deliveries = max_deliveries or int(
-            execution.get("max_deliveries_per_run") or 20
-        )
+        resolved_max_deliveries = AD_MAX_DELIVERIES_PER_RUN
         result = _run_async(
             run_ad_delivery_with_db(max_deliveries=resolved_max_deliveries, dry_run=dry_run)
         )

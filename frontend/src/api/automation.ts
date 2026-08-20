@@ -233,7 +233,6 @@ export interface AccountAssetTierPolicy {
   ad_multiplier: number
   run_multiplier: number
   probe_multiplier: number
-  warmup_days: number
   age_floor_days: number
 }
 
@@ -267,8 +266,6 @@ export interface AdDeliveryThrottleSettings {
   enabled: boolean
   delivery_interval_seconds: number
   batch_window_seconds: number
-  batch_size_min: number
-  batch_size_max: number
   cooldown_min_seconds: number
   cooldown_max_seconds: number
 }
@@ -276,8 +273,6 @@ export interface AdDeliveryThrottleSettings {
 export interface AdDeliveryExecutionSettings {
   enabled: boolean
   dispatcher_interval_seconds: number
-  max_deliveries_per_run: number
-  max_deliveries_per_account_per_run: number
   group_campaign_cooldown_minutes: number
   stop_account_after_success: boolean
   stop_account_after_failure: boolean
@@ -295,7 +290,6 @@ export interface AdCapacitySettings {
   survival_retry_max_attempts: number
   survival_retry_base_seconds: number
   account_ad_daily_hard_cap: number
-  account_group_daily_cap_default: number
   group_global_daily_hard_cap: number
   group_min_interval_seconds: number
   max_groups_per_account: number
@@ -325,7 +319,6 @@ export interface AdCapacitySettings {
   premium_conversion_capacity_step: number
   deleted_ad_pause_hours: number
   membership_delete_block_count: number
-  warmup_days_before_ads: number
   warmup_daily_interactions_min: number
   warmup_daily_interactions_max: number
   mature_daily_interactions_min: number
