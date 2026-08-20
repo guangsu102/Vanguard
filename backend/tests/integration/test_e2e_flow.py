@@ -3,11 +3,9 @@
 测试完整的业务流程：用户注册 -> 消息收发 -> 违规处理
 """
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
-from typing import Dict, Any
 
 
 class TestEndToEndFlow:
@@ -73,51 +71,31 @@ class TestEndToEndFlow:
         return api
 
     @pytest.mark.asyncio
-    async def test_full_user_journey(
-        self, mock_telegram_bot, mock_db, mock_redis, mock_api_client
-    ):
+    async def test_group_message_processing_flow(self):
         """
-        测试完整用户旅程：
-        1. 用户加入群组
-        2. 发送消息
-        3. 触发规则检测
-        4. 记录违规
-        5. 执行惩罚
+        测试群消息处理流程。
         """
-        # 模拟用户消息
-        mock_message = MagicMock()
-        mock_message.from_user.id = 123456
-        mock_message.from_user.username = "test_user"
-        mock_message.from_user.first_name = "Test"
-        mock_message.chat.id = 100
-        mock_message.text = "Hello, this is a test message"
-        mock_message.message_id = 999
-        mock_message.reply = MagicMock()
-        mock_message.reply.answer = AsyncMock()
+        from app.core.message.handlers import GroupTextHandler
+        from app.core.message.models import MessageType, TelegramMessage
 
-        # 模拟检测到违规内容
-        with patch('app.core.keyword.engine.KeywordMatcher') as mock_matcher:
-            mock_matcher_instance = MagicMock()
-            mock_matcher_instance.match = MagicMock(return_value=[
-                {"rule_id": 1, "pattern": "test", "action": "warn"}
-            ])
-            mock_matcher.return_value = mock_matcher_instance
+        keyword_handler = AsyncMock(return_value=True)
+        moderation_handler = AsyncMock(return_value=True)
+        message = TelegramMessage(
+            message_id=999,
+            chat_id=100,
+            sender_id=123456,
+            sender_name="test_user",
+            message_type=MessageType.GROUP_TEXT,
+            content="Hello, this is a test message",
+        )
+        handler = GroupTextHandler(
+            keyword_handler=keyword_handler,
+            moderation_handler=moderation_handler,
+        )
 
-            # 执行消息处理流程
-            from app.core.message.handlers import MessageHandler
-
-            handler = MessageHandler(
-                db=mock_db,
-                redis=mock_redis,
-                api_client=mock_api_client,
-                bot=mock_telegram_bot
-            )
-
-            result = await handler.process_message(mock_message)
-
-            # 验证结果
-            assert result["processed"] is True
-            assert result["user_id"] == 123456
+        assert await handler.handle(message) is True
+        keyword_handler.assert_awaited_once_with(message)
+        moderation_handler.assert_awaited_once_with(message)
 
     @pytest.mark.asyncio
     async def test_registration_to_activation_flow(
@@ -304,7 +282,7 @@ class TestErrorRecovery:
         error_prone_system["redis"].set = AsyncMock(return_value=True)
 
         saved = False
-        for attempt in range(3):
+        for _attempt in range(3):
             try:
                 await error_prone_system["db"].save({"test": "data"})
                 saved = True

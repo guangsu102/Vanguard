@@ -7,11 +7,10 @@ Tests the integration between:
 - Data flow validation
 """
 
-import pytest
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+
 import httpx
+import pytest
 
 
 class TestBotAPIClient:
@@ -253,7 +252,6 @@ class TestDataFlowIntegration:
     @pytest.mark.asyncio
     async def test_user_registration_flow(self):
         """Test complete user registration flow."""
-        mock_db = AsyncMock()
 
         from app.modules.acquisition.api_integration import AcquisitionAPIClient
         from app.modules.integrations.api_client import BotAPIClient
@@ -349,12 +347,13 @@ class TestAPIEndpoints:
 class TestWebSocketIntegration:
     """Test WebSocket integration."""
 
-    def test_connection_manager(self):
+    @pytest.mark.asyncio
+    async def test_connection_manager(self):
         """Test WebSocket connection manager."""
         from app.api.websocket import ConnectionManager
 
         manager = ConnectionManager()
-        assert len(manager.active_connections) == 0
+        assert await manager.get_client_count() == 0
 
     def test_channels_defined(self):
         """Test WebSocket channels are defined."""

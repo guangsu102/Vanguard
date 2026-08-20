@@ -32,8 +32,8 @@ from app.modules.acquisition.models import (
     AdDeliveryLog,
     AutoJoinAttempt,
     DeliveryStatus,
-    GroupAdProfile,
     GroupAdPolicyMode,
+    GroupAdProfile,
     GroupAdTier,
 )
 
@@ -44,6 +44,7 @@ AD_GROUP_CONTROL_ERROR_PREFIX = "group_control:"
 AD_GROUP_LEFT_ERROR_PREFIX = "group_control_left:"
 AD_ACCOUNT_GROUP_DEFAULT_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["account_group_daily_cap_default"])
 AD_DELIVERY_DEFAULT_ACCOUNT_DAILY_LIMIT = int(DEFAULT_AD_CAPACITY_SETTINGS["account_ad_daily_hard_cap"])
+AD_GROUP_ABSOLUTE_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
 
 
 @dataclass(frozen=True)
@@ -356,7 +357,13 @@ class AccountDynamicFrequencyService:
             configured = int(profile.daily_capacity or tier_cap or 0)
         else:
             configured = int(tier_cap or 0)
-        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
+        hard_cap = max(
+            0,
+            min(
+                AD_GROUP_ABSOLUTE_DAILY_CAP,
+                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
+            ),
+        )
         result = max(0, min(configured, tier_cap or configured, hard_cap))
         if policy_mode in {
             GroupAdPolicyMode.UNKNOWN_PROBE.value,

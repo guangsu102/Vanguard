@@ -3,10 +3,10 @@ XSS/SQL 注入测试
 测试应用对常见注入攻击的防护
 """
 
-import pytest
 import re
-from typing import List, Any
-from html import escape
+from html import escape, unescape
+
+import pytest
 
 
 class TestXSSPrevention:
@@ -24,9 +24,17 @@ class TestXSSPrevention:
 
         for dangerous in dangerous_inputs:
             escaped = escape(dangerous, quote=True)
-            # 转义后不应该包含未转义的标签
-            assert '<' not in escaped or '&lt;' in escaped
-            assert 'script' not in escaped.lower()
+            # 编码保留文本内容，但不能保留可解析的 HTML 语法。
+            assert unescape(escaped) == dangerous
+            if '<' in dangerous:
+                assert '<' not in escaped
+                assert '&lt;' in escaped
+            if '>' in dangerous:
+                assert '>' not in escaped
+                assert '&gt;' in escaped
+            if '"' in dangerous:
+                assert '"' not in escaped
+                assert '&quot;' in escaped
 
     def test_attribute_escape(self):
         """测试属性转义"""
@@ -34,7 +42,9 @@ class TestXSSPrevention:
 
         # 在 HTML 属性中应该被转义
         escaped = escape(user_input, quote=True)
-        assert 'onerror' not in escaped
+        assert unescape(escaped) == user_input
+        assert '"' not in escaped
+        assert '&quot;' in escaped
 
     def test_url_xss_prevention(self):
         """测试 URL XSS 防护"""
@@ -66,7 +76,12 @@ class TestXSSPrevention:
         html_with_events = '<img src=x onerror=alert(1) onload=alert(2)>'
 
         # 剥离事件处理器
-        cleaned = re.sub(r'\s*on\w+\s*=\s*["\'][^"\']*["\']', '', html_with_events, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r'\s+on\w+\s*=\s*(?:"[^"]*"|\'[^\']*\'|[^\s>]+)',
+            '',
+            html_with_events,
+            flags=re.IGNORECASE,
+        )
 
         assert 'onerror' not in cleaned
         assert 'onload' not in cleaned
@@ -121,7 +136,6 @@ class TestSQLInjectionPrevention:
 
         # 参数化查询应该安全处理
         safe_query = "SELECT * FROM users WHERE name = %s"
-        params = (user_input,)
 
         # 不应该在查询中拼接用户输入
         assert user_input not in safe_query
@@ -135,7 +149,7 @@ class TestSQLInjectionPrevention:
         escaped_input = dangerous_input.replace("'", "''")
 
         assert escaped_input == "user'' OR ''1''=''1"
-        assert "OR" not in escaped_input  # 转义后不再是有效的 SQL
+        assert escaped_input.count("''") == dangerous_input.count("'")
 
     def test_numeric_input_validation(self):
         """测试数字输入验证"""
@@ -316,7 +330,7 @@ class TestInputFiltering:
     def test_whitelist_validation(self):
         """测试白名单验证"""
         # 只允许特定字符
-        allowed_pattern = r'^[a-zA-Z0-9\s@.\-]+$'
+        allowed_pattern = r'^[a-zA-Z0-9_\s@.\-]+$'
 
         valid_inputs = ["user@example.com", "John Doe", "test-user_123"]
         invalid_inputs = ["<script>", "'; DROP", "user`whoami`"]
@@ -375,7 +389,10 @@ class TestOutputEncoding:
         url_encoded = quote(user_input, safe='')
 
         assert '%' in url_encoded
-        assert ' ' in url_encoded  # 被编码了
+        assert ' ' not in url_encoded
+        assert '%20' in url_encoded
+        assert '%26' in url_encoded
+        assert '%3D' in url_encoded
 
     def test_css_output_encoding(self):
         """测试 CSS 输出编码"""
@@ -408,8 +425,6 @@ class TestContentSecurityPolicy:
         """测试 CSP 阻止内联脚本"""
         csp = "script-src 'self'"
 
-        inline_script = '<script>alert(1)</script>'
-        external_script = '<script src="external.js"></script>'
 
         # CSP 不允许 'unsafe-inline'
         allows_inline = "'unsafe-inline'" in csp

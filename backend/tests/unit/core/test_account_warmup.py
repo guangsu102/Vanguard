@@ -63,7 +63,8 @@ def test_short_warmup_still_enters_ramp_before_normal():
     context = account_warmup_context(policy, account, now, action="ad_delivery")
 
     assert context.stage == "ramp"
-    assert context.remaining_days == 1
+    assert context.warmup_days == 7
+    assert context.remaining_days == 3
 
 
 def test_user_initiated_private_message_is_not_blocked_by_warmup():

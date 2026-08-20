@@ -15,12 +15,12 @@ import json
 import random
 import re
 import time
-from uuid import uuid4
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from inspect import isawaitable
 from typing import Any, Optional
+from uuid import uuid4
 
 import structlog
 from sqlalchemy import and_, desc, func, or_, select
@@ -37,39 +37,39 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.account.pool import AccountPool, get_account_pool
-from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.telegram_execution import TelegramExecutionService
-from app.core.automation_settings import (
-    get_account_asset_policy_settings,
-    get_auto_join_scheduler_settings,
-    get_ad_capacity_settings,
-    get_ad_delivery_execution_settings,
-    get_ad_delivery_throttle_settings,
-    get_ad_failure_policy_settings,
-    get_group_ai_interaction_settings,
-)
-from app.core.runtime_settings import (
-    DEFAULT_AD_CAPACITY_SETTINGS,
-    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
-)
 from app.core.ai.keyword_generator import (
     KeywordGenerator,
     normalize_keyword_text,
     validate_search_keyword_text,
 )
 from app.core.ai.llm_client import LLMClient, LLMProvider
+from app.core.automation_settings import (
+    get_account_asset_policy_settings,
+    get_ad_capacity_settings,
+    get_ad_delivery_execution_settings,
+    get_ad_delivery_throttle_settings,
+    get_ad_failure_policy_settings,
+    get_auto_join_scheduler_settings,
+    get_group_ai_interaction_settings,
+)
 from app.core.config import settings
 from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupAccountMembership
 from app.core.keyword.models import KeywordType
+from app.core.runtime_settings import (
+    DEFAULT_AD_CAPACITY_SETTINGS,
+    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
+)
 from app.modules.acquisition.auto_reply.speaker import Speaker
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.config import AcquisitionConfig
 from app.modules.acquisition.dynamic_frequency import AccountDynamicFrequencyService
 from app.modules.acquisition.models import (
     AccountAdBinding,
-    AcquisitionTracking,
     AcquisitionMessage,
+    AcquisitionTracking,
     AdCampaign,
     AdCreative,
     AdCreativeType,
@@ -79,11 +79,11 @@ from app.modules.acquisition.models import (
     AutoJoinAttempt,
     DeliveryStatus,
     GroupAdPolicyEvent,
-    GroupAdProfile,
     GroupAdPolicyMode,
+    GroupAdProfile,
     GroupAdTier,
-    GroupSearchRecord,
     GroupSearchKeyword,
+    GroupSearchRecord,
     MessageType,
     SearchKeywordSource,
     SearchKeywordStatus,
@@ -121,6 +121,7 @@ AD_GROUP_CONTROL_ACCOUNT_SUSPECT_WINDOW_MINUTES = 60
 AD_GROUP_CONTROL_ACCOUNT_SUSPECT_GROUPS = 5
 AD_ACCOUNT_SUSPECT_PAUSE_SECONDS = 2 * 60 * 60
 GROUP_STATUS_AD_BLOCKED = "ad_blocked"
+AD_GROUP_ABSOLUTE_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
 MEMBERSHIP_AD_STATUS_WARMING = "warming"
 MEMBERSHIP_AD_STATUS_ACTIVE = "active"
 MEMBERSHIP_AD_STATUS_BLOCKED = "blocked"
@@ -6008,7 +6009,6 @@ class AcquisitionAutomationService:
             profile.ad_policy_probe_at = None
             profile.ad_policy_probe_error = "stale_sending_recovered"
             profile.updated_at = now
-            await self.db.commit()
         mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
         if mode == GroupAdPolicyMode.FORBIDDEN.value:
             raise RuntimeError("group_ad_forbidden")
@@ -7023,7 +7023,13 @@ class AcquisitionAutomationService:
             }
 
         tier_caps = capacity.get("tier_daily_capacities") or {}
-        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
+        hard_cap = max(
+            0,
+            min(
+                AD_GROUP_ABSOLUTE_DAILY_CAP,
+                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
+            ),
+        )
         target_capacity = min(
             hard_cap,
             int(tier_caps.get(target_tier, 0) or 0),
@@ -7068,7 +7074,13 @@ class AcquisitionAutomationService:
         if int(profile.ad_policy_confidence or 0) < confidence_floor:
             return 0
         configured = int(profile.daily_capacity or tier_cap or 0)
-        hard_cap = int(capacity.get("group_global_daily_hard_cap") or DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
+        hard_cap = max(
+            0,
+            min(
+                AD_GROUP_ABSOLUTE_DAILY_CAP,
+                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
+            ),
+        )
         result = max(0, min(configured, tier_cap or configured, hard_cap))
         if policy_mode in {
             GroupAdPolicyMode.UNKNOWN_PROBE.value,

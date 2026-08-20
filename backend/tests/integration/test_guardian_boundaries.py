@@ -2,7 +2,27 @@ import pytest
 
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.group.models import Group
-from app.modules.guardian.models import ManagedGroupBinding, ManagedGroupBindingStatus, ManagedGroupBotRole
+from app.core.security import get_current_user
+from app.main import app
+from app.modules.guardian.models import (
+    ManagedGroupBinding,
+    ManagedGroupBindingStatus,
+    ManagedGroupBotRole,
+)
+
+
+@pytest.fixture(autouse=True)
+def override_authentication():
+    """Exercise guardian boundaries as an authenticated administrator."""
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": 1,
+        "username": "guardian-test",
+        "role": "admin",
+    }
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 async def _create_guardian_bot(test_db, identifier: str = "@guardian_bot") -> TelegramAccount:

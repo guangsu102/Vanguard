@@ -202,7 +202,7 @@ async def test_join_group_api_persists_resolved_group_and_membership(test_db, mo
     wrapper = SimpleNamespace(account_id=account.id)
     pool = SimpleNamespace(
         add_account_from_db=AsyncMock(return_value=wrapper),
-        acquire_by_id=AsyncMock(return_value=wrapper),
+        acquire_by_id=AsyncMock(side_effect=[wrapper, None]),
         release=AsyncMock(),
     )
 

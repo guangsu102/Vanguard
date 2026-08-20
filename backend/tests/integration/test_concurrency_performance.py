@@ -5,17 +5,38 @@ Tests system performance under concurrent load conditions.
 """
 
 import asyncio
-import time
-import psutil
 import os
-from typing import List, Dict, Any
+import time
 from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
+import psutil
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from app.core.database import get_db
+from app.core.security import get_current_user
 from app.main import app
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def override_api_dependencies(test_db):
+    """Keep protected endpoint load tests authenticated and database-isolated."""
+    async def override_get_db():
+        yield test_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": 1,
+        "username": "performance-test",
+        "role": "admin",
+    }
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 @dataclass
@@ -155,7 +176,7 @@ async def test_mixed_endpoint_concurrency():
         report = metrics.report()
         print(f"\nMixed Endpoint Concurrency:\n{report}")
 
-        assert metrics.success_rate >= 90, f"Success rate too low for mixed endpoints"
+        assert metrics.success_rate >= 90, "Success rate too low for mixed endpoints"
 
 
 @pytest.mark.asyncio
@@ -208,19 +229,19 @@ async def test_sustained_concurrency():
         metrics = ConcurrencyMetrics(concurrent_level=concurrent_users)
 
         start_time = time.perf_counter()
-        while time.time() - start_time < duration_seconds:
+        while time.perf_counter() - start_time < duration_seconds:
             tasks = [
                 concurrent_request_task(client, metrics, "/health")
                 for _ in range(concurrent_users)
             ]
             await asyncio.gather(*tasks)
 
-        metrics.total_time = time.time() - start_time
+        metrics.total_time = time.perf_counter() - start_time
 
         report = metrics.report()
         print(f"\nSustained Concurrency ({duration_seconds}s):\n{report}")
 
-        assert metrics.success_rate >= 95, f"Success rate too low for sustained load"
+        assert metrics.success_rate >= 95, "Success rate too low for sustained load"
         assert metrics.throughput >= 50, f"Throughput too low: {metrics.throughput:.2f}"
 
 
@@ -330,7 +351,7 @@ async def test_async_task_scheduling():
     async def cpu_bound_task(task_id: int) -> float:
         start = time.perf_counter()
         await asyncio.sleep(0.01)
-        result = sum(i * i for i in range(1000))
+        sum(i * i for i in range(1000))
         return time.perf_counter() - start
 
     task_counts = [10, 50, 100, 200]
@@ -345,7 +366,7 @@ async def test_async_task_scheduling():
         throughput = count / total_time
         print(f"  {count} tasks: {total_time:.2f}s, {throughput:.2f} tasks/s")
 
-        expected_time = (count / 10) * 0.01
+        expected_time = count * 0.01
         efficiency = expected_time / total_time * 100
         assert efficiency > 50, f"Task scheduling efficiency too low: {efficiency:.2f}%"
 

@@ -6,13 +6,34 @@ Tests API endpoint performance under various load conditions.
 
 import asyncio
 import time
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import pytest
 import pytest_asyncio
-from httpx import ASGITransport, AsyncClient, Response
+from httpx import ASGITransport, AsyncClient
 
+from app.core.database import get_db
+from app.core.security import get_current_user
 from app.main import app
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def override_api_dependencies(test_db):
+    """Keep protected endpoint benchmarks authenticated and database-isolated."""
+    async def override_get_db():
+        yield test_db
+
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": 1,
+        "username": "performance-test",
+        "role": "admin",
+    }
+    try:
+        yield
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(get_current_user, None)
 
 
 class PerformanceMetrics:
@@ -256,8 +277,9 @@ async def test_response_time_consistency():
 @pytest.mark.asyncio
 async def test_memory_under_load():
     """Test memory usage remains stable under load."""
-    import psutil
     import os
+
+    import psutil
 
     process = psutil.Process(os.getpid())
     initial_memory = process.memory_info().rss / 1024 / 1024

@@ -3,12 +3,12 @@ API 安全测试
 测试 API 端点的安全性
 """
 
-import pytest
 import hashlib
 import hmac
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
-from typing import Dict, Any
+from unittest.mock import MagicMock
+
+import pytest
 
 
 class TestAuthentication:
@@ -107,7 +107,6 @@ class TestAuthorization:
         """测试 CSRF 保护"""
         # 模拟 CSRF token
         csrf_token = "csrf_token_123"
-        session_token = "session_token_456"
 
         # 正常请求应该包含 CSRF token
         request_headers = {
@@ -164,7 +163,7 @@ class TestInputValidation:
         valid_phones = ["+1234567890", "8613888888888", "+86 138 8888 8888"]
         invalid_phones = ["abc", "123", ""]
 
-        phone_pattern = r'^\+?[1-9]\d{1,14}$'
+        phone_pattern = r'^\+?[1-9]\d{7,14}$'
 
         import re
         for phone in valid_phones:
@@ -319,7 +318,7 @@ class TestRateLimitSecurity:
 
         # 模拟攻击
         attack_blocked = False
-        for i in range(150):
+        for _ in range(150):
             if not rate_limiter.is_allowed(attacker):
                 attack_blocked = True
                 break
@@ -365,8 +364,7 @@ class TestHTTPSecurity:
             assert content_type in valid_types
 
         for content_type in invalid_types:
-            # 不应该允许脚本内容类型
-            assert "javascript" not in content_type
+            assert content_type not in valid_types
 
 
 class TestAPIVersioning:

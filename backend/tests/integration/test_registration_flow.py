@@ -3,11 +3,10 @@
 测试用户从引流到注册的完整转化流程
 """
 
-import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 class TestUserRegistration:
@@ -109,7 +108,7 @@ class TestUserRegistration:
 
     @pytest.mark.asyncio
     async def test_registration_with_tracking_code(
-        self, mock_api_client, mock_db, mock_redis
+        self, mock_api_client, mock_redis
     ):
         """测试带追踪码的注册"""
         from app.modules.acquisition.api_integration import AcquisitionAPIClient
@@ -125,7 +124,18 @@ class TestUserRegistration:
         )
 
         assert result["data"]["user_id"] == 123456
-        mock_db.record_conversion.assert_called()
+        mock_api_client.register_user.assert_awaited_once_with(
+            user_id=123456,
+            username="tracked_user",
+            source="telegram",
+            source_group_id=100,
+            tracking_code="SUMMER2026",
+        )
+        mock_api_client.track_user_action.assert_awaited_once_with(
+            user_id=123456,
+            action="register",
+            metadata={"keyword": "vpn"},
+        )
 
 
 class TestTrialActivation:
@@ -204,7 +214,7 @@ class TestConversionTracking:
         tracker = MagicMock()
         tracker.track_event = AsyncMock(return_value={"code": 0})
         tracker.track_conversion = AsyncMock(return_value={"code": 0})
-        tracker.get_analytics = MagicMock(return_value={
+        tracker.get_analytics = AsyncMock(return_value={
             "total_users": 100,
             "conversions": 25,
             "conversion_rate": 0.25
@@ -267,7 +277,7 @@ class TestReferralFlow:
             }
         })
         service.track_referral = AsyncMock(return_value={"code": 0})
-        service.get_referral_rewards = MagicMock(return_value={
+        service.get_referral_rewards = AsyncMock(return_value={
             "code": 0,
             "data": {
                 "total_referrals": 5,

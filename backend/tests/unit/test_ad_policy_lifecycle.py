@@ -17,6 +17,7 @@ from app.modules.acquisition.automation import (
 )
 from app.modules.acquisition.dynamic_frequency import AccountDynamicFrequencyService
 from app.modules.acquisition.models import (
+    AccountAdBinding,
     AcquisitionTracking,
     AdCampaign,
     AdDeliveryLog,
@@ -879,3 +880,80 @@ async def test_telegram_success_never_releases_reserved_capacity_when_log_confir
     service._release_group_daily_delivery_slot.assert_not_awaited()
     service._release_ad_delivery_budget.assert_not_awaited()
     db.rollback.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_ad_policy_probe_keeps_group_lock_until_sending_state_is_committed(
+    test_db,
+    monkeypatch,
+):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        phone="+15550003000",
+        identifier="+15550003000",
+        session_name="stale_ad_policy_probe",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=930000, title="Stale Probe Group", level=GroupLevel.A, status="active")
+    campaign = AdCampaign(name="Stale Probe Campaign", enabled=True, status="active")
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    profile = GroupAdProfile(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+        ad_policy_probe_status="sending",
+        ad_policy_probe_at=now - timedelta(hours=1),
+        ad_tier=GroupAdTier.TRIAL.value,
+        daily_capacity=1,
+    )
+    membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        account_id=account.id,
+        status="joined",
+        join_method="manual",
+        probe_status="success",
+        ad_status="active",
+    )
+    binding = AccountAdBinding(
+        account_id=account.id,
+        ad_campaign_id=campaign.id,
+        enabled=True,
+    )
+    test_db.add_all([profile, membership, binding])
+    await test_db.commit()
+
+    commit_states: list[str] = []
+    session_type = type(test_db)
+    original_commit = session_type.commit
+
+    async def capture_commit(session):
+        commit_states.append(profile.ad_policy_probe_status)
+        await original_commit(session)
+
+    monkeypatch.setattr(session_type, "commit", capture_commit)
+    service = AcquisitionAutomationService(test_db)
+    monkeypatch.setattr(service, "_get_account_operation_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_ad_account_risk_skip_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_group_can_receive_ads", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_sync_account_pool", AsyncMock())
+    monkeypatch.setattr(
+        service,
+        "_reserve_group_daily_delivery_slot",
+        AsyncMock(return_value=(True, "reserved", "group-slot")),
+    )
+    monkeypatch.setattr(
+        service,
+        "_record_ad_delivery",
+        AsyncMock(return_value=SimpleNamespace(id=1)),
+    )
+    monkeypatch.setattr(service, "_send_ad_text", AsyncMock(return_value=9000))
+    monkeypatch.setattr(service, "_finalize_ad_delivery_log", AsyncMock())
+
+    result = await service.send_group_ad_policy_probe(group.id, account_id=account.id)
+
+    assert result["ad_policy_probe_status"] == "sent"
+    assert commit_states == ["sending", "sent"]

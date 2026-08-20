@@ -411,7 +411,11 @@ class TestAutoJoinAudit:
         account_pool = MagicMock()
         account_pool.acquire_by_id = AsyncMock(return_value=account)
         account_pool.release = AsyncMock()
-        service = AcquisitionAutomationService(db=MagicMock(), account_pool=account_pool)
+        db = MagicMock()
+        settings_result = MagicMock()
+        settings_result.scalar_one_or_none.return_value = None
+        db.execute = AsyncMock(return_value=settings_result)
+        service = AcquisitionAutomationService(db=db, account_pool=account_pool)
         service.telegram_execution = TelegramExecutionService(None)
         service._join_verification_settings = AsyncMock(
             return_value=JoinVerificationSettings(ai_enabled=False)
@@ -2227,7 +2231,7 @@ class TestAdDeliveryFailureHandling:
         assert [log.status for log in logs] == [DeliveryStatus.FAILED.value, DeliveryStatus.SUCCESS.value]
 
     @pytest.mark.asyncio
-    async def test_choose_delivery_creative_uses_existing_variant_pool(self, test_db):
+    async def test_choose_delivery_creative_uses_existing_variant_pool(self, test_db, monkeypatch):
         account = TelegramAccount(
             phone="+15550000003",
             identifier="+15550000003",
@@ -2281,6 +2285,7 @@ class TestAdDeliveryFailureHandling:
         await test_db.refresh(binding)
 
         service = AcquisitionAutomationService(db=test_db)
+        monkeypatch.setattr(service, "_generate_and_bind_ad_creatives", AsyncMock(return_value=[]))
         chosen = await service._choose_delivery_creative(binding, group.group_id)
 
         assert chosen is not None

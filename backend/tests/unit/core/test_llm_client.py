@@ -12,23 +12,24 @@ Tests cover:
 - Error handling
 """
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
-from dataclasses import dataclass
+
+import pytest
 
 from app.core.ai.llm_client import (
+    CostStats,
     LLMClient,
     LLMProvider,
     LLMResponse,
-    CostStats,
 )
 
 
 class TestLLMClient:
     """Test LLMClient class."""
 
-    def test_init_default(self):
+    def test_init_default(self, monkeypatch):
         """Test initialization with defaults."""
+        monkeypatch.setattr("app.core.ai.llm_client.settings.OPENAI_API_KEY", None)
         client = LLMClient()
         assert client.provider == LLMProvider.OPENAI
         assert client.api_key is None

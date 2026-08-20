@@ -3,13 +3,11 @@
 测试系统在高并发情况下的表现
 """
 
-import pytest
 import asyncio
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
-from typing import List, Dict, Any
-import statistics
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 
 class TestConcurrentRequests:
@@ -31,13 +29,14 @@ class TestConcurrentRequests:
             await mock_api_client.request(f"/api/resource/{i}")
             return i
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         results = await asyncio.gather(*[make_request(i) for i in range(num_requests)])
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
 
         assert len(results) == num_requests
         print(f"\n[Concurrent API] {num_requests} requests in {elapsed:.2f}s")
-        print(f"[Concurrent API] Throughput: {num_requests/elapsed:.2f} req/s")
+        throughput = num_requests / elapsed if elapsed > 0 else float("inf")
+        print(f"[Concurrent API] Throughput: {throughput:.2f} req/s")
 
     @pytest.mark.asyncio
     async def test_concurrent_user_registrations(self, mock_api_client):
@@ -201,7 +200,6 @@ class TestMemoryLeaks:
     async def test_no_memory_leak_in_cache(self):
         """测试缓存无内存泄漏"""
         cache = {}
-        initial_size = len(cache)
 
         # 模拟频繁的缓存操作
         for i in range(10000):
@@ -233,6 +231,7 @@ class TestMemoryLeaks:
 
         # 删除引用
         objects.clear()
+        del obj
 
         # 强制垃圾回收
         gc.collect()
@@ -309,7 +308,7 @@ class TestCircuitBreaker:
                     if time.time() - self.last_failure_time > self.timeout:
                         self.state = "half_open"
                     else:
-                        raise Exception("Circuit breaker is OPEN")
+                        raise RuntimeError("Circuit breaker is OPEN")
 
                 try:
                     result = func()
@@ -334,35 +333,32 @@ class TestCircuitBreaker:
 
     def test_circuit_breaker_opens(self, circuit_breaker):
         """测试熔断器打开"""
-        for i in range(3):
-            with pytest.raises(Exception):
-                circuit_breaker.call(lambda: (_ for _ in ()).throw(Exception("Error")))
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                circuit_breaker.call(lambda: (_ for _ in ()).throw(RuntimeError("Error")))
 
         assert circuit_breaker.state == "open"
 
         # 再次调用应该立即失败
-        with pytest.raises(Exception, match="Circuit breaker is OPEN"):
+        with pytest.raises(RuntimeError, match="Circuit breaker is OPEN"):
             circuit_breaker.call(lambda: True)
 
     def test_circuit_breaker_half_open(self, circuit_breaker):
         """测试熔断器半开"""
         # 打开熔断器
         for _ in range(3):
-            with pytest.raises(Exception):
-                circuit_breaker.call(lambda: (_ for _ in ()).throw(Exception()))
+            with pytest.raises(RuntimeError):
+                circuit_breaker.call(lambda: (_ for _ in ()).throw(RuntimeError()))
 
         assert circuit_breaker.state == "open"
 
         # 模拟超时后尝试
         circuit_breaker.last_failure_time = time.time() - 10
 
-        # 再次调用会进入半开状态
-        try:
-            circuit_breaker.call(lambda: True)
-        except Exception:
-            pass
-
-        assert circuit_breaker.state == "half_open"
+        # 成功的半开探测应关闭熔断器并恢复服务
+        assert circuit_breaker.call(lambda: True) is True
+        assert circuit_breaker.state == "closed"
+        assert circuit_breaker.failure_count == 0
 
 
 class TestPerformanceBenchmarks:
@@ -376,11 +372,9 @@ class TestPerformanceBenchmarks:
 
         start_time = time.time()
 
-        # 模拟关键词匹配
-        matches = []
-        for kw in keywords:
-            if kw in test_text:
-                matches.append(kw)
+        # 按完整 token 匹配，避免 keyword_5 命中 keyword_500。
+        tokens = set(test_text.split())
+        matches = [kw for kw in keywords if kw in tokens]
 
         elapsed = time.time() - start_time
 
