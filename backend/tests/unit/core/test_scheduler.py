@@ -276,6 +276,25 @@ class TestTaskDefinitions:
 
         assert get_task_status is not None
 
+    def test_result_skip_reasons_counts_only_skip_details(self):
+        from app.core.scheduler.tasks import _result_skip_reasons
+
+        result = {
+            "details": [
+                {"action": "skip", "reason": "daily_join_quota"},
+                {"reason": "daily_join_quota"},
+                {"action": "dry_run", "reason": "dry_run"},
+                {"action": "stop_after_failure", "reason": "account_banned"},
+                {"action": "skip"},
+                "invalid",
+            ]
+        }
+
+        assert _result_skip_reasons(result) == {
+            "daily_join_quota": 2,
+            "dry_run": 1,
+        }
+
 
 class TestSchedulerModuleExports:
     """Tests for module exports."""

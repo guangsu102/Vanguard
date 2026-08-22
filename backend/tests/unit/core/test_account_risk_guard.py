@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.core.account.models import (
+    AccountOperationConfig,
     AccountRiskDailyStat,
     AccountRiskEvent,
     AccountStatus,
@@ -13,6 +14,7 @@ from app.core.account.models import (
 )
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard, RiskBudget
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
+from app.modules.acquisition.models import AccountAdBinding, AdCampaign
 
 
 @pytest.mark.asyncio
@@ -28,6 +30,23 @@ async def test_manual_ban_account_sets_banned_state_and_audits(test_db):
     await test_db.commit()
     await test_db.refresh(account)
 
+    operation_config = AccountOperationConfig(
+        account_id=account.id,
+        enabled=True,
+        auto_join_enabled=True,
+        auto_ads_enabled=True,
+    )
+    campaign = AdCampaign(name="Manual Ban Campaign", enabled=True, status="active")
+    test_db.add_all([operation_config, campaign])
+    await test_db.flush()
+    binding = AccountAdBinding(
+        account_id=account.id,
+        ad_campaign_id=campaign.id,
+        enabled=True,
+    )
+    test_db.add(binding)
+    await test_db.commit()
+
     guard = AccountRiskGuard(test_db)
     banned = await guard.manual_ban_account(
         account.id,
@@ -40,6 +59,13 @@ async def test_manual_ban_account_sets_banned_state_and_audits(test_db):
     assert banned.risk_score == 100.0
     assert banned.risk_level == "quarantined"
     assert banned.risk_reason == "account_banned"
+
+    await test_db.refresh(operation_config)
+    await test_db.refresh(binding)
+    assert operation_config.enabled is False
+    assert operation_config.auto_join_enabled is False
+    assert operation_config.auto_ads_enabled is False
+    assert binding.enabled is False
 
     event = (await test_db.execute(select(AccountRiskEvent))).scalars().one()
     assert event.status == "quarantine"
@@ -500,7 +526,7 @@ async def test_many_group_scoped_write_failures_do_not_freeze_account(test_db):
 
 
 @pytest.mark.asyncio
-async def test_explicit_platform_group_write_ban_fuses_only_group_writes(test_db):
+async def test_explicit_platform_group_write_ban_quarantines_account(test_db):
     account = TelegramAccount(
         phone="+15559990040",
         identifier="+15559990040",
@@ -516,6 +542,23 @@ async def test_explicit_platform_group_write_ban_fuses_only_group_writes(test_db
     await test_db.commit()
     await test_db.refresh(account)
 
+    operation_config = AccountOperationConfig(
+        account_id=account.id,
+        enabled=True,
+        auto_join_enabled=True,
+        auto_ads_enabled=True,
+    )
+    campaign = AdCampaign(name="Platform Ban Campaign", enabled=True, status="active")
+    test_db.add_all([operation_config, campaign])
+    await test_db.flush()
+    binding = AccountAdBinding(
+        account_id=account.id,
+        ad_campaign_id=campaign.id,
+        enabled=True,
+    )
+    test_db.add(binding)
+    await test_db.commit()
+
     wrapper = SimpleNamespace(account_id=account.id, country_code="US")
     guard = AccountRiskGuard(test_db, cache=FakeCache())
     await guard.record_failure(
@@ -527,9 +570,16 @@ async def test_explicit_platform_group_write_ban_fuses_only_group_writes(test_db
     )
     await test_db.refresh(account)
 
-    assert account.risk_score == 0.0
-    assert account.risk_level == "normal"
+    assert account.risk_score == 100.0
+    assert account.risk_level == "quarantined"
     assert account.risk_reason == "platform_group_write_banned"
+
+    await test_db.refresh(operation_config)
+    await test_db.refresh(binding)
+    assert operation_config.enabled is False
+    assert operation_config.auto_join_enabled is False
+    assert operation_config.auto_ads_enabled is False
+    assert binding.enabled is False
 
     for action in (
         AccountRiskAction.GROUP_MESSAGE,
@@ -553,7 +603,8 @@ async def test_explicit_platform_group_write_ban_fuses_only_group_writes(test_db
             target_type="group",
             target_id=f"@{action.value}_target",
         )
-        assert decision.allowed is True
+        assert decision.allowed is False
+        assert decision.reason == "account_risk_quarantined"
 
     await guard.record_success(
         wrapper,

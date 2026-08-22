@@ -2341,6 +2341,65 @@ class TestAdDeliveryFailureHandling:
         assert {item.id for item in pool} == {first.id, second.id}
 
     @pytest.mark.asyncio
+    async def test_ad_delivery_excludes_inactive_and_blocked_accounts(self, test_db):
+        eligible = TelegramAccount(
+            identifier="ad-binding-eligible",
+            session_name="ad_binding_eligible",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        inactive = TelegramAccount(
+            identifier="ad-binding-inactive",
+            session_name="ad_binding_inactive",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=False,
+        )
+        banned = TelegramAccount(
+            identifier="ad-binding-banned",
+            session_name="ad_binding_banned",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.BANNED,
+            is_active=True,
+        )
+        errored = TelegramAccount(
+            identifier="ad-binding-error",
+            session_name="ad_binding_error",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ERROR,
+            is_active=True,
+        )
+        campaign = AdCampaign(
+            name="Account State Filter Campaign",
+            enabled=True,
+            status="active",
+        )
+        test_db.add_all([eligible, inactive, banned, errored, campaign])
+        await test_db.flush()
+        bindings = [
+            AccountAdBinding(
+                account_id=account.id,
+                ad_campaign_id=campaign.id,
+                enabled=True,
+            )
+            for account in (eligible, inactive, banned, errored)
+        ]
+        test_db.add_all(bindings)
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db)
+        enabled = await service._list_enabled_ad_bindings()
+
+        assert [binding.account_id for binding in enabled] == [eligible.id]
+        for binding in bindings[1:]:
+            account_bindings = await service._list_enabled_ad_bindings_for_account(
+                binding.account_id,
+                [binding.id],
+            )
+            assert account_bindings == []
+
+    @pytest.mark.asyncio
     async def test_choose_delivery_creative_generates_and_binds_ai_variants(self, test_db, monkeypatch):
         class FakeLLM:
             async def generate(self, *args, **kwargs):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import Counter
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Optional
@@ -76,6 +77,18 @@ async def _run_with_db(
 
 def _skipped_result(task: str, reason: str, **extra: Any) -> dict[str, Any]:
     return {"status": "skipped", "task": task, "reason": reason, **extra}
+
+
+def _result_skip_reasons(result: dict[str, Any]) -> dict[str, int]:
+    reasons: Counter[str] = Counter()
+    for detail in result.get("details") or []:
+        if not isinstance(detail, dict):
+            continue
+        reason = detail.get("reason")
+        action = str(detail.get("action") or "").lower()
+        if reason and (not action or action in {"skip", "dry_run"} or "skip" in action):
+            reasons[str(reason)] += 1
+    return dict(sorted(reasons.items()))
 
 
 def _timestamp_to_iso(value: float) -> str:
@@ -1238,8 +1251,12 @@ def auto_join_groups_task(
             result["execution_lock"] = reservation
         logger.info(
             "auto_join_groups_completed",
+            processed=result.get("processed", 0),
+            updated=result.get("updated", 0),
             succeeded=result.get("succeeded", 0),
+            skipped=result.get("skipped", 0),
             failed=result.get("failed", 0),
+            skip_reasons=_result_skip_reasons(result),
         )
         return result
     except Exception as exc:
@@ -1342,8 +1359,12 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
         result["execution_lock"] = reservation
         logger.info(
             "deliver_ads_completed",
+            processed=result.get("processed", 0),
+            updated=result.get("updated", 0),
             succeeded=result.get("succeeded", 0),
+            skipped=result.get("skipped", 0),
             failed=result.get("failed", 0),
+            skip_reasons=_result_skip_reasons(result),
         )
         return result
     except Exception as exc:

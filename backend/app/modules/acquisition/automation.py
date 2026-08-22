@@ -4991,12 +4991,17 @@ class AcquisitionAutomationService:
     async def _list_enabled_ad_bindings(self) -> list[AccountAdBinding]:
         rows = await self.db.execute(
             select(AccountAdBinding)
+            .join(TelegramAccount, TelegramAccount.id == AccountAdBinding.account_id)
             .options(
                 selectinload(AccountAdBinding.account),
                 selectinload(AccountAdBinding.campaign),
                 selectinload(AccountAdBinding.creative),
             )
-            .where(AccountAdBinding.enabled == True)
+            .where(
+                AccountAdBinding.enabled == True,
+                TelegramAccount.is_active == True,
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+            )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )
         return self._dedupe_ad_delivery_bindings(list(rows.scalars().all()))
@@ -5019,6 +5024,7 @@ class AcquisitionAutomationService:
             return []
         rows = await self.db.execute(
             select(AccountAdBinding)
+            .join(TelegramAccount, TelegramAccount.id == AccountAdBinding.account_id)
             .options(
                 selectinload(AccountAdBinding.account),
                 selectinload(AccountAdBinding.campaign),
@@ -5028,6 +5034,8 @@ class AcquisitionAutomationService:
                 AccountAdBinding.enabled == True,
                 AccountAdBinding.account_id == account_id,
                 AccountAdBinding.id.in_(binding_ids),
+                TelegramAccount.is_active == True,
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
             )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )

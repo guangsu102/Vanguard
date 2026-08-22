@@ -22,6 +22,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import (
+    AccountOperationConfig,
     AccountRiskDailyStat,
     AccountRiskEvent,
     AccountRiskLevel,
@@ -390,7 +391,12 @@ class AccountRiskGuard:
         elif reason == "group_write_forbidden" and self._confirmed_account_wide_group_write_ban(
             merged_details
         ):
-            await self._persist_platform_group_write_ban(account)
+            await self.quarantine_account(
+                account,
+                reason="platform_group_write_banned",
+                action=action,
+                details=merged_details,
+            )
 
     async def _classify_error(
         self,
@@ -533,6 +539,8 @@ class AccountRiskGuard:
             db_account.last_risk_event_at = now
             db_account.last_risk_decay_at = now
             self.db.add(db_account)
+            if reason in {"account_banned", "platform_group_write_banned"}:
+                await self._disable_account_automation(account_id, now=now)
             await self.db.commit()
         await self.record_event(
             account,
@@ -705,21 +713,40 @@ class AccountRiskGuard:
             candidates.append(int(f"-100{exact}"))
         return list(dict.fromkeys(candidates))
 
-    async def _persist_platform_group_write_ban(self, account: Any) -> None:
-        account_id = self._account_id(account)
+    async def _disable_account_automation(
+        self,
+        account_id: Optional[int],
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
         if account_id is None:
             return
 
-        db_account = await self._get_db_account(account_id)
-        if db_account is None or db_account.risk_reason == "platform_group_write_banned":
-            return
+        # Keep the acquisition import local so the account risk module remains
+        # usable while acquisition models are still being initialized.
+        from app.modules.acquisition.models import AccountAdBinding
 
-        now = datetime.utcnow()
-        db_account.risk_reason = "platform_group_write_banned"
-        db_account.last_risk_event_at = now
-        db_account.last_risk_decay_at = now
-        self.db.add(db_account)
-        await self.db.commit()
+        changed_at = now or datetime.utcnow()
+        operation_configs = await self.db.execute(
+            select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id)
+        )
+        for config in operation_configs.scalars().all():
+            config.enabled = False
+            config.auto_join_enabled = False
+            config.auto_ads_enabled = False
+            config.updated_at = changed_at
+            self.db.add(config)
+
+        bindings = await self.db.execute(
+            select(AccountAdBinding).where(
+                AccountAdBinding.account_id == account_id,
+                AccountAdBinding.enabled == True,
+            )
+        )
+        for binding in bindings.scalars().all():
+            binding.enabled = False
+            binding.updated_at = changed_at
+            self.db.add(binding)
 
     async def _reconcile_group_write_success(self, account: Any) -> None:
         """Clear only risk state that a successful group send directly disproves."""
@@ -961,6 +988,7 @@ class AccountRiskGuard:
         account.last_risk_event_at = now
         account.last_risk_decay_at = now
         self.db.add(account)
+        await self._disable_account_automation(account.id, now=now)
         await self.record_event(
             account,
             AccountRiskAction.JOIN,
