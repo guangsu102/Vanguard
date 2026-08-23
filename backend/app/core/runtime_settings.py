@@ -362,7 +362,7 @@ DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "dispatcher_interval_seconds": 60,
+    "dispatcher_interval_seconds": 600,
     "group_campaign_cooldown_minutes": 4320,
     "stop_account_after_success": True,
     "stop_account_after_failure": True,

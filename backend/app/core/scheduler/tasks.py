@@ -359,14 +359,10 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
     try:
         await _ensure_db_initialized()
         from app.core import database as db_module
-        from app.core.automation_settings import (
-            get_ad_capacity_settings,
-            get_ad_delivery_execution_settings,
-        )
+        from app.core.automation_settings import get_ad_delivery_execution_settings
 
         async with db_module.get_db_session() as db:
             execution = await get_ad_delivery_execution_settings(db)
-            capacity = await get_ad_capacity_settings(db)
         if not execution["enabled"]:
             return {
                 "should_run": False,
@@ -381,8 +377,6 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
         except (TypeError, ValueError):
             last_run_at = None
         interval_seconds = int(execution["dispatcher_interval_seconds"])
-        if capacity.get("enabled", True):
-            interval_seconds = min(interval_seconds, 60)
         if last_run_at is not None and now - last_run_at < interval_seconds:
             return {
                 "should_run": False,

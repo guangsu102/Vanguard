@@ -222,7 +222,7 @@ class AdDeliveryThrottleUpdate(BaseModel):
 
 class AdDeliveryExecutionUpdate(BaseModel):
     enabled: bool = True
-    dispatcher_interval_seconds: int = Field(default=60, ge=1, le=86400)
+    dispatcher_interval_seconds: int = Field(default=600, ge=1, le=86400)
     group_campaign_cooldown_minutes: int = Field(default=4320, ge=4320, le=10080)
     stop_account_after_success: bool = True
     stop_account_after_failure: bool = True

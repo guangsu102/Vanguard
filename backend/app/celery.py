@@ -119,19 +119,19 @@ celery_app.conf.beat_schedule = {
     },
     "deliver-ads-every-10min": {
         "task": "app.core.scheduler.tasks.deliver_ads_task",
-        "schedule": 60.0,
-        "options": {"queue": "automation", "rate_limit": "60/h"},
+        "schedule": 600.0,
+        "options": {"queue": "automation", "rate_limit": "6/h"},
     },
     "check-ad-survival-every-minute": {
         "task": "app.core.scheduler.tasks.check_ad_survival_task",
         "schedule": 60.0,
         "options": {"queue": "automation", "rate_limit": "120/h"},
     },
-    "audit-group-ad-policies-every-15min": {
+    "audit-group-ad-policies-hourly": {
         "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
-        "schedule": crontab(minute="*/15"),
+        "schedule": crontab(minute=15),
         "kwargs": {"limit": 5},
-        "options": {"queue": "automation", "rate_limit": "4/h"},
+        "options": {"queue": "automation", "rate_limit": "1/h"},
     },
     "auto-probe-unknown-ad-policies-every-5min": {
         "task": "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task",

@@ -196,6 +196,50 @@ class TestCeleryConfig:
             "keywords_per_account": 10,
             "max_groups_per_keyword": 20,
         }
+        deliver_ads_schedule = beat_schedule["deliver-ads-every-10min"]
+        assert deliver_ads_schedule["schedule"] == 600.0
+        assert deliver_ads_schedule["options"]["rate_limit"] == "6/h"
+        ad_policy_audit_schedule = beat_schedule["audit-group-ad-policies-hourly"]
+        assert ad_policy_audit_schedule["options"]["rate_limit"] == "1/h"
+
+    def test_ad_delivery_runtime_interval_is_not_shortened(self):
+        """Test the runtime guard honors the configured delivery interval."""
+        from app.core import automation_settings, database
+        from app.core.scheduler import tasks
+
+        db_context = MagicMock()
+        db_context.__aenter__ = AsyncMock(return_value=MagicMock())
+        db_context.__aexit__ = AsyncMock(return_value=None)
+        redis_client = MagicMock()
+        redis_client.get = AsyncMock(return_value="880")
+        redis_client.set = AsyncMock()
+        redis_client.aclose = AsyncMock()
+
+        with (
+            patch.object(tasks, "_ensure_db_initialized", new=AsyncMock()),
+            patch.object(database, "get_db_session", return_value=db_context),
+            patch.object(
+                automation_settings,
+                "get_ad_delivery_execution_settings",
+                new=AsyncMock(
+                    return_value={
+                        "enabled": True,
+                        "dispatcher_interval_seconds": 600,
+                        "group_campaign_cooldown_minutes": 4320,
+                        "stop_account_after_success": False,
+                        "stop_account_after_failure": False,
+                    }
+                ),
+            ),
+            patch.object(tasks, "_new_scheduler_redis_client", new=AsyncMock(return_value=redis_client)),
+            patch.object(tasks.time, "time", return_value=1000.0),
+        ):
+            reservation = asyncio.run(tasks._reserve_ad_delivery_execution())
+
+        assert reservation["should_run"] is False
+        assert reservation["reason"] == "ad_delivery_interval"
+        assert reservation["next_run_at"] == "1970-01-01T00:24:40"
+        redis_client.set.assert_not_awaited()
 
     def test_beat_schedule_has_minute_level_tasks(self):
         """Test beat schedule includes minute-level tasks."""

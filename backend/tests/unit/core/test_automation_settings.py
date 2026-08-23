@@ -212,6 +212,7 @@ def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():
 
     assert "max_deliveries_per_run" not in config
     assert "max_deliveries_per_account_per_run" not in config
+    assert config["dispatcher_interval_seconds"] == 600
 
 
 def test_normalize_account_asset_policy_ignores_legacy_warmup_days():
