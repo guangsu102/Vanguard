@@ -6428,11 +6428,6 @@ class AcquisitionAutomationService:
             local_start -= timedelta(days=1)
         return local_start - timedelta(hours=int(capacity.get("timezone_offset_hours", 8)))
 
-    def _ad_current_hour_start(self, now: datetime, capacity: dict[str, Any]) -> datetime:
-        local_now = self._ad_local_time(now, capacity)
-        local_hour = local_now.replace(minute=0, second=0, microsecond=0)
-        return local_hour - timedelta(hours=int(capacity.get("timezone_offset_hours", 8)))
-
     def _ad_window_skip_reason(self, now: datetime, capacity: dict[str, Any]) -> Optional[str]:
         if not capacity.get("enabled", True):
             return None
@@ -6447,16 +6442,37 @@ class AcquisitionAutomationService:
             allowed = local_hour >= start_hour or local_hour < end_hour
         return None if allowed else "ad_time_window_blocked"
 
-    def _ad_scaled_hour_cap(self, daily_cap: int, now: datetime, capacity: dict[str, Any]) -> int:
+    def _ad_weighted_cumulative_cap(self, daily_cap: int, now: datetime, capacity: dict[str, Any]) -> int:
         if daily_cap <= 0:
             return 0
         local_hour = self._ad_local_time(now, capacity).hour
-        weights = capacity.get("hourly_weights") or {}
-        weight = int(weights.get(str(local_hour), 0) or 0)
-        total_weight = sum(max(0, int(value or 0)) for value in weights.values())
-        if weight <= 0 or total_weight <= 0:
+        start_hour = int(capacity.get("window_start_hour", 9))
+        end_hour = int(capacity.get("window_end_hour", 2))
+        if start_hour == end_hour:
+            window_hours = [(start_hour + offset) % 24 for offset in range(24)]
+        elif start_hour < end_hour:
+            window_hours = list(range(start_hour, end_hour))
+        else:
+            window_hours = list(range(start_hour, 24)) + list(range(end_hour))
+        if local_hour not in window_hours:
             return 0
-        return max(1, int((daily_cap * weight + total_weight - 1) // total_weight))
+
+        weights = capacity.get("hourly_weights") or {}
+        hour_weights = {
+            hour: max(0, int(weights.get(str(hour), 0) or 0))
+            for hour in window_hours
+        }
+        if hour_weights[local_hour] <= 0:
+            return 0
+        total_weight = sum(hour_weights.values())
+        if total_weight <= 0:
+            return 0
+
+        current_index = window_hours.index(local_hour)
+        cumulative_weight = sum(hour_weights[hour] for hour in window_hours[: current_index + 1])
+        # Midpoint-weighted slots make low daily caps favor peaks instead of treating every nonzero hour equally.
+        rounded_cap = (2 * daily_cap * cumulative_weight + total_weight) // (2 * total_weight)
+        return min(daily_cap, int(rounded_cap))
 
     async def refresh_group_ad_policies(
         self,
@@ -7155,6 +7171,7 @@ class AcquisitionAutomationService:
         membership: GroupAccountMembership,
         *,
         account_daily_limit: int,
+        account_sent_today: int,
         now: datetime,
     ) -> Optional[str]:
         group = membership.group
@@ -7194,12 +7211,10 @@ class AcquisitionAutomationService:
             await self.db.commit()
 
         day_start = self._ad_operating_day_start(now, capacity)
-        hour_start = self._ad_current_hour_start(now, capacity)
-        account_hour_cap = self._ad_scaled_hour_cap(account_daily_limit, now, capacity)
+        account_hour_cap = self._ad_weighted_cumulative_cap(account_daily_limit, now, capacity)
         if account_hour_cap <= 0:
             return "account_hour_budget_zero"
-        account_hour_sent = await self._count_successful_ads(since=hour_start, account_id=binding.account_id)
-        if account_hour_sent >= account_hour_cap:
+        if account_sent_today >= account_hour_cap:
             return "account_hour_budget"
 
         group_daily_cap = self._group_ad_daily_capacity(profile, capacity)
@@ -7218,12 +7233,6 @@ class AcquisitionAutomationService:
         group_day_sent = await self._count_successful_ads(since=day_start, telegram_group_id=membership.telegram_group_id)
         if group_day_sent >= group_daily_cap:
             return "group_daily_budget"
-        group_hour_cap = self._ad_scaled_hour_cap(group_daily_cap, now, capacity)
-        if group_hour_cap <= 0:
-            return "group_hour_budget_zero"
-        group_hour_sent = await self._count_successful_ads(since=hour_start, telegram_group_id=membership.telegram_group_id)
-        if group_hour_sent >= group_hour_cap:
-            return "group_hour_budget"
 
         account_group_cap = await self._account_group_ad_daily_capacity(binding.account_id, membership, capacity)
         if account_group_cap <= 0:
@@ -7235,16 +7244,6 @@ class AcquisitionAutomationService:
         )
         if account_group_day_sent >= account_group_cap:
             return "account_group_daily_budget"
-        account_group_hour_cap = self._ad_scaled_hour_cap(account_group_cap, now, capacity)
-        if account_group_hour_cap <= 0:
-            return "account_group_hour_budget_zero"
-        account_group_hour_sent = await self._count_successful_ads(
-            since=hour_start,
-            account_id=binding.account_id,
-            telegram_group_id=membership.telegram_group_id,
-        )
-        if account_group_hour_sent >= account_group_hour_cap:
-            return "account_group_hour_budget"
         return None
 
     async def _pause_account_if_group_control_looks_account_wide(self, account_id: int) -> bool:
@@ -7371,7 +7370,8 @@ class AcquisitionAutomationService:
                 AdDeliveryLog.sent_at >= today,
             )
         )
-        if (account_sent_today.scalar() or 0) >= account_daily_limit:
+        account_sent_today_count = int(account_sent_today.scalar() or 0)
+        if account_sent_today_count >= account_daily_limit:
             return "account_daily_message_quota"
 
         if campaign.max_sends_per_group_per_day > 0:
@@ -7403,6 +7403,7 @@ class AcquisitionAutomationService:
             binding,
             membership,
             account_daily_limit=account_daily_limit,
+            account_sent_today=account_sent_today_count,
             now=now,
         )
         if capacity_reason:
