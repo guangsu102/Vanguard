@@ -242,7 +242,7 @@ async def test_ad_policy_reads_public_messages_from_before_twenty_four_hour_cuto
 
 
 @pytest.mark.asyncio
-async def test_group_history_two_pass_ai_can_enable_one_per_day_soft_ad_trial(test_db):
+async def test_group_history_high_confidence_ai_uses_single_pass_for_soft_ad_trial(test_db):
     service = AcquisitionAutomationService(test_db)
     verdict = {
         "mode": "soft_ad_trial",
@@ -290,6 +290,8 @@ async def test_group_history_two_pass_ai_can_enable_one_per_day_soft_ad_trial(te
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
     assert result.reason == "group_history_supports_soft_ad_trial"
     assert result.confidence == 92
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -358,7 +360,7 @@ async def test_sync_group_policy_preserves_ai_soft_ad_trial_mode(test_db):
 
 
 @pytest.mark.asyncio
-async def test_group_rules_require_two_gpt_reviews_for_direct_soft_ad_permission(test_db):
+async def test_group_rules_high_confidence_direct_permission_uses_single_gpt_review(test_db):
     service = AcquisitionAutomationService(test_db)
     verdict = {
         "mode": "soft_ad_allowed",
@@ -390,8 +392,9 @@ async def test_group_rules_require_two_gpt_reviews_for_direct_soft_ad_permission
     assert result.ad_allowed is True
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_ALLOWED.value
     assert result.confidence == 98
-    assert result.decision_source == "gpt-5.4_two_pass"
-    assert len(result.ai_reviews) == 2
+    assert result.decision_source == "gpt-5.4"
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -403,7 +406,7 @@ async def test_group_rules_gpt_disagreement_and_api_failure_fail_closed(test_db)
         "explicit_permission": True,
         "direct_posting_without_prior_approval": True,
         "requires_admin_approval": False,
-        "conflict": False,
+        "conflict": True,
         "evidence_indexes": [0],
         "rationale": "Appears allowed.",
     }
@@ -444,6 +447,188 @@ async def test_group_rules_gpt_disagreement_and_api_failure_fail_closed(test_db)
     assert failed.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert failed.reason == "group_rules_ai_unavailable"
     assert failed.decision_source == "gpt_fail_closed"
+
+
+@pytest.mark.asyncio
+async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_fails_closed(test_db):
+    service = AcquisitionAutomationService(test_db)
+    verdict = {
+        "mode": "soft_ad_allowed",
+        "confidence": 90,
+        "explicit_permission": True,
+        "direct_posting_without_prior_approval": True,
+        "requires_admin_approval": False,
+        "conflict": False,
+        "evidence_indexes": [0],
+        "rationale": "Permission appears direct but confidence is below the configured threshold.",
+    }
+    service._ad_policy_llm_client = SimpleNamespace(
+        generate=AsyncMock(side_effect=[json.dumps(verdict), json.dumps(verdict)])
+    )
+    evidence = [{"source": "pinned_message", "text": "本群允许软广，可直接发布"}]
+
+    result = await service._evaluate_group_ad_rules_with_ai(
+        evidence,
+        service._evaluate_group_ad_rules(evidence),
+        {
+            "ad_policy_ai_enabled": True,
+            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_timeout_seconds": 30,
+            "ad_policy_ai_min_confidence": 95,
+            "ad_policy_ai_require_second_pass": True,
+        },
+    )
+
+    assert result.ad_allowed is None
+    assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
+    assert result.reason == "group_rules_ai_consensus_failed"
+    assert result.decision_source == "gpt-5.6-terra_two_pass"
+    assert len(result.ai_reviews) == 2
+    assert service._ad_policy_llm_client.generate.await_count == 2
+
+
+def test_ad_policy_evidence_hash_is_stable_until_retention_bucket_changes():
+    capacity = {
+        "ad_policy_ai_enabled": True,
+        "ad_policy_ai_model": "gpt-5.6-terra",
+        "ad_policy_ai_min_confidence": 95,
+        "ad_policy_ai_require_second_pass": True,
+    }
+    retained = [
+        {
+            "source": "recent_promotional_message",
+            "text": "GPT Plus\n 低价通道",
+            "message_id": 101,
+            "sender_id": 201,
+            "age_hours": 25,
+        },
+        {"source": "group_profile", "text": "title=AI交流群"},
+    ]
+    retained_reordered = [
+        {"source": "group_profile", "text": "title=AI交流群"},
+        {
+            "source": "recent_promotional_message",
+            "text": "GPT Plus 低价通道",
+            "message_id": 101,
+            "sender_id": 201,
+            "age_hours": 50,
+        },
+    ]
+    not_yet_retained = [
+        {**retained[0], "age_hours": 23},
+        retained[1],
+    ]
+
+    retained_hash = AcquisitionAutomationService._ad_policy_evidence_hash(retained, capacity)
+    assert retained_hash == AcquisitionAutomationService._ad_policy_evidence_hash(
+        retained_reordered,
+        capacity,
+    )
+    assert retained_hash != AcquisitionAutomationService._ad_policy_evidence_hash(
+        not_yet_retained,
+        capacity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_rules_audit_reuses_matching_evidence_hash_without_llm(test_db, monkeypatch):
+    service = AcquisitionAutomationService(test_db)
+    capacity = {
+        "ad_policy_ai_enabled": True,
+        "ad_policy_ai_model": "gpt-5.6-terra",
+        "ad_policy_ai_timeout_seconds": 30,
+        "ad_policy_ai_min_confidence": 95,
+        "ad_policy_ai_require_second_pass": True,
+    }
+    evidence = [{"source": "pinned_message", "text": "本群允许软广，可直接发布"}]
+    evidence_hash = service._ad_policy_evidence_hash(evidence, capacity)
+    profile = GroupAdProfile(
+        group_id=1,
+        telegram_group_id=930004,
+        ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        ad_policy_confidence=98,
+        ad_policy_verified_at=datetime.utcnow(),
+        ad_policy_evidence_hash=evidence_hash,
+    )
+    service._ad_policy_llm_client = SimpleNamespace(generate=AsyncMock())
+    monkeypatch.setattr(acquisition_automation, "get_ad_capacity_settings", AsyncMock(return_value=capacity))
+    monkeypatch.setattr(service, "_fetch_messages_before", AsyncMock(return_value=[]))
+    monkeypatch.setattr(service, "_read_group_ad_rules_evidence", AsyncMock(return_value=evidence))
+
+    result = await service._audit_group_ad_rules(
+        SimpleNamespace(),
+        SimpleNamespace(),
+        [],
+        profile=profile,
+    )
+
+    assert result.ad_allowed is True
+    assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_ALLOWED.value
+    assert result.decision_source == "evidence_cache"
+    assert result.evidence_hash == evidence_hash
+    assert result.cache_hit is True
+    service._ad_policy_llm_client.generate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_ad_policy_is_reaudited_only_after_twenty_four_hours(test_db, monkeypatch):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        phone="+15550003004",
+        identifier="+15550003004",
+        session_name="ad_policy_reaudit_cooldown",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    recent_group = Group(group_id=930005, title="Recent Unknown", level=GroupLevel.A, status="active")
+    due_group = Group(group_id=930006, title="Due Unknown", level=GroupLevel.A, status="active")
+    test_db.add_all([account, recent_group, due_group])
+    await test_db.flush()
+    test_db.add_all(
+        [
+            GroupAccountMembership(
+                group_id=recent_group.id,
+                telegram_group_id=recent_group.group_id,
+                account_id=account.id,
+                status="joined",
+            ),
+            GroupAccountMembership(
+                group_id=due_group.id,
+                telegram_group_id=due_group.group_id,
+                account_id=account.id,
+                status="joined",
+            ),
+            GroupAdProfile(
+                group_id=recent_group.id,
+                telegram_group_id=recent_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                ad_policy_verified_at=now - timedelta(hours=23),
+            ),
+            GroupAdProfile(
+                group_id=due_group.id,
+                telegram_group_id=due_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                ad_policy_verified_at=now - timedelta(hours=25),
+            ),
+        ]
+    )
+    await test_db.commit()
+    service = AcquisitionAutomationService(test_db)
+    monkeypatch.setattr(service, "_sync_account_pool", AsyncMock())
+
+    result = await service.refresh_group_ad_policies(limit=10, dry_run=True)
+
+    assert result["processed"] == 1
+    assert result["skipped"] == 1
+    assert result["details"] == [
+        {
+            "group_id": due_group.id,
+            "telegram_group_id": due_group.group_id,
+            "account_id": account.id,
+            "action": "would_audit_ad_policy",
+        }
+    ]
 
 
 @pytest.mark.asyncio

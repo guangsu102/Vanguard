@@ -1401,6 +1401,9 @@ def audit_group_ad_policies_task(limit: int = 5, dry_run: bool = False):
             processed=result.get("processed", 0),
             updated=result.get("updated", 0),
             failed=result.get("failed", 0),
+            cache_hits=result.get("cache_hits", 0),
+            llm_reviews=result.get("llm_reviews", 0),
+            llm_second_passes=result.get("llm_second_passes", 0),
         )
         return result
     except Exception as exc:

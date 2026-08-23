@@ -1021,6 +1021,9 @@ class GroupAdProfile(Base):
     ad_policy_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="广告许可失效时间"
     )
+    ad_policy_evidence_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, comment="最近广告策略审计证据哈希"
+    )
     ad_tier: Mapped[str] = mapped_column(
         String(30),
         default=GroupAdTier.OBSERVING.value,

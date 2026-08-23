@@ -11,6 +11,7 @@ components into background-friendly workflows:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import re
@@ -185,6 +186,8 @@ DEFAULT_KEYWORD_GENERATE_COUNTS = {
 
 JOIN_AUDIT_MESSAGE_LIMIT = 50
 AD_POLICY_OLDER_MESSAGE_LIMIT = 50
+AD_POLICY_UNKNOWN_REAUDIT_HOURS = 24
+AD_POLICY_EVIDENCE_HASH_VERSION = "v1"
 JOIN_AUDIT_MIN_TEXT_MESSAGES = 10
 JOIN_AUDIT_MIN_CHINESE_MESSAGE_RATIO = 0.5
 JOIN_AUDIT_MIN_CHINESE_CHAR_RATIO = 0.35
@@ -419,6 +422,8 @@ class GroupAdRulesAuditResult:
     confidence: int = 0
     decision_source: str = "local_rules"
     ai_reviews: list[dict[str, Any]] = field(default_factory=list)
+    evidence_hash: Optional[str] = None
+    cache_hit: bool = False
 
     def details(self) -> dict[str, Any]:
         return {
@@ -432,6 +437,8 @@ class GroupAdRulesAuditResult:
             "confidence": self.confidence,
             "decision_source": self.decision_source,
             "ai_reviews": self.ai_reviews,
+            "evidence_hash": self.evidence_hash,
+            "cache_hit": self.cache_hit,
         }
 
 
@@ -3568,6 +3575,92 @@ class AcquisitionAutomationService:
 
         return sorted(evidence, key=evidence_priority)[:20]
 
+    @staticmethod
+    def _ad_policy_evidence_hash(
+        evidence: list[dict[str, Any]],
+        capacity: dict[str, Any],
+    ) -> str:
+        canonical_evidence: list[dict[str, Any]] = []
+        for item in evidence:
+            age_hours = item.get("age_hours")
+            try:
+                retained_24h = (
+                    float(age_hours) >= SOFT_AD_TRIAL_MIN_RETAINED_HOURS
+                    if age_hours is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                retained_24h = None
+            canonical_evidence.append(
+                {
+                    "source": str(item.get("source") or ""),
+                    "text": re.sub(r"\s+", " ", str(item.get("text") or "")).strip(),
+                    "message_id": str(item["message_id"])
+                    if item.get("message_id") is not None
+                    else None,
+                    "sender_id": str(item["sender_id"])
+                    if item.get("sender_id") is not None
+                    else None,
+                    "retained_24h": retained_24h,
+                }
+            )
+        canonical_evidence.sort(
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        payload = {
+            "version": AD_POLICY_EVIDENCE_HASH_VERSION,
+            "ai_enabled": bool(capacity.get("ad_policy_ai_enabled", True)),
+            "model": str(capacity.get("ad_policy_ai_model") or "gpt-5.6-terra"),
+            "min_confidence": int(capacity.get("ad_policy_ai_min_confidence") or 95),
+            "require_second_pass": bool(capacity.get("ad_policy_ai_require_second_pass", True)),
+            "evidence": canonical_evidence,
+        }
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _cached_group_ad_policy_result(
+        profile: Optional[GroupAdProfile],
+        evidence: list[dict[str, Any]],
+        evidence_hash: str,
+    ) -> Optional[GroupAdRulesAuditResult]:
+        if profile is None or not profile.ad_policy_evidence_hash:
+            return None
+        if profile.ad_policy_evidence_hash != evidence_hash or profile.ad_policy_verified_at is None:
+            return None
+
+        mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
+        if mode == GroupAdPolicyMode.FORBIDDEN.value:
+            ad_allowed: Optional[bool] = False
+        elif mode in {
+            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+            GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+        }:
+            ad_allowed = True
+        else:
+            ad_allowed = None
+        return GroupAdRulesAuditResult(
+            ad_allowed=ad_allowed,
+            policy_mode=mode,
+            reason="group_rules_evidence_unchanged",
+            evidence=evidence,
+            confidence=max(0, min(100, int(profile.ad_policy_confidence or 0))),
+            decision_source="evidence_cache",
+            evidence_hash=evidence_hash,
+            cache_hit=True,
+        )
+
     def _evaluate_group_ad_rules(self, evidence: list[dict[str, Any]]) -> GroupAdRulesAuditResult:
         deny_matches: list[dict[str, Any]] = []
         allow_matches: list[dict[str, Any]] = []
@@ -3806,7 +3899,19 @@ class AcquisitionAutomationService:
                 timeout_seconds=timeout_seconds,
             )
             reviews = [first]
-            if capacity.get("ad_policy_ai_require_second_pass", True):
+            first_required_confidence = (
+                max(80, min_confidence - 15)
+                if first["mode"] == GroupAdPolicyMode.SOFT_AD_TRIAL.value
+                else min_confidence
+            )
+            needs_second_pass = bool(
+                capacity.get("ad_policy_ai_require_second_pass", True)
+                and (
+                    first["conflict"]
+                    or int(first["confidence"]) < first_required_confidence
+                )
+            )
+            if needs_second_pass:
                 reviews.append(
                     await self._ask_ad_policy_ai(
                         evidence,
@@ -3909,6 +4014,7 @@ class AcquisitionAutomationService:
         client: Any,
         entity: Any,
         messages: list[Any],
+        profile: Optional[GroupAdProfile] = None,
     ) -> GroupAdRulesAuditResult:
         policy_messages = list(messages)
         older_messages = await self._fetch_messages_before(
@@ -3922,8 +4028,13 @@ class AcquisitionAutomationService:
             item for item in older_messages if self._message_id(item) not in seen_message_ids
         )
         evidence = await self._read_group_ad_rules_evidence(client, entity, policy_messages)
-        local_result = self._evaluate_group_ad_rules(evidence)
         capacity = await get_ad_capacity_settings(self.db)
+        evidence_hash = self._ad_policy_evidence_hash(evidence, capacity)
+        cached_result = self._cached_group_ad_policy_result(profile, evidence, evidence_hash)
+        if cached_result is not None:
+            return cached_result
+        local_result = self._evaluate_group_ad_rules(evidence)
+        local_result.evidence_hash = evidence_hash
         return await self._evaluate_group_ad_rules_with_ai(evidence, local_result, capacity)
 
     async def _run_post_verification_rechecks(
@@ -6482,6 +6593,7 @@ class AcquisitionAutomationService:
     ) -> dict[str, Any]:
         """Re-audit unknown or expired policies for already joined groups."""
         now = _now()
+        unknown_cutoff = now - timedelta(hours=AD_POLICY_UNKNOWN_REAUDIT_HOURS)
         batch_size = max(1, min(int(limit), 20))
         rows = await self.db.execute(
             select(GroupAdProfile, Group, GroupAccountMembership, TelegramAccount)
@@ -6493,9 +6605,20 @@ class AcquisitionAutomationService:
                 Group.status == "active",
                 TelegramAccount.is_active == True,
                 or_(
-                    GroupAdProfile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value,
-                    GroupAdProfile.ad_policy_verified_at.is_(None),
-                    GroupAdProfile.ad_policy_expires_at <= now,
+                    and_(
+                        GroupAdProfile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value,
+                        or_(
+                            GroupAdProfile.ad_policy_verified_at.is_(None),
+                            GroupAdProfile.ad_policy_verified_at <= unknown_cutoff,
+                        ),
+                    ),
+                    and_(
+                        GroupAdProfile.ad_policy_mode != GroupAdPolicyMode.UNKNOWN.value,
+                        or_(
+                            GroupAdProfile.ad_policy_verified_at.is_(None),
+                            GroupAdProfile.ad_policy_expires_at <= now,
+                        ),
+                    ),
                 ),
             )
             .order_by(
@@ -6516,10 +6639,22 @@ class AcquisitionAutomationService:
                 break
 
         if not candidates:
-            return {"processed": 0, "updated": 0, "failed": 0, "skipped": 0, "details": []}
+            return {
+                "processed": 0,
+                "updated": 0,
+                "failed": 0,
+                "skipped": 0,
+                "cache_hits": 0,
+                "llm_reviews": 0,
+                "llm_second_passes": 0,
+                "details": [],
+            }
         await self._sync_account_pool([item[3] for item in candidates])
 
         result = AutomationRunResult()
+        cache_hits = 0
+        llm_reviews = 0
+        llm_second_passes = 0
         for profile, group, membership, _account in candidates:
             result.processed += 1
             if dry_run:
@@ -6544,7 +6679,15 @@ class AcquisitionAutomationService:
                     raise RuntimeError("policy audit account unavailable")
                 entity = await account.client.get_entity(group.username or group.group_id)
                 messages = await self._fetch_recent_messages(account.client, entity, limit=JOIN_AUDIT_MESSAGE_LIMIT)
-                policy = await self._audit_group_ad_rules(account.client, entity, messages)
+                policy = await self._audit_group_ad_rules(
+                    account.client,
+                    entity,
+                    messages,
+                    profile=profile,
+                )
+                cache_hits += int(policy.cache_hit)
+                llm_reviews += len(policy.ai_reviews)
+                llm_second_passes += int(len(policy.ai_reviews) > 1)
                 audit = JoinedGroupAuditResult(
                     passed=True,
                     ad_allowed=policy.ad_allowed,
@@ -6564,6 +6707,8 @@ class AcquisitionAutomationService:
                         "confidence": policy.confidence,
                         "reason": policy.reason,
                         "decision_source": policy.decision_source,
+                        "cache_hit": policy.cache_hit,
+                        "llm_review_count": len(policy.ai_reviews),
                     }
                 )
                 if policy.reason == "group_rules_ai_unavailable":
@@ -6582,7 +6727,12 @@ class AcquisitionAutomationService:
             finally:
                 if account is not None:
                     await self.account_pool.release(account)
-        return result.as_dict()
+        return {
+            **result.as_dict(),
+            "cache_hits": cache_hits,
+            "llm_reviews": llm_reviews,
+            "llm_second_passes": llm_second_passes,
+        }
 
     async def auto_probe_unknown_group_ad_policies(
         self,
@@ -6805,9 +6955,11 @@ class AcquisitionAutomationService:
         capacity = await get_ad_capacity_settings(self.db)
         profile = await self._get_or_create_group_ad_profile(group, capacity)
         previous_mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
-        audit_mode = str((audit.ad_rule_details or {}).get("policy_mode") or GroupAdPolicyMode.UNKNOWN.value)
-        audit_confidence = max(0, min(100, int((audit.ad_rule_details or {}).get("confidence") or 0)))
-        audit_source = str((audit.ad_rule_details or {}).get("decision_source") or "group_rules")[:80]
+        audit_details = audit.ad_rule_details or {}
+        audit_mode = str(audit_details.get("policy_mode") or GroupAdPolicyMode.UNKNOWN.value)
+        audit_confidence = max(0, min(100, int(audit_details.get("confidence") or 0)))
+        audit_source = str(audit_details.get("decision_source") or "group_rules")[:80]
+        evidence_hash = str(audit_details.get("evidence_hash") or "").lower()
         manual_active = (
             profile.ad_policy_source == "manual"
             and (profile.ad_policy_expires_at is None or profile.ad_policy_expires_at > now)
@@ -6852,6 +7004,9 @@ class AcquisitionAutomationService:
             profile.ad_tier = GroupAdTier.OBSERVING.value
         profile.ad_policy_source = "group_rules_conflict" if manual_active else audit_source
         profile.ad_policy_verified_at = now
+        profile.ad_policy_evidence_hash = (
+            evidence_hash if re.fullmatch(r"[0-9a-f]{64}", evidence_hash) else None
+        )
         profile.tier_changed_at = now
         profile.daily_capacity = int((capacity.get("tier_daily_capacities") or {}).get(profile.ad_tier, 0) or 0)
         profile.updated_at = now
