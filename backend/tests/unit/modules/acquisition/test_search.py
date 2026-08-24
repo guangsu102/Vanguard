@@ -1634,6 +1634,112 @@ class TestAdDeliveryFailureHandling:
         assert membership.ad_eligible_after == now + timedelta(hours=23)
 
     @pytest.mark.asyncio
+    async def test_missing_probe_eligibility_is_backfilled_before_ad_delivery(self, test_db):
+        now = datetime(2026, 8, 24, 4, 0)
+        membership = SimpleNamespace(
+            warmup_status="writable_verified",
+            probe_status="success",
+            note="",
+            interaction_started_at=now - timedelta(days=20),
+            joined_at=now - timedelta(days=20),
+            first_ad_allowed_at=now - timedelta(days=5),
+            ad_eligible_after=None,
+            last_probe_at=None,
+            updated_at=None,
+        )
+        service = AcquisitionAutomationService(test_db)
+        service._get_account_operation_config = AsyncMock(return_value=None)
+        service._maybe_send_ad_interaction = AsyncMock()
+
+        reason = await service._ad_warmup_skip_reason(1, membership, now, dry_run=False)
+
+        assert reason == "ad_warmup_after_probe"
+        assert membership.ad_eligible_after == now + timedelta(hours=24)
+        service._maybe_send_ad_interaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ad_only_mode_cannot_bypass_probe_eligibility_wait(self, test_db):
+        now = datetime(2026, 8, 24, 4, 0)
+        membership = SimpleNamespace(
+            warmup_status="writable_verified",
+            probe_status="success",
+            note="",
+            interaction_started_at=now - timedelta(days=20),
+            joined_at=now - timedelta(days=20),
+            first_ad_allowed_at=now - timedelta(days=5),
+            ad_eligible_after=now + timedelta(hours=6),
+            last_probe_at=now - timedelta(days=1),
+            updated_at=None,
+        )
+        service = AcquisitionAutomationService(test_db)
+        service._get_account_operation_config = AsyncMock(
+            return_value=SimpleNamespace(operation_mode="ad_only")
+        )
+        service._maybe_send_ad_interaction = AsyncMock()
+
+        reason = await service._ad_warmup_skip_reason(1, membership, now, dry_run=False)
+
+        assert reason == "ad_warmup_after_probe"
+        service._maybe_send_ad_interaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_policy_probe_requires_persisted_eligibility_deadline(self, test_db, monkeypatch):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            phone="+15550000913",
+            identifier="+15550000913",
+            session_name="missing_ad_eligibility_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        group = Group(group_id=910013, title="Missing eligibility", level=GroupLevel.A, status="active")
+        test_db.add_all([account, group])
+        await test_db.flush()
+        test_db.add_all(
+            [
+                GroupAccountMembership(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    account_id=account.id,
+                    status="joined",
+                    join_method="manual",
+                    warmup_status="writable_verified",
+                    probe_status="success",
+                    ad_status="active",
+                    first_ad_allowed_at=now - timedelta(days=1),
+                    ad_eligible_after=None,
+                ),
+                GroupAdProfile(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                ),
+            ]
+        )
+        await test_db.commit()
+        capacity = {
+            **acquisition_automation.DEFAULT_AD_CAPACITY_SETTINGS,
+            "enabled": True,
+            "ad_policy_auto_probe_enabled": True,
+            "ad_policy_auto_probe_daily_limit_per_account": 1,
+        }
+        monkeypatch.setattr(
+            acquisition_automation,
+            "get_ad_capacity_settings",
+            AsyncMock(return_value=capacity),
+        )
+
+        service = AcquisitionAutomationService(test_db)
+        result = await service.auto_probe_unknown_group_ad_policies(dry_run=True)
+
+        assert result["processed"] == 0
+        assert result["reason"] == "no_eligible_unknown_group"
+
+        with pytest.raises(RuntimeError, match="no_probe_ready_membership"):
+            await service.send_group_ad_policy_probe(group.id, account_id=account.id)
+
+    @pytest.mark.asyncio
     async def test_account_warmup_deadline_blocks_ad_when_interactions_are_disabled(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(

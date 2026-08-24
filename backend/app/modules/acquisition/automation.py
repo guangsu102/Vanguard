@@ -6231,9 +6231,9 @@ class AcquisitionAutomationService:
                 continue
             if membership.ad_status == MEMBERSHIP_AD_STATUS_BLOCKED:
                 continue
-            if membership.ad_eligible_after and membership.ad_eligible_after > now:
+            if membership.ad_eligible_after is None or membership.ad_eligible_after > now:
                 continue
-            if membership.first_ad_allowed_at and membership.first_ad_allowed_at > now:
+            if membership.first_ad_allowed_at is None or membership.first_ad_allowed_at > now:
                 continue
             eligible_memberships.append(membership)
         if not eligible_memberships:
@@ -6456,14 +6456,11 @@ class AcquisitionAutomationService:
         dry_run: bool,
     ) -> Optional[str]:
         operation_config = await self._get_account_operation_config(account_id)
-        if (
+        is_ad_only = bool(
             operation_config
             and (getattr(operation_config, "operation_mode", None) or AccountOperationMode.GROWTH.value)
             == AccountOperationMode.AD_ONLY.value
-        ):
-            if membership.warmup_status == "blocked" or membership.probe_status == "failed":
-                return "ad_only_group_blocked"
-            return None
+        )
 
         blocked = self._membership_latest_event(
             membership.note,
@@ -6471,7 +6468,7 @@ class AcquisitionAutomationService:
         )
         success = self._membership_latest_event(membership.note, {"ad_probe_success"})
         if membership.warmup_status == "blocked" or membership.probe_status == "failed":
-            return "ad_probe_blocked"
+            return "ad_only_group_blocked" if is_ad_only else "ad_probe_blocked"
         if membership.probe_status == "success" or success:
             capacity = await get_ad_capacity_settings(self.db)
             interaction_started_at = membership.interaction_started_at or membership.joined_at or now
@@ -6483,12 +6480,13 @@ class AcquisitionAutomationService:
                 warmup_days = await self._account_ad_warmup_days(account_id)
                 membership.first_ad_allowed_at = interaction_started_at + timedelta(days=warmup_days)
                 changed = True
-            if changed:
-                membership.updated_at = now
-                await self.db.commit()
-                changed = False
 
-            eligible_after = membership.ad_eligible_after or self._parse_note_datetime(success.get("ad_eligible_after") if success else None)
+            eligible_after = membership.ad_eligible_after
+            if eligible_after is None:
+                eligible_after = self._parse_note_datetime(success.get("ad_eligible_after") if success else None)
+                if eligible_after is not None:
+                    membership.ad_eligible_after = eligible_after
+                    changed = True
             probe_completed_at = membership.last_probe_at or self._parse_note_datetime(
                 success.get("at") if success else None
             )
@@ -6498,6 +6496,10 @@ class AcquisitionAutomationService:
                     eligible_after = minimum_eligible_after
                     membership.ad_eligible_after = minimum_eligible_after
                     changed = True
+            elif eligible_after is None:
+                eligible_after = now + timedelta(seconds=AD_WARMUP_AD_MIN_DELAY_SECONDS)
+                membership.ad_eligible_after = eligible_after
+                changed = True
             if changed:
                 membership.updated_at = now
                 await self.db.commit()
@@ -6519,6 +6521,12 @@ class AcquisitionAutomationService:
                 }:
                     return warmup_interaction_reason
                 return "ad_warmup_not_complete"
+            if is_ad_only:
+                if membership.warmup_status != "ad_eligible":
+                    membership.warmup_status = "ad_eligible"
+                    membership.updated_at = now
+                    await self.db.commit()
+                return None
             mature_interaction_reason = await self._maybe_send_ad_interaction(
                 account_id,
                 membership,
@@ -6539,7 +6547,7 @@ class AcquisitionAutomationService:
                 await self.db.commit()
             return None
         if blocked:
-            return "ad_probe_blocked"
+            return "ad_only_group_blocked" if is_ad_only else "ad_probe_blocked"
         if dry_run:
             return "ad_probe_required"
         quota_reason = await self._new_ad_group_quota_skip_reason(account_id, now)
@@ -6875,14 +6883,10 @@ class AcquisitionAutomationService:
                         ),
                     ),
                 ),
-                or_(
-                    GroupAccountMembership.first_ad_allowed_at.is_(None),
-                    GroupAccountMembership.first_ad_allowed_at <= now,
-                ),
-                or_(
-                    GroupAccountMembership.ad_eligible_after.is_(None),
-                    GroupAccountMembership.ad_eligible_after <= now,
-                ),
+                GroupAccountMembership.first_ad_allowed_at.is_not(None),
+                GroupAccountMembership.first_ad_allowed_at <= now,
+                GroupAccountMembership.ad_eligible_after.is_not(None),
+                GroupAccountMembership.ad_eligible_after <= now,
             )
             .order_by(GroupAdProfile.updated_at.asc(), GroupAdProfile.id.asc())
             .limit(max(100, (int(limit) if limit is not None else per_account_limit) * 20))
