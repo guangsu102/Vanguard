@@ -132,12 +132,12 @@ def _proxy_to_response(proxy: Proxy, bound_accounts: Optional[list[TelegramAccou
     """Convert Proxy model to response."""
     bound_accounts = bound_accounts or []
     first_bound_account = bound_accounts[0] if bound_accounts else None
-    # Map is_active to status
-    if proxy.is_active:
-        if proxy.consecutive_failures >= 3:
-            status = "error"
-        else:
-            status = "active"
+    # Health failures take precedence over a manual inactive state because the
+    # health checker also disables proxies after repeated failures.
+    if proxy.consecutive_failures >= 3:
+        status = "error"
+    elif proxy.is_active:
+        status = "active"
     else:
         status = "inactive"
 
