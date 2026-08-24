@@ -233,8 +233,8 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
     campaign = SimpleNamespace(id=701)
     binding = SimpleNamespace(id=702, account_id=703, campaign=campaign)
     memberships = [
-        SimpleNamespace(telegram_group_id=704, group=SimpleNamespace(id=705)),
-        SimpleNamespace(telegram_group_id=706, group=SimpleNamespace(id=707)),
+        SimpleNamespace(telegram_group_id=704, probe_status="scheduled", group=SimpleNamespace(id=705)),
+        SimpleNamespace(telegram_group_id=706, probe_status="success", group=SimpleNamespace(id=707)),
     ]
     creative = SimpleNamespace(id=708)
 
@@ -243,7 +243,7 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
     monkeypatch.setattr(service, "_ad_dynamic_run_limit", AsyncMock(return_value=0))
     monkeypatch.setattr(service, "_choose_delivery_creative", AsyncMock(return_value=creative))
     monkeypatch.setattr(service, "_campaign_is_active", lambda _campaign: True)
-    probe_check = AsyncMock(side_effect=["ad_probe_waiting", None])
+    probe_check = AsyncMock(return_value="ad_probe_waiting")
     monkeypatch.setattr(service, "_ad_skip_reason", probe_check)
     send_ad = AsyncMock()
     monkeypatch.setattr(service, "_send_ad", send_ad)
@@ -261,13 +261,14 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
         stop_after_failure=False,
     )
 
-    assert probe_check.await_count == 2
-    assert result.processed == 2
+    assert probe_check.await_count == 1
+    assert result.processed == 1
     assert result.skipped == 2
     assert [item["reason"] for item in result.details] == [
-        "ad_probe_waiting",
         "account_dynamic_health_paused",
+        "ad_probe_waiting",
     ]
+    service._choose_delivery_creative.assert_not_awaited()
     send_ad.assert_not_awaited()
 
 

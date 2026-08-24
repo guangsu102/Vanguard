@@ -188,9 +188,9 @@ class TestCeleryConfig:
         # Check for 30-second task
         assert "campaign-check-every-30s" in beat_schedule
         assert beat_schedule["campaign-check-every-30s"]["schedule"] == 30.0
-        assert "auto-join-groups-dispatcher-every-minute" in beat_schedule
-        auto_join_schedule = beat_schedule["auto-join-groups-dispatcher-every-minute"]
-        assert auto_join_schedule["schedule"] == 60.0
+        assert "auto-join-groups-dispatcher-every-5min" in beat_schedule
+        auto_join_schedule = beat_schedule["auto-join-groups-dispatcher-every-5min"]
+        assert str(auto_join_schedule["schedule"]) == "<crontab: */5 * * * * (m/h/dM/MY/d)>"
         assert auto_join_schedule["kwargs"] == {
             "scheduled": True,
             "keywords_per_account": 10,
@@ -199,6 +199,8 @@ class TestCeleryConfig:
         deliver_ads_schedule = beat_schedule["deliver-ads-every-10min"]
         assert deliver_ads_schedule["schedule"] == 600.0
         assert deliver_ads_schedule["options"]["rate_limit"] == "6/h"
+        assert beat_schedule["check-ad-survival-every-2min"]["schedule"] == 120.0
+        assert "group-ai-warmup-dispatcher-every-30min" in beat_schedule
         ad_policy_audit_schedule = beat_schedule["audit-group-ad-policies-hourly"]
         assert ad_policy_audit_schedule["options"]["rate_limit"] == "1/h"
 
@@ -240,6 +242,20 @@ class TestCeleryConfig:
         assert reservation["reason"] == "ad_delivery_interval"
         assert reservation["next_run_at"] == "1970-01-01T00:24:40"
         redis_client.set.assert_not_awaited()
+
+    def test_finish_execution_records_reservation_start_time(self):
+        from app.core.scheduler import tasks
+
+        redis_client = MagicMock()
+        redis_client.set = AsyncMock()
+        redis_client.delete = AsyncMock()
+        redis_client.aclose = AsyncMock()
+
+        with patch.object(tasks, "_new_scheduler_redis_client", new=AsyncMock(return_value=redis_client)):
+            asyncio.run(tasks._finish_ad_delivery_execution(1234.5))
+
+        redis_client.set.assert_awaited_once_with(tasks.AD_DELIVERY_LAST_RUN_KEY, "1234.5")
+        redis_client.delete.assert_awaited_once_with(tasks.AD_DELIVERY_LOCK_KEY)
 
     def test_beat_schedule_has_minute_level_tasks(self):
         """Test beat schedule includes minute-level tasks."""

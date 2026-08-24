@@ -113,6 +113,12 @@ class AccountDynamicFrequencyService:
         return max(minimum, min(maximum, float(value)))
 
     @staticmethod
+    def scaled_positive_capacity(base_capacity: int, multiplier: float) -> int:
+        if base_capacity <= 0 or multiplier <= 0:
+            return 0
+        return max(1, int(round(base_capacity * multiplier)))
+
+    @staticmethod
     def business_stage_or_default(config: AccountOperationConfig | None) -> str:
         raw = str(getattr(config, "business_stage", "") or AccountBusinessStage.NEW.value)
         valid = {stage.value for stage in AccountBusinessStage}
@@ -1065,7 +1071,7 @@ class AccountDynamicFrequencyService:
                 account_group_default_cap,
                 int(membership.account_group_daily_cap or account_group_default_cap),
             )
-            account_group_capacity = max(0, int(round(account_group_base * account_ad_multiplier)))
+            account_group_capacity = self.scaled_positive_capacity(account_group_base, account_ad_multiplier)
             base_capacity = min(
                 value
                 for value in (group_capacity, account_group_capacity)

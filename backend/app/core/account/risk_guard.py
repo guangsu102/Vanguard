@@ -35,6 +35,7 @@ from app.core.automation_settings import (
     get_account_warmup_policy_settings,
 )
 from app.core.config import get_settings
+from app.core.operating_time import operating_date
 from app.core.redis import RedisCache
 
 logger = structlog.get_logger()
@@ -793,7 +794,7 @@ class AccountRiskGuard:
                 return False, "risk_budget_unavailable", None
             return True, "redis_unavailable_budget_not_enforced", None
 
-        day_key = datetime.utcnow().strftime("%Y%m%d")
+        day_key = operating_date().strftime("%Y%m%d")
         total_key = f"risk:account:{account_id}:daily:total:{day_key}"
         action_key = f"risk:account:{account_id}:daily:{action.value}:{day_key}"
         group_write_key = (
@@ -1239,7 +1240,7 @@ class AccountRiskGuard:
         reason: Optional[str],
         target_type: Optional[str],
     ) -> None:
-        today = date.today()
+        today = operating_date()
         result = await self.db.execute(
             select(AccountRiskDailyStat).where(
                 AccountRiskDailyStat.account_id == account_id,

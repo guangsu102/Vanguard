@@ -20,6 +20,7 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.group.models import Group, GroupAccountMembership
+from app.core.operating_time import operating_day_start
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AutoJoinAttempt,
@@ -54,7 +55,7 @@ def _now() -> datetime:
 
 
 def _day_start(now: datetime) -> datetime:
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return operating_day_start(now)
 
 
 @dataclass

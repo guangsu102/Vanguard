@@ -340,11 +340,11 @@ async def _reserve_manual_auto_join() -> dict[str, Any]:
             await _close_scheduler_redis_client(client)
 
 
-async def _finish_auto_join_execution() -> None:
+async def _finish_auto_join_execution(started_at: float) -> None:
     client = None
     try:
         client = await _new_scheduler_redis_client()
-        await client.set(AUTO_JOIN_SCHEDULER_LAST_RUN_KEY, str(time.time()))
+        await client.set(AUTO_JOIN_SCHEDULER_LAST_RUN_KEY, str(started_at))
         await client.delete(AUTO_JOIN_SCHEDULER_LOCK_KEY)
     except Exception as exc:
         logger.warning("auto_join_execution_finish_failed", error=str(exc))
@@ -425,11 +425,11 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
             await _close_scheduler_redis_client(client)
 
 
-async def _finish_ad_delivery_execution() -> None:
+async def _finish_ad_delivery_execution(started_at: float) -> None:
     client = None
     try:
         client = await _new_scheduler_redis_client()
-        await client.set(AD_DELIVERY_LAST_RUN_KEY, str(time.time()))
+        await client.set(AD_DELIVERY_LAST_RUN_KEY, str(started_at))
         await client.delete(AD_DELIVERY_LOCK_KEY)
     except Exception as exc:
         logger.warning("ad_delivery_execution_finish_failed", error=str(exc))
@@ -1258,7 +1258,7 @@ def auto_join_groups_task(
         return {"error": str(exc)}
     finally:
         if reservation and reservation.get("should_run"):
-            _run_async(_finish_auto_join_execution())
+            _run_async(_finish_auto_join_execution(float(reservation["started_at"])))
 
 
 @celery_app.task
@@ -1366,7 +1366,7 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
         return {"error": str(exc)}
     finally:
         if reservation and reservation.get("should_run"):
-            _run_async(_finish_ad_delivery_execution())
+            _run_async(_finish_ad_delivery_execution(float(reservation["started_at"])))
 
 
 @celery_app.task

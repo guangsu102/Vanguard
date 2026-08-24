@@ -24,6 +24,9 @@ from app.modules.acquisition.models import (
     AdDeliveryLog,
     AdSendMode,
     DeliveryStatus,
+    GroupAdPolicyMode,
+    GroupAdProfile,
+    GroupAdTier,
 )
 
 
@@ -305,7 +308,7 @@ async def test_scheduled_time_is_enforced_when_dynamic_capacity_is_enabled(test_
     binding = SimpleNamespace(account_id=7)
     membership = SimpleNamespace(
         telegram_group_id=-100456,
-        group=SimpleNamespace(id=303, status="active", level=SimpleNamespace(value="A")),
+        group=SimpleNamespace(id=303, group_id=-100456, status="active", level=SimpleNamespace(value="A")),
     )
 
     monkeypatch.setattr(automation_module, "_now", lambda: datetime(2026, 7, 14, 5, 0))
@@ -331,6 +334,56 @@ async def test_scheduled_time_is_enforced_when_dynamic_capacity_is_enabled(test_
 
     assert reason == "scheduled_time_not_due"
     dynamic_limit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approval_required_group_is_blocked_before_writable_probe(test_db, monkeypatch):
+    now = datetime(2026, 7, 14, 5, 0)
+    group = Group(group_id=-100457, title="Approval only", level=GroupLevel.A, status="active")
+    test_db.add(group)
+    await test_db.flush()
+    test_db.add(
+        GroupAdProfile(
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            ad_policy_mode=GroupAdPolicyMode.APPROVAL_REQUIRED.value,
+            ad_policy_confidence=100,
+            ad_policy_source="manual",
+            ad_policy_verified_at=now - timedelta(days=1),
+            ad_policy_expires_at=now + timedelta(days=30),
+            ad_tier=GroupAdTier.OBSERVING.value,
+            daily_capacity=0,
+        )
+    )
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    campaign = AdCampaign(
+        id=93,
+        name="approval blocked",
+        send_mode=AdSendMode.INTERVAL.value,
+        target_group_levels=json.dumps(["A"]),
+    )
+    binding = SimpleNamespace(account_id=7)
+    membership = SimpleNamespace(telegram_group_id=group.group_id, group=group)
+    warmup_check = AsyncMock(return_value=None)
+    monkeypatch.setattr(automation_module, "_now", lambda: now)
+    monkeypatch.setattr(service, "_ad_recent_inflight_delivery_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_ad_recent_undeliverable_failure_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_get_account_operation_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_ad_account_risk_skip_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_group_can_receive_ads", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_ad_warmup_skip_reason", warmup_check)
+
+    reason = await service._ad_skip_reason(
+        binding,
+        campaign,
+        SimpleNamespace(id=1),
+        membership,
+    )
+
+    assert reason == "group_ad_approval_required"
+    warmup_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio

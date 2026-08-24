@@ -794,6 +794,24 @@ class TestAutoJoinStateHandling:
 
         assert settings.ai_timeout_seconds == 45.0
 
+    @pytest.mark.asyncio
+    async def test_join_verification_ai_timeout_is_pending_recheck(self):
+        service = AcquisitionAutomationService(db=MagicMock())
+        service._ask_join_verification_ai = AsyncMock(side_effect=TimeoutError)
+        settings = JoinVerificationSettings(ai_timeout_seconds=0.01)
+
+        decision, result = await service._ask_join_verification_ai_safely(
+            [],
+            can_send_messages=False,
+            permission_reason="verification_required",
+            settings_config=settings,
+        )
+
+        assert decision is None
+        assert result is not None
+        assert result.reason == "verification_pending_recheck"
+        assert result.should_leave is False
+
     def test_join_request_success_message_is_pending(self):
         service = AcquisitionAutomationService(db=MagicMock())
 
@@ -1580,6 +1598,97 @@ class TestAdDeliveryFailureHandling:
 
         assert cap == 1
 
+    def test_scaled_positive_ad_capacity_preserves_low_multiplier_trial_slot(self):
+        account = SimpleNamespace(asset_tier=AccountAssetTier.MONTH_1.value)
+        multiplier = AccountDynamicFrequencyService.account_asset_multiplier(
+            DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS,
+            account,
+            "ad_multiplier",
+        )
+
+        assert multiplier == 0.25
+        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, multiplier) == 1
+        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, 0.5) == 1
+        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, 0.0) == 0
+
+    @pytest.mark.asyncio
+    async def test_recent_successful_probe_enforces_24_hour_ad_wait(self, test_db):
+        now = datetime(2026, 8, 24, 4, 0)
+        membership = SimpleNamespace(
+            warmup_status="writable_verified",
+            probe_status="success",
+            note="",
+            interaction_started_at=now - timedelta(days=2),
+            joined_at=now - timedelta(days=2),
+            first_ad_allowed_at=now - timedelta(days=1),
+            ad_eligible_after=now - timedelta(minutes=1),
+            last_probe_at=now - timedelta(hours=1),
+            updated_at=None,
+        )
+        service = AcquisitionAutomationService(test_db)
+        service._get_account_operation_config = AsyncMock(return_value=None)
+
+        reason = await service._ad_warmup_skip_reason(1, membership, now, dry_run=False)
+
+        assert reason == "ad_warmup_after_probe"
+        assert membership.ad_eligible_after == now + timedelta(hours=23)
+
+    @pytest.mark.asyncio
+    async def test_ad_candidate_query_excludes_unknown_completed_and_approval_groups(self, test_db):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            phone="+15550000912",
+            identifier="+15550000912",
+            session_name="ad_candidate_filter_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        groups = [
+            Group(group_id=910001 + index, title=f"Candidate {index}", level=GroupLevel.A, status="active")
+            for index in range(4)
+        ]
+        test_db.add_all([account, *groups])
+        await test_db.flush()
+        modes = [
+            GroupAdPolicyMode.UNKNOWN.value,
+            GroupAdPolicyMode.UNKNOWN.value,
+            GroupAdPolicyMode.APPROVAL_REQUIRED.value,
+            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        ]
+        probe_statuses = ["success", "scheduled", "scheduled", "success"]
+        for group, mode, probe_status in zip(groups, modes, probe_statuses, strict=True):
+            test_db.add(
+                GroupAccountMembership(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    account_id=account.id,
+                    status="joined",
+                    join_method="manual",
+                    warmup_status="writable_verified",
+                    probe_status=probe_status,
+                    ad_status="active",
+                    ad_eligible_after=now - timedelta(minutes=1),
+                )
+            )
+            test_db.add(
+                GroupAdProfile(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    ad_policy_mode=mode,
+                    ad_tier=GroupAdTier.TRIAL.value,
+                    daily_capacity=1,
+                )
+            )
+        await test_db.commit()
+
+        candidates = await AcquisitionAutomationService(test_db)._list_joined_groups_for_account(account.id)
+
+        assert {item.telegram_group_id for item in candidates} == {
+            groups[1].group_id,
+            groups[3].group_id,
+        }
+
     @pytest.mark.asyncio
     async def test_ad_daily_limit_uses_recent_probe_formula_and_business_stage(self, test_db):
         account = TelegramAccount(
@@ -2171,7 +2280,7 @@ class TestAdDeliveryFailureHandling:
             warmup_status="ad_eligible",
             probe_status="success",
             ad_status="active",
-            last_probe_at=datetime.utcnow(),
+            last_probe_at=datetime.utcnow() - timedelta(days=2),
             ad_eligible_after=datetime.utcnow() - timedelta(minutes=1),
             interaction_started_at=datetime.utcnow() - timedelta(days=20),
             first_ad_allowed_at=datetime.utcnow() - timedelta(days=5),
@@ -2185,7 +2294,7 @@ class TestAdDeliveryFailureHandling:
             warmup_status="ad_eligible",
             probe_status="success",
             ad_status="active",
-            last_probe_at=datetime.utcnow(),
+            last_probe_at=datetime.utcnow() - timedelta(days=2),
             ad_eligible_after=datetime.utcnow() - timedelta(minutes=1),
             interaction_started_at=datetime.utcnow() - timedelta(days=20),
             first_ad_allowed_at=datetime.utcnow() - timedelta(days=5),
@@ -2216,6 +2325,7 @@ class TestAdDeliveryFailureHandling:
         service._ad_account_throttle_skip_reason = AsyncMock(return_value=None)
         service._ad_dynamic_daily_limit = AsyncMock(return_value=2)
         service._ad_dynamic_run_limit = AsyncMock(return_value=2)
+        service._ad_weighted_cumulative_cap = MagicMock(return_value=2)
         service._maybe_send_ad_interaction = AsyncMock(return_value=None)
         service._reserve_group_daily_delivery_slot = AsyncMock(return_value=(True, "reserved", "test-slot"))
         service._release_group_daily_delivery_slot = AsyncMock()

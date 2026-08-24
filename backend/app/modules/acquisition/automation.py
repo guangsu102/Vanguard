@@ -67,6 +67,7 @@ from app.core.automation_settings import (
 from app.core.config import settings
 from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupAccountMembership
+from app.core.operating_time import operating_day_start
 from app.core.keyword.models import KeywordType
 from app.core.runtime_settings import (
     DEFAULT_AD_CAPACITY_SETTINGS,
@@ -125,8 +126,8 @@ AD_GROUP_UNDELIVERABLE_FAILURE_LOOKBACK_HOURS = 24
 MEMBERSHIP_NOTE_MAX_CHARS = 8000
 AD_WARMUP_PROBE_MIN_DELAY_SECONDS = 20 * 60
 AD_WARMUP_PROBE_MAX_DELAY_SECONDS = 180 * 60
-AD_WARMUP_AD_MIN_DELAY_SECONDS = 10 * 60
-AD_WARMUP_AD_MAX_DELAY_SECONDS = 60 * 60
+AD_WARMUP_AD_MIN_DELAY_SECONDS = 24 * 60 * 60
+AD_WARMUP_AD_MAX_DELAY_SECONDS = 48 * 60 * 60
 AD_GROUP_CONTROL_ACCOUNT_SUSPECT_WINDOW_MINUTES = 60
 AD_GROUP_CONTROL_ACCOUNT_SUSPECT_GROUPS = 5
 AD_ACCOUNT_SUSPECT_PAUSE_SECONDS = 2 * 60 * 60
@@ -354,8 +355,7 @@ def _now() -> datetime:
 
 
 def _day_start(now: Optional[datetime] = None) -> datetime:
-    current = now or _now()
-    return current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return operating_day_start(now)
 
 
 @dataclass
@@ -2926,8 +2926,8 @@ class AcquisitionAutomationService:
                 attempted=True,
                 success=False,
                 action="ai_timeout",
-                reason="verification_ai_timeout",
-                should_leave=True,
+                reason="verification_pending_recheck",
+                should_leave=False,
                 decision_source="ai",
             )
 
@@ -3921,7 +3921,12 @@ class AcquisitionAutomationService:
                     )
                 )
         except Exception as exc:
-            self.logger.warning("group_ad_policy_ai_failed", model=model, error=str(exc))
+            self.logger.warning(
+                "group_ad_policy_ai_failed",
+                model=model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             local_result.ad_allowed = None
             local_result.policy_mode = GroupAdPolicyMode.UNKNOWN.value
             local_result.reason = "group_rules_ai_unavailable"
@@ -4707,7 +4712,6 @@ class AcquisitionAutomationService:
             "verification_failed",
             "verification_unknown",
             "verification_leave_required",
-            "verification_ai_timeout",
             "button_click_timeout",
             "answer_send_timeout",
             "captcha_manual_required",
@@ -4900,12 +4904,42 @@ class AcquisitionAutomationService:
                 continue
 
             memberships = await self._list_joined_groups_for_account(binding.account_id)
+            if not allow_ad_delivery:
+                pending_probe_memberships = [
+                    membership
+                    for membership in memberships
+                    if str(getattr(membership, "probe_status", "") or "") != "success"
+                ]
+                if len(pending_probe_memberships) != len(memberships):
+                    result.skipped += 1
+                    result.details.append(
+                        {
+                            "binding_id": binding.id,
+                            "account_id": binding.account_id,
+                            "campaign_id": campaign.id,
+                            "reason": "account_dynamic_health_paused",
+                        }
+                    )
+                memberships = pending_probe_memberships
             for membership in memberships:
                 group = membership.group
                 if not group:
                     continue
                 result.processed += 1
 
+                skip_reason = await self._ad_skip_reason(binding, campaign, None, membership, dry_run=dry_run)
+                if skip_reason:
+                    result.skipped += 1
+                    result.details.append(
+                        {
+                            "binding_id": binding.id,
+                            "account_id": binding.account_id,
+                            "campaign_id": campaign.id,
+                            "group_id": group.id,
+                            "reason": skip_reason,
+                        }
+                    )
+                    continue
                 creative = await self._choose_delivery_creative(binding, membership.telegram_group_id)
                 if creative is None:
                     result.skipped += 1
@@ -4916,20 +4950,6 @@ class AcquisitionAutomationService:
                             "campaign_id": campaign.id,
                             "group_id": group.id,
                             "reason": "no_creative",
-                        }
-                    )
-                    continue
-
-                skip_reason = await self._ad_skip_reason(binding, campaign, creative, membership, dry_run=dry_run)
-                if skip_reason:
-                    result.skipped += 1
-                    result.details.append(
-                        {
-                            "binding_id": binding.id,
-                            "account_id": binding.account_id,
-                            "campaign_id": campaign.id,
-                            "group_id": group.id,
-                            "reason": skip_reason,
                         }
                     )
                     continue
@@ -5744,6 +5764,7 @@ class AcquisitionAutomationService:
         return text.strip()
 
     async def _list_joined_groups_for_account(self, account_id: int) -> list[GroupAccountMembership]:
+        now = _now()
         last_sent_at = (
             select(
                 AdDeliveryLog.telegram_group_id.label("telegram_group_id"),
@@ -5759,10 +5780,52 @@ class AcquisitionAutomationService:
         rows = await self.db.execute(
             select(GroupAccountMembership)
             .options(selectinload(GroupAccountMembership.group))
+            .join(Group, Group.id == GroupAccountMembership.group_id)
+            .outerjoin(GroupAdProfile, GroupAdProfile.group_id == GroupAccountMembership.group_id)
             .outerjoin(last_sent_at, last_sent_at.c.telegram_group_id == GroupAccountMembership.telegram_group_id)
             .where(
                 GroupAccountMembership.account_id == account_id,
                 GroupAccountMembership.status == "joined",
+                Group.status == "active",
+                or_(
+                    GroupAccountMembership.probe_status.is_(None),
+                    GroupAccountMembership.probe_status != "failed",
+                ),
+                or_(
+                    GroupAccountMembership.warmup_status.is_(None),
+                    GroupAccountMembership.warmup_status != "blocked",
+                ),
+                or_(
+                    GroupAccountMembership.ad_status.is_(None),
+                    GroupAccountMembership.ad_status != MEMBERSHIP_AD_STATUS_BLOCKED,
+                ),
+                or_(
+                    GroupAccountMembership.probe_status.is_(None),
+                    GroupAccountMembership.probe_status != "success",
+                    GroupAccountMembership.ad_eligible_after.is_(None),
+                    GroupAccountMembership.ad_eligible_after <= now,
+                ),
+                or_(
+                    GroupAdProfile.id.is_(None),
+                    and_(
+                        GroupAdProfile.ad_policy_mode.notin_(
+                            [
+                                GroupAdPolicyMode.FORBIDDEN.value,
+                                GroupAdPolicyMode.APPROVAL_REQUIRED.value,
+                                GroupAdPolicyMode.UNKNOWN_PROBE.value,
+                            ]
+                        ),
+                        or_(
+                            GroupAdProfile.ad_policy_mode != GroupAdPolicyMode.UNKNOWN.value,
+                            GroupAccountMembership.probe_status.is_(None),
+                            GroupAccountMembership.probe_status != "success",
+                        ),
+                        or_(
+                            GroupAdProfile.ad_tier.is_(None),
+                            GroupAdProfile.ad_tier != GroupAdTier.BLOCKED.value,
+                        ),
+                    ),
+                ),
             )
             .order_by(
                 last_sent_at.c.last_sent_at.asc().nullsfirst(),
@@ -6423,8 +6486,21 @@ class AcquisitionAutomationService:
             if changed:
                 membership.updated_at = now
                 await self.db.commit()
+                changed = False
 
             eligible_after = membership.ad_eligible_after or self._parse_note_datetime(success.get("ad_eligible_after") if success else None)
+            probe_completed_at = membership.last_probe_at or self._parse_note_datetime(
+                success.get("at") if success else None
+            )
+            if probe_completed_at is not None:
+                minimum_eligible_after = probe_completed_at + timedelta(seconds=AD_WARMUP_AD_MIN_DELAY_SECONDS)
+                if eligible_after is None or eligible_after < minimum_eligible_after:
+                    eligible_after = minimum_eligible_after
+                    membership.ad_eligible_after = minimum_eligible_after
+                    changed = True
+            if changed:
+                membership.updated_at = now
+                await self.db.commit()
             if eligible_after and now < eligible_after:
                 return "ad_warmup_after_probe"
             if membership.first_ad_allowed_at and now < membership.first_ad_allowed_at:
@@ -7328,16 +7404,18 @@ class AcquisitionAutomationService:
         account_daily_limit: int,
         account_sent_today: int,
         now: datetime,
+        capacity: Optional[dict[str, Any]] = None,
+        profile: Optional[GroupAdProfile] = None,
     ) -> Optional[str]:
         group = membership.group
         if group is None:
             return "group_missing"
-        capacity = await get_ad_capacity_settings(self.db)
+        capacity = capacity or await get_ad_capacity_settings(self.db)
         window_reason = self._ad_window_skip_reason(now, capacity)
         if window_reason:
             return window_reason
 
-        profile = await self._get_or_create_group_ad_profile(group, capacity)
+        profile = profile or await self._get_or_create_group_ad_profile(group, capacity)
         await self._refresh_group_ad_profile_tier(profile, group, now, capacity)
         if profile.ad_policy_mode == GroupAdPolicyMode.FORBIDDEN.value:
             return "group_ad_forbidden"
@@ -7431,7 +7509,7 @@ class AcquisitionAutomationService:
         self,
         binding: AccountAdBinding,
         campaign: AdCampaign,
-        creative: AdCreative,
+        creative: Optional[AdCreative],
         membership: GroupAccountMembership,
         *,
         dry_run: bool = False,
@@ -7479,6 +7557,15 @@ class AcquisitionAutomationService:
         if not await self._group_can_receive_ads(group):
             return "group_level_disallows_ads"
 
+        capacity_settings = await get_ad_capacity_settings(self.db)
+        profile = await self._get_or_create_group_ad_profile(group, capacity_settings)
+        if profile.ad_policy_mode == GroupAdPolicyMode.FORBIDDEN.value:
+            return "group_ad_forbidden"
+        if profile.ad_policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
+            return "group_ad_approval_required"
+        if profile.ad_tier == GroupAdTier.BLOCKED.value or group.status == GROUP_STATUS_AD_BLOCKED:
+            return "group_ad_blocked"
+
         warmup_reason = await self._ad_warmup_skip_reason(
             binding.account_id,
             membership,
@@ -7488,7 +7575,6 @@ class AcquisitionAutomationService:
         if warmup_reason:
             return warmup_reason
 
-        capacity_settings = await get_ad_capacity_settings(self.db)
         group_recent_sent = await self.db.execute(
             select(func.max(AdDeliveryLog.sent_at)).where(
                 AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
@@ -7560,6 +7646,8 @@ class AcquisitionAutomationService:
             account_daily_limit=account_daily_limit,
             account_sent_today=account_sent_today_count,
             now=now,
+            capacity=capacity_settings,
+            profile=profile,
         )
         if capacity_reason:
             return capacity_reason

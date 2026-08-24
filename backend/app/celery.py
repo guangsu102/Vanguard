@@ -105,11 +105,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/15"),
         "options": {"queue": "proxy_validation"},
     },
-    "auto-join-groups-dispatcher-every-minute": {
+    "auto-join-groups-dispatcher-every-5min": {
         "task": "app.core.scheduler.tasks.auto_join_groups_task",
-        "schedule": 60.0,
+        "schedule": crontab(minute="*/5"),
         "kwargs": {"scheduled": True, "keywords_per_account": 10, "max_groups_per_keyword": 20},
-        "options": {"queue": "automation", "rate_limit": "60/h"},
+        "options": {"queue": "automation", "rate_limit": "12/h"},
     },
     "recover-orphaned-groups-every-5min": {
         "task": "app.core.scheduler.tasks.recover_orphaned_groups_task",
@@ -122,10 +122,10 @@ celery_app.conf.beat_schedule = {
         "schedule": 600.0,
         "options": {"queue": "automation", "rate_limit": "6/h"},
     },
-    "check-ad-survival-every-minute": {
+    "check-ad-survival-every-2min": {
         "task": "app.core.scheduler.tasks.check_ad_survival_task",
-        "schedule": 60.0,
-        "options": {"queue": "automation", "rate_limit": "120/h"},
+        "schedule": 120.0,
+        "options": {"queue": "automation", "rate_limit": "30/h"},
     },
     "audit-group-ad-policies-hourly": {
         "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
@@ -138,10 +138,10 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/5"),
         "options": {"queue": "automation", "rate_limit": "12/h"},
     },
-    "group-ai-warmup-dispatcher-every-minute": {
+    "group-ai-warmup-dispatcher-every-30min": {
         "task": "app.core.scheduler.tasks.group_ai_warmup_task",
-        "schedule": 60.0,
-        "options": {"queue": "automation", "rate_limit": "60/h"},
+        "schedule": crontab(minute="*/30"),
+        "options": {"queue": "automation", "rate_limit": "2/h"},
     },
     # -------------------------------------------------------------------------
     # Hour-level Tasks
