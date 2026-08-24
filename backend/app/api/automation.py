@@ -1408,6 +1408,10 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "risk_pause_until": account.risk_pause_until.isoformat()
                 if account.risk_pause_until
                 else None,
+                "operation_mode": (
+                    getattr(op_config, "operation_mode", None) or AccountOperationMode.GROWTH.value
+                    if op_config else AccountOperationMode.GROWTH.value
+                ),
                 "auto_join_enabled": bool(op_config.auto_join_enabled) if op_config else False,
                 "auto_ads_enabled": bool(op_config.auto_ads_enabled) if op_config else False,
                 "business_stage": business_stage,
@@ -2411,10 +2415,65 @@ async def list_account_ad_bindings(
     }
 
 
+async def _validate_ad_only_binding_scope(
+    account_ids: list[int],
+    campaign_id: int,
+    db: AsyncSession,
+) -> None:
+    campaign = (
+        await db.execute(select(AdCampaign).where(AdCampaign.id == campaign_id))
+    ).scalar_one_or_none()
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    config_rows = await db.execute(
+        select(AccountOperationConfig.account_id, AccountOperationConfig.operation_mode).where(
+            AccountOperationConfig.account_id.in_(account_ids)
+        )
+    )
+    ad_only_account_ids = {
+        account_id
+        for account_id, operation_mode in config_rows.all()
+        if operation_mode == AccountOperationMode.AD_ONLY.value
+    }
+    if not ad_only_account_ids:
+        return
+
+    target_group_ids = campaign.get_target_group_ids()
+    if not target_group_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Ad-only accounts require a campaign with explicit target groups",
+        )
+
+    membership_rows = await db.execute(
+        select(GroupAccountMembership.account_id, GroupAccountMembership.group_id)
+        .join(Group, Group.id == GroupAccountMembership.group_id)
+        .where(
+            GroupAccountMembership.account_id.in_(ad_only_account_ids),
+            GroupAccountMembership.group_id.in_(target_group_ids),
+            GroupAccountMembership.status == "joined",
+            GroupAccountMembership.join_method == "manual_link_join",
+            Group.ad_delivery_account_id == GroupAccountMembership.account_id,
+        )
+    )
+    eligible_pairs = set(membership_rows.all())
+    missing_pairs = [
+        (account_id, group_id)
+        for account_id in sorted(ad_only_account_ids)
+        for group_id in target_group_ids
+        if (account_id, group_id) not in eligible_pairs
+    ]
+    if missing_pairs:
+        account_id, group_id = missing_pairs[0]
+        raise HTTPException(status_code=409, detail=f"Ad-only account {account_id} must manually join and take over target group {group_id}")
+
+
 @router.post("/ads/bindings", status_code=status.HTTP_201_CREATED)
 async def create_account_ad_binding(
     request: AccountAdBindingCreate, db: AsyncSession = Depends(get_db)
 ) -> dict:
+    await _validate_ad_only_binding_scope([request.account_id], request.ad_campaign_id, db)
     binding = AccountAdBinding(**request.model_dump())
     db.add(binding)
     await db.commit()
@@ -2464,6 +2523,8 @@ async def create_account_ad_bindings_batch(
             status_code=409,
             detail=f'Banned account cannot be bound: {banned_account_ids[0]}',
         )
+    await _validate_ad_only_binding_scope(account_ids, request.ad_campaign_id, db)
+
 
     requested_creative_ids = list(dict.fromkeys(request.creative_ids))
     creatives = (

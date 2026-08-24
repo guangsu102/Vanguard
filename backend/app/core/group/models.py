@@ -113,6 +113,11 @@ class Group(Base):
     status: Mapped[str] = mapped_column(String(30), default="active", nullable=False, comment="群状态")
     discovery_source: Mapped[str] = mapped_column(String(50), default="manual", nullable=False, comment="发现来源")
     source_keyword: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, comment="来源关键词")
+    ad_delivery_account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="移交后的唯一广告执行账号ID",
+    )
     last_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最后发言时间")
     
     # Rating
@@ -148,6 +153,7 @@ class Group(Base):
         Index("idx_level", "level"),
         Index("idx_group_status", "status"),
         Index("idx_group_source_keyword", "source_keyword"),
+        Index("idx_group_ad_delivery_account", "ad_delivery_account_id"),
     )
 
     account_memberships: Mapped[list["GroupAccountMembership"]] = relationship(

@@ -695,6 +695,14 @@ const accountMap = computed(() => {
 })
 
 const targetGroupMap = computed(() => new Map(targetGroups.value.map((item) => [item.id, item])))
+const accountOperationModeMap = computed(() =>
+  new Map(dynamicStatuses.value.map((item) => [item.account_id, item.operation_mode])),
+)
+const targetGroupAccountIsAdOnly = computed(() =>
+  targetGroupForm.accountId === selectedAccountId.value
+    ? accountConfigForm.operation_mode === 'ad_only'
+    : accountOperationModeMap.value.get(targetGroupForm.accountId || 0) === 'ad_only',
+)
 
 const selectedDynamicStatus = computed(() =>
   dynamicStatuses.value.find((item) => item.account_id === selectedAccountId.value),
@@ -718,7 +726,8 @@ const targetGroupLabel = (groupId: number) => {
   const group = targetGroupMap.value.get(groupId)
   if (!group) return `#${groupId}`
   const identity = group.username ? `@${group.username.replace(/^@/, '')}` : group.chatId
-  return `${group.title || identity} · ${identity}`
+  const owner = group.adDeliveryAccountId ? ` · 专用 ${accountLabel(group.adDeliveryAccountId)}` : ''
+  return `${group.title || identity} · ${identity}${owner}`
 }
 
 const campaignTargetLabel = (campaign: any) => {
@@ -1513,9 +1522,16 @@ const saveTargetGroup = async () => {
       campaignForm.target_group_ids.push(group.id);
     }
     targetGroupDialogVisible.value = false;
-    ElMessage.success(
-      `已加入并添加 ${group.title || group.username || group.chatId}`,
-    );
+    const groupName = group.title || group.username || group.chatId;
+    if (targetGroupAccountIsAdOnly.value) {
+      if (group.adDeliveryAccountId === targetGroupForm.accountId) {
+        ElMessage.success(`已由专用账号接管 ${groupName}，普通账号退群处理已执行`);
+      } else {
+        ElMessage.warning(`已加入 ${groupName}，但广告许可未达到接管条件，未执行移交和退群`);
+      }
+    } else {
+      ElMessage.success(`已加入并添加 ${groupName}`);
+    }
   } finally {
     savingTargetGroup.value = false;
   }
@@ -2245,7 +2261,7 @@ onBeforeUnmount(() => {
               <el-form-item label="账号模式">
                 <el-select v-model="accountConfigForm.operation_mode">
                   <el-option label="增长运营" value="growth" />
-                  <el-option label="广告专用" value="ad_only" />
+                  <el-option label="手动投放专用" value="ad_only" />
                 </el-select>
               </el-form-item>
               <el-form-item label="启用配置">
@@ -2254,7 +2270,7 @@ onBeforeUnmount(() => {
               <el-form-item label="自动加群">
                 <el-switch v-model="accountConfigForm.auto_join_enabled" :disabled="isAdOnlyAccount" />
               </el-form-item>
-              <el-form-item label="账号自动投放广告">
+              <el-form-item :label="isAdOnlyAccount ? '指定群广告投放' : '账号自动投放广告'">
                 <el-switch v-model="accountConfigForm.auto_ads_enabled" />
               </el-form-item>
               <el-form-item label="每日最大加群数">
@@ -3852,6 +3868,14 @@ onBeforeUnmount(() => {
 
     <el-dialog v-model="targetGroupDialogVisible" title="通过链接加入群" width="520px">
       <el-form label-width="110px">
+        <el-alert
+          v-if="targetGroupAccountIsAdOnly"
+          title="接管成功后，该群中的普通账号将自动退群"
+          type="warning"
+          :closable="false"
+          show-icon
+          class="handover-alert"
+        />
         <el-form-item label="群链接" required>
           <el-input
             v-model="targetGroupForm.groupLink"
@@ -3873,13 +3897,19 @@ onBeforeUnmount(() => {
       </el-form>
       <template #footer>
         <el-button @click="targetGroupDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="savingTargetGroup" @click="saveTargetGroup">加入并添加</el-button>
+        <el-button type="primary" :loading="savingTargetGroup" @click="saveTargetGroup">
+          {{ targetGroupAccountIsAdOnly ? '接管并添加' : '加入并添加' }}
+        </el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <style scoped lang="scss">
+.handover-alert {
+  margin-bottom: 16px;
+}
+
 .automation-page {
   padding: 0;
 }

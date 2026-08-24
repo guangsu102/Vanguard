@@ -32,6 +32,7 @@ export interface Group {
   status: GroupStatus
   discoverySource: DiscoverySource | string
   sourceKeyword?: string
+  adDeliveryAccountId?: number
   level: GroupLevel
   levelScore: number
   ruleScore: number
@@ -110,6 +111,7 @@ const toCamelGroup = (raw: any): Group => {
     status: raw.status || 'active',
     discoverySource: raw.discovery_source || raw.discoverySource || 'manual',
     sourceKeyword: raw.source_keyword || raw.sourceKeyword || '',
+    adDeliveryAccountId: raw.ad_delivery_account_id ?? raw.adDeliveryAccountId ?? undefined,
     level: raw.level || 'unrated',
     levelScore: Number(raw.level_score ?? raw.levelScore ?? 0),
     ruleScore: Number(raw.rule_score ?? raw.ruleScore ?? 0),

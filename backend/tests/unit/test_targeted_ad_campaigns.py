@@ -11,10 +11,17 @@ import app.modules.acquisition.automation as automation_module
 from app.api.automation import (
     AccountAdBindingBatchCreate,
     AdCampaignCreate,
+    _validate_ad_only_binding_scope,
     create_account_ad_bindings_batch,
     create_ad_campaign,
 )
-from app.core.account.models import AccountStatus, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountOperationConfig,
+    AccountOperationMode,
+    AccountStatus,
+    AccountType,
+    TelegramAccount,
+)
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.automation import AcquisitionAutomationService
 from app.modules.acquisition.models import (
@@ -449,3 +456,94 @@ async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
 
     assert reason == "interval_not_due"
+
+
+@pytest.mark.asyncio
+async def test_handed_over_group_rejects_previous_growth_account(test_db, monkeypatch):
+    service = AcquisitionAutomationService(test_db)
+    campaign = AdCampaign(id=94, name="legacy growth campaign", target_group_ids=json.dumps([404]))
+    binding = SimpleNamespace(account_id=7)
+    membership = SimpleNamespace(
+        telegram_group_id=-100404,
+        join_method="keyword_auto_join",
+        group=SimpleNamespace(
+            id=404,
+            status="active",
+            level=SimpleNamespace(value="A"),
+            ad_delivery_account_id=9,
+        ),
+    )
+    monkeypatch.setattr(service, "_get_account_operation_config", AsyncMock(return_value=None))
+
+    reason = await service._ad_skip_reason(binding, campaign, None, membership)
+
+    assert reason == "group_assigned_to_other_ad_account"
+
+
+@pytest.mark.asyncio
+async def test_ad_only_account_rejects_level_based_campaign(test_db, monkeypatch):
+    service = AcquisitionAutomationService(test_db)
+    campaign = AdCampaign(id=95, name="level campaign", target_group_ids="[]")
+    binding = SimpleNamespace(account_id=9)
+    membership = SimpleNamespace(
+        telegram_group_id=-100405,
+        join_method="manual_link_join",
+        group=SimpleNamespace(
+            id=405,
+            status="active",
+            level=SimpleNamespace(value="A"),
+            ad_delivery_account_id=9,
+        ),
+    )
+    config = SimpleNamespace(operation_mode=AccountOperationMode.AD_ONLY.value)
+    monkeypatch.setattr(service, "_get_account_operation_config", AsyncMock(return_value=config))
+
+    reason = await service._ad_skip_reason(binding, campaign, None, membership)
+
+    assert reason == "ad_only_requires_explicit_groups"
+
+
+@pytest.mark.asyncio
+async def test_ad_only_binding_requires_manual_takeover(test_db):
+    account = TelegramAccount(
+        identifier="manual-binding-account",
+        session_name="manual-binding-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=-100406, title="Manual binding group", level=GroupLevel.A)
+    campaign = AdCampaign(name="manual binding campaign")
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    campaign.target_group_ids = json.dumps([group.id])
+    test_db.add_all(
+        [
+            AccountOperationConfig(
+                account_id=account.id,
+                operation_mode=AccountOperationMode.AD_ONLY.value,
+            ),
+            GroupAccountMembership(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                account_id=account.id,
+                status="joined",
+                join_method="keyword_auto_join",
+            ),
+        ]
+    )
+    await test_db.commit()
+
+    with pytest.raises(HTTPException, match="must manually join and take over"):
+        await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)
+
+    membership = (
+        await test_db.execute(
+            select(GroupAccountMembership).where(GroupAccountMembership.account_id == account.id)
+        )
+    ).scalar_one()
+    membership.join_method = "manual_link_join"
+    group.ad_delivery_account_id = account.id
+    await test_db.commit()
+
+    await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)

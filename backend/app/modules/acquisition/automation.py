@@ -6469,6 +6469,8 @@ class AcquisitionAutomationService:
         success = self._membership_latest_event(membership.note, {"ad_probe_success"})
         if membership.warmup_status == "blocked" or membership.probe_status == "failed":
             return "ad_only_group_blocked" if is_ad_only else "ad_probe_blocked"
+        if is_ad_only:
+            return None
         if membership.probe_status == "success" or success:
             capacity = await get_ad_capacity_settings(self.db)
             interaction_started_at = membership.interaction_started_at or membership.joined_at or now
@@ -6847,7 +6849,12 @@ class AcquisitionAutomationService:
             .join(Group, Group.id == GroupAdProfile.group_id)
             .join(GroupAccountMembership, GroupAccountMembership.group_id == Group.id)
             .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
+            .outerjoin(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
             .where(
+                or_(
+                    AccountOperationConfig.id.is_(None),
+                    AccountOperationConfig.operation_mode != AccountOperationMode.AD_ONLY.value,
+                ),
                 GroupAdProfile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value,
                 or_(
                     GroupAdProfile.ad_policy_probe_status.not_in(["sending", "sent"]),
@@ -7518,6 +7525,25 @@ class AcquisitionAutomationService:
         group = membership.group
         if group is None:
             return "group_missing"
+        op_config = await self._get_account_operation_config(binding.account_id)
+        operation_mode = (
+            getattr(op_config, "operation_mode", None) or AccountOperationMode.GROWTH.value
+        )
+        assigned_account_id = getattr(group, "ad_delivery_account_id", None)
+        if assigned_account_id is not None:
+            if assigned_account_id != binding.account_id:
+                return "group_assigned_to_other_ad_account"
+            if operation_mode != AccountOperationMode.AD_ONLY.value:
+                return "group_assignment_requires_ad_only_mode"
+
+        target_group_ids = campaign.get_target_group_ids()
+        if operation_mode == AccountOperationMode.AD_ONLY.value:
+            if assigned_account_id != binding.account_id:
+                return "ad_only_group_not_assigned"
+            if not target_group_ids:
+                return "ad_only_requires_explicit_groups"
+            if membership.join_method != "manual_link_join":
+                return "ad_only_requires_manual_link_join"
         inflight_reason = await self._ad_recent_inflight_delivery_reason(
             binding.account_id,
             campaign.id,
@@ -7535,7 +7561,6 @@ class AcquisitionAutomationService:
         if recent_failure_reason:
             return recent_failure_reason
 
-        target_group_ids = campaign.get_target_group_ids()
         if target_group_ids:
             if group.id not in target_group_ids:
                 return "group_not_targeted"
@@ -7545,7 +7570,6 @@ class AcquisitionAutomationService:
                 return "group_level_not_targeted"
 
         now = _now()
-        op_config = await self._get_account_operation_config(binding.account_id)
         if op_config and (not op_config.enabled or not op_config.auto_ads_enabled):
             return "account_ads_disabled"
         if op_config and self._in_quiet_hours(op_config, now):

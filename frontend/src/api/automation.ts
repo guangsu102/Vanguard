@@ -370,6 +370,7 @@ export interface AdDynamicStatus {
   risk_score: number
   risk_reason?: string
   risk_pause_until?: string
+  operation_mode: AccountOperationMode
   auto_join_enabled: boolean
   auto_ads_enabled: boolean
   business_stage: 'new' | 'normal' | 'hot' | 'cooldown' | string
