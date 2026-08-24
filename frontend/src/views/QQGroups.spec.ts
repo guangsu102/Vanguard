@@ -74,6 +74,7 @@ describe('QQGroups view', () => {
           ElTableColumn: true,
           ElTag: { template: '<span><slot /></span>' },
           ElTooltip: true,
+          ElPagination: true,
         },
         directives: {
           loading: {},
@@ -85,7 +86,7 @@ describe('QQGroups view', () => {
     expect(wrapper.text()).toContain('NapCat QQ 群')
     expect(wrapper.text()).toContain('在线')
     expect(qqMocks.getConnection).toHaveBeenCalledTimes(1)
-    expect(qqMocks.listGroups).toHaveBeenCalledWith({ limit: 500 })
+    expect(qqMocks.listGroups).toHaveBeenCalledWith({ offset: 0, limit: 20 })
     expect(wsMocks.subscribe).toHaveBeenCalledWith('qq:messages')
 
     wrapper.unmount()

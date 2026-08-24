@@ -10,10 +10,14 @@ from sqlalchemy import select
 import app.modules.acquisition.automation as automation_module
 from app.api.automation import (
     AccountAdBindingBatchCreate,
+    AccountAdBindingCreate,
+    AccountAdBindingUpdate,
     AdCampaignCreate,
     _validate_ad_only_binding_scope,
+    create_account_ad_binding,
     create_account_ad_bindings_batch,
     create_ad_campaign,
+    update_account_ad_binding,
 )
 from app.core.account.models import (
     AccountOperationConfig,
@@ -250,6 +254,74 @@ async def test_batch_binding_supports_multiple_accounts_and_legacy_account_id(te
     ).scalars().all()
     assert len(binding_rows) == 6
     assert {binding.account_id for binding in binding_rows} == {account.id for account in accounts}
+
+
+@pytest.mark.asyncio
+async def test_binding_create_and_enable_reject_unavailable_accounts(test_db):
+    campaign = AdCampaign(name="unavailable account binding")
+    creative = AdCreative(name="Unavailable account creative", content="test", enabled=True)
+    banned_account = TelegramAccount(
+        phone="+15550008801",
+        identifier="+15550008801",
+        session_name="single_banned_ad_binding",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.BANNED,
+        is_active=True,
+    )
+    errored_account = TelegramAccount(
+        phone="+15550008802",
+        identifier="+15550008802",
+        session_name="single_error_ad_binding",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ERROR,
+        is_active=True,
+    )
+    inactive_account = TelegramAccount(
+        phone="+15550008803",
+        identifier="+15550008803",
+        session_name="single_inactive_ad_binding",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=False,
+    )
+    test_db.add_all([campaign, creative, banned_account, errored_account, inactive_account])
+    await test_db.flush()
+
+    rejected = (
+        (banned_account, "Banned account cannot be bound"),
+        (errored_account, "Errored account cannot be bound"),
+        (inactive_account, "Inactive account cannot be bound"),
+    )
+    for account, expected_detail in rejected:
+        with pytest.raises(HTTPException) as exc:
+            await create_account_ad_binding(
+                AccountAdBindingCreate(
+                    account_id=account.id,
+                    ad_campaign_id=campaign.id,
+                    creative_id=creative.id,
+                ),
+                db=test_db,
+            )
+        assert exc.value.status_code == 409
+        assert expected_detail in exc.value.detail
+
+    disabled_binding = AccountAdBinding(
+        account_id=banned_account.id,
+        ad_campaign_id=campaign.id,
+        creative_id=creative.id,
+        enabled=False,
+    )
+    test_db.add(disabled_binding)
+    await test_db.flush()
+
+    with pytest.raises(HTTPException) as enable_exc:
+        await update_account_ad_binding(
+            disabled_binding.id,
+            AccountAdBindingUpdate(enabled=True),
+            db=test_db,
+        )
+    assert enable_exc.value.status_code == 409
+    assert "Banned account cannot be bound" in enable_exc.value.detail
 
 
 def test_scheduled_slot_uses_configured_timezone_and_handles_midnight():

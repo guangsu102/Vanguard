@@ -2394,6 +2394,46 @@ def _binding_to_dict(item: AccountAdBinding) -> dict:
     }
 
 
+async def _validate_ad_binding_accounts(
+    account_ids: list[int],
+    db: AsyncSession,
+) -> dict[int, TelegramAccount]:
+    account_rows = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id.in_(account_ids))
+    )
+    accounts_by_id = {account.id: account for account in account_rows.scalars().all()}
+    missing_account_ids = [
+        account_id for account_id in account_ids if account_id not in accounts_by_id
+    ]
+    if missing_account_ids:
+        raise HTTPException(status_code=404, detail=f"Account not found: {missing_account_ids[0]}")
+
+    for account_id in account_ids:
+        account = accounts_by_id[account_id]
+        if account.account_type != AccountType.PROMOTER:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Only promoter accounts can be bound: {account_id}",
+            )
+        if account.status == AccountStatus.BANNED:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Banned account cannot be bound: {account_id}",
+            )
+        if account.status == AccountStatus.ERROR:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Errored account cannot be bound: {account_id}",
+            )
+        if not account.is_active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Inactive account cannot be bound: {account_id}",
+            )
+
+    return accounts_by_id
+
+
 @router.get("/ads/bindings")
 async def list_account_ad_bindings(
     account_id: Optional[int] = None,
@@ -2473,6 +2513,7 @@ async def _validate_ad_only_binding_scope(
 async def create_account_ad_binding(
     request: AccountAdBindingCreate, db: AsyncSession = Depends(get_db)
 ) -> dict:
+    await _validate_ad_binding_accounts([request.account_id], db)
     await _validate_ad_only_binding_scope([request.account_id], request.ad_campaign_id, db)
     binding = AccountAdBinding(**request.model_dump())
     db.add(binding)
@@ -2502,27 +2543,7 @@ async def create_account_ad_bindings_batch(
     if any(account_id <= 0 for account_id in account_ids):
         raise HTTPException(status_code=400, detail='account_ids must contain positive integers')
 
-    existing_account_rows = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id.in_(account_ids))
-    )
-    accounts_by_id = {
-        account.id: account for account in existing_account_rows.scalars().all()
-    }
-    missing_account_ids = [
-        account_id for account_id in account_ids if account_id not in accounts_by_id
-    ]
-    if missing_account_ids:
-        raise HTTPException(status_code=404, detail=f'Account not found: {missing_account_ids[0]}')
-    banned_account_ids = [
-        account_id
-        for account_id in account_ids
-        if accounts_by_id[account_id].status == AccountStatus.BANNED
-    ]
-    if banned_account_ids:
-        raise HTTPException(
-            status_code=409,
-            detail=f'Banned account cannot be bound: {banned_account_ids[0]}',
-        )
+    await _validate_ad_binding_accounts(account_ids, db)
     await _validate_ad_only_binding_scope(account_ids, request.ad_campaign_id, db)
 
 
@@ -2597,6 +2618,7 @@ async def ensure_ad_creative_pool(
     request: CreativePoolEnsureRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    await _validate_ad_binding_accounts([request.account_id], db)
     service = AcquisitionAutomationService(db)
     try:
         result = await service.ensure_ad_creative_pool(
@@ -2621,6 +2643,8 @@ async def update_account_ad_binding(
     ).scalar_one_or_none()
     if not binding:
         raise HTTPException(status_code=404, detail="Binding not found")
+    if request.enabled is True:
+        await _validate_ad_binding_accounts([binding.account_id], db)
     for field, value in request.model_dump(exclude_none=True).items():
         setattr(binding, field, value)
     await db.commit()

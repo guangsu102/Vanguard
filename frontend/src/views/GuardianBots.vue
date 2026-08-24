@@ -2,10 +2,13 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElMessage, ElSwitch, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { guardianApi, type GuardianBot } from '@/api/guardian'
+import ClientListPagination from '@/components/ClientListPagination.vue'
+import { useClientPagination } from '@/utils/clientPagination'
 
 const loading = ref(false)
 const dialogVisible = ref(false)
 const bots = ref<GuardianBot[]>([])
+const botPagination = useClientPagination(bots, 20)
 
 const form = reactive({
   identifier: '',
@@ -18,7 +21,7 @@ const form = reactive({
 const loadBots = async () => {
   loading.value = true
   try {
-    const res = await guardianApi.listBots({ limit: 100 })
+    const res = await guardianApi.listBots({ limit: 200 })
     bots.value = res.data.data
   } finally {
     loading.value = false
@@ -65,7 +68,7 @@ onMounted(loadBots)
       </div>
     </div>
 
-    <el-table v-loading="loading" :data="bots" border>
+    <el-table v-loading="loading" :data="botPagination.rows.value" border>
       <el-table-column prop="identifier" label="标识" min-width="180" />
       <el-table-column prop="display_name" label="名称" min-width="160" />
       <el-table-column prop="bot_username" label="Bot 用户名" min-width="160" />
@@ -86,6 +89,11 @@ onMounted(loadBots)
         </template>
       </el-table-column>
     </el-table>
+    <ClientListPagination
+      v-model:page="botPagination.page.value"
+      v-model:page-size="botPagination.pageSize.value"
+      :total="botPagination.total.value"
+    />
 
     <el-dialog v-model="dialogVisible" title="新增 Bot 账号" width="520px">
       <el-form label-width="110px">

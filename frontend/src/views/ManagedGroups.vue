@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { ElButton, ElCheckbox, ElDialog, ElForm, ElFormItem, ElInput, ElInputNumber, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { guardianApi, type GuardianBot, type ManagedGroupBinding } from '@/api/guardian'
 import { accountsApi, type Account } from '@/api/accounts'
+import ClientListPagination from '@/components/ClientListPagination.vue'
+import { useClientPagination } from '@/utils/clientPagination'
 
 const router = useRouter()
 const loading = ref(false)
@@ -26,6 +28,7 @@ const announcementChannelId = ref<number | undefined>()
 const groups = ref<ManagedGroupBinding[]>([])
 const bots = ref<GuardianBot[]>([])
 const promoterAccounts = ref<Account[]>([])
+const groupPagination = useClientPagination(groups, 20)
 const selectedSyncBotId = ref<number | undefined>()
 
 const form = reactive({
@@ -77,8 +80,8 @@ const loadData = async () => {
   loading.value = true
   try {
     const [groupsRes, botsRes, accountsRes] = await Promise.all([
-      guardianApi.listManagedGroups({ limit: 100 }),
-      guardianApi.listBots({ enabled: true, limit: 100 }),
+      guardianApi.listManagedGroups({ limit: 200 }),
+      guardianApi.listBots({ enabled: true, limit: 200 }),
       accountsApi.list({ account_type: 'promoter', limit: 100 }),
     ])
     groups.value = groupsRes.data.data
@@ -410,7 +413,7 @@ onMounted(loadData)
       </div>
     </div>
 
-    <el-table v-loading="loading" :data="groups" border>
+    <el-table v-loading="loading" :data="groupPagination.rows.value" border>
       <el-table-column prop="telegram_group_id" label="Telegram ID" min-width="150" />
       <el-table-column label="类型" width="90">
         <template #default="{ row }">
@@ -463,6 +466,11 @@ onMounted(loadData)
         </template>
       </el-table-column>
     </el-table>
+    <ClientListPagination
+      v-model:page="groupPagination.page.value"
+      v-model:page-size="groupPagination.pageSize.value"
+      :total="groupPagination.total.value"
+    />
 
     <el-dialog v-model="dialogVisible" title="绑定现有群或频道" width="560px">
       <el-form label-width="120px">

@@ -1,26 +1,73 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import Accounts from './Accounts.vue'
 
-const fetchList = vi.fn().mockResolvedValue([])
-const update = vi.fn().mockResolvedValue({})
-const remove = vi.fn().mockResolvedValue({})
-const enable = vi.fn().mockResolvedValue({})
-const disable = vi.fn().mockResolvedValue({})
-const setPage = vi.fn()
-const setPageSize = vi.fn()
-const setAccountTypeFilter = vi.fn()
-const push = vi.fn()
+const {
+  fetchList,
+  update,
+  remove,
+  enable,
+  disable,
+  setPage,
+  setPageSize,
+  setAccountTypeFilter,
+  push,
+  getAdDynamicStatus,
+} = vi.hoisted(() => ({
+  fetchList: vi.fn().mockResolvedValue([]),
+  update: vi.fn().mockResolvedValue({}),
+  remove: vi.fn().mockResolvedValue({}),
+  enable: vi.fn().mockResolvedValue({}),
+  disable: vi.fn().mockResolvedValue({}),
+  setPage: vi.fn(),
+  setPageSize: vi.fn(),
+  setAccountTypeFilter: vi.fn(),
+  push: vi.fn(),
+  getAdDynamicStatus: vi.fn().mockResolvedValue({
+    data: {
+      data: [
+        {
+          account_id: 1,
+          account_label: 'Alice',
+          risk_level: 'limited',
+          risk_score: 42,
+          health_score: 71,
+          ad_eligible_groups: 3,
+          dynamic_daily_limit: 4,
+          dynamic_run_limit: 1,
+          recent_errors: [],
+          delivery_diagnostic: {
+            ad_delivery_allowed: false,
+            probe_execution_allowed: true,
+            primary_block_label: '广告频控阻塞',
+            primary_block_severity: 'warning',
+            block_reasons: [],
+            blocked_group_samples: [],
+          },
+        },
+      ],
+    },
+  }),
+}))
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({
     push,
+  }),
+  useRoute: () => ({
+    query: {},
   }),
 }))
 
 vi.mock('@/api/proxies', () => ({
   proxiesApi: {
     list: vi.fn().mockResolvedValue({ data: { data: { list: [] } } }),
+  },
+}))
+
+vi.mock('@/api/automation', () => ({
+  automationApi: {
+    getAdDynamicStatus,
   },
 }))
 
@@ -105,6 +152,9 @@ const globalStubs = {
   'el-table-column': { template: '<td />' },
   'el-descriptions': { template: '<div />' },
   'el-descriptions-item': { template: '<div />' },
+  'el-tabs': { template: '<div><slot /></div>' },
+  'el-tab-pane': { template: '<div><slot /></div>' },
+  'el-empty': { template: '<div />' },
 }
 
 const globalConfig = {
@@ -121,6 +171,7 @@ describe('Accounts view', () => {
     enable.mockClear()
     disable.mockClear()
     push.mockClear()
+    getAdDynamicStatus.mockClear()
   })
 
   it('renders page and account row', () => {
@@ -138,6 +189,25 @@ describe('Accounts view', () => {
     expect(fetchList).toHaveBeenCalledTimes(1)
     expect(setAccountTypeFilter).toHaveBeenCalledWith('promoter')
     expect(fetchList).toHaveBeenCalledWith({ account_type: 'promoter' })
+  })
+
+  it('shows an obvious delivery status and opens account details', async () => {
+    const wrapper = mount(Accounts, {
+      global: globalConfig,
+    })
+    await flushPromises()
+
+    const vm = wrapper.vm as any
+    const account = { id: 1, identifier: 'alice-promoter' }
+
+    expect(getAdDynamicStatus).toHaveBeenCalledTimes(1)
+    expect(vm.columns.some((column: any) => column.slot === 'deliveryStatus')).toBe(true)
+    expect(vm.deliveryStatusLabel(account)).toBe('广告频控阻塞')
+    expect(vm.deliveryStatusType(account)).toBe('warning')
+
+    vm.openDeliveryBlockDrawer(account)
+    expect(vm.deliveryBlockDrawerVisible).toBe(true)
+    expect(vm.selectedDeliveryStatus.account_id).toBe(1)
   })
 
   it('calls enable and disable actions', async () => {

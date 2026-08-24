@@ -10,6 +10,7 @@ import {
   type QQManagedGroup,
 } from '@/api/qq'
 import wsClient from '@/utils/websocket'
+import ClientListPagination from '@/components/ClientListPagination.vue'
 
 const loading = ref(false)
 const connection = ref<QQConnectionStatus>({
@@ -20,6 +21,8 @@ const connection = ref<QQConnectionStatus>({
 })
 const groups = ref<QQManagedGroup[]>([])
 const total = ref(0)
+const groupPage = ref(1)
+const groupPageSize = ref(20)
 
 const registerVisible = ref(false)
 const registerLoading = ref(false)
@@ -35,6 +38,8 @@ const messagesLoading = ref(false)
 const currentGroup = ref<QQManagedGroup | null>(null)
 const messages = ref<QQGroupMessage[]>([])
 const messageTotal = ref(0)
+const messagePage = ref(1)
+const messagePageSize = ref(20)
 const messageFilters = reactive({ keyword: '', member_qq: '' })
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null
@@ -70,11 +75,19 @@ const loadData = async () => {
   try {
     const [connectionRes, groupsRes] = await Promise.all([
       qqApi.getConnection(),
-      qqApi.listGroups({ limit: 500 }),
+      qqApi.listGroups({
+        offset: (groupPage.value - 1) * groupPageSize.value,
+        limit: groupPageSize.value,
+      }),
     ])
     connection.value = connectionRes.data.data
     groups.value = groupsRes.data.data
     total.value = groupsRes.data.total
+    const lastPage = Math.max(1, Math.ceil(total.value / groupPageSize.value))
+    if (groupPage.value > lastPage) {
+      groupPage.value = lastPage
+      await loadData()
+    }
   } finally {
     loading.value = false
   }
@@ -170,6 +183,17 @@ const sendNotification = async () => {
   }
 }
 
+const handleGroupPageChange = async (page: number) => {
+  groupPage.value = page
+  await loadData()
+}
+
+const handleGroupPageSizeChange = async (pageSize: number) => {
+  groupPageSize.value = pageSize
+  groupPage.value = 1
+  await loadData()
+}
+
 const loadMessages = async () => {
   if (!currentGroup.value) return
   messagesLoading.value = true
@@ -177,7 +201,8 @@ const loadMessages = async () => {
     const response = await qqApi.listMessages(currentGroup.value.id, {
       keyword: messageFilters.keyword.trim() || undefined,
       member_qq: messageFilters.member_qq.trim() || undefined,
-      limit: 200,
+      offset: (messagePage.value - 1) * messagePageSize.value,
+      limit: messagePageSize.value,
     })
     messages.value = response.data.data
     messageTotal.value = response.data.total
@@ -189,8 +214,25 @@ const loadMessages = async () => {
 const openMessages = async (row: QQManagedGroup) => {
   currentGroup.value = row
   messagesVisible.value = true
+  messagePage.value = 1
   messageFilters.keyword = ''
   messageFilters.member_qq = ''
+  await loadMessages()
+}
+
+const searchMessages = async () => {
+  messagePage.value = 1
+  await loadMessages()
+}
+
+const handleMessagePageChange = async (page: number) => {
+  messagePage.value = page
+  await loadMessages()
+}
+
+const handleMessagePageSizeChange = async (pageSize: number) => {
+  messagePageSize.value = pageSize
+  messagePage.value = 1
   await loadMessages()
 }
 
@@ -207,7 +249,10 @@ const handleRealtimeMessage = (payload: unknown) => {
   const message = payload as QQGroupMessage
   if (!message || message.group_id !== currentGroup.value?.id) return
   if (messages.value.some((item) => item.id === message.id)) return
-  messages.value.unshift(message)
+  if (messagePage.value === 1) {
+    messages.value.unshift(message)
+    messages.value = messages.value.slice(0, messagePageSize.value)
+  }
   messageTotal.value += 1
 }
 
@@ -332,6 +377,13 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
       </el-table>
+      <ClientListPagination
+        :page="groupPage"
+        :page-size="groupPageSize"
+        :total="total"
+        @update:page="handleGroupPageChange"
+        @update:page-size="handleGroupPageSizeChange"
+      />
     </section>
 
     <el-dialog v-model="registerVisible" title="登记 QQ 群" width="520px">
@@ -372,12 +424,12 @@ onBeforeUnmount(() => {
 
     <el-drawer v-model="messagesVisible" :title="currentGroup?.local_name || '群消息'" size="78%">
       <div class="message-toolbar">
-        <el-input v-model="messageFilters.keyword" clearable placeholder="消息关键词" @keyup.enter="loadMessages" />
-        <el-input v-model="messageFilters.member_qq" clearable placeholder="成员 QQ" @keyup.enter="loadMessages" />
-        <el-button :icon="Refresh" :loading="messagesLoading" @click="loadMessages">查询</el-button>
+        <el-input v-model="messageFilters.keyword" clearable placeholder="消息关键词" @keyup.enter="searchMessages" />
+        <el-input v-model="messageFilters.member_qq" clearable placeholder="成员 QQ" @keyup.enter="searchMessages" />
+        <el-button :icon="Refresh" :loading="messagesLoading" @click="searchMessages">查询</el-button>
         <span class="message-total">{{ messageTotal }} 条</span>
       </div>
-      <el-table v-loading="messagesLoading" :data="messages" row-key="id" height="calc(100vh - 190px)">
+      <el-table v-loading="messagesLoading" :data="messages" row-key="id" height="calc(100vh - 260px)">
         <el-table-column label="时间" width="170">
           <template #default="{ row }">{{ formatTime(row.occurred_at) }}</template>
         </el-table-column>
@@ -420,6 +472,13 @@ onBeforeUnmount(() => {
           </template>
         </el-table-column>
       </el-table>
+      <ClientListPagination
+        :page="messagePage"
+        :page-size="messagePageSize"
+        :total="messageTotal"
+        @update:page="handleMessagePageChange"
+        @update:page-size="handleMessagePageSizeChange"
+      />
     </el-drawer>
   </div>
 </template>

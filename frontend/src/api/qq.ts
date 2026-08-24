@@ -66,7 +66,7 @@ export const qqApi = {
   getConnection: () =>
     apiClient.get<{ data: QQConnectionStatus }>('/qq/connection'),
 
-  listGroups: (params?: { status?: string; monitoring_enabled?: boolean; limit?: number }) =>
+  listGroups: (params?: { status?: string; monitoring_enabled?: boolean; offset?: number; limit?: number }) =>
     apiClient.get<{ data: QQManagedGroup[]; total: number }>('/qq/groups', { params }),
 
   syncGroups: () =>

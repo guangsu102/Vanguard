@@ -5,6 +5,7 @@ import { Select, Download, Delete, FolderOpened } from '@element-plus/icons-vue'
 import { useSettingsStore } from '@/stores/settings'
 import { settingsApi } from '@/api/settings'
 import { downloadBlob } from '@/utils/download'
+import ClientListPagination from '@/components/ClientListPagination.vue'
 import dayjs from 'dayjs'
 
 const settingsStore = useSettingsStore()
@@ -194,6 +195,16 @@ const handleClearLogs = async () => {
   } catch (error) {
     ElMessage.error('清空失败')
   }
+}
+
+const handleLogPageChange = async (page: number) => {
+  settingsStore.setPage(page)
+  await settingsStore.fetchLogs()
+}
+
+const handleLogPageSizeChange = async (pageSize: number) => {
+  settingsStore.setPageSize(pageSize)
+  await settingsStore.fetchLogs()
 }
 
 const handleBackup = async () => {
@@ -410,6 +421,13 @@ onMounted(() => {
               </template>
             </el-table-column>
           </el-table>
+          <ClientListPagination
+            :page="settingsStore.page"
+            :page-size="settingsStore.pageSize"
+            :total="settingsStore.logTotal"
+            @update:page="handleLogPageChange"
+            @update:page-size="handleLogPageSizeChange"
+          />
         </el-card>
       </el-tab-pane>
 

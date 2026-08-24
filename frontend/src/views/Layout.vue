@@ -4,7 +4,7 @@ import { ElContainer, ElAside, ElMenu, ElMenuItem, ElSubMenu, ElIcon, ElScrollba
 import {
   Odometer, User, ChatDotRound,
   Key, UserFilled, Present, SetUp, DataLine, Setting,
-  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor, Connection, ChatLineSquare
+  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor, Connection, ChatLineSquare, Document
 } from '@element-plus/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -23,6 +23,8 @@ const menuItems = [
     icon: Promotion,
     children: [
       { path: '/growth-dashboard', title: '增长驾驶舱', icon: Promotion },
+      { path: '/growth-settings', title: '配置中心', icon: Setting },
+      { path: '/growth-logs', title: '增长日志', icon: Document },
       { path: '/accounts', title: '推广账号', icon: User },
       { path: '/proxies', title: '静态代理IP', icon: Connection },
       { path: '/groups', title: '群池管理', icon: ChatDotRound },

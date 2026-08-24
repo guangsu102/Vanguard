@@ -3,11 +3,15 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElInputNumber, ElMessage, ElSelect, ElOption, ElSwitch, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { guardianApi, type ManagedGroupBinding, type ModerationSensitiveKeyword } from '@/api/guardian'
+import ClientListPagination from '@/components/ClientListPagination.vue'
 
 const route = useRoute()
 const loading = ref(false)
 const dialogVisible = ref(false)
 const keywords = ref<ModerationSensitiveKeyword[]>([])
+const keywordTotal = ref(0)
+const keywordPage = ref(1)
+const keywordPageSize = ref(20)
 const managedGroups = ref<ManagedGroupBinding[]>([])
 const currentGroupId = ref<number | undefined>()
 
@@ -51,12 +55,13 @@ const loadManagedGroups = async () => {
 const loadKeywords = async () => {
   loading.value = true
   try {
-    const params: Record<string, any> = { page: 1, page_size: 100 }
+    const params: Record<string, any> = { page: keywordPage.value, page_size: keywordPageSize.value }
     if (currentGroupId.value) {
       params.group_id = currentGroupId.value
     }
     const res = await guardianApi.listSensitiveKeywords(params)
     keywords.value = res.data.data
+    keywordTotal.value = res.data.total
   } finally {
     loading.value = false
   }
@@ -90,9 +95,21 @@ const toggleKeyword = async (row: ModerationSensitiveKeyword) => {
   await loadKeywords()
 }
 
+const handleKeywordPageChange = async (page: number) => {
+  keywordPage.value = page
+  await loadKeywords()
+}
+
+const handleKeywordPageSizeChange = async (pageSize: number) => {
+  keywordPageSize.value = pageSize
+  keywordPage.value = 1
+  await loadKeywords()
+}
+
 watch(
   () => route.query.groupId,
   async () => {
+    keywordPage.value = 1
     applyRouteGroup()
     await loadKeywords()
   },
@@ -100,6 +117,7 @@ watch(
 
 watch(currentGroupId, async (value) => {
   form.group_id = value
+  keywordPage.value = 1
   await loadKeywords()
 })
 
@@ -152,6 +170,13 @@ onMounted(async () => {
         </template>
       </el-table-column>
     </el-table>
+    <ClientListPagination
+      :page="keywordPage"
+      :page-size="keywordPageSize"
+      :total="keywordTotal"
+      @update:page="handleKeywordPageChange"
+      @update:page-size="handleKeywordPageSizeChange"
+    />
 
     <el-dialog v-model="dialogVisible" title="新增群管敏感词" width="560px">
       <el-form label-width="120px">

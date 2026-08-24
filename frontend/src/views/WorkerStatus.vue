@@ -3,18 +3,19 @@ import { onMounted, ref } from 'vue'
 import { Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { guardianApi, type TelegramWorkerStatus } from '@/api/guardian'
+import ClientListPagination from '@/components/ClientListPagination.vue'
+import { useClientPagination } from '@/utils/clientPagination'
 
 const loading = ref(false)
 const workers = ref<TelegramWorkerStatus[]>([])
-const total = ref(0)
 const role = ref('')
+const workerPagination = useClientPagination(workers, 20)
 
 const fetchWorkers = async () => {
   loading.value = true
   try {
-    const res = await guardianApi.listWorkers({ role: role.value || undefined, limit: 200 })
+    const res = await guardianApi.listWorkers({ role: role.value || undefined, limit: 500 })
     workers.value = res.data.data
-    total.value = res.data.total
   } catch (error) {
     ElMessage.error('加载执行器状态失败')
   } finally {
@@ -49,7 +50,7 @@ onMounted(fetchWorkers)
       <el-button :icon="Refresh" :loading="loading" @click="fetchWorkers">刷新</el-button>
     </div>
 
-    <el-table v-loading="loading" :data="workers" border>
+    <el-table v-loading="loading" :data="workerPagination.rows.value" border>
       <el-table-column prop="worker_id" label="Worker ID" min-width="220" />
       <el-table-column prop="role" label="角色" width="170" />
       <el-table-column prop="status" label="状态" width="110">
@@ -76,8 +77,11 @@ onMounted(fetchWorkers)
         </template>
       </el-table-column>
     </el-table>
-
-    <div class="footer">共 {{ total }} 个执行器</div>
+    <ClientListPagination
+      v-model:page="workerPagination.page.value"
+      v-model:page-size="workerPagination.pageSize.value"
+      :total="workerPagination.total.value"
+    />
   </div>
 </template>
 
@@ -92,11 +96,6 @@ onMounted(fetchWorkers)
   display: flex;
   align-items: center;
   justify-content: space-between;
-}
-
-.footer {
-  color: #606266;
-  font-size: 13px;
 }
 
 .age {

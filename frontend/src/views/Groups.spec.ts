@@ -12,6 +12,12 @@ const setPage = vi.fn()
 const setPageSize = vi.fn()
 const fetchAccounts = vi.fn().mockResolvedValue([])
 
+vi.mock('vue-router', () => ({
+  useRoute: () => ({
+    query: {},
+  }),
+}))
+
 vi.mock('@/stores/group', () => ({
   useGroupStore: () => ({
     list: [
@@ -95,6 +101,9 @@ const globalStubs = {
   'el-table': { template: '<table><slot /></table>' },
   'el-table-column': { template: '<div />' },
   'el-empty': { template: '<div />' },
+  'el-pagination': { template: '<div />' },
+  'el-tabs': { template: '<div><slot /></div>' },
+  'el-tab-pane': { template: '<div><slot /></div>' },
 }
 
 describe('Groups view', () => {

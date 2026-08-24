@@ -8,6 +8,9 @@ import SearchBar from '@/components/SearchBar.vue'
 import FormDrawer from '@/components/FormDrawer.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import AccountLoginDialog from '@/components/AccountLoginDialog.vue'
+import AccountOperationalStatusPanel from '@/components/AccountOperationalStatusPanel.vue'
+import AccountDeliveryBlockDrawer from '@/components/AccountDeliveryBlockDrawer.vue'
+import ClientListPagination from '@/components/ClientListPagination.vue'
 import { useAccountStore } from '@/stores/account'
 import { proxiesApi, type Proxy } from '@/api/proxies'
 import {
@@ -19,13 +22,22 @@ import {
   type AccountRiskSummary,
   type AccountWarmupStage,
 } from '@/api/accounts'
-import { useRouter } from 'vue-router'
+import { automationApi, type AdDynamicStatus } from '@/api/automation'
+import { useRoute, useRouter } from 'vue-router'
 import { accountAssetTierOptions } from '@/config/accountAssetTiers'
+import { useClientPagination } from '@/utils/clientPagination'
 
+const route = useRoute()
 const router = useRouter()
 const accountStore = useAccountStore()
 
 const loading = ref(false)
+const activeAccountTab = ref(route.query.tab === 'operations' ? 'operations' : 'list')
+const operationalStatusLoading = ref(false)
+const dynamicStatuses = ref<AdDynamicStatus[]>([])
+const deliveryBlockDrawerVisible = ref(false)
+const selectedDeliveryAccount = ref<Account | null>(null)
+const selectedDeliveryStatus = ref<AdDynamicStatus | null>(null)
 const drawerVisible = ref(false)
 const loginDialogVisible = ref(false)
 const editingId = ref<number | null>(null)
@@ -36,6 +48,16 @@ const selectedSecurityAccount = ref<Account | null>(null)
 const riskSummary = ref<AccountRiskSummary | null>(null)
 const riskEvents = ref<AccountRiskEvent[]>([])
 const environmentEvents = ref<AccountEnvironmentEvent[]>([])
+const todayUsageRows = computed(() => riskSummary.value?.today_usage || [])
+const todayUsagePagination = useClientPagination(todayUsageRows, 10)
+const riskEventPagination = useClientPagination(riskEvents, 10)
+const environmentEventPagination = useClientPagination(environmentEvents, 10)
+
+const resetSecurityPagination = () => {
+  todayUsagePagination.reset()
+  riskEventPagination.reset()
+  environmentEventPagination.reset()
+}
 
 const formData = reactive({
   display_name: '',
@@ -121,6 +143,7 @@ const columns = [
   { prop: 'asset_tier', label: '资产等级', width: '110', slot: 'assetTier' },
   { prop: 'warmup_stage', label: '托管暖号', width: '130', slot: 'warmupStage' },
   { prop: 'status', label: '状态', width: '110', slot: 'status' },
+  { prop: 'delivery_status', label: '投放状态', width: '190', slot: 'deliveryStatus' },
   { prop: 'country_code', label: '国家/地区', width: '120', slot: 'country' },
   { prop: 'proxy_mode', label: '代理', width: '160', slot: 'proxy' },
   { prop: 'api_config_name', label: 'API配置', minWidth: '120' },
@@ -132,6 +155,51 @@ const columns = [
 ]
 
 const promoterAccounts = computed(() => accountStore.list.filter((item) => item.account_type === 'promoter'))
+
+type DeliveryTagType = 'success' | 'warning' | 'danger' | 'info'
+
+const operationalStatusMap = computed(
+  () => new Map(dynamicStatuses.value.map((item) => [item.account_id, item])),
+)
+
+const deliveryStatusFor = (account: any) => operationalStatusMap.value.get(account.id) || null
+
+const deliveryStatusType = (account: any): DeliveryTagType => {
+  const diagnostic = deliveryStatusFor(account)?.delivery_diagnostic
+  if (!diagnostic) return 'info'
+  if (diagnostic.ad_delivery_allowed) return 'success'
+  if (diagnostic.primary_block_severity === 'warning') return 'warning'
+  return 'danger'
+}
+
+const deliveryStatusLabel = (account: any) => {
+  const diagnostic = deliveryStatusFor(account)?.delivery_diagnostic
+  if (!diagnostic) return '状态评估中'
+  if (diagnostic.ad_delivery_allowed) return '可投放'
+  return diagnostic.primary_block_label || '投放阻塞'
+}
+
+const openDeliveryBlockDrawer = (account: any) => {
+  selectedDeliveryAccount.value = account
+  selectedDeliveryStatus.value = deliveryStatusFor(account)
+  deliveryBlockDrawerVisible.value = true
+}
+
+const loadOperationalStatuses = async () => {
+  operationalStatusLoading.value = true
+  try {
+    const response = await automationApi.getAdDynamicStatus()
+    dynamicStatuses.value = response.data.data
+    if (selectedDeliveryAccount.value) {
+      selectedDeliveryStatus.value = deliveryStatusFor(selectedDeliveryAccount.value)
+    }
+  } catch (error) {
+    console.error('Failed to load account operational statuses:', error)
+    ElMessage.error('账号投放状态加载失败')
+  } finally {
+    operationalStatusLoading.value = false
+  }
+}
 
 const formatProxyOption = (proxy: Proxy) => {
   const bound = proxy.bindAccountCount || 0
@@ -309,6 +377,7 @@ const formatDetails = (details?: string) => {
 }
 
 const openSecurityDrawer = async (row: Account) => {
+  resetSecurityPagination()
   selectedSecurityAccount.value = row
   securityDrawerVisible.value = true
   securityLoading.value = true
@@ -435,6 +504,7 @@ const goToGuardianBots = () => {
 onMounted(() => {
   fetchData()
   loadProxyOptions()
+  loadOperationalStatuses()
 })
 </script>
 
@@ -445,7 +515,7 @@ onMounted(() => {
         <h2 class="page-title">推广账号</h2>
         <p class="page-desc">这里只管理用于搜群、加群、广告投放和私聊引导的推广账号。</p>
       </div>
-      <div class="header-actions">
+      <div v-if="activeAccountTab === 'list'" class="header-actions">
         <el-button @click="goToGuardianBots">
           <el-icon><ChatDotRound /></el-icon>
           查看Bot账号
@@ -457,6 +527,12 @@ onMounted(() => {
       </div>
     </div>
 
+    <el-tabs v-model="activeAccountTab" class="account-tabs">
+      <el-tab-pane label="账号列表" name="list" />
+      <el-tab-pane label="账号运营态" name="operations" />
+    </el-tabs>
+
+    <div v-show="activeAccountTab === 'list'">
     <el-alert
       title="群治理 Bot 已独立到“群治理中心”，不会再和推广账号混用。"
       type="info"
@@ -523,6 +599,17 @@ onMounted(() => {
           <el-tag :type="row.is_active ? 'success' : 'info'" effect="plain">
             {{ row.is_active ? '已启用' : '已停用' }}
           </el-tag>
+        </div>
+      </template>
+
+      <template #deliveryStatus="{ row }">
+        <div class="delivery-status-cell">
+          <el-tag :type="deliveryStatusType(row)" effect="dark" size="small">
+            {{ deliveryStatusLabel(row) }}
+          </el-tag>
+          <el-button type="primary" link size="small" @click="openDeliveryBlockDrawer(row)">
+            阻塞明细
+          </el-button>
         </div>
       </template>
 
@@ -599,6 +686,20 @@ onMounted(() => {
         </el-button>
       </template>
     </TableCard>
+    </div>
+
+    <AccountOperationalStatusPanel
+      v-if="activeAccountTab === 'operations'"
+      :statuses="dynamicStatuses"
+      :loading="operationalStatusLoading"
+      @refresh="loadOperationalStatuses"
+    />
+
+    <AccountDeliveryBlockDrawer
+      v-model:visible="deliveryBlockDrawerVisible"
+      :account="selectedDeliveryAccount"
+      :status="selectedDeliveryStatus"
+    />
 
     <AccountLoginDialog
       v-model:visible="loginDialogVisible"
@@ -689,7 +790,7 @@ onMounted(() => {
         </el-descriptions>
 
         <h3 class="security-title">今日动作使用量</h3>
-        <el-table :data="riskSummary?.today_usage || []" size="small" max-height="220" empty-text="暂无今日动作">
+        <el-table :data="todayUsagePagination.rows.value" size="small" max-height="220" empty-text="暂无今日动作">
           <el-table-column prop="action" label="动作" width="130" />
           <el-table-column label="状态" width="100">
             <template #default="{ row }">
@@ -700,9 +801,15 @@ onMounted(() => {
           <el-table-column prop="count" label="次数" width="80" />
           <el-table-column prop="last_reason" label="最近原因" min-width="150" show-overflow-tooltip />
         </el-table>
+        <ClientListPagination
+          v-model:page="todayUsagePagination.page.value"
+          v-model:page-size="todayUsagePagination.pageSize.value"
+          :total="todayUsagePagination.total.value"
+          :page-sizes="[5, 10, 20]"
+        />
 
         <h3 class="security-title">风险事件</h3>
-        <el-table :data="riskEvents" size="small" max-height="260" empty-text="暂无风险事件">
+        <el-table :data="riskEventPagination.rows.value" size="small" max-height="260" empty-text="暂无风险事件">
           <el-table-column prop="created_at" label="时间" width="150">
             <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
           </el-table-column>
@@ -717,9 +824,15 @@ onMounted(() => {
             <template #default="{ row }">{{ row.target_id || '-' }}</template>
           </el-table-column>
         </el-table>
+        <ClientListPagination
+          v-model:page="riskEventPagination.page.value"
+          v-model:page-size="riskEventPagination.pageSize.value"
+          :total="riskEventPagination.total.value"
+          :page-sizes="[5, 10, 20, 30]"
+        />
 
         <h3 class="security-title">环境事件</h3>
-        <el-table :data="environmentEvents" size="small" max-height="260" empty-text="暂无环境事件">
+        <el-table :data="environmentEventPagination.rows.value" size="small" max-height="260" empty-text="暂无环境事件">
           <el-table-column prop="created_at" label="时间" width="150">
             <template #default="{ row }">{{ formatDate(row.created_at) }}</template>
           </el-table-column>
@@ -735,6 +848,12 @@ onMounted(() => {
             <template #default="{ row }">{{ formatDetails(row.details) }}</template>
           </el-table-column>
         </el-table>
+        <ClientListPagination
+          v-model:page="environmentEventPagination.page.value"
+          v-model:page-size="environmentEventPagination.pageSize.value"
+          :total="environmentEventPagination.total.value"
+          :page-sizes="[5, 10, 20, 30]"
+        />
       </div>
     </el-drawer>
     <FormDrawer
@@ -854,9 +973,20 @@ onMounted(() => {
   margin-bottom: 16px;
 }
 
+.account-tabs {
+  min-width: 0;
+}
+
 .header-actions {
   display: flex;
   gap: 12px;
+}
+
+.delivery-status-cell {
+  display: flex;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .identifier-cell,

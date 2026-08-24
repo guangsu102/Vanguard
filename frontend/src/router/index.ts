@@ -37,6 +37,18 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '增长驾驶舱', icon: 'Promotion' },
       },
       {
+        path: 'growth-settings',
+        name: 'GrowthSettings',
+        component: () => import('@/views/GrowthSettings.vue'),
+        meta: { title: '配置中心', icon: 'Setting' },
+      },
+      {
+        path: 'growth-logs',
+        name: 'GrowthLogs',
+        component: () => import('@/views/GrowthLogs.vue'),
+        meta: { title: '增长日志', icon: 'Document' },
+      },
+      {
         path: 'proxies',
         name: 'Proxies',
         component: () => import('@/views/Proxies.vue'),

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElAlert, ElButton, ElDrawer, ElIcon, ElMessage, ElMessageBox, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { Delete, Edit, Plus, RefreshRight, User } from '@element-plus/icons-vue'
 import { useAccountStore } from '@/stores/account'
@@ -8,13 +9,19 @@ import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
 import FormDrawer from '@/components/FormDrawer.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import ClientListPagination from '@/components/ClientListPagination.vue'
+import GroupAdPolicyPanel from '@/components/GroupAdPolicyPanel.vue'
+import GroupFailoverPanel from '@/components/GroupFailoverPanel.vue'
+import { useClientPagination } from '@/utils/clientPagination'
 import dayjs from 'dayjs'
 import type { Group, GroupFormData, GroupMember } from '@/api/groups'
 
+const route = useRoute()
 const groupStore = useGroupStore()
 const accountStore = useAccountStore()
 
 const loading = ref(false)
+const activeGroupTab = ref(['pool', 'ad-policy', 'failover'].includes(String(route.query.tab)) ? String(route.query.tab) : 'pool')
 const drawerVisible = ref(false)
 const detailDrawerVisible = ref(false)
 const editingId = ref<number | null>(null)
@@ -40,11 +47,22 @@ const formRules = {
 
 const accountOptions = computed(() => [
   { label: '暂不关联推广账号', value: undefined },
-  ...accountStore.list.map((account) => ({
-    label: `${account.display_name || account.identifier} · ${account.status}`,
-    value: account.id,
-  })),
+  ...accountStore.list
+    .filter((account) => account.is_active !== false && !['banned', 'error'].includes(account.status || ''))
+    .map((account) => ({
+      label: `${account.display_name || account.identifier} · ${account.status}`,
+      value: account.id,
+    })),
 ])
+
+const memberSource = computed(() => groupStore.members)
+const {
+  page: memberPage,
+  pageSize: memberPageSize,
+  total: memberTotal,
+  rows: pagedMembers,
+  reset: resetMemberPage,
+} = useClientPagination(memberSource, 10)
 
 const levelTagType = (level: string) => {
   if (level === 'A') return 'success'
@@ -296,6 +314,7 @@ const handleDelete = async (row: Group) => {
 const handleViewMembers = async (row: Group) => {
   try {
     selectedGroup.value = row
+    resetMemberPage()
     await groupStore.fetchMembers(row.id)
     detailDrawerVisible.value = true
   } catch {
@@ -343,7 +362,7 @@ onMounted(() => {
         <h2 class="page-title">群池管理</h2>
         <p class="page-desc">增长中心维护的候选群与已入群池，用于搜群、加群、广告投放和转化分析。</p>
       </div>
-      <div class="header-actions">
+      <div v-if="activeGroupTab === 'pool'" class="header-actions">
         <el-button type="primary" @click="openAddDrawer">
           <el-icon><Plus /></el-icon>
           添加群池条目
@@ -351,6 +370,13 @@ onMounted(() => {
       </div>
     </div>
 
+    <el-tabs v-model="activeGroupTab" class="group-tabs">
+      <el-tab-pane label="群池列表" name="pool" />
+      <el-tab-pane label="群广告许可与档位" name="ad-policy" />
+      <el-tab-pane label="封号群资源恢复" name="failover" />
+    </el-tabs>
+
+    <div v-show="activeGroupTab === 'pool'">
     <el-alert
       title="Bot 管理群已独立到“群治理中心 / Bot管理群”，这里仅保留增长侧群池。"
       type="info"
@@ -455,6 +481,11 @@ onMounted(() => {
         </el-button>
       </template>
     </TableCard>
+    </div>
+
+    <GroupAdPolicyPanel v-if="activeGroupTab === 'ad-policy'" />
+
+    <GroupFailoverPanel v-if="activeGroupTab === 'failover'" />
 
     <FormDrawer
       v-model:visible="drawerVisible"
@@ -473,7 +504,7 @@ onMounted(() => {
       size="680px"
       :show-close="false"
     >
-      <el-table :data="groupStore.members" stripe>
+      <el-table :data="pagedMembers" stripe>
         <el-table-column prop="id" label="ID" width="70" />
         <el-table-column prop="accountPhone" label="推广账号" min-width="160" />
         <el-table-column prop="joinMethod" label="入群方式" width="130">
@@ -493,9 +524,11 @@ onMounted(() => {
         </el-table-column>
       </el-table>
 
-      <div class="member-statistics">
-        <span>已记录推广账号数: {{ groupStore.memberTotal }}</span>
-      </div>
+      <ClientListPagination
+        v-model:page="memberPage"
+        v-model:page-size="memberPageSize"
+        :total="memberTotal"
+      />
     </el-drawer>
   </div>
 </template>
@@ -527,6 +560,10 @@ onMounted(() => {
 
 .page-alert {
   margin-bottom: 16px;
+}
+
+.group-tabs {
+  min-width: 0;
 }
 
 .header-actions {
@@ -561,13 +598,5 @@ onMounted(() => {
 .conversion-rate {
   font-weight: 600;
   color: #67c23a;
-}
-
-.member-statistics {
-  margin-top: 16px;
-  padding: 16px;
-  background: #f5f7fa;
-  border-radius: 4px;
-  color: #606266;
 }
 </style>

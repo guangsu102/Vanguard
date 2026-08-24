@@ -15,9 +15,7 @@ import {
   type AdFailurePolicy,
   type EffectiveLimitItem,
   type EffectiveLimitSummary,
-  type GroupAdProfile,
   type AutoJoinSchedulerConfig,
-  type AutoJoinVerificationLog,
 } from '@/api/automation'
 import { settingsApi, type GroupAiInteractionSettings } from '@/api/settings'
 import {
@@ -31,11 +29,18 @@ import {
   createDefaultWarmupPolicy,
 } from '@/config/automationDefaults'
 
+const props = withDefaults(
+  defineProps<{
+    view?: 'dashboard' | 'config'
+  }>(),
+  { view: 'dashboard' },
+)
+const isConfigView = computed(() => props.view === 'config')
+
 const loading = ref(false)
 const saving = ref('')
 const effectiveLimits = ref<EffectiveLimitSummary | null>(null)
 const activeConfigTab = ref('join')
-const activeEventTab = ref('attempts')
 const route = useRoute()
 
 const configTabNames = ['join', 'warmup', 'asset', 'risk', 'ads', 'group-ai'] as const
@@ -49,11 +54,6 @@ const applyConfigQuery = (config: unknown) => {
 }
 
 const dynamicStatuses = ref<AdDynamicStatus[]>([])
-const autoJoinAttempts = ref<any[]>([])
-const verificationLogs = ref<AutoJoinVerificationLog[]>([])
-const deliveryLogs = ref<any[]>([])
-const groupAdProfiles = ref<GroupAdProfile[]>([])
-let groupProfilesRefreshTimer: number | null = null
 
 const riskActionOptions = [
   { label: '搜群', value: 'search' },
@@ -129,13 +129,6 @@ const adCapacityTierOptions = [
   { label: '优质', value: 'premium' },
 ]
 
-const adPolicyModeOptions = [
-  { label: '禁止广告', value: 'forbidden' },
-  { label: '许可未知', value: 'unknown' },
-  { label: '需管理员审批', value: 'approval_required' },
-  { label: '允许软广告', value: 'soft_ad_allowed' },
-  { label: '允许高容量广告', value: 'high_volume_ad_allowed' },
-]
 
 const adHourlyWeightOptions = Array.from({ length: 24 }, (_, hour) => ({
   label: `${hour}:00`,
@@ -506,8 +499,6 @@ const dynamicFactorLabels: Record<string, string> = {
 }
 
 const effectiveLimitRows = computed(() => effectiveLimits.value?.items || [])
-const groupGlobalAdDailyLimit = computed(() => effectiveLimitRows.value
-  .find((item) => item.key === 'group_global_ad_daily')?.value)
 
 const effectiveLimitLabel = (key: string) => effectiveLimitLabels[key] || key
 const effectiveSourceLabel = (key: string) => effectiveSourceLabels[key] || key
@@ -629,10 +620,6 @@ const loadAll = async () => {
       failureRes,
       effectiveLimitsRes,
       settingsRes,
-      attemptsRes,
-      verificationRes,
-      deliveryRes,
-      groupProfilesRes,
     ] = await Promise.all([
       automationApi.getAdDynamicStatus(),
       automationApi.getAutoJoinSchedulerConfig(),
@@ -645,10 +632,6 @@ const loadAll = async () => {
       automationApi.getAdFailurePolicy(),
       automationApi.getEffectiveLimits(),
       settingsApi.get(),
-      automationApi.getAutoJoinAttempts({ limit: 20 }),
-      automationApi.getAutoJoinVerificationLogs({ limit: 20 }),
-      automationApi.getDeliveryLogs({ limit: 20 }),
-      automationApi.getGroupAdProfiles(),
     ])
 
     dynamicStatuses.value = dynamicRes.data.data
@@ -662,24 +645,10 @@ const loadAll = async () => {
     Object.assign(adFailurePolicyForm, failureRes.data.data)
     Object.assign(groupAiForm, settingsRes.data.data.groupAiInteraction || {})
     syncGroupAiTextFields()
-    autoJoinAttempts.value = attemptsRes.data.data
-    verificationLogs.value = verificationRes.data.data
-    deliveryLogs.value = deliveryRes.data.data
-    groupAdProfiles.value = groupProfilesRes.data.data
     effectiveLimits.value = effectiveLimitsRes.data.data
     captureAllSnapshots()
   } finally {
     loading.value = false
-  }
-}
-
-const refreshGroupAdProfiles = async () => {
-  if (loading.value || document.visibilityState === 'hidden') return
-  try {
-    const response = await automationApi.getGroupAdProfiles()
-    groupAdProfiles.value = response.data.data
-  } catch (error) {
-    console.error('Failed to refresh group advertisement profiles:', error)
   }
 }
 
@@ -826,104 +795,12 @@ function formatDuration(seconds: number) {
   return `${Math.round(seconds / 3600)} 小时`
 }
 
-function riskTagType(level: string) {
-  if (['frozen', 'quarantined'].includes(level)) return 'danger'
-  if (['limited', 'watch'].includes(level)) return 'warning'
-  return 'success'
-}
-
-function statusTagType(status: string) {
-  if (['success', 'joined', 'active'].includes(status)) return 'success'
-  if (['failed', 'error', 'frozen', 'quarantined'].includes(status)) return 'danger'
-  if (['pending', 'scheduled', 'limited', 'watch'].includes(status)) return 'warning'
-  return 'info'
-}
-
 function challengeActionLabel(value?: string) {
   return unknownChallengeActionOptions.find((item) => item.value === value)?.label || value || '-'
 }
 
 function groupAiModeLabel(value: string) {
   return groupAiModeOptions.find((item) => item.value === value)?.label || value
-}
-
-function accountLabel(row: any) {
-  return row.account_label || `#${row.account_id}`
-}
-
-function compactError(row: any) {
-  const error = row.recent_errors?.[0]
-  return error ? `${error.error || '-'} (${error.count})` : '-'
-}
-
-const saveGroupAdPolicy = async (row: any) => {
-  let note = ''
-  try {
-    const result = await ElMessageBox.prompt('请填写许可依据、管理员确认或禁止原因', '确认群广告策略', {
-      confirmButtonText: '确认保存',
-      cancelButtonText: '取消',
-      inputPattern: /\S{2,}/,
-      inputErrorMessage: '至少填写 2 个字符',
-    })
-    note = result.value
-  } catch {
-    return
-  }
-  saving.value = `group-policy-${row.group_id}`
-  try {
-    const res = await automationApi.updateGroupAdPolicy(row.group_id, {
-      mode: row.ad_policy_mode,
-      confidence: row.ad_policy_mode === 'unknown' ? 0 : 100,
-      note,
-    })
-    Object.assign(row, res.data.data)
-    ElMessage.success('群广告许可已更新')
-  } finally {
-    saving.value = ''
-  }
-}
-
-function severityTagType(severity?: string) {
-  if (severity === 'danger') return 'danger'
-  if (severity === 'warning') return 'warning'
-  if (severity === 'success') return 'success'
-  return 'info'
-}
-
-function diagnosticTagType(row: any) {
-  return severityTagType(row.delivery_diagnostic?.primary_block_severity)
-}
-
-function diagnosticLabel(row: any) {
-  return row.delivery_diagnostic?.primary_block_label || '-'
-}
-
-function dynamicHealthTagType(row: any) {
-  return severityTagType(row.dynamic_health_diagnostic?.primary_severity)
-}
-
-function dynamicHealthText(row: any) {
-  const diagnostic = row.dynamic_health_diagnostic
-  if (!diagnostic) return '-'
-  const main = diagnostic.primary_label
-  const top = diagnostic.negative_adjustments?.[0]
-  return top ? `${main} · ${top.label} ${top.delta}` : main
-}
-
-function nextActionText(row: any) {
-  const diagnostic = row.delivery_diagnostic
-  if (!diagnostic) return '-'
-  return diagnostic.next_action_at
-    ? `${diagnostic.next_action_label} · ${diagnostic.next_action_at.slice(5, 16).replace('T', ' ')}`
-    : diagnostic.next_action_label
-}
-
-function groupDiagnosticText(row: any) {
-  const item = row.delivery_diagnostic?.group_diagnostics
-  if (!item) return '-'
-  const probeState = row.delivery_diagnostic?.probe_execution_allowed ? '探针可运行' : '探针阻断'
-  const adState = row.delivery_diagnostic?.ad_delivery_allowed ? '广告可发送' : '广告暂停'
-  return `${probeState} · ${adState} · 就绪 ${item.ready} · Premium ${item.premium || 0} · 待许可 ${(item.ad_permission_unknown || 0) + (item.ad_policy_expired || 0)} · 待探针 ${item.pending_probe} · 阻断 ${item.probe_failed + item.blocked + (item.ad_permission_forbidden || 0)}`
 }
 
 watch(
@@ -937,15 +814,10 @@ onMounted(() => {
   window.addEventListener('beforeunload', beforeWindowUnload)
   applyConfigQuery(route.query.config)
   loadAll()
-  groupProfilesRefreshTimer = window.setInterval(refreshGroupAdProfiles, 30_000)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('beforeunload', beforeWindowUnload)
-  if (groupProfilesRefreshTimer !== null) {
-    window.clearInterval(groupProfilesRefreshTimer)
-    groupProfilesRefreshTimer = null
-  }
 })
 </script>
 
@@ -953,15 +825,16 @@ onBeforeUnmount(() => {
   <div class="growth-dashboard" v-loading="loading">
     <div class="page-toolbar">
       <div>
-        <h2>增长驾驶舱</h2>
-        <div class="toolbar-meta">
+        <h2>{{ isConfigView ? '配置中心' : '增长驾驶舱' }}</h2>
+        <div v-if="!isConfigView" class="toolbar-meta">
           账号 {{ metrics.total }} 个 · 加群 {{ metrics.activeJoin }} 个 · 广告 {{ metrics.activeAds }} 个 · 风控 {{ metrics.paused }} 个
         </div>
+        <div v-else class="toolbar-meta">入群、暖号、账号资产、风控、广告与群 AI 策略</div>
       </div>
       <el-button :icon="Refresh" :loading="loading" @click="refreshAll">刷新</el-button>
     </div>
 
-    <div class="metric-grid">
+    <div v-if="!isConfigView" class="metric-grid">
       <div class="metric-cell">
         <span>可投放群</span>
         <strong>{{ metrics.eligibleGroups }}</strong>
@@ -980,7 +853,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <section class="panel">
+    <section v-if="!isConfigView" class="panel">
       <div class="panel-header">
         <h3>流程总览</h3>
       </div>
@@ -1000,7 +873,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel">
+    <section v-if="!isConfigView" class="panel">
       <div class="panel-header">
         <div>
           <h3>最终生效上限</h3>
@@ -1050,186 +923,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <section class="panel">
-      <div class="panel-header">
-        <h3>账号运营态</h3>
-        <el-tag type="info" effect="plain">{{ dynamicStatuses.length }} 个账号</el-tag>
-      </div>
-      <el-table :data="dynamicStatuses" height="360" size="small" border>
-        <el-table-column label="账号" min-width="150">
-          <template #default="{ row }">
-            <div class="account-cell">
-              <span>{{ accountLabel(row) }}</span>
-              <small>#{{ row.account_id }}</small>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="开关" width="130">
-          <template #default="{ row }">
-            <el-tag :type="row.auto_join_enabled ? 'success' : 'info'" size="small">加群</el-tag>
-            <el-tag :type="row.auto_ads_enabled ? 'success' : 'info'" size="small">广告</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="风控" min-width="130">
-          <template #default="{ row }">
-            <el-tag :type="riskTagType(row.risk_level)" size="small">{{ row.risk_level }}</el-tag>
-            <span class="inline-score">{{ row.risk_score }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="健康诊断" min-width="210" show-overflow-tooltip>
-          <template #default="{ row }">
-            <el-tag :type="dynamicHealthTagType(row)" size="small">{{ row.dynamic_health_diagnostic?.primary_label || '-' }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="暖号" min-width="150">
-          <template #default="{ row }">
-            <el-tag size="small" effect="plain">{{ row.warmup_stage }}</el-tag>
-            <span class="muted-text">{{ row.warmup_remaining_days }} 天</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="探针/发言" min-width="150">
-          <template #default="{ row }">
-            <div>{{ pct(row.probe_success_rate_24h) }} / {{ pct(row.writable_rate) }}</div>
-          </template>
-        </el-table-column>
-        <el-table-column prop="ad_eligible_groups" label="可投放群" width="100" />
-        <el-table-column label="实时广告额度（日 / 轮）" min-width="190">
-          <template #default="{ row }">
-            {{ row.dynamic_daily_limit }} / {{ row.dynamic_run_limit }}
-          </template>
-        </el-table-column>
-        <el-table-column label="投放阻塞" min-width="170">
-          <template #default="{ row }">
-            <el-tag :type="diagnosticTagType(row)" size="small">{{ diagnosticLabel(row) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="下一步" min-width="220" show-overflow-tooltip>
-          <template #default="{ row }">{{ nextActionText(row) }}</template>
-        </el-table-column>
-        <el-table-column label="群状态" min-width="240" show-overflow-tooltip>
-          <template #default="{ row }">{{ groupDiagnosticText(row) }}</template>
-        </el-table-column>
-        <el-table-column label="近期错误" min-width="220" show-overflow-tooltip>
-          <template #default="{ row }">{{ compactError(row) }}</template>
-        </el-table-column>
-      </el-table>
-    </section>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h3>群广告许可与档位</h3>
-        <el-tag type="info" effect="plain">
-          单群全局硬上限 {{ groupGlobalAdDailyLimit ?? '-' }}/天
-        </el-tag>
-      </div>
-      <el-table :data="groupAdProfiles" size="small" border height="360">
-        <el-table-column label="群" min-width="180" show-overflow-tooltip>
-          <template #default="{ row }">{{ row.group_title || row.telegram_group_id }}</template>
-        </el-table-column>
-        <el-table-column label="广告许可" min-width="180">
-          <template #default="{ row }">
-            <el-select v-model="row.ad_policy_mode" size="small">
-              <el-option v-for="item in adPolicyModeOptions" :key="item.value" :label="item.label" :value="item.value" />
-            </el-select>
-          </template>
-        </el-table-column>
-        <el-table-column label="档位" width="100">
-          <template #default="{ row }"><el-tag size="small">{{ row.ad_tier }}</el-tag></template>
-        </el-table-column>
-        <el-table-column prop="daily_capacity" label="日容量" width="90" />
-        <el-table-column label="24h样本" width="100">
-          <template #default="{ row }">{{ row.metrics?.completed_samples || 0 }}</template>
-        </el-table-column>
-        <el-table-column label="24h存活" width="100">
-          <template #default="{ row }">{{ pct(row.metrics?.survival_rate_24h || 0) }}</template>
-        </el-table-column>
-        <el-table-column label="转化" width="80">
-          <template #default="{ row }">{{ row.metrics?.conversions || 0 }}</template>
-        </el-table-column>
-        <el-table-column label="无删除" width="90">
-          <template #default="{ row }">{{ row.metrics?.clean_days || 0 }}天</template>
-        </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
-          <template #default="{ row }">
-            <el-button
-              :icon="Check"
-              type="primary"
-              size="small"
-              :loading="saving === `group-policy-${row.group_id}`"
-              @click="saveGroupAdPolicy(row)"
-            >保存</el-button>
-          </template>
-        </el-table-column>
-      </el-table>
-    </section>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h3>投放阻塞明细</h3>
-        <el-tag type="info" effect="plain">只读诊断</el-tag>
-      </div>
-      <div class="diagnostic-grid">
-        <div v-for="row in dynamicStatuses" :key="row.account_id" class="diagnostic-card">
-          <div class="diagnostic-card__head">
-            <div>
-              <strong>{{ accountLabel(row) }}</strong>
-              <small>#{{ row.account_id }}</small>
-            </div>
-            <el-tag :type="diagnosticTagType(row)" size="small">{{ diagnosticLabel(row) }}</el-tag>
-          </div>
-          <div class="diagnostic-next">{{ nextActionText(row) }}</div>
-          <div class="diagnostic-next">健康：{{ dynamicHealthText(row) }}</div>
-          <div class="diagnostic-counts">{{ groupDiagnosticText(row) }}</div>
-          <div class="diagnostic-tags">
-            <el-tag
-              v-for="item in row.dynamic_health_diagnostic?.negative_adjustments || []"
-              :key="item.reason"
-              :type="severityTagType(item.severity)"
-              size="small"
-              effect="plain"
-            >
-              {{ item.label }} {{ item.delta }}
-            </el-tag>
-          </div>
-          <div class="diagnostic-tags">
-            <el-tag
-              v-for="reason in row.delivery_diagnostic?.block_reasons || []"
-              :key="reason.reason"
-              :type="severityTagType(reason.severity)"
-              size="small"
-              effect="plain"
-            >
-              {{ reason.label }}{{ reason.detail ? `：${reason.detail}` : '' }}
-            </el-tag>
-          </div>
-          <el-table
-            v-if="row.delivery_diagnostic?.blocked_group_samples?.length"
-            :data="row.delivery_diagnostic.blocked_group_samples"
-            size="small"
-            border
-            height="180"
-          >
-            <el-table-column label="群" min-width="150" show-overflow-tooltip>
-              <template #default="{ row: group }">{{ group.title || group.telegram_group_id }}</template>
-            </el-table-column>
-            <el-table-column label="原因" min-width="140">
-              <template #default="{ row: group }">
-                <el-tag :type="severityTagType(group.severity)" size="small">
-                  {{ group.label }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="状态" min-width="180" show-overflow-tooltip>
-              <template #default="{ row: group }">
-                {{ group.warmup_status }} / {{ group.probe_status }} / {{ group.ad_status }}
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel">
+    <section v-if="isConfigView" class="panel">
       <div class="panel-header">
         <h3>配置中心</h3>
         <div class="config-summary">
@@ -1943,59 +1637,6 @@ onBeforeUnmount(() => {
       </el-tabs>
     </section>
 
-    <section class="panel">
-      <div class="panel-header">
-        <h3>事件流水</h3>
-      </div>
-      <el-tabs v-model="activeEventTab">
-        <el-tab-pane label="入群" name="attempts">
-          <el-table :data="autoJoinAttempts" size="small" border height="260">
-            <el-table-column prop="id" label="ID" width="80" />
-            <el-table-column prop="account_id" label="账号" width="90" />
-            <el-table-column label="群" min-width="180" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.group_title || row.group_username || row.keyword || '-' }}</template>
-            </el-table-column>
-            <el-table-column label="状态" width="110">
-              <template #default="{ row }">
-                <el-tag :type="statusTagType(row.status)" size="small">{{ row.status || '-' }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
-            <el-table-column prop="attempted_at" label="时间" min-width="170" />
-          </el-table>
-        </el-tab-pane>
-        <el-tab-pane label="群检测" name="verification">
-          <el-table :data="verificationLogs" size="small" border height="260">
-            <el-table-column prop="account_id" label="账号" width="90" />
-            <el-table-column prop="group_title" label="群" min-width="180" show-overflow-tooltip />
-            <el-table-column label="动作" width="110">
-              <template #default="{ row }">{{ row.action }}</template>
-            </el-table-column>
-            <el-table-column label="结果" width="110">
-              <template #default="{ row }">
-                <el-tag :type="row.success ? 'success' : 'warning'" size="small">{{ row.success === false ? '失败' : '成功' }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="reason" label="原因" min-width="220" show-overflow-tooltip />
-            <el-table-column prop="updated_at" label="时间" min-width="170" />
-          </el-table>
-        </el-tab-pane>
-        <el-tab-pane label="广告" name="delivery">
-          <el-table :data="deliveryLogs" size="small" border height="260">
-            <el-table-column prop="account_id" label="账号" width="90" />
-            <el-table-column prop="group_title" label="群" min-width="180" show-overflow-tooltip />
-            <el-table-column label="状态" width="110">
-              <template #default="{ row }">
-                <el-tag :type="statusTagType(row.status)" size="small">{{ row.status || '-' }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column prop="survival_status" label="存活" width="110" />
-            <el-table-column prop="error" label="错误" min-width="220" show-overflow-tooltip />
-            <el-table-column prop="created_at" label="时间" min-width="170" />
-          </el-table>
-        </el-tab-pane>
-      </el-tabs>
-    </section>
   </div>
 </template>
 
