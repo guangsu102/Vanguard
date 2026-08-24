@@ -6518,11 +6518,7 @@ class AcquisitionAutomationService:
                     "ad_warmup_interaction_account_issue",
                 }:
                     return warmup_interaction_reason
-                if membership.warmup_status != "ad_eligible":
-                    membership.warmup_status = "ad_eligible"
-                    membership.updated_at = now
-                    await self.db.commit()
-                return None
+                return "ad_warmup_not_complete"
             mature_interaction_reason = await self._maybe_send_ad_interaction(
                 account_id,
                 membership,

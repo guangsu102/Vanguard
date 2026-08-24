@@ -1634,6 +1634,29 @@ class TestAdDeliveryFailureHandling:
         assert membership.ad_eligible_after == now + timedelta(hours=23)
 
     @pytest.mark.asyncio
+    async def test_account_warmup_deadline_blocks_ad_when_interactions_are_disabled(self, test_db):
+        now = datetime(2026, 8, 24, 4, 0)
+        membership = SimpleNamespace(
+            warmup_status="writable_verified",
+            probe_status="success",
+            note="",
+            interaction_started_at=now - timedelta(days=2),
+            joined_at=now - timedelta(days=2),
+            first_ad_allowed_at=now + timedelta(days=5),
+            ad_eligible_after=now - timedelta(days=1),
+            last_probe_at=now - timedelta(days=2),
+            updated_at=None,
+        )
+        service = AcquisitionAutomationService(test_db)
+        service._get_account_operation_config = AsyncMock(return_value=None)
+        service._maybe_send_ad_interaction = AsyncMock(return_value="ad_warmup_interaction_disabled")
+
+        reason = await service._ad_warmup_skip_reason(1, membership, now, dry_run=False)
+
+        assert reason == "ad_warmup_not_complete"
+        assert membership.warmup_status == "writable_verified"
+
+    @pytest.mark.asyncio
     async def test_ad_candidate_query_excludes_unknown_completed_and_approval_groups(self, test_db):
         now = datetime.utcnow()
         account = TelegramAccount(
