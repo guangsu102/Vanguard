@@ -1102,6 +1102,9 @@ async def test_stale_ad_policy_probe_keeps_group_lock_until_sending_state_is_com
         join_method="manual",
         probe_status="success",
         ad_status="active",
+        interaction_started_at=now - timedelta(days=10),
+        first_ad_allowed_at=now - timedelta(days=5),
+        ad_eligible_after=now - timedelta(days=1),
     )
     binding = AccountAdBinding(
         account_id=account.id,

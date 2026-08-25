@@ -3,7 +3,6 @@ import hashlib
 import os
 import re
 import qrcode
-from io import BytesIO
 from pathlib import Path
 from typing import Optional
 

@@ -10,9 +10,6 @@ Responsible for:
 - Health monitoring
 """
 
-import asyncio
-import hashlib
-import secrets
 from datetime import datetime
 from typing import Optional
 
@@ -24,7 +21,6 @@ from sqlalchemy.orm import selectinload
 from app.core.account.exceptions import (
     AccountAlreadyExistsError,
     AccountNotFoundError,
-    AccountSessionError,
     InvalidAPIConfigError,
 )
 from app.core.account.models import AccountAssetTier, AccountStatus, AccountType, ProxyMode, TelegramAccount, TelegramAPIConfig

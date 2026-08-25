@@ -5,7 +5,6 @@ Client for interacting with Decodo proxy API.
 Handles proxy extraction based on location (country/state/city).
 """
 
-import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -15,8 +14,6 @@ import httpx
 import structlog
 
 from app.core.account.exceptions import (
-    ProxyConnectionError,
-    ProxyNotFoundError,
     ProxyProviderError,
 )
 from app.core.config import get_settings
@@ -315,32 +312,6 @@ class DecodoClient:
         Returns:
             List of ProxyInfo objects for the specified country.
         """
-        # Map country codes to Decodo location names
-        country_map = {
-            "US": "United States",
-            "GB": "United Kingdom",
-            "DE": "Germany",
-            "FR": "France",
-            "ES": "Spain",
-            "IT": "Italy",
-            "NL": "Netherlands",
-            "CA": "Canada",
-            "AU": "Australia",
-            "JP": "Japan",
-            "KR": "South Korea",
-            "BR": "Brazil",
-            "MX": "Mexico",
-            "IN": "India",
-            "RU": "Russia",
-            "CN": "China",
-            "HK": "Hong Kong",
-            "SG": "Singapore",
-            "AE": "United Arab Emirates",
-            "SA": "Saudi Arabia",
-        }
-        
-        location = country_map.get(country_code.upper(), country_code)
-        
         return await self.get_proxies(
             country=country_code.lower() if len(country_code) == 2 else None,
             session_type=SessionType.STICKY,

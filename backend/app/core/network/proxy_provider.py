@@ -10,7 +10,6 @@ Supported providers:
 """
 
 import asyncio
-import re
 from dataclasses import dataclass
 from typing import Optional
 

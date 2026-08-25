@@ -5,7 +5,6 @@ Run with: python -m app.modules.guardian
 """
 
 import asyncio
-import sys
 
 
 async def main():

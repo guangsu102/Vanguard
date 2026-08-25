@@ -6,7 +6,7 @@ Schedule management for automatic group messaging.
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 import structlog

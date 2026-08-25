@@ -15,7 +15,6 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.pool import AccountPool
-from app.modules.guardian.models import ViolationAction
 
 logger = structlog.get_logger()
 

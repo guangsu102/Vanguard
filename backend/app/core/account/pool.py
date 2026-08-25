@@ -29,7 +29,7 @@ from app.core.account.evomi import EvomiClient, ProxyInfo, get_evomi_client
 from app.core.account.models import AccountStatus, AccountType, ProxyMode
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
-from app.core.account.session_crypto import decrypt_session_string, encrypt_session_string
+from app.core.account.session_crypto import decrypt_session_string
 from app.core.account.environment_guard import AccountEnvironmentGuard
 from app.core.network.fingerprint import FingerprintManager
 

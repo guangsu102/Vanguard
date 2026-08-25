@@ -1,6 +1,5 @@
 """内容文案模板库"""
 import random
-from typing import Optional
 
 
 class ContentTemplates:

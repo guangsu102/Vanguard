@@ -7,21 +7,19 @@
 - 群组分級策略
 """
 import asyncio
-import re
 import random
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, List
 from dataclasses import dataclass
 
 from telethon import TelegramClient, events
-from telethon.tl.types import PeerChannel, User
 from loguru import logger
 
 from ..core.database import Database
 from ..core.cache import RedisClient
 from ..core.api import XBoardAPIClient
-from .keywords import KeywordManager, Keyword
-from .group_manager import GroupManager, GroupGrade, GroupStatus
+from .keywords import KeywordManager
+from .group_manager import GroupManager, GroupGrade
 
 
 @dataclass
@@ -325,7 +323,6 @@ class LeadGenHandler:
     async def handle_user_joined(self, event):
         """处理用户加入"""
         chat_id = event.chat_id
-        user_id = event.action_message.sender_id
 
         # 获取我的账号
         me = await self.client.get_me()

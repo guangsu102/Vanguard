@@ -5,7 +5,7 @@ code. The active Vanguard mainline uses backend/app/integrations/xboard/client.p
 with HMAC signed /api/v1/... requests.
 """
 import httpx
-from typing import Optional, Any
+from typing import Optional
 from loguru import logger
 
 

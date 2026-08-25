@@ -15,7 +15,7 @@ Features:
 import asyncio
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -25,7 +25,6 @@ from sqlalchemy import select, delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import Proxy, ProxyType, TelegramAccount
-from app.core.exceptions import ProxyNotFoundError
 from app.core.network.ssrf_guard import get_safe_health_check_url, validate_url
 
 logger = structlog.get_logger()

@@ -3,8 +3,7 @@ Unit Tests for Guardian Rule Engine
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
+from unittest.mock import AsyncMock
 
 from app.modules.guardian.moderation.rule_engine import (
     GuardianRuleEngine,
@@ -12,7 +11,6 @@ from app.modules.guardian.moderation.rule_engine import (
     EvaluationResult,
 )
 from app.modules.guardian.models import (
-    ModerationRule,
     RuleType,
     ViolationLevel,
     ViolationAction,

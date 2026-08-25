@@ -8,7 +8,6 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AccountLoginDialog: typeof import('./components/AccountLoginDialog.vue')['default']
-    ConfirmDialog: typeof import('./components/ConfirmDialog.vue')['default']
     ECharts: typeof import('./components/ECharts.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElAvatar: typeof import('element-plus/es')['ElAvatar']

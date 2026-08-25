@@ -14,7 +14,7 @@ from typing import Optional
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.acquisition.models import ConversationContext as DBConversationContext, GuideFlow, GuideState
+from app.modules.acquisition.models import ConversationContext as DBConversationContext
 
 logger = structlog.get_logger()
 

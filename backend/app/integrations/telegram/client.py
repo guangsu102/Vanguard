@@ -8,9 +8,7 @@ Supports both Bot Token and User Session authentication.
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from enum import Enum
-from functools import wraps
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import httpx

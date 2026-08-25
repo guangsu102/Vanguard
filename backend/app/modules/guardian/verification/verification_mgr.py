@@ -9,10 +9,9 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
-import json
 
 import structlog
-from sqlalchemy import select, and_, delete
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.guardian.config import get_guardian_config

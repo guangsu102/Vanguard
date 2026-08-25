@@ -13,7 +13,6 @@ Scoring dimensions:
 All thresholds are configurable via GroupLevelConfig.
 """
 
-from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from app.core.group.models import Group, GroupLevel

@@ -7,9 +7,7 @@
 - 弃单自动挽回
 - 一键裂变海报生成
 """
-import asyncio
 import random
-from datetime import datetime
 from typing import Dict
 
 from telethon import TelegramClient, events
@@ -78,7 +76,6 @@ class ServiceHandler:
         user_id = event.sender_id
         chat = await event.get_chat()
         first_name = getattr(chat, 'first_name', "") or "用户"
-        username = getattr(chat, 'username', "") or ""
 
         checkin_config = self.config["service"]["checkin"]
 
@@ -386,7 +383,7 @@ class ServiceBot:
                 message_text = self.content.get_checkin_success(name=first_name, bonus_mb=bonus_mb, is_special=is_special)
                 await message.answer(message_text)
 
-        except Exception as e:
+        except Exception:
             await message.answer("系统繁忙，请稍后再试。")
 
     async def process_abandoned_orders(self):

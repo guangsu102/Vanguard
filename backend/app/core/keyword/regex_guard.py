@@ -47,17 +47,13 @@ def _count_quantifier_depth(pattern: str) -> int:
     """Count nested quantifier depth as a proxy for risk."""
     depth = 0
     max_depth = 0
-    in_group = False
     for i, ch in enumerate(pattern):
         if ch == '(':
-            in_group = True
             depth += 1
         elif ch == ')':
             depth -= 1
             if depth < 0:
                 depth = 0
-            if depth == 0:
-                in_group = False
         # Check if next char is a quantifier applied to a group
         if depth > 0 and i + 1 < len(pattern):
             next_ch = pattern[i + 1]

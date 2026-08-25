@@ -95,7 +95,6 @@ class BotAPIClient:
             httpx.HTTPStatusError: On HTTP error status
         """
         client = await self._get_client()
-        url = f"{self.base_url}{path}"
 
         last_error = None
         for attempt in range(self.max_retries):

@@ -1,16 +1,16 @@
 """PostgreSQL 数据库连接与模型"""
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator
 from uuid import uuid4
 
 from sqlalchemy import (
     Column, String, Integer, BigInteger, Boolean, DateTime,
-    Text, Enum as SQLEnum, Index, create_engine
+    Text, Enum as SQLEnum, Index
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import UUID
 from loguru import logger
 import enum
 

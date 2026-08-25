@@ -10,8 +10,6 @@ Handlers:
 - CallbackHandler: Handles callback queries
 """
 
-import asyncio
-from abc import ABC
 from typing import Optional
 
 import structlog

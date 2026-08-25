@@ -172,7 +172,6 @@ class TaskScheduler:
 
         Supports: second, minute, hour, day_of_week
         """
-        from calendar import monthrange
 
         now = datetime.utcnow()
         next_run = now.replace(microsecond=0)

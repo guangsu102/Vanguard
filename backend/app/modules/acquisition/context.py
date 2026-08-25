@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.acquisition.models import ConversationContext as DBConversationContext

@@ -12,9 +12,8 @@ Features:
 
 import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Optional
 
 import structlog
 

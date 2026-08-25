@@ -6,7 +6,6 @@
 - 竞品与广告清洗
 - 节点状态播报
 """
-import asyncio
 import re
 from datetime import datetime
 from typing import Dict, Optional
@@ -78,7 +77,6 @@ class GroupOpsHandler:
         chat_id = event.chat_id
         chat = await event.get_chat()
         first_name = getattr(chat, 'first_name', "") or ""
-        username = getattr(chat, 'username', "") or "未知用户"
 
         logger.info(f"[{self.account_name}] 检测到违规内容，用户 {user_id}: {keyword}")
 

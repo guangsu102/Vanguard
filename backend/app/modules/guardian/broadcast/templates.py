@@ -6,7 +6,7 @@ Message templates for broadcasting to groups.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 
 import structlog
 

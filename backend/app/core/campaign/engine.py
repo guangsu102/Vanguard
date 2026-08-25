@@ -14,11 +14,11 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.campaign.models import Campaign, CampaignTracking, CampaignTriggerTiming, CampaignType
-from app.core.user.models import User, UserState
+from app.core.user.models import User
 from app.core.exceptions import CampaignNotFoundError, ValidationError
 
 logger = structlog.get_logger()

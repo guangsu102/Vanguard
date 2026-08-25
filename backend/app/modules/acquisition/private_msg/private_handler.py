@@ -6,7 +6,7 @@ Handles private messages and user conversations.
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
@@ -29,7 +29,6 @@ from app.modules.acquisition.private_msg.welcome import WelcomeGenerator
 from app.modules.acquisition.private_msg.guide_flow import GuideFlowManager
 from app.modules.acquisition.tracking.tracker import Tracker
 from app.modules.acquisition.config import AcquisitionConfig
-from app.modules.acquisition.exceptions import MessageSendError
 
 logger = structlog.get_logger()
 

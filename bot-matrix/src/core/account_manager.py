@@ -1,12 +1,11 @@
 """Telegram 账号管理器 - 支持用户账号矩阵"""
 import asyncio
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from itertools import cycle
 
 from telethon import TelegramClient
-from telethon.sessions import StringSession
 from loguru import logger
 
 

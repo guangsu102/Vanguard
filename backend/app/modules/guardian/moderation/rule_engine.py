@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, and_
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.guardian.models import (

@@ -2697,8 +2697,6 @@ class AcquisitionAutomationService:
             raise RuntimeError("account unavailable")
         try:
             await self.telegram_execution.join_group(account, group, source="auto_join")
-        except Exception as exc:
-            raise
         finally:
             await self.account_pool.release(account)
 
@@ -6469,7 +6467,7 @@ class AcquisitionAutomationService:
         success = self._membership_latest_event(membership.note, {"ad_probe_success"})
         if membership.warmup_status == "blocked" or membership.probe_status == "failed":
             return "ad_only_group_blocked" if is_ad_only else "ad_probe_blocked"
-        if is_ad_only:
+        if is_ad_only and membership.probe_status != "success" and not success:
             return None
         if membership.probe_status == "success" or success:
             capacity = await get_ad_capacity_settings(self.db)
@@ -8014,7 +8012,7 @@ class AcquisitionAutomationService:
             )
             account.record_message(success=result is not None)
             return result
-        except Exception as exc:
+        except Exception:
             account.record_message(success=False)
             raise
         finally:

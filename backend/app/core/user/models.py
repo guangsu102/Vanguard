@@ -12,7 +12,6 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     Enum as SQLEnum,
-    ForeignKey,
     Index,
     Integer,
     String,

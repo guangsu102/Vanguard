@@ -1261,7 +1261,6 @@ async def update_group_ad_policy(
 async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
     now = datetime.utcnow()
     service = AcquisitionAutomationService(db)
-    execution = await get_ad_delivery_execution_settings(db)
     warmup_policy = await get_account_warmup_policy_settings(db)
     campaign = (
         await db.execute(

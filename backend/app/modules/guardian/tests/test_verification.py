@@ -3,7 +3,7 @@ Unit Tests for Verification Manager
 """
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 from datetime import datetime, timedelta
 
 from app.modules.guardian.verification.verification_mgr import (
@@ -12,10 +12,6 @@ from app.modules.guardian.verification.verification_mgr import (
     VerifyResult,
 )
 from app.modules.guardian.verification.captcha_gen import CaptchaGenerator, Captcha
-from app.modules.guardian.models import (
-    VerificationType,
-    VerificationState,
-)
 
 
 class TestVerificationManager:

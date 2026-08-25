@@ -8,7 +8,6 @@ Provides utilities for Telegram account login flow:
 - Session management
 """
 
-import asyncio
 import os
 from dataclasses import dataclass
 from pathlib import Path

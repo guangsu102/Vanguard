@@ -20,7 +20,7 @@ from app.modules.acquisition.tracking.url_builder import URLBuilder
 from app.modules.acquisition.tracking.attribution import AttributionAnalyzer
 from app.modules.acquisition.models import AcquisitionTracking
 from app.modules.acquisition.config import AcquisitionConfig
-from app.modules.acquisition.exceptions import InvalidTrackingCodeError, TrackingCodeExpiredError
+from app.modules.acquisition.exceptions import TrackingCodeExpiredError
 
 logger = structlog.get_logger()
 

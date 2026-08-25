@@ -7,11 +7,10 @@ RESTful API for acquisition tracking, messages, triggers, and guide flows.
 import re
 from datetime import datetime
 from typing import Optional
-import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc, and_
+from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -29,7 +28,6 @@ from app.modules.acquisition.models import (
     TriggerType,
     GuideFlow,
     GuideState,
-    ConversationContext,
     MessageTemplate,
     MessageType,
 )

@@ -11,7 +11,7 @@ import io
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from enum import Enum
 
 import structlog

@@ -14,7 +14,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.acquisition.models import MessageTemplate, MessageType
-from app.modules.acquisition.exceptions import TemplateNotFoundError
 
 logger = structlog.get_logger()
 

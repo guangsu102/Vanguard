@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
-from sqlalchemy import select, and_, func
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.guardian.config import get_guardian_config
@@ -18,7 +18,6 @@ from app.modules.guardian.models import (
     Violation,
     ViolationAction,
     ViolationLevel,
-    ModerationRule,
 )
 from app.core.user.models import User
 
