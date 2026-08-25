@@ -25,6 +25,7 @@ from uuid import uuid4
 
 import structlog
 from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -48,14 +49,9 @@ from app.core.ai.keyword_generator import (
 )
 from app.core.ai.llm_client import LLMClient, LLMProvider
 from app.core.automation_constants import (
-    AD_ACCOUNT_GROUP_DAILY_CAP,
-    AD_DELIVERY_BATCH_SIZE,
-    AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN,
-    AD_MAX_DELIVERIES_PER_RUN,
     AD_MIN_WARMUP_DAYS,
 )
 from app.core.automation_settings import (
-    get_account_asset_policy_settings,
     get_account_warmup_policy_settings,
     get_ad_capacity_settings,
     get_ad_delivery_execution_settings,
@@ -69,10 +65,7 @@ from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupAccountMembership
 from app.core.operating_time import operating_day_start
 from app.core.keyword.models import KeywordType
-from app.core.runtime_settings import (
-    DEFAULT_AD_CAPACITY_SETTINGS,
-    DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
-)
+from app.core.runtime_settings import DEFAULT_AD_CAPACITY_SETTINGS
 from app.modules.acquisition.auto_reply.speaker import Speaker
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.config import AcquisitionConfig
@@ -85,6 +78,9 @@ from app.modules.acquisition.models import (
     AdCreative,
     AdCreativeType,
     AdDeliveryLog,
+    AdDeliveryPolicy,
+    AdDeliveryScheduleState,
+    AdScheduleStatus,
     AdSendMode,
     AdSurvivalStatus,
     AutoJoinAttempt,
@@ -132,7 +128,6 @@ AD_GROUP_CONTROL_ACCOUNT_SUSPECT_WINDOW_MINUTES = 60
 AD_GROUP_CONTROL_ACCOUNT_SUSPECT_GROUPS = 5
 AD_ACCOUNT_SUSPECT_PAUSE_SECONDS = 2 * 60 * 60
 GROUP_STATUS_AD_BLOCKED = "ad_blocked"
-AD_GROUP_ABSOLUTE_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
 MEMBERSHIP_AD_STATUS_WARMING = "warming"
 MEMBERSHIP_AD_STATUS_ACTIVE = "active"
 MEMBERSHIP_AD_STATUS_BLOCKED = "blocked"
@@ -1508,7 +1503,11 @@ class AcquisitionAutomationService:
             join_error_status = (
                 DeliveryStatus.PENDING
                 if join_error_reason == "join_request_pending"
-                else DeliveryStatus.FAILED
+                else (
+                    DeliveryStatus.SKIPPED
+                    if join_error_reason.startswith("risk_guard_blocked:")
+                    else DeliveryStatus.FAILED
+                )
             )
             await self._record_join_attempt(
                 account.id,
@@ -1547,6 +1546,20 @@ class AcquisitionAutomationService:
                         "keyword": source_keyword,
                         "action": "join_request_pending",
                         "error": str(exc),
+                    }
+                )
+                return result
+
+            if join_error_status == DeliveryStatus.SKIPPED:
+                result.skipped += 1
+                result.details.append(
+                    {
+                        "account_id": account.id,
+                        "group_id": db_group.id,
+                        "telegram_group_id": group.group_id,
+                        "keyword": source_keyword,
+                        "action": "skip",
+                        "reason": join_error_reason,
                     }
                 )
                 return result
@@ -2702,6 +2715,9 @@ class AcquisitionAutomationService:
 
     def _classify_join_error(self, exc: Exception) -> str:
         text = f"{exc.__class__.__name__}: {exc}".lower()
+        risk_guard_match = re.search(r"risk_guard_blocked:[a-z0-9_:-]+", text)
+        if risk_guard_match:
+            return risk_guard_match.group(0)
         if "peer_flood" in text or "peer flood" in text or "peerflood" in text:
             return "peer_flood"
         if "user_restricted" in text or "userrestricted" in text or "account_restricted" in text:
@@ -4604,7 +4620,7 @@ class AcquisitionAutomationService:
                 warmup_status="joined_pending_test" if status == "joined" else "blocked",
                 probe_status="not_started" if status == "joined" else "skipped",
                 ad_status=MEMBERSHIP_AD_STATUS_WARMING if status == "joined" else MEMBERSHIP_AD_STATUS_BLOCKED,
-                account_group_daily_cap=AD_ACCOUNT_GROUP_DAILY_CAP,
+
                 interaction_started_at=now if status == "joined" else None,
                 first_ad_allowed_at=first_ad_allowed_at,
                 note=note,
@@ -4796,14 +4812,18 @@ class AcquisitionAutomationService:
     # ------------------------------------------------------------------
 
     async def run_ad_delivery(self, *, max_deliveries: int = 20, dry_run: bool = False) -> dict[str, Any]:
-        """Run one advertisement delivery pass."""
+        """Run one advertisement delivery dispatcher page."""
         result = AutomationRunResult()
         execution = await get_ad_delivery_execution_settings(self.db)
         if not execution["enabled"]:
             result.details.append({"action": "skip", "reason": "ad_delivery_execution_disabled"})
             return result.as_dict()
-        max_deliveries = AD_MAX_DELIVERIES_PER_RUN
-        max_per_account = AD_MAX_DELIVERIES_PER_ACCOUNT_PER_RUN
+
+        page_size = max(1, int(execution["dispatcher_batch_size"]))
+        max_deliveries = min(max(0, int(max_deliveries)), page_size)
+        if max_deliveries <= 0:
+            return result.as_dict()
+
         bindings = await self._list_enabled_ad_bindings()
         if not bindings:
             return result.as_dict()
@@ -4816,61 +4836,103 @@ class AcquisitionAutomationService:
         for binding in bindings:
             binding_ids_by_account.setdefault(binding.account_id, []).append(binding.id)
 
-        delivery_budget = {"remaining": max(0, int(max_deliveries))}
+        delivery_budget = {"remaining": max_deliveries}
         delivery_budget_lock = asyncio.Lock()
         reserved_ad_targets: set[int] = set()
         ad_target_lock = asyncio.Lock()
 
+        async def run_account_worker(
+            service: "AcquisitionAutomationService",
+            account_id: int,
+        ) -> AutomationRunResult:
+            lock_token: Optional[str] = None
+            if not dry_run:
+                try:
+                    lock_token = await service._claim_ad_account_worker_lock(
+                        account_id,
+                        lease_seconds=int(execution["job_lease_seconds"]),
+                    )
+                except Exception as exc:
+                    service.logger.warning(
+                        "ad_delivery_account_lock_unavailable",
+                        account_id=account_id,
+                        error=str(exc),
+                    )
+                    skipped = AutomationRunResult(skipped=1)
+                    skipped.details.append(
+                        {
+                            "account_id": account_id,
+                            "action": "skip",
+                            "reason": "account_worker_lock_unavailable",
+                        }
+                    )
+                    return skipped
+                if lock_token is None:
+                    skipped = AutomationRunResult(skipped=1)
+                    skipped.details.append(
+                        {
+                            "account_id": account_id,
+                            "action": "skip",
+                            "reason": "account_delivery_inflight",
+                        }
+                    )
+                    return skipped
+            try:
+                return await service._run_ad_delivery_for_account(
+                    account_id,
+                    binding_ids=binding_ids_by_account.get(account_id, []),
+                    dry_run=dry_run,
+                    delivery_budget=delivery_budget,
+                    delivery_budget_lock=delivery_budget_lock,
+                    reserved_ad_targets=reserved_ad_targets,
+                    ad_target_lock=ad_target_lock,
+                    max_deliveries_per_account=page_size,
+                    stop_after_success=False,
+                    stop_after_failure=False,
+                )
+            finally:
+                if lock_token is not None:
+                    try:
+                        await service._release_ad_account_worker_lock(
+                            account_id,
+                            lock_token,
+                        )
+                    except Exception as exc:
+                        service.logger.warning(
+                            "ad_delivery_account_lock_release_failed",
+                            account_id=account_id,
+                            error=str(exc),
+                        )
+
         if len(account_ids) == 1:
-            account_id = account_ids[0]
-            account_result = await self._run_ad_delivery_for_account(
-                account_id,
-                binding_ids=binding_ids_by_account.get(account_id, []),
-                dry_run=dry_run,
-                delivery_budget=delivery_budget,
-                delivery_budget_lock=delivery_budget_lock,
-                reserved_ad_targets=reserved_ad_targets,
-                ad_target_lock=ad_target_lock,
-                max_deliveries_per_account=max_per_account,
-                stop_after_success=execution["stop_account_after_success"],
-                stop_after_failure=execution["stop_account_after_failure"],
-            )
+            account_result = await run_account_worker(self, account_ids[0])
             result.merge(account_result)
             return result.as_dict()
 
         from app.core import database as db_module
 
-        semaphore = asyncio.Semaphore(min(len(account_ids), ACCOUNT_PARALLELISM_LIMIT))
+        parallelism = min(len(account_ids), max(1, int(execution["max_parallel_accounts"])))
+        semaphore = asyncio.Semaphore(parallelism)
 
         async def run_one(account_id: int) -> dict[str, Any]:
             try:
                 async with semaphore:
                     async with db_module.get_db_session() as db:
                         service = AcquisitionAutomationService(db)
-                        account_result = await service._run_ad_delivery_for_account(
-                            account_id,
-                            binding_ids=binding_ids_by_account.get(account_id, []),
-                            dry_run=dry_run,
-                            delivery_budget=delivery_budget,
-                            delivery_budget_lock=delivery_budget_lock,
-                            reserved_ad_targets=reserved_ad_targets,
-                            ad_target_lock=ad_target_lock,
-                            max_deliveries_per_account=max_per_account,
-                            stop_after_success=execution["stop_account_after_success"],
-                            stop_after_failure=execution["stop_account_after_failure"],
-                        )
+                        account_result = await run_account_worker(service, account_id)
                         return account_result.as_dict()
             except Exception as exc:
                 self.logger.error("ad_delivery_account_worker_failed", account_id=account_id, error=str(exc))
                 failed = AutomationRunResult(failed=1)
                 failed.errors.append(f"ad delivery worker failed account={account_id}: {exc}")
-                failed.details.append({"account_id": account_id, "action": "account_worker_failed", "error": str(exc)})
+                failed.details.append(
+                    {"account_id": account_id, "action": "account_worker_failed", "error": str(exc)}
+                )
                 return failed.as_dict()
 
         account_results = await asyncio.gather(*(run_one(account_id) for account_id in account_ids))
         for account_result in account_results:
             result.merge(account_result)
-
         return result.as_dict()
 
     async def _run_ad_delivery_for_account(
@@ -4887,13 +4949,27 @@ class AcquisitionAutomationService:
         stop_after_success: bool,
         stop_after_failure: bool,
     ) -> AutomationRunResult:
+        """Process one account serially; dispatcher pages are not business quotas."""
+        del max_deliveries_per_account, stop_after_success, stop_after_failure
         result = AutomationRunResult()
         bindings = await self._list_enabled_ad_bindings_for_account(account_id, binding_ids)
         if not bindings:
             return result
 
-        dynamic_run_limit = await self._ad_dynamic_run_limit(account_id, max_deliveries_per_account, _now())
-        allow_ad_delivery = dynamic_run_limit > 0
+        has_growth_binding = any(
+            str(
+                getattr(binding.campaign, "delivery_policy", None)
+                or AdDeliveryPolicy.GROWTH.value
+            )
+            == AdDeliveryPolicy.GROWTH.value
+            for binding in bindings
+        )
+        growth_health_allowed = (
+            await self._growth_ad_health_allowed(account_id, _now())
+            if has_growth_binding
+            else True
+        )
+        execution = await get_ad_delivery_execution_settings(self.db)
 
         for binding in bindings:
             campaign = binding.campaign
@@ -4901,8 +4977,11 @@ class AcquisitionAutomationService:
                 result.skipped += 1
                 continue
 
+            delivery_policy = str(
+                getattr(campaign, "delivery_policy", None) or AdDeliveryPolicy.GROWTH.value
+            )
             memberships = await self._list_joined_groups_for_account(binding.account_id)
-            if not allow_ad_delivery:
+            if delivery_policy == AdDeliveryPolicy.GROWTH.value and not growth_health_allowed:
                 pending_probe_memberships = [
                     membership
                     for membership in memberships
@@ -4919,13 +4998,16 @@ class AcquisitionAutomationService:
                         }
                     )
                 memberships = pending_probe_memberships
+
             for membership in memberships:
                 group = membership.group
                 if not group:
                     continue
                 result.processed += 1
 
-                skip_reason = await self._ad_skip_reason(binding, campaign, None, membership, dry_run=dry_run)
+                skip_reason = await self._ad_skip_reason(
+                    binding, campaign, None, membership, dry_run=dry_run
+                )
                 if skip_reason:
                     result.skipped += 1
                     result.details.append(
@@ -4938,7 +5020,10 @@ class AcquisitionAutomationService:
                         }
                     )
                     continue
-                creative = await self._choose_delivery_creative(binding, membership.telegram_group_id)
+
+                creative = await self._choose_delivery_creative(
+                    binding, membership.telegram_group_id
+                )
                 if creative is None:
                     result.skipped += 1
                     result.details.append(
@@ -4951,7 +5036,11 @@ class AcquisitionAutomationService:
                         }
                     )
                     continue
-                if not allow_ad_delivery:
+
+                if (
+                    delivery_policy == AdDeliveryPolicy.GROWTH.value
+                    and not growth_health_allowed
+                ):
                     result.skipped += 1
                     result.details.append(
                         {
@@ -4965,7 +5054,9 @@ class AcquisitionAutomationService:
                     continue
 
                 target_key = int(membership.telegram_group_id)
-                if not await self._reserve_ad_delivery_target(target_key, reserved_ad_targets, ad_target_lock):
+                if not await self._reserve_ad_delivery_target(
+                    target_key, reserved_ad_targets, ad_target_lock
+                ):
                     result.skipped += 1
                     result.details.append(
                         {
@@ -4992,11 +5083,13 @@ class AcquisitionAutomationService:
                     )
                     continue
 
-                group_slot_reserved, group_slot_reason, group_slot_key = await self._reserve_group_daily_delivery_slot(
-                    membership,
-                    _now(),
+                schedule_id, schedule_token, schedule_reason = await self._claim_ad_schedule_state(
+                    campaign=campaign,
+                    account_id=binding.account_id,
+                    membership=membership,
+                    lease_seconds=int(execution["job_lease_seconds"]),
                 )
-                if not group_slot_reserved:
+                if schedule_token is None:
                     result.skipped += 1
                     result.details.append(
                         {
@@ -5004,14 +5097,27 @@ class AcquisitionAutomationService:
                             "group_id": group.id,
                             "campaign_id": campaign.id,
                             "action": "skip",
-                            "reason": group_slot_reason,
+                            "reason": schedule_reason,
                         }
                     )
                     continue
 
-                if not await self._reserve_ad_delivery_budget(delivery_budget, delivery_budget_lock):
-                    await self._release_group_daily_delivery_slot(group_slot_key)
-                    result.details.append({"account_id": binding.account_id, "action": "delivery_budget_exhausted"})
+                if not await self._reserve_ad_delivery_budget(
+                    delivery_budget, delivery_budget_lock
+                ):
+                    await self._finish_ad_schedule_state(
+                        schedule_id,
+                        schedule_token,
+                        campaign=campaign,
+                        succeeded=False,
+                        reason="dispatcher_page_exhausted",
+                    )
+                    result.details.append(
+                        {
+                            "account_id": binding.account_id,
+                            "action": "dispatcher_page_exhausted",
+                        }
+                    )
                     return result
 
                 delivery_log: Optional[AdDeliveryLog] = None
@@ -5025,19 +5131,36 @@ class AcquisitionAutomationService:
                         DeliveryStatus.PENDING,
                         reservation_token=uuid4().hex,
                     )
-                    message_id = await self._send_ad(binding.account_id, membership.telegram_group_id, creative)
+                    message_id = await self._send_ad(
+                        binding.account_id,
+                        membership.telegram_group_id,
+                        creative,
+                        delivery_policy=delivery_policy,
+                    )
                     telegram_send_completed = True
+                    sent_at = _now()
                     await self._finalize_ad_delivery_log(
                         delivery_log,
                         DeliveryStatus.SUCCESS,
                         telegram_message_id=message_id,
-                        sent_at=_now(),
+                        sent_at=sent_at,
                         survival_required=True,
                     )
                     membership.warmup_status = "ad_delivered"
-                    membership.updated_at = _now()
+                    membership.updated_at = sent_at
                     await self.db.commit()
-                    await self._schedule_next_ad_delivery_after_success(binding.account_id)
+                    await self._schedule_next_ad_delivery_after_success(
+                        binding.account_id,
+                        delivery_policy=delivery_policy,
+                    )
+                    await self._finish_ad_schedule_state(
+                        schedule_id,
+                        schedule_token,
+                        campaign=campaign,
+                        succeeded=True,
+                        reason=None,
+                        completed_at=sent_at,
+                    )
                     result.succeeded += 1
                     result.details.append(
                         {
@@ -5046,19 +5169,25 @@ class AcquisitionAutomationService:
                             "campaign_id": campaign.id,
                             "creative_id": creative.id,
                             "message_id": message_id,
+                            "delivery_policy": delivery_policy,
                         }
                     )
-                    if stop_after_success or result.succeeded >= dynamic_run_limit:
-                        return result
                 except Exception as exc:
                     if not telegram_send_completed:
-                        await self._release_ad_delivery_budget(delivery_budget, delivery_budget_lock)
-                        await self._release_group_daily_delivery_slot(group_slot_key)
+                        await self._release_ad_delivery_budget(
+                            delivery_budget, delivery_budget_lock
+                        )
                     classified_error = self._classify_ad_delivery_error(exc)
+                    risk_guard_blocked = classified_error.startswith("risk_guard_blocked:")
+                    delivery_status = (
+                        DeliveryStatus.SKIPPED
+                        if risk_guard_blocked and not telegram_send_completed
+                        else DeliveryStatus.FAILED
+                    )
                     if delivery_log is not None and not telegram_send_completed:
                         await self._finalize_ad_delivery_log(
                             delivery_log,
-                            DeliveryStatus.FAILED,
+                            delivery_status,
                             error=classified_error,
                         )
                     elif delivery_log is None:
@@ -5067,7 +5196,7 @@ class AcquisitionAutomationService:
                             group,
                             campaign,
                             creative,
-                            DeliveryStatus.FAILED,
+                            delivery_status,
                             error=classified_error,
                         )
                     else:
@@ -5075,8 +5204,8 @@ class AcquisitionAutomationService:
                         await self.db.rollback()
                         result.failed += 1
                         result.errors.append(
-                            f"telegram send completed but delivery confirmation failed account={binding.account_id} "
-                            f"group={membership.telegram_group_id}: {exc}"
+                            "telegram send completed but delivery confirmation failed "
+                            f"account={binding.account_id} group={membership.telegram_group_id}: {exc}"
                         )
                         result.details.append(
                             {
@@ -5088,9 +5217,34 @@ class AcquisitionAutomationService:
                             }
                         )
                         return result
+
+                    await self._finish_ad_schedule_state(
+                        schedule_id,
+                        schedule_token,
+                        campaign=campaign,
+                        succeeded=False,
+                        reason=classified_error,
+                    )
+                    if risk_guard_blocked:
+                        result.skipped += 1
+                        result.details.append(
+                            {
+                                "account_id": binding.account_id,
+                                "group_id": group.id,
+                                "campaign_id": campaign.id,
+                                "creative_id": creative.id,
+                                "action": "stop_after_risk_guard",
+                                "reason": classified_error,
+                            }
+                        )
+                        return result
                     if self._is_group_control_ad_error(classified_error):
-                        await self._handle_group_control_ad_failure(binding.account_id, group, classified_error)
-                        await self._pause_account_if_group_control_looks_account_wide(binding.account_id)
+                        await self._handle_group_control_ad_failure(
+                            binding.account_id, group, classified_error
+                        )
+                        await self._pause_account_if_group_control_looks_account_wide(
+                            binding.account_id
+                        )
                     elif classified_error.startswith("account_issue:"):
                         await self._pause_ad_account(
                             binding.account_id,
@@ -5099,24 +5253,176 @@ class AcquisitionAutomationService:
                         )
                     result.failed += 1
                     result.errors.append(
-                        f"ad delivery failed account={binding.account_id} group={group.group_id}: {exc}"
+                        f"ad delivery failed account={binding.account_id} "
+                        f"group={group.group_id}: {exc}"
                     )
-                    if stop_after_failure and self._is_ad_delivery_stop_error(classified_error):
-                        result.details.append(
-                            {
-                                "account_id": binding.account_id,
-                                "group_id": group.id,
-                                "campaign_id": campaign.id,
-                                "creative_id": creative.id,
-                                "action": "stop_after_failure",
-                                "reason": classified_error,
-                            }
-                        )
-                        return result
                     continue
 
         return result
 
+    async def _claim_ad_schedule_state(
+        self,
+        *,
+        campaign: AdCampaign,
+        account_id: int,
+        membership: GroupAccountMembership,
+        lease_seconds: int,
+    ) -> tuple[Optional[int], Optional[str], Optional[str]]:
+        now = _now()
+        row = await self.db.execute(
+            select(AdDeliveryScheduleState)
+            .where(
+                AdDeliveryScheduleState.campaign_id == campaign.id,
+                AdDeliveryScheduleState.account_id == account_id,
+                AdDeliveryScheduleState.group_id == membership.group_id,
+            )
+            .with_for_update()
+        )
+        state = row.scalar_one_or_none()
+        if state is None:
+            state = AdDeliveryScheduleState(
+                campaign_id=campaign.id,
+                account_id=account_id,
+                group_id=membership.group_id,
+                telegram_group_id=membership.telegram_group_id,
+                next_due_at=now,
+                status=AdScheduleStatus.IDLE.value,
+            )
+            self.db.add(state)
+            try:
+                await self.db.flush()
+            except IntegrityError:
+                await self.db.rollback()
+                row = await self.db.execute(
+                    select(AdDeliveryScheduleState)
+                    .where(
+                        AdDeliveryScheduleState.campaign_id == campaign.id,
+                        AdDeliveryScheduleState.account_id == account_id,
+                        AdDeliveryScheduleState.group_id == membership.group_id,
+                    )
+                    .with_for_update()
+                )
+                state = row.scalar_one()
+
+        if (
+            state.status == AdScheduleStatus.SENDING.value
+            and state.lease_expires_at is not None
+            and state.lease_expires_at > now
+        ):
+            return state.id, None, "delivery_tuple_inflight"
+        if state.next_due_at > now:
+            return state.id, None, "delivery_schedule_not_due"
+
+        token = uuid4().hex
+        state.status = AdScheduleStatus.SENDING.value
+        state.lock_token = token
+        state.lease_expires_at = now + timedelta(seconds=max(30, lease_seconds))
+        state.last_attempt_at = now
+        state.attempt_count = int(state.attempt_count or 0) + 1
+        state.last_reason = None
+        state.updated_at = now
+        await self.db.commit()
+        return state.id, token, None
+
+    async def _finish_ad_schedule_state(
+        self,
+        state_id: Optional[int],
+        token: Optional[str],
+        *,
+        campaign: AdCampaign,
+        succeeded: bool,
+        reason: Optional[str],
+        completed_at: Optional[datetime] = None,
+    ) -> None:
+        if state_id is None or token is None:
+            return
+        row = await self.db.execute(
+            select(AdDeliveryScheduleState)
+            .where(
+                AdDeliveryScheduleState.id == state_id,
+                AdDeliveryScheduleState.lock_token == token,
+            )
+            .with_for_update()
+        )
+        state = row.scalar_one_or_none()
+        if state is None:
+            return
+
+        now = completed_at or _now()
+        if succeeded:
+            state.status = AdScheduleStatus.IDLE.value
+            state.last_success_at = now
+            state.next_due_at = await self._next_ad_schedule_due_at(campaign, now)
+            state.last_reason = None
+        else:
+            execution = await get_ad_delivery_execution_settings(self.db)
+            state.status = AdScheduleStatus.RETRY.value
+            state.next_due_at = now + timedelta(
+                seconds=max(30, int(execution["dispatcher_interval_seconds"]))
+            )
+            state.last_reason = (reason or "delivery_failed")[:255]
+        state.lock_token = None
+        state.lease_expires_at = None
+        state.updated_at = now
+        await self.db.commit()
+
+    async def _next_ad_schedule_due_at(
+        self,
+        campaign: AdCampaign,
+        now: datetime,
+    ) -> datetime:
+        delivery_policy = str(
+            getattr(campaign, "delivery_policy", None) or AdDeliveryPolicy.GROWTH.value
+        )
+        if delivery_policy == AdDeliveryPolicy.GROWTH.value:
+            execution = await get_ad_delivery_execution_settings(self.db)
+            return now + timedelta(
+                seconds=int(execution["growth_group_global_cooldown_seconds"])
+            )
+
+        if campaign.send_mode == AdSendMode.SCHEDULED.value:
+            capacity = await get_ad_capacity_settings(self.db)
+            next_slot = self._next_scheduled_slot(
+                campaign,
+                now,
+                timezone_offset_hours=int(capacity.get("timezone_offset_hours", 8)),
+            )
+            if next_slot is not None:
+                return next_slot
+
+        return now + timedelta(minutes=max(1, int(campaign.interval_minutes or 0)))
+
+    def _next_scheduled_slot(
+        self,
+        campaign: AdCampaign,
+        now: datetime,
+        *,
+        timezone_offset_hours: int,
+    ) -> Optional[datetime]:
+        offset = timedelta(hours=timezone_offset_hours)
+        local_now = now + offset
+        candidates: list[datetime] = []
+        for item in campaign.get_scheduled_times():
+            try:
+                hour, minute = item.split(":", 1)
+                hour_value = int(hour)
+                minute_value = int(minute)
+                if not 0 <= hour_value <= 23 or not 0 <= minute_value <= 59:
+                    continue
+            except (ValueError, AttributeError):
+                continue
+            for day_delta in (0, 1, 2):
+                candidate = (local_now + timedelta(days=day_delta)).replace(
+                    hour=hour_value,
+                    minute=minute_value,
+                    second=0,
+                    microsecond=0,
+                )
+                if candidate > local_now + timedelta(minutes=5):
+                    candidates.append(candidate)
+        if not candidates:
+            return None
+        return min(candidates) - offset
     async def _list_enabled_ad_bindings(self) -> list[AccountAdBinding]:
         rows = await self.db.execute(
             select(AccountAdBinding)
@@ -5201,60 +5507,6 @@ class AcquisitionAutomationService:
     ) -> None:
         async with delivery_budget_lock:
             delivery_budget["remaining"] = int(delivery_budget.get("remaining") or 0) + 1
-
-    async def _reserve_group_daily_delivery_slot(
-        self,
-        membership: GroupAccountMembership,
-        now: datetime,
-    ) -> tuple[bool, str, Optional[str]]:
-        group = membership.group
-        if group is None:
-            return False, "group_missing", None
-        capacity = await get_ad_capacity_settings(self.db)
-        profile = await self._get_or_create_group_ad_profile(group, capacity)
-        daily_cap = self._group_ad_daily_capacity(profile, capacity)
-        if daily_cap <= 0:
-            return False, "group_daily_budget_zero", None
-        day_start = self._ad_operating_day_start(now, capacity)
-        key = f"vanguard:ad_delivery:group:{membership.telegram_group_id}:{day_start.strftime('%Y%m%d')}"
-        ttl = max(60, int((day_start + timedelta(days=1) - now).total_seconds()) + 3600)
-        client = await self._new_ad_delivery_redis_client()
-        try:
-            if not await client.exists(key):
-                persisted_count = await self._count_successful_ads(
-                    since=day_start,
-                    telegram_group_id=membership.telegram_group_id,
-                )
-                await client.set(key, persisted_count, ex=ttl, nx=True)
-            reserved = int(await client.incr(key))
-            if reserved == 1:
-                await client.expire(key, ttl)
-            if reserved > daily_cap:
-                await client.decr(key)
-                return False, "group_global_daily_budget", None
-            return True, "reserved", key
-        except Exception as exc:
-            self.logger.error(
-                "group_daily_delivery_slot_reserve_failed",
-                group_id=membership.telegram_group_id,
-                error=str(exc),
-            )
-            return False, "group_daily_reservation_unavailable", None
-        finally:
-            await self._close_ad_delivery_redis_client(client)
-
-    async def _release_group_daily_delivery_slot(self, key: Optional[str]) -> None:
-        if not key:
-            return
-        client = await self._new_ad_delivery_redis_client()
-        try:
-            current = int(await client.get(key) or 0)
-            if current > 0:
-                await client.decr(key)
-        except Exception as exc:
-            self.logger.warning("group_daily_delivery_slot_release_failed", key=key, error=str(exc))
-        finally:
-            await self._close_ad_delivery_redis_client(client)
 
     def _campaign_is_active(self, campaign: AdCampaign) -> bool:
         now = _now()
@@ -6115,9 +6367,27 @@ class AcquisitionAutomationService:
             await self.db.commit()
             return "ad_probe_success_wait"
         except Exception as exc:
-            account.record_message(success=False)
             classified_error = self._classify_ad_delivery_error(exc)
             now = _now()
+            if classified_error.startswith("risk_guard_blocked:"):
+                membership.note = self._append_membership_note(
+                    membership.note,
+                    {
+                        "event": "ad_probe_skipped",
+                        "error": classified_error[:500],
+                        "probe": message,
+                    },
+                )
+                membership.warmup_status = "probe_scheduled"
+                membership.probe_status = "scheduled"
+                membership.probe_due_at = now + timedelta(minutes=30)
+                membership.last_probe_error = classified_error[:1000]
+                membership.last_checked_at = now
+                membership.updated_at = now
+                await self.db.commit()
+                return "ad_probe_risk_guard_skipped"
+
+            account.record_message(success=False)
             membership.note = self._append_membership_note(
                 membership.note,
                 {
@@ -6278,10 +6548,7 @@ class AcquisitionAutomationService:
         profile.ad_policy_source = probe_source
         profile.ad_policy_expires_at = now + timedelta(days=2)
         profile.ad_tier = GroupAdTier.TRIAL.value
-        profile.daily_capacity = min(
-            1,
-            int((capacity.get("tier_daily_capacities") or {}).get(GroupAdTier.TRIAL.value, 1) or 1),
-        )
+        profile.daily_capacity = 0
         profile.ad_policy_probe_status = "sending"
         profile.ad_policy_probe_at = now
         profile.ad_policy_probe_account_id = binding.account_id
@@ -6305,17 +6572,6 @@ class AcquisitionAutomationService:
         await self.db.commit()
 
         await self._sync_account_pool([membership.account])
-        slot_reserved, slot_reason, slot_key = await self._reserve_group_daily_delivery_slot(membership, now)
-        if not slot_reserved:
-            profile.ad_policy_mode = GroupAdPolicyMode.UNKNOWN.value
-            profile.ad_tier = GroupAdTier.OBSERVING.value
-            profile.daily_capacity = 0
-            profile.ad_policy_probe_status = "failed"
-            profile.ad_policy_probe_error = slot_reason[:1000]
-            profile.updated_at = now
-            await self.db.commit()
-            raise RuntimeError(slot_reason)
-
         message = random.choice(AD_POLICY_PROBE_MESSAGES)
         delivery_log: Optional[AdDeliveryLog] = None
         telegram_send_completed = False
@@ -6385,7 +6641,6 @@ class AcquisitionAutomationService:
             classified_error = self._classify_ad_delivery_error(exc)
             group_control_rejection = self._is_group_control_ad_error(classified_error)
             if not telegram_send_completed:
-                await self._release_group_daily_delivery_slot(slot_key)
                 if delivery_log is not None:
                     await self._finalize_ad_delivery_log(
                         delivery_log,
@@ -6444,6 +6699,16 @@ class AcquisitionAutomationService:
                 )
                 await self._pause_account_if_group_control_looks_account_wide(binding.account_id)
             raise RuntimeError(classified_error) from exc
+
+    @staticmethod
+    def _probe_block_event_is_active(
+        membership: GroupAccountMembership,
+        blocked_event: Optional[dict[str, Any]],
+    ) -> bool:
+        return bool(blocked_event) and membership.probe_status not in {
+            "not_started",
+            "scheduled",
+        }
 
     async def _ad_warmup_skip_reason(
         self,
@@ -6546,7 +6811,7 @@ class AcquisitionAutomationService:
                 membership.updated_at = now
                 await self.db.commit()
             return None
-        if blocked:
+        if self._probe_block_event_is_active(membership, blocked):
             return "ad_only_group_blocked" if is_ad_only else "ad_probe_blocked"
         if dry_run:
             return "ad_probe_required"
@@ -6561,14 +6826,8 @@ class AcquisitionAutomationService:
     async def _ad_dynamic_account_health(self, account_id: int, now: datetime) -> dict[str, Any]:
         return await self.dynamic_frequency.account_health(account_id, now)
 
-    async def _ad_dynamic_daily_limit(
-        self,
-        account_id: int,
-        op_config: Optional[AccountOperationConfig],
-        campaign: AdCampaign,
-        now: datetime,
-    ) -> int:
-        return await self.dynamic_frequency.ad_dynamic_daily_limit(account_id, op_config, campaign, now)
+    async def _growth_ad_health_allowed(self, account_id: int, now: datetime) -> bool:
+        return await self.dynamic_frequency.growth_ad_health_allowed(account_id, now)
 
     async def _ad_probe_budget_metrics(
         self,
@@ -6584,9 +6843,6 @@ class AcquisitionAutomationService:
             health_score=health_score,
             op_config=op_config,
         )
-
-    async def _ad_dynamic_run_limit(self, account_id: int, configured_run_limit: int, now: datetime) -> int:
-        return await self.dynamic_frequency.ad_dynamic_run_limit(account_id, configured_run_limit, now)
 
     def _ad_time_window_multiplier(self, now: datetime) -> float:
         return self.dynamic_frequency.ad_time_window_multiplier(now)
@@ -7012,7 +7268,6 @@ class AcquisitionAutomationService:
             return profile
         capacity = capacity or await get_ad_capacity_settings(self.db)
         tier = GroupAdTier.BLOCKED.value if group.status == GROUP_STATUS_AD_BLOCKED else GroupAdTier.OBSERVING.value
-        tier_caps = capacity.get("tier_daily_capacities") or {}
         profile = GroupAdProfile(
             group_id=group.id,
             telegram_group_id=group.group_id,
@@ -7022,7 +7277,7 @@ class AcquisitionAutomationService:
                 else GroupAdPolicyMode.UNKNOWN.value
             ),
             ad_tier=tier,
-            daily_capacity=int(tier_caps.get(tier, 0) or 0),
+            daily_capacity=0,
             blocked_at=_now() if tier == GroupAdTier.BLOCKED.value else None,
             blocked_reason="group_status_ad_blocked" if tier == GroupAdTier.BLOCKED.value else None,
         )
@@ -7089,7 +7344,7 @@ class AcquisitionAutomationService:
             evidence_hash if re.fullmatch(r"[0-9a-f]{64}", evidence_hash) else None
         )
         profile.tier_changed_at = now
-        profile.daily_capacity = int((capacity.get("tier_daily_capacities") or {}).get(profile.ad_tier, 0) or 0)
+        profile.daily_capacity = 0
         profile.updated_at = now
         if previous_mode != profile.ad_policy_mode or manual_active:
             self.db.add(
@@ -7106,44 +7361,6 @@ class AcquisitionAutomationService:
             )
         await self.db.commit()
         return profile
-
-    @staticmethod
-    def _premium_evidence_capacity(
-        completed_samples: int,
-        conversions: int,
-        capacity: dict[str, Any],
-        tier_cap: int,
-    ) -> int:
-        """Ramp Premium capacity using both survival samples and conversions."""
-        if tier_cap <= 0:
-            return 0
-
-        min_samples = max(1, int(capacity.get("premium_min_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_min_samples"]))
-        growth_samples = max(min_samples + 1, int(capacity.get("premium_growth_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_samples"]))
-        full_samples = max(growth_samples + 1, int(capacity.get("premium_full_capacity_samples") or DEFAULT_AD_CAPACITY_SETTINGS["premium_full_capacity_samples"]))
-
-        # These ceilings are safety boundaries even when runtime settings are too aggressive.
-        entry_capacity = min(tier_cap, DEFAULT_AD_CAPACITY_SETTINGS["premium_entry_capacity"], max(1, int(capacity.get("premium_entry_capacity") or DEFAULT_AD_CAPACITY_SETTINGS["premium_entry_capacity"])))
-        growth_capacity = min(
-            tier_cap,
-            DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_capacity"],
-            max(entry_capacity, int(capacity.get("premium_growth_capacity") or DEFAULT_AD_CAPACITY_SETTINGS["premium_growth_capacity"])),
-        )
-
-        if completed_samples <= min_samples:
-            sample_capacity = entry_capacity
-        elif completed_samples < growth_samples:
-            progress = (completed_samples - min_samples) / max(1, growth_samples - min_samples)
-            sample_capacity = round(entry_capacity + (growth_capacity - entry_capacity) * progress)
-        elif completed_samples < full_samples:
-            progress = (completed_samples - growth_samples) / max(1, full_samples - growth_samples)
-            sample_capacity = round(growth_capacity + (tier_cap - growth_capacity) * progress)
-        else:
-            sample_capacity = tier_cap
-
-        conversion_step = min(DEFAULT_AD_CAPACITY_SETTINGS["premium_conversion_capacity_step"], max(1, int(capacity.get("premium_conversion_capacity_step") or DEFAULT_AD_CAPACITY_SETTINGS["premium_conversion_capacity_step"])))
-        conversion_capacity = max(entry_capacity, max(0, conversions) * conversion_step)
-        return max(1, min(tier_cap, sample_capacity, conversion_capacity))
 
     async def _refresh_group_ad_profile_tier(
         self,
@@ -7274,97 +7491,13 @@ class AcquisitionAutomationService:
                 "trial_validated": trial_validated,
             }
 
-        tier_caps = capacity.get("tier_daily_capacities") or {}
-        hard_cap = max(
-            0,
-            min(
-                AD_GROUP_ABSOLUTE_DAILY_CAP,
-                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
-            ),
-        )
-        target_capacity = min(
-            hard_cap,
-            int(tier_caps.get(target_tier, 0) or 0),
-        )
-        if target_tier == GroupAdTier.PREMIUM.value:
-            completed_samples = int(metrics.get("completed_samples") or 0)
-            target_capacity = self._premium_evidence_capacity(
-                completed_samples,
-                int(metrics.get("conversions") or 0),
-                capacity,
-                target_capacity,
-            )
         if profile.ad_tier != target_tier:
             profile.ad_tier = target_tier
             profile.tier_changed_at = now
-        profile.daily_capacity = target_capacity
+        profile.daily_capacity = 0
         profile.updated_at = now
         await self.db.commit()
-        return {"ad_tier": target_tier, "daily_capacity": target_capacity, **metrics}
-
-    def _group_ad_daily_capacity(self, profile: GroupAdProfile, capacity: dict[str, Any]) -> int:
-        tier = str(profile.ad_tier or GroupAdTier.LOW.value)
-        tier_caps = capacity.get("tier_daily_capacities") or {}
-        tier_cap = int(tier_caps.get(tier, 0) or 0)
-        if tier == GroupAdTier.BLOCKED.value:
-            return 0
-        policy_mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
-        if policy_mode not in {
-            GroupAdPolicyMode.UNKNOWN_PROBE.value,
-            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-            GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
-        }:
-            return 0
-        confidence_floor = (
-            0
-            if policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
-            else 80
-            if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-            else 90
-        )
-        if int(profile.ad_policy_confidence or 0) < confidence_floor:
-            return 0
-        configured = int(profile.daily_capacity or tier_cap or 0)
-        hard_cap = max(
-            0,
-            min(
-                AD_GROUP_ABSOLUTE_DAILY_CAP,
-                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
-            ),
-        )
-        result = max(0, min(configured, tier_cap or configured, hard_cap))
-        if policy_mode in {
-            GroupAdPolicyMode.UNKNOWN_PROBE.value,
-            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-        }:
-            return min(result, 1)
-        return result
-
-    async def _account_group_ad_daily_capacity(
-        self,
-        account_id: int,
-        membership: GroupAccountMembership,
-        capacity: dict[str, Any],
-    ) -> int:
-        configured_cap = AD_ACCOUNT_GROUP_DAILY_CAP
-        membership_cap = int(membership.account_group_daily_cap or configured_cap)
-        base_cap = min(configured_cap, membership_cap)
-        if base_cap <= 0:
-            return 0
-        account = await self.db.get(TelegramAccount, account_id)
-        if account is None:
-            return base_cap
-        asset_policy = await get_account_asset_policy_settings(self.db)
-        multiplier = self.dynamic_frequency.account_asset_multiplier(
-            asset_policy,
-            account,
-            "ad_multiplier",
-            default=1.0,
-        )
-        if multiplier <= 0:
-            return 0
-        return max(1, int(round(base_cap * multiplier)))
+        return {"ad_tier": target_tier, **metrics}
 
     async def _count_successful_ads(
         self,
@@ -7399,89 +7532,6 @@ class AcquisitionAutomationService:
         )
         if int(rows.scalar() or 0) >= limit:
             return "new_ad_group_daily_quota"
-        return None
-
-    async def _ad_capacity_skip_reason(
-        self,
-        binding: AccountAdBinding,
-        membership: GroupAccountMembership,
-        *,
-        account_daily_limit: int,
-        account_sent_today: int,
-        now: datetime,
-        capacity: Optional[dict[str, Any]] = None,
-        profile: Optional[GroupAdProfile] = None,
-    ) -> Optional[str]:
-        group = membership.group
-        if group is None:
-            return "group_missing"
-        capacity = capacity or await get_ad_capacity_settings(self.db)
-        window_reason = self._ad_window_skip_reason(now, capacity)
-        if window_reason:
-            return window_reason
-
-        profile = profile or await self._get_or_create_group_ad_profile(group, capacity)
-        await self._refresh_group_ad_profile_tier(profile, group, now, capacity)
-        if profile.ad_policy_mode == GroupAdPolicyMode.FORBIDDEN.value:
-            return "group_ad_forbidden"
-        if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value:
-            return "group_ad_permission_unknown"
-        if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
-            return "group_ad_policy_probe_pending"
-        if profile.ad_policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
-            return "group_ad_approval_required"
-        confidence_floor = 80 if profile.ad_policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
-        if int(profile.ad_policy_confidence or 0) < confidence_floor:
-            return "group_ad_permission_low_confidence"
-        if profile.ad_policy_expires_at and profile.ad_policy_expires_at <= now:
-            return "group_ad_permission_expired"
-        if profile.paused_until and profile.paused_until > now:
-            return "group_ad_paused"
-        if membership.ad_pause_until and membership.ad_pause_until > now:
-            return "membership_ad_paused"
-        if profile.ad_tier == GroupAdTier.BLOCKED.value or group.status == GROUP_STATUS_AD_BLOCKED:
-            return "group_ad_blocked"
-        if getattr(membership, "ad_status", MEMBERSHIP_AD_STATUS_WARMING) == MEMBERSHIP_AD_STATUS_BLOCKED:
-            return "membership_ad_blocked"
-        if membership.probe_status == "success" and membership.ad_status != MEMBERSHIP_AD_STATUS_ACTIVE:
-            membership.ad_status = MEMBERSHIP_AD_STATUS_ACTIVE
-            membership.updated_at = now
-            await self.db.commit()
-
-        day_start = self._ad_operating_day_start(now, capacity)
-        account_hour_cap = self._ad_weighted_cumulative_cap(account_daily_limit, now, capacity)
-        if account_hour_cap <= 0:
-            return "account_hour_budget_zero"
-        if account_sent_today >= account_hour_cap:
-            return "account_hour_budget"
-
-        group_daily_cap = self._group_ad_daily_capacity(profile, capacity)
-        if group_daily_cap <= 0:
-            return "group_daily_budget_zero"
-        group_last_sent_row = await self.db.execute(
-            select(func.max(AdDeliveryLog.sent_at)).where(
-                AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
-                AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-            )
-        )
-        group_last_sent_at = group_last_sent_row.scalar()
-        group_min_interval = int(capacity.get("group_min_interval_seconds") or DEFAULT_AD_CAPACITY_SETTINGS["group_min_interval_seconds"])
-        if group_last_sent_at and now < group_last_sent_at + timedelta(seconds=group_min_interval):
-            return "group_ad_delivery_interval"
-        group_day_sent = await self._count_successful_ads(since=day_start, telegram_group_id=membership.telegram_group_id)
-        if group_day_sent >= group_daily_cap:
-            return "group_daily_budget"
-
-        account_group_cap = await self._account_group_ad_daily_capacity(binding.account_id, membership, capacity)
-        if account_group_cap <= 0:
-            return "account_group_daily_budget_zero"
-        account_group_day_sent = await self._count_successful_ads(
-            since=day_start,
-            account_id=binding.account_id,
-            telegram_group_id=membership.telegram_group_id,
-        )
-        if account_group_day_sent >= account_group_cap:
-            return "account_group_daily_budget"
         return None
 
     async def _pause_account_if_group_control_looks_account_wide(self, account_id: int) -> bool:
@@ -7523,25 +7573,42 @@ class AcquisitionAutomationService:
         group = membership.group
         if group is None:
             return "group_missing"
+
         op_config = await self._get_account_operation_config(binding.account_id)
-        operation_mode = (
+        operation_mode_raw = (
             getattr(op_config, "operation_mode", None) or AccountOperationMode.GROWTH.value
         )
-        assigned_account_id = getattr(group, "ad_delivery_account_id", None)
-        if assigned_account_id is not None:
-            if assigned_account_id != binding.account_id:
-                return "group_assigned_to_other_ad_account"
-            if operation_mode != AccountOperationMode.AD_ONLY.value:
-                return "group_assignment_requires_ad_only_mode"
+        operation_mode = str(getattr(operation_mode_raw, "value", operation_mode_raw))
+        policy_raw = (
+            getattr(campaign, "delivery_policy", None) or AdDeliveryPolicy.GROWTH.value
+        )
+        delivery_policy = str(getattr(policy_raw, "value", policy_raw))
+        if delivery_policy != operation_mode:
+            return "campaign_account_policy_mismatch"
 
+        assigned_account_id = getattr(group, "ad_delivery_account_id", None)
         target_group_ids = campaign.get_target_group_ids()
-        if operation_mode == AccountOperationMode.AD_ONLY.value:
+        if delivery_policy == AdDeliveryPolicy.AD_ONLY.value:
             if assigned_account_id != binding.account_id:
                 return "ad_only_group_not_assigned"
             if not target_group_ids:
                 return "ad_only_requires_explicit_groups"
             if membership.join_method != "manual_link_join":
                 return "ad_only_requires_manual_link_join"
+            if campaign.send_mode == AdSendMode.AFTER_JOIN.value:
+                return "ad_only_requires_frequency"
+        elif assigned_account_id is not None:
+            return "group_reserved_for_ad_only"
+
+        if target_group_ids:
+            if group.id not in target_group_ids:
+                return "group_not_targeted"
+        else:
+            levels = campaign.get_target_levels()
+            group_level = str(getattr(group.level, "value", group.level))
+            if group_level not in levels:
+                return "group_level_not_targeted"
+
         inflight_reason = await self._ad_recent_inflight_delivery_reason(
             binding.account_id,
             campaign.id,
@@ -7551,6 +7618,7 @@ class AcquisitionAutomationService:
             return inflight_reason
         if group.status != "active":
             return f"group_status_{group.status}"
+
         recent_failure_reason = await self._ad_recent_undeliverable_failure_reason(
             binding.account_id,
             campaign.id,
@@ -7559,152 +7627,145 @@ class AcquisitionAutomationService:
         if recent_failure_reason:
             return recent_failure_reason
 
-        if target_group_ids:
-            if group.id not in target_group_ids:
-                return "group_not_targeted"
-        else:
-            levels = campaign.get_target_levels()
-            if group.level.value not in levels:
-                return "group_level_not_targeted"
-
         now = _now()
         if op_config and (not op_config.enabled or not op_config.auto_ads_enabled):
             return "account_ads_disabled"
         if op_config and self._in_quiet_hours(op_config, now):
             return "account_quiet_hours"
-        account_risk_reason = await self._ad_account_risk_skip_reason(binding.account_id, now)
+
+        account_risk_reason = await self._ad_account_risk_skip_reason(
+            binding.account_id, now
+        )
         if account_risk_reason:
             return account_risk_reason
-
         if not await self._group_can_receive_ads(group):
             return "group_level_disallows_ads"
 
         capacity_settings = await get_ad_capacity_settings(self.db)
+        window_reason = self._ad_window_skip_reason(now, capacity_settings)
+        if window_reason:
+            return window_reason
+
         profile = await self._get_or_create_group_ad_profile(group, capacity_settings)
         if profile.ad_policy_mode == GroupAdPolicyMode.FORBIDDEN.value:
             return "group_ad_forbidden"
+        if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN.value:
+            return "group_ad_permission_unknown"
+        if profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value:
+            return "group_ad_policy_probe_pending"
         if profile.ad_policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value:
             return "group_ad_approval_required"
+        if profile.ad_policy_expires_at and profile.ad_policy_expires_at <= now:
+            return "group_ad_permission_expired"
+        if profile.paused_until and profile.paused_until > now:
+            return "group_ad_paused"
+        if membership.ad_pause_until and membership.ad_pause_until > now:
+            return "membership_ad_paused"
         if profile.ad_tier == GroupAdTier.BLOCKED.value or group.status == GROUP_STATUS_AD_BLOCKED:
             return "group_ad_blocked"
+        if getattr(membership, "ad_status", MEMBERSHIP_AD_STATUS_WARMING) == MEMBERSHIP_AD_STATUS_BLOCKED:
+            return "membership_ad_blocked"
 
-        warmup_reason = await self._ad_warmup_skip_reason(
-            binding.account_id,
-            membership,
-            now,
-            dry_run=dry_run,
-        )
-        if warmup_reason:
-            return warmup_reason
+        if delivery_policy == AdDeliveryPolicy.AD_ONLY.value:
+            if profile.ad_policy_mode not in {
+                GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+            }:
+                return "ad_only_group_permission_required"
+            if int(profile.ad_policy_confidence or 0) < 90:
+                return "group_ad_permission_low_confidence"
+        else:
+            warmup_reason = await self._ad_warmup_skip_reason(
+                binding.account_id,
+                membership,
+                now,
+                dry_run=dry_run,
+            )
+            if warmup_reason:
+                return warmup_reason
+            if profile.ad_policy_mode not in {
+                GroupAdPolicyMode.SOFT_AD_TRIAL.value,
+                GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+            }:
+                return "group_ad_permission_required"
+            confidence_floor = (
+                80
+                if profile.ad_policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
+                else 90
+            )
+            if int(profile.ad_policy_confidence or 0) < confidence_floor:
+                return "group_ad_permission_low_confidence"
 
         group_recent_sent = await self.db.execute(
             select(func.max(AdDeliveryLog.sent_at)).where(
                 AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
-                AdDeliveryLog.ad_campaign_id == campaign.id,
                 AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
             )
         )
         group_last_sent_at = group_recent_sent.scalar()
-        if (
-            campaign.send_mode == AdSendMode.INTERVAL.value
-            and group_last_sent_at
-            and now < group_last_sent_at + timedelta(minutes=campaign.interval_minutes)
-        ):
-            return "interval_not_due"
 
-        scheduled_slot_start: Optional[datetime] = None
-        if campaign.send_mode == AdSendMode.SCHEDULED.value:
-            scheduled_slot_start = self._scheduled_slot_start(
-                campaign,
-                now,
-                timezone_offset_hours=int(capacity_settings.get("timezone_offset_hours", 8)),
+        if delivery_policy == AdDeliveryPolicy.GROWTH.value:
+            execution = await get_ad_delivery_execution_settings(self.db)
+            cooldown_seconds = int(
+                execution["growth_group_global_cooldown_seconds"]
             )
-            if scheduled_slot_start is None:
-                return "scheduled_time_not_due"
-
-        today = self._ad_operating_day_start(now, capacity_settings)
-        account_daily_limit = await self._ad_dynamic_daily_limit(binding.account_id, op_config, campaign, now)
-        if account_daily_limit <= 0:
-            return "account_dynamic_health_paused"
-        account_sent_today = await self.db.execute(
-            select(func.count(AdDeliveryLog.id)).where(
-                AdDeliveryLog.account_id == binding.account_id,
-                AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                AdDeliveryLog.sent_at >= today,
-            )
-        )
-        account_sent_today_count = int(account_sent_today.scalar() or 0)
-        if account_sent_today_count >= account_daily_limit:
-            return "account_daily_message_quota"
-
-        if campaign.max_sends_per_group_per_day > 0:
-            group_campaign_sent_today = await self.db.execute(
-                select(func.count(AdDeliveryLog.id)).where(
+            if (
+                group_last_sent_at
+                and now < group_last_sent_at + timedelta(seconds=cooldown_seconds)
+            ):
+                return "growth_group_global_cooldown"
+        else:
+            campaign_last_sent_row = await self.db.execute(
+                select(func.max(AdDeliveryLog.sent_at)).where(
                     AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
                     AdDeliveryLog.ad_campaign_id == campaign.id,
                     AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                    AdDeliveryLog.sent_at >= today,
                 )
             )
-            if (group_campaign_sent_today.scalar() or 0) >= campaign.max_sends_per_group_per_day:
-                return "campaign_group_daily_quota"
-
-        if scheduled_slot_start is not None:
-            scheduled_slot_sent = await self.db.execute(
-                select(func.count(AdDeliveryLog.id)).where(
-                    AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
-                    AdDeliveryLog.ad_campaign_id == campaign.id,
-                    AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                    AdDeliveryLog.sent_at >= scheduled_slot_start - timedelta(minutes=5),
-                    AdDeliveryLog.sent_at < scheduled_slot_start + timedelta(minutes=6),
+            campaign_last_sent_at = campaign_last_sent_row.scalar()
+            if campaign.send_mode == AdSendMode.INTERVAL.value:
+                if (
+                    campaign_last_sent_at
+                    and now
+                    < campaign_last_sent_at
+                    + timedelta(minutes=max(1, int(campaign.interval_minutes or 0)))
+                ):
+                    return "interval_not_due"
+            elif campaign.send_mode == AdSendMode.SCHEDULED.value:
+                scheduled_slot_start = self._scheduled_slot_start(
+                    campaign,
+                    now,
+                    timezone_offset_hours=int(
+                        capacity_settings.get("timezone_offset_hours", 8)
+                    ),
                 )
-            )
-            if (scheduled_slot_sent.scalar() or 0) > 0:
-                return "scheduled_slot_already_sent"
-
-        capacity_reason = await self._ad_capacity_skip_reason(
-            binding,
-            membership,
-            account_daily_limit=account_daily_limit,
-            account_sent_today=account_sent_today_count,
-            now=now,
-            capacity=capacity_settings,
-            profile=profile,
-        )
-        if capacity_reason:
-            return capacity_reason
-
-        execution = await get_ad_delivery_execution_settings(self.db)
-        group_cooldown_minutes = int(execution.get("group_campaign_cooldown_minutes") or DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS["group_campaign_cooldown_minutes"])
-        if (
-            not capacity_settings.get("enabled", True)
-            and group_cooldown_minutes > 0
-            and group_last_sent_at
-            and now < group_last_sent_at + timedelta(minutes=group_cooldown_minutes)
-        ):
-            return "group_campaign_cooldown"
-
-        if not capacity_settings.get("enabled", True):
-            if campaign.send_mode == AdSendMode.AFTER_JOIN.value:
-                if membership.joined_at and now < membership.joined_at + timedelta(minutes=campaign.min_wait_after_join_minutes):
-                    return "waiting_after_join"
-                sent_before = await self.db.execute(
+                if scheduled_slot_start is None:
+                    return "scheduled_time_not_due"
+                scheduled_slot_sent = await self.db.execute(
                     select(func.count(AdDeliveryLog.id)).where(
-                        AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
+                        AdDeliveryLog.telegram_group_id
+                        == membership.telegram_group_id,
                         AdDeliveryLog.ad_campaign_id == campaign.id,
                         AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
+                        AdDeliveryLog.sent_at
+                        >= scheduled_slot_start - timedelta(minutes=5),
+                        AdDeliveryLog.sent_at
+                        < scheduled_slot_start + timedelta(minutes=6),
                     )
                 )
-                if (sent_before.scalar() or 0) > 0:
-                    return "after_join_already_sent"
+                if int(scheduled_slot_sent.scalar() or 0) > 0:
+                    return "scheduled_slot_already_sent"
 
-        if op_config:
-            throttle_reason = await self._ad_account_throttle_skip_reason(op_config, now)
+        if op_config and delivery_policy == AdDeliveryPolicy.GROWTH.value:
+            throttle_reason = await self._ad_account_throttle_skip_reason(
+                op_config,
+                now,
+                delivery_policy=delivery_policy,
+            )
             if throttle_reason:
                 return throttle_reason
-
         return None
-
     async def _group_can_receive_ads(self, group: Group) -> bool:
         group_operation = await self.group_manager.get_operation_config(group)
         if getattr(group.level, "value", group.level) in {"A", "B"}:
@@ -7715,40 +7776,37 @@ class AcquisitionAutomationService:
         self,
         config: AccountOperationConfig,
         now: datetime,
+        *,
+        delivery_policy: str,
     ) -> Optional[str]:
         throttle = await get_ad_delivery_throttle_settings(self.db)
         if not throttle["enabled"]:
-            last_account_sent = await self.db.execute(
-                select(func.max(AdDeliveryLog.sent_at)).where(
-                    AdDeliveryLog.account_id == config.account_id,
-                    AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                )
-            )
-            sent_at = last_account_sent.scalar()
-            if sent_at and now < sent_at + timedelta(seconds=config.message_interval_seconds):
-                return "account_message_interval"
-            return None
+            min_interval_seconds = max(0, int(config.message_interval_seconds))
+        else:
+            min_interval_seconds = int(throttle["growth_min_interval_seconds"])
 
-        cooldown_until = await self._get_ad_delivery_cooldown_until(config.account_id)
+        try:
+            cooldown_until = await self._get_ad_delivery_cooldown_until(config.account_id)
+        except Exception as exc:
+            self.logger.warning(
+                "ad_delivery_throttle_redis_unavailable",
+                account_id=config.account_id,
+                error=str(exc),
+            )
+            cooldown_until = None
         if cooldown_until is not None and time.time() < cooldown_until:
             return "account_ad_cooldown"
 
-        last_sent_at = await self._get_ad_delivery_last_sent_at(config.account_id)
-        if last_sent_at is not None and time.time() - last_sent_at < throttle["delivery_interval_seconds"]:
-            return "account_ad_delivery_interval"
-
-        window_start = now - timedelta(seconds=throttle["batch_window_seconds"])
-        batch_sent = await self.db.execute(
-            select(func.count(AdDeliveryLog.id)).where(
+        last_account_sent = await self.db.execute(
+            select(func.max(AdDeliveryLog.sent_at)).where(
                 AdDeliveryLog.account_id == config.account_id,
                 AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                AdDeliveryLog.sent_at >= window_start,
             )
         )
-        if (batch_sent.scalar() or 0) >= AD_DELIVERY_BATCH_SIZE:
-            return "account_ad_batch_window_quota"
+        sent_at = last_account_sent.scalar()
+        if sent_at and now < sent_at + timedelta(seconds=min_interval_seconds):
+            return "account_ad_delivery_interval"
         return None
-
     async def _ad_account_risk_skip_reason(self, account_id: int, now: datetime) -> Optional[str]:
         row = await self.db.execute(select(TelegramAccount).where(TelegramAccount.id == account_id))
         account = row.scalar_one_or_none()
@@ -7801,32 +7859,30 @@ class AcquisitionAutomationService:
         )
         return "group_delivery_inflight" if int(row.scalar() or 0) > 0 else None
 
-    async def _schedule_next_ad_delivery_after_success(self, account_id: int) -> None:
+    async def _schedule_next_ad_delivery_after_success(
+        self,
+        account_id: int,
+        *,
+        delivery_policy: str,
+    ) -> None:
         config = await self._get_account_operation_config(account_id)
-        if config is None:
+        if config is None or delivery_policy == AdDeliveryPolicy.AD_ONLY.value:
             return
 
         throttle = await get_ad_delivery_throttle_settings(self.db)
-        now = _now()
         if not throttle["enabled"]:
-            await self._set_ad_delivery_cooldown(account_id, config.message_interval_seconds)
-            return
-
-        window_start = now - timedelta(seconds=throttle["batch_window_seconds"])
-        batch_sent = await self.db.execute(
-            select(func.count(AdDeliveryLog.id)).where(
-                AdDeliveryLog.account_id == account_id,
-                AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
-                AdDeliveryLog.sent_at >= window_start,
+            cooldown_seconds = max(0, int(config.message_interval_seconds))
+        else:
+            cooldown_seconds = random.randint(
+                int(throttle["growth_min_interval_seconds"]),
+                int(throttle["growth_max_interval_seconds"]),
             )
-        )
-        sent_in_window = batch_sent.scalar() or 0
-        batch_target = await self._get_or_create_ad_batch_target(account_id, throttle)
-        await self._set_ad_delivery_last_sent_at(account_id)
-        if sent_in_window >= batch_target:
-            cooldown_seconds = random.randint(throttle["cooldown_min_seconds"], throttle["cooldown_max_seconds"])
-            await self._set_ad_delivery_cooldown(account_id, cooldown_seconds)
 
+        await self._set_ad_delivery_last_sent_at(
+            account_id,
+            ttl_seconds=max(86400, cooldown_seconds * 2),
+        )
+        await self._set_ad_delivery_cooldown(account_id, cooldown_seconds)
     async def _new_ad_delivery_redis_client(self):
         import redis.asyncio as redis
 
@@ -7843,6 +7899,46 @@ class AcquisitionAutomationService:
             result = close()
             if isawaitable(result):
                 await result
+
+    async def _claim_ad_account_worker_lock(
+        self,
+        account_id: int,
+        *,
+        lease_seconds: int,
+    ) -> Optional[str]:
+        token = uuid4().hex
+        client = await self._new_ad_delivery_redis_client()
+        try:
+            acquired = await client.set(
+                f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:worker_lock",
+                token,
+                nx=True,
+                ex=max(60, int(lease_seconds)),
+            )
+            return token if acquired else None
+        finally:
+            await self._close_ad_delivery_redis_client(client)
+
+    async def _release_ad_account_worker_lock(
+        self,
+        account_id: int,
+        token: str,
+    ) -> None:
+        key = f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:worker_lock"
+        client = await self._new_ad_delivery_redis_client()
+        try:
+            if hasattr(client, "eval"):
+                await client.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] "
+                    "then return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    key,
+                    token,
+                )
+            elif await client.get(key) == token:
+                await client.delete(key)
+        finally:
+            await self._close_ad_delivery_redis_client(client)
 
     async def _get_ad_delivery_cooldown_until(self, account_id: int) -> Optional[float]:
         client = await self._new_ad_delivery_redis_client()
@@ -7883,30 +7979,16 @@ class AcquisitionAutomationService:
         except (TypeError, ValueError):
             return None
 
-    async def _set_ad_delivery_last_sent_at(self, account_id: int) -> None:
+    async def _set_ad_delivery_last_sent_at(
+        self, account_id: int, *, ttl_seconds: int = 86400
+    ) -> None:
         client = await self._new_ad_delivery_redis_client()
         try:
             await client.setex(
                 f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:last_sent_at",
-                3600,
+                max(60, int(ttl_seconds)),
                 str(time.time()),
             )
-        finally:
-            await self._close_ad_delivery_redis_client(client)
-
-    async def _get_or_create_ad_batch_target(self, account_id: int, throttle: dict[str, Any]) -> int:
-        key = f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:batch_target"
-        client = await self._new_ad_delivery_redis_client()
-        try:
-            raw = await client.get(key)
-            if raw is not None:
-                try:
-                    return int(raw)
-                except (TypeError, ValueError):
-                    pass
-            batch_target = AD_DELIVERY_BATCH_SIZE
-            await client.setex(key, max(1, int(throttle["batch_window_seconds"])), str(batch_target))
-            return batch_target
         finally:
             await self._close_ad_delivery_redis_client(client)
 
@@ -7993,7 +8075,14 @@ class AcquisitionAutomationService:
             return int(f"-100{telegram_group_id}")
         return telegram_group_id
 
-    async def _send_ad(self, account_id: int, telegram_group_id: int, creative: AdCreative) -> Optional[int]:
+    async def _send_ad(
+        self,
+        account_id: int,
+        telegram_group_id: int,
+        creative: AdCreative,
+        *,
+        delivery_policy: str = AdDeliveryPolicy.GROWTH.value,
+    ) -> Optional[int]:
         content = self._render_ad_content(creative)
         if not content.strip() or "{{link_url}}" in content:
             raise ValueError("ad creative contains unresolved content")
@@ -8009,6 +8098,7 @@ class AcquisitionAutomationService:
                 content,
                 media_url=creative.media_url if creative.creative_type in [AdCreativeType.IMAGE.value, AdCreativeType.MIXED.value] else None,
                 source="ad_delivery",
+                delivery_policy=delivery_policy,
             )
             account.record_message(success=result is not None)
             return result
@@ -8051,6 +8141,10 @@ class AcquisitionAutomationService:
         raw = str(exc) or exc.__class__.__name__
         text = raw.lower()
         class_name = exc.__class__.__name__.lower()
+
+        risk_guard_match = re.search(r"risk_guard_blocked:[a-z0-9_:-]+", text)
+        if risk_guard_match:
+            return risk_guard_match.group(0)
 
         if "peer_flood" in text or "peer flood" in text or "peerflood" in text or "peerflood" in class_name:
             return f"account_issue:peer_flood:{raw}"
@@ -8439,7 +8533,7 @@ class AcquisitionAutomationService:
                 GroupAdTier.VALIDATED.value: GroupAdTier.TRIAL.value,
             }
             profile.ad_tier = downgrade.get(profile.ad_tier, GroupAdTier.TRIAL.value)
-            profile.daily_capacity = int((capacity.get("tier_daily_capacities") or {}).get(profile.ad_tier, 0) or 0)
+            profile.daily_capacity = 0
             profile.tier_changed_at = now
             if unknown_policy_probe:
                 profile.ad_policy_mode = GroupAdPolicyMode.FORBIDDEN.value

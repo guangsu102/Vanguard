@@ -40,6 +40,7 @@ def test_normalize_account_risk_guard_settings_enforces_acquisition_hard_caps():
         }
     )
 
+    assert config["account_outbound_message_hard_cap_default"] == 30
     assert config["global_daily_limit"] == 30
     assert config["group_write_daily_limit"] == 8
     assert config["actions"]["join"] == {"daily_limit": 6, "cooldown_seconds": 7200}
@@ -56,8 +57,8 @@ def test_normalize_account_risk_guard_settings_enforces_acquisition_hard_caps():
         "cooldown_seconds": 21600,
     }
     assert config["actions"]["ad_delivery"] == {
-        "daily_limit": 5,
-        "cooldown_seconds": 9000,
+        "daily_limit": 999,
+        "cooldown_seconds": 0,
     }
 
 def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
@@ -70,10 +71,10 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["survival_check_delay_seconds"] == 120
     assert config["survival_one_hour_seconds"] == 3600
     assert config["survival_twenty_four_hour_seconds"] == 86400
-    assert config["account_ad_daily_hard_cap"] == 5
+    assert "account_ad_daily_hard_cap" not in config
     assert "account_group_daily_cap_default" not in config
-    assert config["group_global_daily_hard_cap"] == 400
-    assert config["group_min_interval_seconds"] == 259200
+    assert "group_global_daily_hard_cap" not in config
+    assert "group_min_interval_seconds" not in config
     assert config["max_groups_per_account"] == 400
     assert config["max_new_ad_groups_per_day"] == 2
     assert config["leave_on_deleted_ad"] is True
@@ -89,23 +90,11 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert config["premium_min_samples"] == 20
     assert config["premium_growth_samples"] == 100
     assert config["premium_full_capacity_samples"] == 1000
-    assert config["premium_entry_capacity"] == 20
-    assert config["premium_growth_capacity"] == 50
-    assert config["premium_conversion_capacity_step"] == 20
-    assert config["premium_clean_days_auto"] == 5
+    assert "premium_entry_capacity" not in config
+    assert "premium_growth_capacity" not in config
+    assert "premium_conversion_capacity_step" not in config
     assert config["premium_clean_days_verified"] == 3
-    assert config["tier_daily_capacities"] == {
-        "blocked": 0,
-        "observing": 0,
-        "trial": 1,
-        "validated": 3,
-        "stable": 10,
-        "low": 3,
-        "medium": 10,
-        "high": 20,
-        "premium": 400,
-    }
-    assert set(config["hourly_weights"]) == {str(hour) for hour in range(24)}
+    assert "tier_daily_capacities" not in config
     assert config["hourly_weights"]["2"] == 1
     assert config["hourly_weights"]["15"] > config["hourly_weights"]["9"]
     assert config["hourly_weights"]["1"] < config["hourly_weights"]["23"]
@@ -165,13 +154,11 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["ad_policy_auto_probe_interval_hours"] == 1
     assert config["warmup_daily_interactions_min"] == 4
     assert config["warmup_daily_interactions_max"] == 9
-    assert config["tier_daily_capacities"]["premium"] == 400
-    assert config["tier_daily_capacities"]["low"] == 8
-    assert config["hourly_weights"]["1"] == 17
+    assert "tier_daily_capacities" not in config
     assert config["hourly_weights"]["2"] == 18
 
 
-def test_normalize_ad_capacity_settings_keeps_premium_safety_ranges_canonical():
+def test_normalize_ad_capacity_settings_ignores_retired_capacity_curve():
     config = normalize_ad_capacity_settings(
         {
             "premiumEntryCapacity": 400,
@@ -180,10 +167,9 @@ def test_normalize_ad_capacity_settings_keeps_premium_safety_ranges_canonical():
         }
     )
 
-    assert config["premium_entry_capacity"] == 20
-    assert config["premium_growth_capacity"] == 50
-    assert config["premium_conversion_capacity_step"] == 20
-
+    assert "premium_entry_capacity" not in config
+    assert "premium_growth_capacity" not in config
+    assert "premium_conversion_capacity_step" not in config
 
 def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
     config = normalize_ad_delivery_throttle_settings(
@@ -196,11 +182,16 @@ def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
         }
     )
 
-    assert config["delivery_interval_seconds"] == 9000
+    assert config["growth_min_interval_seconds"] == 9000
+    assert config["growth_max_interval_seconds"] == 10800
+    assert "ad_only_min_interval_seconds" not in config
+    assert "ad_only_max_interval_seconds" not in config
     assert "batch_size_min" not in config
     assert "batch_size_max" not in config
-    assert config["cooldown_min_seconds"] == 9000
-    assert config["cooldown_max_seconds"] == 9000
+    assert "delivery_interval_seconds" not in config
+    assert "batch_window_seconds" not in config
+    assert "cooldown_min_seconds" not in config
+    assert "cooldown_max_seconds" not in config
 
 def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():
     config = normalize_ad_delivery_execution_settings(
@@ -212,7 +203,14 @@ def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():
 
     assert "max_deliveries_per_run" not in config
     assert "max_deliveries_per_account_per_run" not in config
-    assert config["dispatcher_interval_seconds"] == 600
+    assert config["dispatcher_interval_seconds"] == 60
+    assert config["dispatcher_batch_size"] == 100
+    assert config["max_parallel_accounts"] == 3
+    assert config["job_lease_seconds"] == 300
+    assert config["growth_group_global_cooldown_seconds"] == 86400
+    assert "group_campaign_cooldown_minutes" not in config
+    assert "stop_account_after_success" not in config
+    assert "stop_account_after_failure" not in config
 
 
 def test_normalize_account_asset_policy_ignores_legacy_warmup_days():

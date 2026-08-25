@@ -15,7 +15,7 @@ from app.modules.acquisition.automation import (
     GroupAdRulesAuditResult,
     JoinedGroupAuditResult,
 )
-from app.modules.acquisition.dynamic_frequency import AccountDynamicFrequencyService
+
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AcquisitionTracking,
@@ -27,44 +27,6 @@ from app.modules.acquisition.models import (
     GroupAdProfile,
     GroupAdTier,
 )
-
-
-def test_group_capacity_requires_explicit_ad_permission():
-    group = Group(group_id=930001, title="Unknown Policy Group", level=GroupLevel.A, status="active")
-    profile = GroupAdProfile(
-        group_id=1,
-        telegram_group_id=group.group_id,
-        ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
-        ad_policy_confidence=100,
-        ad_tier=GroupAdTier.PREMIUM.value,
-        daily_capacity=400,
-    )
-    capacity = {
-        "group_global_daily_hard_cap": 400,
-        "tier_daily_capacities": {"premium": 400},
-    }
-
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 0
-
-    profile.ad_policy_mode = GroupAdPolicyMode.SOFT_AD_TRIAL.value
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 1
-    profile.ad_policy_confidence = 80
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 1
-    profile.ad_policy_confidence = 79
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 0
-
-    profile.ad_policy_mode = GroupAdPolicyMode.SOFT_AD_ALLOWED.value
-    profile.ad_policy_confidence = 100
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 400
-
-    profile.ad_policy_confidence = 89
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 0
-
-    capacity["group_global_daily_hard_cap"] = 999
-    profile.daily_capacity = 999
-    profile.ad_policy_confidence = 100
-    capacity["tier_daily_capacities"]["premium"] = 999
-    assert AccountDynamicFrequencyService.group_ad_daily_capacity(profile, group, capacity) == 400
 
 
 def test_no_link_campaign_generates_profile_cta_creatives_only():
@@ -356,7 +318,7 @@ async def test_sync_group_policy_preserves_ai_soft_ad_trial_mode(test_db):
 
     assert profile.ad_policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
     assert profile.ad_tier == GroupAdTier.TRIAL.value
-    assert profile.daily_capacity == 1
+    assert profile.daily_capacity == 0
 
 
 @pytest.mark.asyncio
@@ -640,7 +602,7 @@ async def test_unknown_ad_policy_is_reaudited_only_after_twenty_four_hours(test_
         (GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value, "manual", 3),
     ],
 )
-async def test_premium_requires_clean_24h_samples_and_real_conversion(
+async def test_premium_evidence_tier_requires_clean_24h_samples_and_real_conversion(
     test_db,
     policy_mode,
     policy_source,
@@ -706,36 +668,11 @@ async def test_premium_requires_clean_24h_samples_and_real_conversion(
     assert metrics["survival_rate_24h"] == 1.0
     assert metrics["conversions"] == 1
     assert profile.ad_tier == GroupAdTier.PREMIUM.value
-    assert profile.daily_capacity == 20
-
-
-def test_premium_capacity_ramps_without_jumping_to_400():
-    capacity = {
-        "premium_min_samples": 20,
-        "premium_growth_samples": 100,
-        "premium_full_capacity_samples": 1000,
-        "premium_entry_capacity": 20,
-        "premium_growth_capacity": 50,
-        "premium_conversion_capacity_step": 20,
-    }
-
-    assert AcquisitionAutomationService._premium_evidence_capacity(20, 1, capacity, 400) == 20
-    assert AcquisitionAutomationService._premium_evidence_capacity(40, 2, capacity, 400) == 28
-    assert AcquisitionAutomationService._premium_evidence_capacity(100, 3, capacity, 400) == 50
-    assert AcquisitionAutomationService._premium_evidence_capacity(500, 10, capacity, 400) == 200
-    assert AcquisitionAutomationService._premium_evidence_capacity(1000, 20, capacity, 400) == 400
-
-    unsafe_runtime = {
-        **capacity,
-        "premium_entry_capacity": 400,
-        "premium_growth_capacity": 400,
-        "premium_conversion_capacity_step": 100,
-    }
-    assert AcquisitionAutomationService._premium_evidence_capacity(20, 1, unsafe_runtime, 400) == 20
+    assert profile.daily_capacity == 0
 
 
 @pytest.mark.asyncio
-async def test_manual_policy_api_synchronizes_group_status_and_safe_trial_capacity(test_db, client):
+async def test_manual_policy_api_synchronizes_group_status_and_evidence_tier(test_db, client):
     from app.core.security import get_current_user
     from app.main import app
 
@@ -770,7 +707,7 @@ async def test_manual_policy_api_synchronizes_group_status_and_safe_trial_capaci
         assert allowed_data["ad_policy_mode"] == GroupAdPolicyMode.SOFT_AD_ALLOWED.value
         assert allowed_data["ad_policy_source"] == "manual"
         assert allowed_data["ad_tier"] == GroupAdTier.TRIAL.value
-        assert allowed_data["daily_capacity"] == 1
+        assert "daily_capacity" not in allowed_data
         await test_db.refresh(group)
         assert group.status == "active"
 
@@ -781,7 +718,7 @@ async def test_manual_policy_api_synchronizes_group_status_and_safe_trial_capaci
         assert forbidden.status_code == 200
         forbidden_data = forbidden.json()["data"]
         assert forbidden_data["ad_tier"] == GroupAdTier.BLOCKED.value
-        assert forbidden_data["daily_capacity"] == 0
+        assert "daily_capacity" not in forbidden_data
         await test_db.refresh(group)
         assert group.status == "ad_blocked"
 
@@ -913,74 +850,6 @@ async def test_first_deleted_ad_pauses_membership_without_global_group_block(tes
 
 
 @pytest.mark.asyncio
-async def test_group_daily_reservation_seeds_redis_from_persisted_delivery_count(test_db, monkeypatch):
-    class FakeRedis:
-        def __init__(self):
-            self.values: dict[str, int] = {}
-
-        async def exists(self, key):
-            return key in self.values
-
-        async def set(self, key, value, *, ex=None, nx=False):
-            if nx and key in self.values:
-                return False
-            self.values[key] = int(value)
-            return True
-
-        async def incr(self, key):
-            self.values[key] = self.values.get(key, 0) + 1
-            return self.values[key]
-
-        async def expire(self, key, ttl):
-            return key in self.values
-
-        async def decr(self, key):
-            self.values[key] = max(0, self.values.get(key, 0) - 1)
-            return self.values[key]
-
-    now = datetime.utcnow()
-    group = Group(group_id=930030, title="Redis Baseline Group", level=GroupLevel.A, status="active")
-    test_db.add(group)
-    await test_db.flush()
-    profile = GroupAdProfile(
-        group_id=group.id,
-        telegram_group_id=group.group_id,
-        ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-        ad_policy_confidence=100,
-        ad_policy_verified_at=now - timedelta(days=5),
-        ad_policy_expires_at=now + timedelta(days=5),
-        ad_tier=GroupAdTier.PREMIUM.value,
-        daily_capacity=400,
-    )
-    membership = SimpleNamespace(
-        telegram_group_id=group.group_id,
-        group=group,
-    )
-    test_db.add(profile)
-    await test_db.commit()
-
-    capacity = {
-        "timezone_offset_hours": 8,
-        "window_start_hour": 9,
-        "group_global_daily_hard_cap": 400,
-        "tier_daily_capacities": {"premium": 400},
-    }
-    monkeypatch.setattr(acquisition_automation, "get_ad_capacity_settings", AsyncMock(return_value=capacity))
-    service = AcquisitionAutomationService(test_db)
-    fake_redis = FakeRedis()
-    service._new_ad_delivery_redis_client = AsyncMock(return_value=fake_redis)
-    service._close_ad_delivery_redis_client = AsyncMock()
-    service._count_successful_ads = AsyncMock(return_value=399)
-
-    first = await service._reserve_group_daily_delivery_slot(membership, now)
-    second = await service._reserve_group_daily_delivery_slot(membership, now)
-
-    assert first[0] is True
-    assert second[:2] == (False, "group_global_daily_budget")
-    assert next(iter(fake_redis.values.values())) == 400
-
-
-@pytest.mark.asyncio
 async def test_survival_check_failure_retries_before_becoming_inconclusive(test_db):
     now = datetime.utcnow()
     account = TelegramAccount(
@@ -1024,7 +893,7 @@ async def test_survival_check_failure_retries_before_becoming_inconclusive(test_
 
 
 @pytest.mark.asyncio
-async def test_telegram_success_never_releases_reserved_capacity_when_log_confirmation_fails():
+async def test_telegram_success_never_releases_dispatcher_budget_when_log_confirmation_fails(monkeypatch):
     db = MagicMock()
     db.rollback = AsyncMock()
     service = AcquisitionAutomationService(db)
@@ -1036,15 +905,19 @@ async def test_telegram_success_never_releases_reserved_capacity_when_log_confir
     pending_log = SimpleNamespace(reservation_token="reserved-token")
     service._list_enabled_ad_bindings_for_account = AsyncMock(return_value=[binding])
     service._list_joined_groups_for_account = AsyncMock(return_value=[membership])
-    service._ad_dynamic_run_limit = AsyncMock(return_value=1)
+    service._growth_ad_health_allowed = AsyncMock(return_value=True)
+    service._claim_ad_schedule_state = AsyncMock(return_value=(1, "schedule-token", None))
+    monkeypatch.setattr(
+        acquisition_automation,
+        "get_ad_delivery_execution_settings",
+        AsyncMock(return_value={"job_lease_seconds": 300}),
+    )
     service._choose_delivery_creative = AsyncMock(return_value=creative)
     service._ad_skip_reason = AsyncMock(return_value=None)
     service._reserve_ad_delivery_target = AsyncMock(return_value=True)
-    service._reserve_group_daily_delivery_slot = AsyncMock(return_value=(True, "reserved", "group-key"))
     service._record_ad_delivery = AsyncMock(return_value=pending_log)
     service._send_ad = AsyncMock(return_value=9001)
     service._finalize_ad_delivery_log = AsyncMock(side_effect=RuntimeError("database commit failed"))
-    service._release_group_daily_delivery_slot = AsyncMock()
     service._release_ad_delivery_budget = AsyncMock()
 
     result = await service._run_ad_delivery_for_account(
@@ -1062,7 +935,6 @@ async def test_telegram_success_never_releases_reserved_capacity_when_log_confir
 
     assert result.failed == 1
     assert service._send_ad.await_count == 1
-    service._release_group_daily_delivery_slot.assert_not_awaited()
     service._release_ad_delivery_budget.assert_not_awaited()
     db.rollback.assert_awaited_once()
 
@@ -1128,11 +1000,6 @@ async def test_stale_ad_policy_probe_keeps_group_lock_until_sending_state_is_com
     monkeypatch.setattr(service, "_ad_account_risk_skip_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(service, "_group_can_receive_ads", AsyncMock(return_value=True))
     monkeypatch.setattr(service, "_sync_account_pool", AsyncMock())
-    monkeypatch.setattr(
-        service,
-        "_reserve_group_daily_delivery_slot",
-        AsyncMock(return_value=(True, "reserved", "group-slot")),
-    )
     monkeypatch.setattr(
         service,
         "_record_ad_delivery",

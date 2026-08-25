@@ -6,7 +6,7 @@ Tests for tasks, alerts, and worker management.
 
 import asyncio
 import sys
-from datetime import datetime
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -301,6 +301,45 @@ class TestCeleryConfig:
 
 class TestTaskDefinitions:
     """Tests for task definitions."""
+
+    def test_run_async_initializes_and_closes_loop_bound_resources(self):
+        from app.core import database, redis
+        from app.core.scheduler import tasks
+
+        events = []
+
+        async def init_redis():
+            events.append("redis_init")
+
+        async def operation():
+            events.append("operation")
+            return "completed"
+
+        async def close_redis():
+            events.append("redis_close")
+
+        async def close_db():
+            events.append("db_close")
+
+        with (
+            patch.object(redis, "redis_client", MagicMock()),
+            patch.object(redis, "init_redis", new=init_redis),
+            patch.object(redis, "close_redis", new=close_redis),
+            patch.object(database, "engine", MagicMock()),
+            patch.object(database, "close_db", new=close_db),
+        ):
+            result = tasks._run_async(operation())
+
+        assert result == "completed"
+        assert events == ["redis_init", "operation", "redis_close", "db_close"]
+
+    def test_scheduler_interval_tolerates_small_dispatch_jitter(self):
+        from app.core.scheduler.tasks import _scheduler_interval_is_due
+
+        assert _scheduler_interval_is_due(1000.0, 1589.9, 600) is False
+        assert _scheduler_interval_is_due(1000.0, 1590.0, 600) is True
+        assert _scheduler_interval_is_due(1000.0, 1599.999, 600) is True
+        assert _scheduler_interval_is_due(None, 1000.0, 600) is True
 
     def test_health_check_accounts_task_exists(self):
         """Test health_check_accounts task is defined."""

@@ -81,6 +81,11 @@ function diagnosticLabel(row: any) {
   return row.delivery_diagnostic?.primary_block_label || '-'
 }
 
+function healthAdmissionLabel(row: any) {
+  if (row.operation_mode === 'ad_only') return '策略绕过'
+  return row.growth_health_allowed ? '通过' : '暂停'
+}
+
 function nextActionText(row: any) {
   const diagnostic = row.delivery_diagnostic
   if (!diagnostic) return '-'
@@ -94,7 +99,7 @@ function groupDiagnosticText(row: any) {
   if (!item) return '-'
   const probeState = row.delivery_diagnostic?.probe_execution_allowed ? '探针可运行' : '探针阻断'
   const adState = row.delivery_diagnostic?.ad_delivery_allowed ? '广告可发送' : '广告暂停'
-  return `${probeState} · ${adState} · 就绪 ${item.ready} · Premium ${item.premium || 0} · 待许可 ${(item.ad_permission_unknown || 0) + (item.ad_policy_expired || 0)} · 待探针 ${item.pending_probe} · 阻断 ${item.probe_failed + item.blocked + (item.ad_permission_forbidden || 0)}`
+  return `${probeState} · ${adState} · 就绪 ${item.ready} · 待许可 ${(item.ad_permission_unknown || 0) + (item.ad_policy_expired || 0)} · 待探针 ${item.pending_probe} · 阻断 ${item.probe_failed + item.blocked + (item.ad_permission_forbidden || 0)}`
 }
 
 function compactError(row: any) {
@@ -153,8 +158,8 @@ function compactError(row: any) {
         <template #default="{ row }">{{ pct(row.probe_success_rate_24h) }} / {{ pct(row.writable_rate) }}</template>
       </el-table-column>
       <el-table-column prop="ad_eligible_groups" label="可投放群" width="100" />
-      <el-table-column label="实时广告额度（日 / 轮）" min-width="190">
-        <template #default="{ row }">{{ row.dynamic_daily_limit }} / {{ row.dynamic_run_limit }}</template>
+      <el-table-column label="Growth 健康准入" min-width="150">
+        <template #default="{ row }">{{ healthAdmissionLabel(row) }}</template>
       </el-table-column>
       <el-table-column label="投放阻塞" min-width="170">
         <template #default="{ row }">

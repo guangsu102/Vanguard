@@ -136,7 +136,6 @@ MESSAGE_ACTIONS = {
     AccountRiskAction.AD_PROBE,
     AccountRiskAction.AI_WARMUP,
     AccountRiskAction.AD_DELIVERY,
-    AccountRiskAction.BOT_MESSAGE,
 }
 ACQUISITION_GROUP_WRITE_ACTIONS = {
     AccountRiskAction.GROUP_MESSAGE,
@@ -156,6 +155,24 @@ AI_ERROR_CLASSIFIER_ALLOWED_REASONS = {
     "telegram_error",
 }
 
+
+ATOMIC_BUDGET_RESERVATION_LUA = """
+local action_count = tonumber(redis.call("GET", KEYS[1]) or "0")
+local outbound_count = tonumber(redis.call("GET", KEYS[2]) or "0")
+local cooldown_until = tonumber(redis.call("GET", KEYS[3]) or "0")
+local action_limit = tonumber(ARGV[1])
+local outbound_limit = tonumber(ARGV[2])
+local cooldown_seconds = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+if cooldown_until > now then return {0, 1, math.ceil(cooldown_until - now)} end
+if action_limit > 0 and action_count >= action_limit then return {0, 2, 0} end
+if outbound_limit > 0 and outbound_count >= outbound_limit then return {0, 3, 0} end
+if action_limit > 0 then redis.call("INCR", KEYS[1]); redis.call("EXPIRE", KEYS[1], ttl) end
+if outbound_limit > 0 then redis.call("INCR", KEYS[2]); redis.call("EXPIRE", KEYS[2], ttl) end
+if cooldown_seconds > 0 then redis.call("SET", KEYS[3], now + cooldown_seconds, "EX", cooldown_seconds) end
+return {1, 0, 0}
+"""
 
 class AccountRiskGuard:
     """Central risk gate for account-level Telegram operations."""
@@ -240,25 +257,28 @@ class AccountRiskGuard:
                 details=details,
             )
             return RiskDecision(True)
-        warmup_settings = await get_account_warmup_policy_settings(self.db)
-        warmup = account_warmup_context(
-            warmup_settings, db_account, now, action=action, details=details
-        )
-        if db_account is not None:
-            self._sync_warmup_stage(db_account, warmup.stage, now)
-        warmup_reason = account_warmup_block_reason(warmup, action, details)
-        if warmup_reason:
-            return await self._block(
-                account, action, warmup_reason, target_type, target_id, details
-            )
+        delivery_policy = str((details or {}).get("delivery_policy") or "growth")
+        ad_only_delivery = action == AccountRiskAction.AD_DELIVERY and delivery_policy == "ad_only"
         budget = self._budget_for_action(action, risk_settings)
-        budget = self._apply_budget_policy(
-            budget,
-            db_account,
-            now,
-            risk_settings=risk_settings,
-            warmup_multiplier=warmup.action_multiplier,
-        )
+        if not ad_only_delivery:
+            warmup_settings = await get_account_warmup_policy_settings(self.db)
+            warmup = account_warmup_context(
+                warmup_settings, db_account, now, action=action, details=details
+            )
+            if db_account is not None:
+                self._sync_warmup_stage(db_account, warmup.stage, now)
+            warmup_reason = account_warmup_block_reason(warmup, action, details)
+            if warmup_reason:
+                return await self._block(
+                    account, action, warmup_reason, target_type, target_id, details
+                )
+            budget = self._apply_budget_policy(
+                budget,
+                db_account,
+                now,
+                risk_settings=risk_settings,
+                warmup_multiplier=warmup.action_multiplier,
+            )
         content_decision = await self._check_content_policy(
             account_id, action, target_type, target_id, details
         )
@@ -779,6 +799,20 @@ class AccountRiskGuard:
         self.db.add(db_account)
         await self.db.commit()
 
+    async def _outbound_message_hard_cap(
+        self, account_id: int, risk_settings: dict[str, Any]
+    ) -> int:
+        configured_default = int(
+            risk_settings.get("account_outbound_message_hard_cap_default", GLOBAL_DAILY_LIMIT)
+        )
+        result = await self.db.execute(
+            select(AccountOperationConfig.max_messages_per_day).where(
+                AccountOperationConfig.account_id == account_id
+            )
+        )
+        override = result.scalar_one_or_none()
+        return max(1, int(override) if override is not None else configured_default)
+
     async def _reserve_budget(
         self,
         account_id: int,
@@ -787,54 +821,58 @@ class AccountRiskGuard:
         risk_settings: dict[str, Any],
     ) -> tuple[bool, str, Optional[int]]:
         if self.cache.client is None:
-            fail_closed = risk_settings.get("redis_fail_closed")
-            if fail_closed is None:
-                fail_closed = bool(getattr(self.settings, "RISK_GUARD_FAIL_CLOSED", False))
-            if fail_closed:
-                return False, "risk_budget_unavailable", None
-            return True, "redis_unavailable_budget_not_enforced", None
+            return False, "risk_budget_unavailable", None
 
         day_key = operating_date().strftime("%Y%m%d")
-        total_key = f"risk:account:{account_id}:daily:total:{day_key}"
         action_key = f"risk:account:{account_id}:daily:{action.value}:{day_key}"
-        group_write_key = (
-            f"risk:account:{account_id}:daily:acquisition_group_write:{day_key}"
-        )
+        outbound_key = f"risk:account:{account_id}:daily:outbound_message:{day_key}"
         cooldown_key = f"risk:account:{account_id}:cooldown:{action.value}"
+        outbound_limit = (
+            await self._outbound_message_hard_cap(account_id, risk_settings)
+            if action in MESSAGE_ACTIONS
+            else 0
+        )
+        action_limit = 0 if action == AccountRiskAction.AD_DELIVERY else int(budget.daily_limit)
+        cooldown_seconds = 0 if action == AccountRiskAction.AD_DELIVERY else int(budget.cooldown_seconds)
+        now = int(datetime.utcnow().timestamp())
+        ttl = 48 * 3600
 
-        cooldown = await self.cache.get(cooldown_key)
-        if cooldown:
-            try:
-                retry_after = max(1, int(float(cooldown) - datetime.utcnow().timestamp()))
-                if retry_after > 0:
-                    return False, f"{action.value}_cooldown", retry_after
-            except ValueError:
-                pass
-
-        total_count = await self.cache.incr(total_key)
-        await self.cache.expire(total_key, 48 * 3600)
-        global_daily_limit = int(risk_settings.get("global_daily_limit", GLOBAL_DAILY_LIMIT))
-        if total_count > global_daily_limit:
-            return False, "account_global_daily_budget", None
-
-        if action in ACQUISITION_GROUP_WRITE_ACTIONS:
-            group_write_count = await self.cache.incr(group_write_key)
-            await self.cache.expire(group_write_key, 48 * 3600)
-            group_write_daily_limit = min(
-                GROUP_WRITE_DAILY_LIMIT,
-                int(risk_settings.get("group_write_daily_limit", GROUP_WRITE_DAILY_LIMIT)),
+        client = self.cache.client
+        if hasattr(client, "eval"):
+            result = await client.eval(
+                ATOMIC_BUDGET_RESERVATION_LUA,
+                3,
+                action_key, outbound_key, cooldown_key,
+                action_limit, outbound_limit, cooldown_seconds, now, ttl,
             )
-            if group_write_count > group_write_daily_limit:
-                return False, "acquisition_group_write_daily_budget", None
+            allowed, reason_code, retry_after = (int(value) for value in result)
+            if allowed:
+                return True, "reserved", None
+            reasons = {
+                1: f"{action.value}_cooldown",
+                2: f"{action.value}_daily_budget",
+                3: "account_outbound_message_hard_cap",
+            }
+            return False, reasons.get(reason_code, "risk_budget_unavailable"), retry_after or None
 
-        action_count = await self.cache.incr(action_key)
-        await self.cache.expire(action_key, 48 * 3600)
-        if action_count > budget.daily_limit:
+        # Lightweight cache adapters used by unit tests do not implement Lua.
+        cooldown = await self.cache.get(cooldown_key)
+        if cooldown and float(cooldown) > now:
+            return False, f"{action.value}_cooldown", max(1, int(float(cooldown) - now))
+        action_count = int(await self.cache.get(action_key) or 0)
+        outbound_count = int(await self.cache.get(outbound_key) or 0)
+        if action_limit > 0 and action_count >= action_limit:
             return False, f"{action.value}_daily_budget", None
-
-        if budget.cooldown_seconds > 0:
-            until = datetime.utcnow().timestamp() + budget.cooldown_seconds
-            await self.cache.set(cooldown_key, str(until), ttl=budget.cooldown_seconds)
+        if outbound_limit > 0 and outbound_count >= outbound_limit:
+            return False, "account_outbound_message_hard_cap", None
+        if action_limit > 0:
+            await self.cache.incr(action_key)
+            await self.cache.expire(action_key, ttl)
+        if outbound_limit > 0:
+            await self.cache.incr(outbound_key)
+            await self.cache.expire(outbound_key, ttl)
+        if cooldown_seconds > 0:
+            await self.cache.set(cooldown_key, str(now + cooldown_seconds), ttl=cooldown_seconds)
         return True, "reserved", None
 
     async def decay_risk_scores(self, *, now: Optional[datetime] = None) -> dict[str, int]:

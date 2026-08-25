@@ -41,9 +41,8 @@ export const createDefaultAutoJoinScheduler = (): CompleteAutoJoinSchedulerConfi
 
 export const createDefaultRiskGuard = (): AccountRiskGuardSettings => ({
   enabled: true,
-  global_daily_limit: 30,
-  group_write_daily_limit: 8,
-  redis_fail_closed: null,
+  account_outbound_message_hard_cap_default: 30,
+  redis_fail_closed: true,
   actions: {
     search: { daily_limit: 100, cooldown_seconds: 30 },
     join: { daily_limit: 6, cooldown_seconds: 7200 },
@@ -52,7 +51,6 @@ export const createDefaultRiskGuard = (): AccountRiskGuardSettings => ({
     ad_probe: { daily_limit: 10, cooldown_seconds: 3600 },
     ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
     moderation: { daily_limit: 60, cooldown_seconds: 15 },
-    ad_delivery: { daily_limit: 5, cooldown_seconds: 9000 },
     profile_update: { daily_limit: 5, cooldown_seconds: 3600 },
     reaction: { daily_limit: 120, cooldown_seconds: 10 },
     forward: { daily_limit: 25, cooldown_seconds: 120 },
@@ -98,25 +96,22 @@ export const createDefaultAssetPolicy = (): AccountAssetPolicySettings => ({
     year_3_plus: { join_multiplier: 1.3, ad_multiplier: 1.35, run_multiplier: 1.25, probe_multiplier: 1.15, age_floor_days: 1095 },
   },
 })
-export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, group_campaign_cooldown_minutes: 4320, stop_account_after_success: true, stop_account_after_failure: true })
-export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, delivery_interval_seconds: 9000, batch_window_seconds: 3600, cooldown_min_seconds: 9000, cooldown_max_seconds: 10800 })
+export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 3, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
+export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 9000, growth_max_interval_seconds: 10800 })
 
 export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   enabled: true, timezone_offset_hours: 8, window_start_hour: 9, window_end_hour: 2,
   survival_check_delay_seconds: 120, survival_one_hour_seconds: 3600, survival_twenty_four_hour_seconds: 86400,
   survival_check_batch_size: 50, survival_retry_max_attempts: 3, survival_retry_base_seconds: 300,
-  account_ad_daily_hard_cap: 5, group_global_daily_hard_cap: 400,
-  group_min_interval_seconds: 259200, max_groups_per_account: 400, max_new_ad_groups_per_day: 2,
+  max_groups_per_account: 400, max_new_ad_groups_per_day: 2,
   leave_on_deleted_ad: true, block_group_on_probe_failure: true, ad_policy_ai_enabled: true,
   ad_policy_ai_model: 'gpt-5.6-terra', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
   ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: false, ad_policy_auto_probe_daily_limit: 1,
   ad_policy_auto_probe_daily_limit_per_account: 10, ad_policy_auto_probe_interval_hours: 24, ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30, premium_min_samples: 20, premium_min_conversions: 1, premium_survival_rate_percent: 95,
   premium_clean_days_auto: 5, premium_clean_days_verified: 3, premium_growth_samples: 100, premium_full_capacity_samples: 1000,
-  premium_entry_capacity: 20, premium_growth_capacity: 50, premium_conversion_capacity_step: 20,
   deleted_ad_pause_hours: 72, membership_delete_block_count: 2,
   warmup_daily_interactions_min: 0, warmup_daily_interactions_max: 1, mature_daily_interactions_min: 0, mature_daily_interactions_max: 1,
-  tier_daily_capacities: { blocked: 0, observing: 0, trial: 1, validated: 3, stable: 10, low: 3, medium: 10, high: 20, premium: 400 },
   hourly_weights: {},
 })
 

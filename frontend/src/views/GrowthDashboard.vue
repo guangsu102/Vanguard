@@ -63,7 +63,6 @@ const riskActionOptions = [
   { label: '广告探针', value: 'ad_probe' },
   { label: 'AI暖群', value: 'ai_warmup' },
   { label: '审核', value: 'moderation' },
-  { label: '广告', value: 'ad_delivery' },
   { label: '资料', value: 'profile_update' },
   { label: '回应', value: 'reaction' },
   { label: '转发', value: 'forward' },
@@ -116,24 +115,6 @@ const groupLevelOptions = [
   { label: 'C', value: 'C' },
   { label: '未评级', value: 'UNRATED' },
 ]
-
-const adCapacityTierOptions = [
-  { label: '封禁', value: 'blocked' },
-  { label: '观察', value: 'observing' },
-  { label: '试投', value: 'trial' },
-  { label: '已验证', value: 'validated' },
-  { label: '稳定', value: 'stable' },
-  { label: '低', value: 'low' },
-  { label: '中', value: 'medium' },
-  { label: '高', value: 'high' },
-  { label: '优质', value: 'premium' },
-]
-
-
-const adHourlyWeightOptions = Array.from({ length: 24 }, (_, hour) => ({
-  label: `${hour}:00`,
-  value: String(hour),
-}))
 
 const unknownChallengeActionOptions = [
   { label: '退出', value: 'leave' },
@@ -368,16 +349,6 @@ const metrics = computed(() => {
   return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess }
 })
 
-const redisFailClosedValue = computed({
-  get: () => {
-    if (riskGuardForm.redis_fail_closed === null) return 'system'
-    return riskGuardForm.redis_fail_closed ? 'closed' : 'open'
-  },
-  set: (value: string) => {
-    riskGuardForm.redis_fail_closed = value === 'system' ? null : value === 'closed'
-  },
-})
-
 const titleBlacklistText = computed({
   get: () => (schedulerForm.search_filter?.title_blacklist || []).join('\n'),
   set: (value: string) => {
@@ -433,14 +404,14 @@ const flowSteps = computed(() => [
     key: 'ad',
     title: '广告',
     enabled: adExecutionForm.enabled,
-    status: '串行投放',
+    status: '账号内串行',
     detail: `删帖检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
   },
   {
     key: 'risk',
     title: '账号风控',
     enabled: riskGuardForm.enabled,
-    status: `${riskGuardForm.global_daily_limit}/天`,
+    status: `${riskGuardForm.account_outbound_message_hard_cap_default}/天`,
     detail: adFailurePolicyForm.leave_on_group_control_failure ? '群控失败自动退群' : '群控失败仅记录',
   },
 ])
@@ -448,53 +419,27 @@ const flowSteps = computed(() => [
 const effectiveLimitLabels: Record<string, string> = {
   account_join_daily: '单号加群日上限',
   account_group_message_daily: '单号群消息日上限',
-  account_ad_daily: '单号广告日上限',
-  account_ad_per_run: '单号单轮广告上限',
-  account_group_ad_daily: '单号单群广告日上限',
-  group_global_ad_daily: '单群全局广告日上限',
-  account_ad_min_interval: '单号广告最小间隔',
-  group_ad_min_interval: '单群广告最小间隔',
+  account_outbound_message_daily_hard_cap: '账号出站消息硬上限',
+  growth_account_ad_min_interval: 'Growth 账号投放间隔',
+  growth_group_global_cooldown: 'Growth 群全局冷却',
 }
 
 const effectiveSourceLabels: Record<string, string> = {
-  'risk.global_daily_limit': '风控单号总日额度',
-  'risk.group_write_daily_limit': '风控群写共享日额度',
   'risk.actions.join.daily_limit': '风控加群日额度',
   'risk.actions.group_message.daily_limit': '风控群消息日额度',
-  'risk.actions.ad_delivery.daily_limit': '风控广告日额度',
-  'ads.capacity.account_ad_daily_hard_cap': '广告单号日硬上限',
-  'system.ads.max_deliveries_per_run': '广告单轮系统上限',
-  'system.ads.max_deliveries_per_account_per_run': '广告单号单轮系统上限',
-  'system.ads.account_group_daily_cap': '单号单群系统日上限',
-  'ads.capacity.group_global_daily_hard_cap': '单群全局日硬上限',
-  'ads.throttle.delivery_interval_seconds': '投放间隔',
-  'ads.throttle.cooldown_min_seconds': '投放最小冷却',
-  'ads.capacity.group_min_interval_seconds': '单群投放间隔',
-  'ads.execution.group_campaign_cooldown_minutes': '群活动冷却',
+  'risk.account_outbound_message_hard_cap_default': '账号出站消息默认硬上限',
+  'ads.throttle.growth_min_interval_seconds': 'Growth 最小投放间隔',
+  'ads.execution.growth_group_global_cooldown_seconds': 'Growth 群全局冷却',
 }
-
 const dynamicFactorLabels: Record<string, string> = {
   'account.max_groups_per_day': '账号加群额度',
   'account.max_messages_per_day': '账号消息额度',
   'asset.join_multiplier': '账号等级加群倍率',
   'asset.action_multiplier': '账号等级动作倍率',
-  'asset.ad_multiplier': '账号等级广告倍率',
   'warmup.join_multiplier': '暖号加群倍率',
   'warmup.group_message_multiplier': '暖号群消息倍率',
-  'warmup.ad_multiplier': '暖号广告倍率',
-  'warmup.run_multiplier': '暖号单轮倍率',
   'risk.level_multiplier': '风险等级倍率',
-  'account.health_score': '账号健康度',
-  'probe.quality_multiplier': '探针质量',
   'time_window.join_multiplier': '加群时段倍率',
-  'time_window.ad_multiplier': '广告时段倍率',
-  'campaign.max_sends_per_account_per_day': '活动单号日上限',
-  'campaign.max_sends_per_group_per_day': '活动单群日上限',
-  'campaign.interval_minutes': '活动投放间隔',
-  'group.ad_tier': '群广告档位',
-  'group.tier_daily_capacity': '群档位容量',
-  'group.evidence_capacity': '群证据容量',
-  'group.ad_policy': '群广告许可',
   'group.last_ad_at': '群最近投放时间',
 }
 
@@ -532,10 +477,9 @@ const fillSchedulerForm = (config: AutoJoinSchedulerConfig) => {
 }
 
 const fillRiskGuardForm = (config: AccountRiskGuardSettings) => {
-  riskGuardForm.enabled = config.enabled
-  riskGuardForm.global_daily_limit = config.global_daily_limit
-  riskGuardForm.group_write_daily_limit = config.group_write_daily_limit
-  riskGuardForm.redis_fail_closed = config.redis_fail_closed
+  riskGuardForm.enabled = true
+  riskGuardForm.account_outbound_message_hard_cap_default = config.account_outbound_message_hard_cap_default
+  riskGuardForm.redis_fail_closed = true
   const actions = { ...createDefaultRiskGuard().actions }
   for (const item of riskActionOptions) {
     actions[item.value] = {
@@ -1172,21 +1116,14 @@ onBeforeUnmount(() => {
           </div>
           <div class="form-grid">
             <el-form label-width="150px" size="small">
-              <el-form-item label="风控开关">
-                <el-switch v-model="riskGuardForm.enabled" />
+              <el-form-item label="风控保护">
+                <el-switch v-model="riskGuardForm.enabled" disabled />
               </el-form-item>
-              <el-form-item label="单号总日额度">
-                <el-input-number v-model="riskGuardForm.global_daily_limit" :min="1" :max="30" />
-              </el-form-item>
-              <el-form-item label="共享群写日额度">
-                <el-input-number v-model="riskGuardForm.group_write_daily_limit" :min="1" :max="8" />
+              <el-form-item label="账号消息默认硬上限">
+                <el-input-number v-model="riskGuardForm.account_outbound_message_hard_cap_default" :min="1" :max="100" />
               </el-form-item>
               <el-form-item label="Redis失败关闭">
-                <el-select v-model="redisFailClosedValue">
-                  <el-option label="跟随系统" value="system" />
-                  <el-option label="失败即关闭" value="closed" />
-                  <el-option label="失败放行" value="open" />
-                </el-select>
+                <el-switch v-model="riskGuardForm.redis_fail_closed" disabled />
               </el-form-item>
             </el-form>
             <el-table :data="riskActionOptions" size="small" border>
@@ -1331,33 +1268,30 @@ onBeforeUnmount(() => {
               <el-form-item label="执行间隔">
                 <el-input-number v-model="adExecutionForm.dispatcher_interval_seconds" :min="1" :max="86400" />
               </el-form-item>
-              <el-form-item label="群广告冷却">
-                <el-input-number v-model="adExecutionForm.group_campaign_cooldown_minutes" :min="4320" :max="10080" />
+              <el-form-item label="调度分页数">
+                <el-input-number v-model="adExecutionForm.dispatcher_batch_size" :min="1" :max="1000" />
               </el-form-item>
-              <el-form-item label="成功后停号">
-                <el-switch v-model="adExecutionForm.stop_account_after_success" />
+              <el-form-item label="并行账号数">
+                <el-input-number v-model="adExecutionForm.max_parallel_accounts" :min="1" :max="20" />
               </el-form-item>
-              <el-form-item label="失败后停号">
-                <el-switch v-model="adExecutionForm.stop_account_after_failure" />
+              <el-form-item label="任务租约秒">
+                <el-input-number v-model="adExecutionForm.job_lease_seconds" :min="60" :max="1800" />
+              </el-form-item>
+              <el-form-item label="Growth群冷却秒">
+                <el-input-number v-model="adExecutionForm.growth_group_global_cooldown_seconds" :min="3600" :max="604800" />
               </el-form-item>
               <el-form-item label="节流策略">
                 <el-switch v-model="adThrottleForm.enabled" />
               </el-form-item>
-              <el-form-item label="投放间隔">
-                <el-input-number v-model="adThrottleForm.delivery_interval_seconds" :min="9000" :max="86400" />
+              <el-form-item label="Growth最小间隔秒">
+                <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="3000" :max="86400" />
               </el-form-item>
-              <el-form-item label="批次窗口">
-                <el-input-number v-model="adThrottleForm.batch_window_seconds" :min="1" :max="3600" />
-              </el-form-item>
-              <el-form-item label="冷却最小秒">
-                <el-input-number v-model="adThrottleForm.cooldown_min_seconds" :min="9000" :max="86400" />
-              </el-form-item>
-              <el-form-item label="冷却最大秒">
-                <el-input-number v-model="adThrottleForm.cooldown_max_seconds" :min="9000" :max="86400" />
+              <el-form-item label="Growth最大间隔秒">
+                <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="3000" :max="86400" />
               </el-form-item>
             </el-form>
             <el-form label-width="150px" size="small">
-              <el-form-item label="动态容量">
+              <el-form-item label="群许可风控">
                 <el-switch v-model="adCapacityForm.enabled" />
               </el-form-item>
               <el-form-item label="时区偏移">
@@ -1369,15 +1303,9 @@ onBeforeUnmount(() => {
               <el-form-item label="窗口结束小时">
                 <el-input-number v-model="adCapacityForm.window_end_hour" :min="0" :max="23" />
               </el-form-item>
-              <el-form-item label="账号广告每日硬上限（系统）">
-                <el-input-number v-model="adCapacityForm.account_ad_daily_hard_cap" :min="1" :max="5" />
-              </el-form-item>
-              <el-form-item label="群全局日硬上限">
-                <el-input-number v-model="adCapacityForm.group_global_daily_hard_cap" :min="1" :max="400" />
-              </el-form-item>
-              <el-form-item label="群广告最小间隔秒">
-                <el-input-number v-model="adCapacityForm.group_min_interval_seconds" :min="259200" :max="604800" />
-              </el-form-item>
+
+
+
               <el-form-item label="单号最大群数">
                 <el-input-number v-model="adCapacityForm.max_groups_per_account" :min="1" :max="1000" />
               </el-form-item>
@@ -1447,18 +1375,14 @@ onBeforeUnmount(() => {
               <el-form-item label="人工许可清洁天数">
                 <el-input-number v-model="adCapacityForm.premium_clean_days_verified" :min="3" :max="30" />
               </el-form-item>
-              <el-form-item label="Premium增长样本">
+              <el-form-item label="高级证据样本">
                 <el-input-number v-model="adCapacityForm.premium_growth_samples" :min="20" :max="1000" />
               </el-form-item>
-              <el-form-item label="Premium满额样本">
+              <el-form-item label="充分证据样本">
                 <el-input-number v-model="adCapacityForm.premium_full_capacity_samples" :min="20" :max="5000" />
               </el-form-item>
-              <el-form-item label="Premium入场容量">
-                <el-input-number v-model="adCapacityForm.premium_entry_capacity" :min="1" :max="20" />
-              </el-form-item>
-              <el-form-item label="Premium增长容量">
-                <el-input-number v-model="adCapacityForm.premium_growth_capacity" :min="1" :max="50" />
-              </el-form-item>
+
+
               <el-form-item label="暖群互动最小">
                 <el-input-number v-model="adCapacityForm.warmup_daily_interactions_min" :min="0" :max="20" />
               </el-form-item>
@@ -1489,28 +1413,6 @@ onBeforeUnmount(() => {
                 </el-select>
               </el-form-item>
             </el-form>
-          </div>
-          <div class="form-grid secondary-grid">
-            <el-table :data="adCapacityTierOptions" size="small" border>
-              <el-table-column label="群等级" width="100">
-                <template #default="{ row }">{{ row.label }}</template>
-              </el-table-column>
-              <el-table-column label="日容量">
-                <template #default="{ row }">
-                  <el-input-number v-model="adCapacityForm.tier_daily_capacities[row.value]" :min="0" :max="10000" size="small" />
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-table :data="adHourlyWeightOptions" size="small" border height="360">
-              <el-table-column label="小时" width="100">
-                <template #default="{ row }">{{ row.label }}</template>
-              </el-table-column>
-              <el-table-column label="权重">
-                <template #default="{ row }">
-                  <el-input-number v-model="adCapacityForm.hourly_weights[row.value]" :min="0" :max="10000" size="small" />
-                </template>
-              </el-table-column>
-            </el-table>
           </div>
           <div class="form-actions">
             <span v-if="saveErrors.ads" class="config-save-error">{{ saveErrors.ads }}</span>

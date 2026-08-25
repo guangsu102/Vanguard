@@ -18,27 +18,30 @@ describe('automation configuration defaults', () => {
     expect(Object.values(warmup.tiers).every((tier) => tier.warmup_days >= 7)).toBe(true)
   })
 
-  it('keeps delivery defaults inside backend hard limits', () => {
+  it('uses policy-specific delivery pacing and dispatcher settings', () => {
     const execution = createDefaultAdDeliveryExecution()
-    expect(execution.group_campaign_cooldown_minutes).toBeGreaterThanOrEqual(4320)
+    expect(execution.growth_group_global_cooldown_seconds).toBe(86400)
+    expect(execution.dispatcher_batch_size).toBe(100)
+    expect(execution.max_parallel_accounts).toBe(3)
 
     const throttle = createDefaultAdDeliveryThrottle()
-    expect(throttle.delivery_interval_seconds).toBeGreaterThanOrEqual(9000)
-    expect(throttle.cooldown_min_seconds).toBeGreaterThanOrEqual(9000)
+    expect(throttle.growth_min_interval_seconds).toBe(9000)
+    expect(throttle.growth_max_interval_seconds).toBe(10800)
   })
 
-  it('keeps ad capacity defaults within system hard limits', () => {
+  it('keeps ad policy and survival defaults without retired delivery caps', () => {
     const capacity = createDefaultAdCapacity()
-    expect(capacity.account_ad_daily_hard_cap).toBe(5)
-    expect(capacity.group_min_interval_seconds).toBe(259200)
     expect(capacity.max_new_ad_groups_per_day).toBe(2)
+    expect(capacity.survival_check_delay_seconds).toBe(120)
+    expect('account_ad_daily_hard_cap' in capacity).toBe(false)
+    expect('tier_daily_capacities' in capacity).toBe(false)
   })
 
-  it('exposes one complete default shape to both configuration pages', () => {
+  it('exposes the unified account outbound hard cap', () => {
     const risk = createDefaultRiskGuard()
-    expect(risk.global_daily_limit).toBe(30)
-    expect(risk.group_write_daily_limit).toBe(8)
-    expect(risk.actions.ad_delivery.daily_limit).toBe(5)
+    expect(risk.account_outbound_message_hard_cap_default).toBe(30)
+    expect(risk.redis_fail_closed).toBe(true)
+    expect(risk.actions.ad_delivery).toBeUndefined()
     expect(createDefaultAdFailurePolicy().group_control_failure_limit).toBe(1)
   })
 })

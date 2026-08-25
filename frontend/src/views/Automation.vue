@@ -158,6 +158,7 @@ const campaignForm = reactive({
   name: '',
   enabled: false,
   status: 'draft',
+  delivery_policy: 'growth' as 'growth' | 'ad_only',
   send_mode: 'after_join' as 'after_join' | 'interval' | 'scheduled',
   target_group_levels: ['A'],
   target_group_ids: [] as number[],
@@ -165,14 +166,13 @@ const campaignForm = reactive({
   end_at: '',
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
-  max_sends_per_group_per_day: 1,
-  max_sends_per_account_per_day: 500,
 })
 
 const emptyCampaignForm = () => ({
   name: '',
   enabled: false,
   status: 'draft',
+  delivery_policy: 'growth' as 'growth' | 'ad_only',
   send_mode: 'after_join' as 'after_join' | 'interval' | 'scheduled',
   target_group_levels: ['A'],
   target_group_ids: [] as number[],
@@ -180,8 +180,6 @@ const emptyCampaignForm = () => ({
   end_at: '',
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
-  max_sends_per_group_per_day: 1,
-  max_sends_per_account_per_day: 500,
 })
 
 const scheduledTimesText = ref('')
@@ -225,7 +223,7 @@ const accountConfigForm = reactive({
   max_groups_total: 100,
   join_interval_min_seconds: 60,
   join_interval_max_seconds: 900,
-  max_messages_per_day: 500,
+  max_messages_per_day: null as number | null,
   message_interval_seconds: 300,
   quiet_hours_start: '',
   quiet_hours_end: '',
@@ -327,7 +325,7 @@ const adAllowedGroupCount = computed(
     groupAdProfiles.value.filter(
       (profile) =>
         allowedGroupPolicyModes.has(profile.ad_policy_mode) &&
-        Number(profile.daily_capacity || 0) > 0,
+        Number(profile.ad_policy_confidence || 0) >= 80,
     ).length,
 );
 const pendingGroupPolicyCount = computed(
@@ -342,12 +340,7 @@ const forbiddenGroupCount = computed(
       (profile) => profile.ad_policy_mode === "forbidden",
     ).length,
 );
-const groupDailyCapacityTotal = computed(() =>
-  groupAdProfiles.value.reduce(
-    (total, profile) => total + Number(profile.daily_capacity || 0),
-    0,
-  ),
-);
+
 const unboundCampaignCount = computed(
   () =>
     campaigns.value.filter(
@@ -543,6 +536,7 @@ const campaignTargetGroups = (campaign: any) =>
     .filter((group: Group | undefined): group is Group => Boolean(group));
 
 const campaignFrequencyText = (campaign: any) => {
+  if (campaign.delivery_policy !== "ad_only") return "群全局冷却 24 小时";
   if (campaign.send_mode === "after_join")
     return `入群 ${campaign.min_wait_after_join_minutes} 分钟后`;
   if (campaign.send_mode === "interval")
@@ -857,6 +851,7 @@ const editCampaign = (campaign: any) => {
     name: campaign.name,
     enabled: campaign.enabled,
     status: campaign.status,
+    delivery_policy: campaign.delivery_policy || 'growth',
     send_mode: campaign.send_mode,
     target_group_levels: campaign.target_group_levels?.length
       ? campaign.target_group_levels
@@ -868,8 +863,6 @@ const editCampaign = (campaign: any) => {
     end_at: campaign.end_at || "",
     min_wait_after_join_minutes: campaign.min_wait_after_join_minutes,
     interval_minutes: campaign.interval_minutes,
-    max_sends_per_group_per_day: campaign.max_sends_per_group_per_day,
-    max_sends_per_account_per_day: campaign.max_sends_per_account_per_day,
   });
   scheduledTimesText.value = campaign.scheduled_times?.join(",") || "";
   campaignDrawerVisible.value = true;
@@ -1155,7 +1148,22 @@ const saveCampaign = async () => {
     return;
   }
   const scheduledTimes = parseScheduledTimes();
-  if (campaignForm.send_mode === "scheduled" && !scheduledTimes.length) {
+  if (campaignForm.delivery_policy === "ad_only" && !campaignForm.target_group_ids.length) {
+    ElMessage.warning("Ad-only 活动必须指定目标群");
+    return;
+  }
+  if (
+    campaignForm.delivery_policy === "ad_only"
+    && !["interval", "scheduled"].includes(campaignForm.send_mode)
+  ) {
+    ElMessage.warning("Ad-only 活动必须设置固定间隔或每日定时");
+    return;
+  }
+  if (
+    campaignForm.delivery_policy === "ad_only"
+    && campaignForm.send_mode === "scheduled"
+    && !scheduledTimes.length
+  ) {
     ElMessage.warning("请至少填写一个定时时点");
     return;
   }
@@ -1374,6 +1382,12 @@ const riskLevelText = (level?: string) => {
   }
   return labels[level || ''] || level || '-'
 }
+
+watch(() => campaignForm.delivery_policy, (policy) => {
+  if (policy === 'ad_only' && campaignForm.send_mode === 'after_join') {
+    campaignForm.send_mode = 'interval'
+  }
+})
 
 watch(selectedAccountId, async (accountId) => {
   if (!accountId) return
@@ -1626,18 +1640,18 @@ onBeforeUnmount(() => {
               <small>成功率 {{ adSuccessRate24h }}%</small>
             </div>
             <div>
-              <span>群每日容量</span>
-              <strong>{{ groupDailyCapacityTotal }}</strong>
-              <small>{{ adAllowedGroupCount }} 个群合计</small>
+              <span>广告许可群</span>
+              <strong>{{ adAllowedGroupCount }}</strong>
+              <small>{{ pendingGroupPolicyCount }} 个待确认</small>
             </div>
             <div>
               <span>调度间隔</span>
               <strong>{{ adDeliveryExecutionForm.dispatcher_interval_seconds }} 秒</strong>
-              <small>串行投放</small>
+              <small>同账号串行，跨账号并行</small>
             </div>
             <div>
-              <span>同群计划冷却</span>
-              <strong>{{ adDeliveryExecutionForm.group_campaign_cooldown_minutes }} 分钟</strong>
+              <span>Growth 群全局冷却</span>
+              <strong>{{ Math.round(adDeliveryExecutionForm.growth_group_global_cooldown_seconds / 3600) }} 小时</strong>
               <small>失败退群 {{ adFailurePolicyForm.leave_on_group_control_failure ? "开启" : "关闭" }}</small>
             </div>
           </section>
@@ -1764,11 +1778,7 @@ onBeforeUnmount(() => {
                         <div class="campaign-detail-block">
                           <span class="detail-label">生效窗口</span>
                           <strong>{{ campaignWindowText(row) }}</strong>
-                          <small
-                            >单群每日 {{ row.max_sends_per_group_per_day }} 次 ·
-                            单号每日
-                            {{ row.max_sends_per_account_per_day }} 次</small
-                          >
+
                         </div>
                       </div>
                     </template>
@@ -1812,7 +1822,7 @@ onBeforeUnmount(() => {
                   <el-table-column label="发送频率" min-width="150">
                     <template #default="{ row }">
                       <div class="primary-cell">
-                        <strong>{{ sendModeText(row.send_mode) }}</strong>
+                        <strong>{{ row.delivery_policy === 'ad_only' ? 'Ad-only' : 'Growth' }}</strong>
                         <small>{{ campaignFrequencyText(row) }}</small>
                       </div>
                     </template>
@@ -2222,6 +2232,16 @@ onBeforeUnmount(() => {
               <el-form-item label="启用计划">
                 <el-switch v-model="campaignForm.enabled" />
               </el-form-item>
+              <el-form-item label="投放策略">
+                <el-segmented
+                  v-model="campaignForm.delivery_policy"
+                  :disabled="Boolean(editingCampaignId && campaignForm.enabled)"
+                  :options="[
+                    { label: 'Growth', value: 'growth' },
+                    { label: 'Ad-only', value: 'ad_only' },
+                  ]"
+                />
+              </el-form-item>
 
               <div class="drawer-section-title">目标群</div>
               <el-form-item label="指定群">
@@ -2256,7 +2276,7 @@ onBeforeUnmount(() => {
                 </div>
               </el-form-item>
               <el-form-item
-                v-if="!campaignForm.target_group_ids.length"
+                v-if="campaignForm.delivery_policy === 'growth' && !campaignForm.target_group_ids.length"
                 label="目标等级"
               >
                 <el-checkbox-group v-model="campaignForm.target_group_levels">
@@ -2280,65 +2300,42 @@ onBeforeUnmount(() => {
                 个账号群席位
               </div>
 
-              <div class="drawer-section-title">发送节奏</div>
-              <el-form-item label="发送模式">
-                <el-segmented
-                  v-model="campaignForm.send_mode"
-                  :options="[
-                    { label: '入群后', value: 'after_join' },
-                    { label: '固定间隔', value: 'interval' },
-                    { label: '每日定时', value: 'scheduled' },
-                  ]"
-                />
-              </el-form-item>
-              <el-form-item
-                v-if="campaignForm.send_mode === 'after_join'"
-                label="入群后等待"
-              >
-                <el-input-number
-                  v-model="campaignForm.min_wait_after_join_minutes"
-                  :min="0"
-                  :max="43200"
-                />
-                <span class="input-suffix">分钟</span>
-              </el-form-item>
-              <el-form-item
-                v-if="campaignForm.send_mode === 'interval'"
-                label="每群发送间隔"
-              >
-                <el-input-number
-                  v-model="campaignForm.interval_minutes"
-                  :min="1"
-                  :max="43200"
-                />
-                <span class="input-suffix">分钟</span>
-              </el-form-item>
-              <el-form-item
-                v-if="campaignForm.send_mode === 'scheduled'"
-                label="每日发送时点"
-                required
-              >
-                <el-input
-                  v-model="scheduledTimesText"
-                  placeholder="09:00, 14:30, 21:00"
-                />
-              </el-form-item>
-
-
-              <div class="drawer-section-title">额度与有效期</div>
+              <template v-if="campaignForm.delivery_policy === 'ad_only'">
+                <div class="drawer-section-title">发送节奏</div>
+                <el-form-item label="发送模式">
+                  <el-segmented
+                    v-model="campaignForm.send_mode"
+                    :options="[
+                      { label: '固定间隔', value: 'interval' },
+                      { label: '每日定时', value: 'scheduled' },
+                    ]"
+                  />
+                </el-form-item>
+                <el-form-item
+                  v-if="campaignForm.send_mode === 'interval'"
+                  label="每群发送间隔"
+                >
+                  <el-input-number
+                    v-model="campaignForm.interval_minutes"
+                    :min="50"
+                    :max="43200"
+                  />
+                  <span class="input-suffix">分钟</span>
+                </el-form-item>
+                <el-form-item
+                  v-if="campaignForm.send_mode === 'scheduled'"
+                  label="每日发送时点"
+                  required
+                >
+                  <el-input
+                    v-model="scheduledTimesText"
+                    placeholder="09:00, 14:30, 21:00"
+                  />
+                </el-form-item>
+              </template>
+              <div class="drawer-section-title">有效期</div>
               <div class="drawer-form-grid">
-                <el-form-item label="单群每日上限">
-                  <el-input-number
-                    v-model="campaignForm.max_sends_per_group_per_day"
-                    :min="0"
-                  />
-                </el-form-item>
-                <el-form-item label="单号每日上限">
-                  <el-input-number
-                    v-model="campaignForm.max_sends_per_account_per_day"
-                    :min="0"
-                  />
-                </el-form-item>
+
                 <el-form-item label="开始时间">
                   <el-date-picker
                     v-model="campaignForm.start_at"
@@ -2633,8 +2630,14 @@ onBeforeUnmount(() => {
                   <el-form-item v-if="!isAdOnlyAccount" label="加群最大间隔(秒)">
                     <el-input-number v-model="accountConfigForm.join_interval_max_seconds" :min="60" :max="86400" />
                   </el-form-item>
-                  <el-form-item label="每日消息上限">
-                    <el-input-number v-model="accountConfigForm.max_messages_per_day" :min="0" :max="20000" />
+                  <el-form-item label="每日出站消息硬上限">
+                    <el-input-number
+                      v-model="accountConfigForm.max_messages_per_day"
+                      :min="1"
+                      :max="20000"
+                      clearable
+                      placeholder="留空使用配置中心默认值"
+                    />
                   </el-form-item>
                   <el-form-item label="消息发送间隔(秒)">
                     <el-input-number v-model="accountConfigForm.message_interval_seconds" :min="1" :max="86400" />

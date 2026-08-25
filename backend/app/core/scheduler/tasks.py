@@ -21,7 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.celery import celery_app
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
-from app.core.automation_constants import AD_MAX_DELIVERIES_PER_RUN
 from app.core.scheduler.alerts import AlertSeverity, TaskAlertManager
 
 logger = structlog.get_logger()
@@ -37,6 +36,7 @@ AD_DELIVERY_LAST_RUN_KEY = "vanguard:ad_delivery:last_run_at"
 GROUP_AI_WARMUP_LAST_RUN_KEY = "vanguard:group_ai_warmup:last_run_at"
 GROUP_AI_WARMUP_LOCK_KEY = "vanguard:group_ai_warmup:lock"
 GROUP_AI_WARMUP_LOCK_TTL_SECONDS = 30 * 60
+SCHEDULER_INTERVAL_EARLY_TOLERANCE_SECONDS = 10
 
 
 def get_alert_manager() -> TaskAlertManager:
@@ -45,14 +45,20 @@ def get_alert_manager() -> TaskAlertManager:
 
 
 async def _run_with_worker_cleanup(awaitable: Awaitable[Any]) -> Any:
-    """Run a Celery coroutine and dispose async DB connections before loop close."""
+    """Run a Celery coroutine and dispose loop-bound resources before loop close."""
+    from app.core import database as db_module
+    from app.core import redis as redis_module
+
+    await redis_module.init_redis()
     try:
         return await awaitable
     finally:
-        from app.core import database as db_module
-
-        if db_module.engine is not None:
-            await db_module.close_db()
+        try:
+            if redis_module.redis_client is not None:
+                await redis_module.close_redis()
+        finally:
+            if db_module.engine is not None:
+                await db_module.close_db()
 
 
 def _run_async(awaitable: Awaitable[Any]) -> Any:
@@ -93,6 +99,19 @@ def _result_skip_reasons(result: dict[str, Any]) -> dict[str, int]:
 
 def _timestamp_to_iso(value: float) -> str:
     return datetime.utcfromtimestamp(value).isoformat()
+
+
+def _scheduler_interval_is_due(
+    last_run_at: Optional[float],
+    now: float,
+    interval_seconds: int,
+) -> bool:
+    if last_run_at is None:
+        return True
+    return (
+        now + SCHEDULER_INTERVAL_EARLY_TOLERANCE_SECONDS
+        >= last_run_at + interval_seconds
+    )
 
 
 def _auto_join_lock_stale_seconds(config: dict[str, Any]) -> int:
@@ -251,7 +270,7 @@ async def _reserve_scheduled_auto_join() -> dict[str, Any]:
                 if recent_joined_at is not None:
                     last_run_at = recent_joined_at.timestamp()
                     await client.set(AUTO_JOIN_SCHEDULER_LAST_RUN_KEY, str(last_run_at))
-        if last_run_at is not None and now - last_run_at < interval_seconds:
+        if not _scheduler_interval_is_due(last_run_at, now, interval_seconds):
             next_run_at = last_run_at + interval_seconds
             return {
                 "should_run": False,
@@ -274,7 +293,7 @@ async def _reserve_scheduled_auto_join() -> dict[str, Any]:
 
         last_raw = await client.get(AUTO_JOIN_SCHEDULER_LAST_RUN_KEY)
         last_run_at = float(last_raw) if last_raw else None
-        if last_run_at is not None and now - last_run_at < interval_seconds:
+        if not _scheduler_interval_is_due(last_run_at, now, interval_seconds):
             await client.delete(AUTO_JOIN_SCHEDULER_LOCK_KEY)
             next_run_at = last_run_at + interval_seconds
             return {
@@ -377,7 +396,7 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
         except (TypeError, ValueError):
             last_run_at = None
         interval_seconds = int(execution["dispatcher_interval_seconds"])
-        if last_run_at is not None and now - last_run_at < interval_seconds:
+        if not _scheduler_interval_is_due(last_run_at, now, interval_seconds):
             return {
                 "should_run": False,
                 "reason": "ad_delivery_interval",
@@ -1346,7 +1365,13 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
     try:
         from app.modules.acquisition.automation import run_ad_delivery_with_db
 
-        resolved_max_deliveries = AD_MAX_DELIVERIES_PER_RUN
+        configured_page_size = int(
+            (reservation.get("execution") or {}).get("dispatcher_batch_size") or 100
+        )
+        resolved_max_deliveries = min(
+            configured_page_size,
+            max(1, int(max_deliveries)) if max_deliveries is not None else configured_page_size,
+        )
         result = _run_async(
             run_ad_delivery_with_db(max_deliveries=resolved_max_deliveries, dry_run=dry_run)
         )

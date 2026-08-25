@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,22 +19,16 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.account.warmup import account_warmup_context
-from app.core.automation_constants import AD_ACCOUNT_GROUP_DAILY_CAP
+
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
     get_account_warmup_policy_settings,
-    get_ad_capacity_settings,
 )
 from app.core.group.models import Group, GroupAccountMembership
-from app.core.runtime_settings import DEFAULT_AD_CAPACITY_SETTINGS
 from app.modules.acquisition.models import (
-    AdCampaign,
     AdDeliveryLog,
     AutoJoinAttempt,
     DeliveryStatus,
-    GroupAdPolicyMode,
-    GroupAdProfile,
-    GroupAdTier,
 )
 
 ACCOUNT_BUSINESS_NEW_DAYS = 3
@@ -43,28 +36,12 @@ ACCOUNT_STABLE_MIN_DAYS = 7
 AD_DYNAMIC_PROBE_WINDOW_HOURS = 6
 AD_GROUP_CONTROL_ERROR_PREFIX = "group_control:"
 AD_GROUP_LEFT_ERROR_PREFIX = "group_control_left:"
-AD_DELIVERY_DEFAULT_ACCOUNT_DAILY_LIMIT = int(DEFAULT_AD_CAPACITY_SETTINGS["account_ad_daily_hard_cap"])
-AD_GROUP_ABSOLUTE_DAILY_CAP = int(DEFAULT_AD_CAPACITY_SETTINGS["group_global_daily_hard_cap"])
 
 
 @dataclass(frozen=True)
 class DailyRange:
     minimum: int
     maximum: int
-
-
-@dataclass(frozen=True)
-class FrequencyPolicy:
-    account_id: int
-    health_score: float
-    business_stage: str
-    lifecycle_segment: str
-    join_daily_limit: int
-    ad_daily_limit: int
-    ad_run_limit: int
-    join_interval_min_seconds: int
-    join_interval_max_seconds: int
-    pause_reason: str | None = None
 
 
 class AccountDynamicFrequencyService:
@@ -77,20 +54,6 @@ class AccountDynamicFrequencyService:
         "recovery": DailyRange(1, 3),
         "normal": DailyRange(5, 12),
         "stable": DailyRange(8, 20),
-        "cooldown": DailyRange(0, 0),
-    }
-    AD_DAILY_RANGES: dict[str, DailyRange] = {
-        "new": DailyRange(0, 3),
-        "recovery": DailyRange(0, 2),
-        "normal": DailyRange(8, 18),
-        "stable": DailyRange(20, AD_DELIVERY_DEFAULT_ACCOUNT_DAILY_LIMIT),
-        "cooldown": DailyRange(0, 0),
-    }
-    AD_RUN_RANGES: dict[str, DailyRange] = {
-        "new": DailyRange(1, 1),
-        "recovery": DailyRange(1, 1),
-        "normal": DailyRange(1, 3),
-        "stable": DailyRange(2, 5),
         "cooldown": DailyRange(0, 0),
     }
     JOIN_INTERVAL_RANGES: dict[str, tuple[int, int]] = {
@@ -111,12 +74,6 @@ class AccountDynamicFrequencyService:
     @staticmethod
     def clamp(value: float, minimum: float, maximum: float) -> float:
         return max(minimum, min(maximum, float(value)))
-
-    @staticmethod
-    def scaled_positive_capacity(base_capacity: int, multiplier: float) -> int:
-        if base_capacity <= 0 or multiplier <= 0:
-            return 0
-        return max(1, int(round(base_capacity * multiplier)))
 
     @staticmethod
     def business_stage_or_default(config: AccountOperationConfig | None) -> str:
@@ -322,85 +279,6 @@ class AccountDynamicFrequencyService:
         )
         return AccountDynamicFrequencyService.clamp(score, 0.0, 100.0)
 
-    @classmethod
-    def initial_group_ad_tier(cls, group: Group | None) -> str:
-        if group is None:
-            return GroupAdTier.LOW.value
-        if str(getattr(group, "status", "") or "") == "ad_blocked":
-            return GroupAdTier.BLOCKED.value
-        return GroupAdTier.OBSERVING.value
-
-    @classmethod
-    def group_ad_daily_capacity(
-        cls,
-        profile: GroupAdProfile | None,
-        group: Group | None,
-        capacity: dict[str, Any],
-    ) -> int:
-        tier = str(getattr(profile, "ad_tier", None) or cls.initial_group_ad_tier(group))
-        policy_mode = str(getattr(profile, "ad_policy_mode", GroupAdPolicyMode.UNKNOWN.value) or GroupAdPolicyMode.UNKNOWN.value)
-        if policy_mode not in {
-            GroupAdPolicyMode.UNKNOWN_PROBE.value,
-            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-            GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
-        }:
-            return 0
-        confidence_floor = (
-            0
-            if policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
-            else 80
-            if policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-            else 90
-        )
-        if int(getattr(profile, "ad_policy_confidence", 0) or 0) < confidence_floor:
-            return 0
-        tier_caps = capacity.get("tier_daily_capacities") or {}
-        tier_cap = int(tier_caps.get(tier, 0) or 0)
-        if tier == GroupAdTier.BLOCKED.value:
-            return 0
-        if profile is not None:
-            configured = int(profile.daily_capacity or tier_cap or 0)
-        else:
-            configured = int(tier_cap or 0)
-        hard_cap = max(
-            0,
-            min(
-                AD_GROUP_ABSOLUTE_DAILY_CAP,
-                int(capacity.get("group_global_daily_hard_cap") or AD_GROUP_ABSOLUTE_DAILY_CAP),
-            ),
-        )
-        result = max(0, min(configured, tier_cap or configured, hard_cap))
-        if policy_mode in {
-            GroupAdPolicyMode.UNKNOWN_PROBE.value,
-            GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-        }:
-            return min(result, 1)
-        return result
-
-    @staticmethod
-    def membership_ad_ramp_multiplier(membership: GroupAccountMembership, now: datetime) -> float:
-        full_capacity_at = getattr(membership, "first_ad_allowed_at", None)
-        if full_capacity_at is None or now >= full_capacity_at:
-            return 1.0
-        started_at = (
-            getattr(membership, "interaction_started_at", None)
-            or getattr(membership, "last_probe_at", None)
-            or getattr(membership, "joined_at", None)
-        )
-        if started_at is None or full_capacity_at <= started_at:
-            return 1.0
-        total_seconds = max(1.0, (full_capacity_at - started_at).total_seconds())
-        elapsed_seconds = max(0.0, (now - started_at).total_seconds())
-        progress = AccountDynamicFrequencyService.clamp(elapsed_seconds / total_seconds, 0.0, 1.0)
-        return AccountDynamicFrequencyService.clamp(0.1 + progress * 0.9, 0.1, 1.0)
-
-    @classmethod
-    def ramped_daily_capacity(cls, daily_cap: int, membership: GroupAccountMembership, now: datetime) -> int:
-        if daily_cap <= 0:
-            return 0
-        return max(1, int(math.ceil(daily_cap * cls.membership_ad_ramp_multiplier(membership, now))))
-
     @staticmethod
     def _membership_audit_payload(note: str | None) -> dict[str, Any]:
         if not note:
@@ -469,32 +347,42 @@ class AccountDynamicFrequencyService:
         high_quality_rate = high_quality_groups / joined_groups if joined_groups else 0.0
 
         probe_rows = await self.db.execute(
-            select(GroupAccountMembership.probe_status, func.count(GroupAccountMembership.id))
-            .where(
+            select(
+                GroupAccountMembership.probe_status,
+                GroupAccountMembership.last_probe_error,
+            ).where(
                 GroupAccountMembership.account_id == account_id,
                 GroupAccountMembership.status == "joined",
                 GroupAccountMembership.last_probe_at >= now - timedelta(hours=24),
             )
-            .group_by(GroupAccountMembership.probe_status)
         )
-        probe_counts = {str(status or "unknown"): int(count or 0) for status, count in probe_rows.all()}
-        probe_success = probe_counts.get("success", 0)
-        probe_failed = probe_counts.get("failed", 0)
+        probe_success = 0
+        probe_failed = 0
+        for status, error in probe_rows.all():
+            if status == "success":
+                probe_success += 1
+            elif status == "failed" and "risk_guard_blocked:" not in str(error or "").lower():
+                probe_failed += 1
         probe_total = probe_success + probe_failed
         probe_success_rate = probe_success / probe_total if probe_total else 1.0
 
         ad_rows = await self.db.execute(
-            select(AdDeliveryLog.status, func.count(AdDeliveryLog.id))
-            .where(
+            select(AdDeliveryLog.status, AdDeliveryLog.error).where(
                 AdDeliveryLog.account_id == account_id,
                 AdDeliveryLog.created_at >= now - timedelta(hours=24),
                 AdDeliveryLog.status.in_([DeliveryStatus.SUCCESS.value, DeliveryStatus.FAILED.value]),
             )
-            .group_by(AdDeliveryLog.status)
         )
-        ad_counts = {str(status or "unknown"): int(count or 0) for status, count in ad_rows.all()}
-        ad_success = ad_counts.get(DeliveryStatus.SUCCESS.value, 0)
-        ad_failed = ad_counts.get(DeliveryStatus.FAILED.value, 0)
+        ad_success = 0
+        ad_failed = 0
+        for status, error in ad_rows.all():
+            if status == DeliveryStatus.SUCCESS.value:
+                ad_success += 1
+            elif (
+                status == DeliveryStatus.FAILED.value
+                and "risk_guard_blocked:" not in str(error or "").lower()
+            ):
+                ad_failed += 1
         ad_total = ad_success + ad_failed
         ad_success_rate = ad_success / ad_total if ad_total else 1.0
 
@@ -539,6 +427,7 @@ class AccountDynamicFrequencyService:
         success = 0
         pending = 0
         failed = 0
+        skipped = 0
         post_join_filtered = 0
         flood_wait = 0
         peer_flood = 0
@@ -546,22 +435,30 @@ class AccountDynamicFrequencyService:
         account_banned = 0
         for status, reason, error, joined_at in rows.all():
             joined = joined_at is not None
+            text = f"{reason or ''} {error or ''}".lower()
+            is_failed = (
+                status == DeliveryStatus.FAILED.value
+                and "risk_guard_blocked:" not in text
+            )
             if joined:
                 success += 1
                 if status != DeliveryStatus.SUCCESS.value:
                     post_join_filtered += 1
             elif status == DeliveryStatus.PENDING.value:
                 pending += 1
-            else:
+            elif is_failed:
                 failed += 1
-            text = f"{reason or ''} {error or ''}".lower()
-            if not joined and self._contains_peer_flood(text):
+            else:
+                skipped += 1
+            if not joined and is_failed and self._contains_peer_flood(text):
                 peer_flood += 1
-            elif not joined and ("flood_wait" in text or "flood wait" in text):
+            elif not joined and is_failed and ("flood_wait" in text or "flood wait" in text):
                 flood_wait += 1
-            if not joined and self._contains_account_restricted(text):
+            if not joined and is_failed and self._contains_account_restricted(text):
                 account_restricted += 1
-            if not joined and ("account_banned" in text or "phone_number_banned" in text):
+            if not joined and is_failed and (
+                "account_banned" in text or "phone_number_banned" in text
+            ):
                 account_banned += 1
 
         total = success + pending + failed
@@ -571,6 +468,7 @@ class AccountDynamicFrequencyService:
             "success": success,
             "pending": pending,
             "failed": failed,
+            "skipped": skipped,
             "post_join_filtered": post_join_filtered,
             "total": total,
             "effective_success": effective_success,
@@ -603,8 +501,10 @@ class AccountDynamicFrequencyService:
                 continue
             if status != DeliveryStatus.FAILED.value:
                 continue
+            text = str(error or "").lower()
+            if "risk_guard_blocked:" in text:
+                continue
             failed += 1
-            text = str(error or "")
             if self._contains_peer_flood(text):
                 peer_flood_failed += 1
                 account_failed += 1
@@ -1019,7 +919,6 @@ class AccountDynamicFrequencyService:
         account = getattr(op_config, "account", None) if op_config else None
         account = account or await self.get_account(account_id)
         asset_policy = await get_account_asset_policy_settings(self.db)
-        capacity = await get_ad_capacity_settings(self.db)
         warmup = await self.managed_warmup_context(account, now, action="ad_probe")
         since = now - timedelta(hours=AD_DYNAMIC_PROBE_WINDOW_HOURS)
         rows = await self.db.execute(
@@ -1048,37 +947,14 @@ class AccountDynamicFrequencyService:
         )
         eligible_memberships = list(eligible_rows.scalars().all())
 
-        eligible_group_ids = [int(membership.group_id) for membership in eligible_memberships if membership.group_id is not None]
-        profile_map: dict[int, GroupAdProfile] = {}
-        if eligible_group_ids:
-            profile_rows = await self.db.execute(
-                select(GroupAdProfile).where(GroupAdProfile.group_id.in_(eligible_group_ids))
-            )
-            profile_map = {int(profile.group_id): profile for profile in profile_rows.scalars().all()}
-
         quality_scores: list[float] = []
         eligible_capacity_limit = 0
-        account_group_default_cap = AD_ACCOUNT_GROUP_DAILY_CAP
-        account_ad_multiplier = self.account_asset_multiplier(asset_policy, account, "ad_multiplier")
         for membership in eligible_memberships:
             group = membership.group
             if group is None or str(getattr(group, "status", "") or "") != "active":
                 continue
             quality_scores.append(self.group_quality_score(group))
-            profile = profile_map.get(int(membership.group_id))
-            group_capacity = self.group_ad_daily_capacity(profile, group, capacity)
-            account_group_base = min(
-                account_group_default_cap,
-                int(membership.account_group_daily_cap or account_group_default_cap),
-            )
-            account_group_capacity = self.scaled_positive_capacity(account_group_base, account_ad_multiplier)
-            base_capacity = min(
-                value
-                for value in (group_capacity, account_group_capacity)
-                if value > 0
-            ) if group_capacity > 0 and account_group_capacity > 0 else 0
-            eligible_capacity_limit += self.ramped_daily_capacity(base_capacity, membership, now)
-
+            eligible_capacity_limit += 1
         score = float(health_score if health_score is not None else (await self.account_health(account_id, now))["health_score"])
         if score >= 90:
             probe_factor = 0.6
@@ -1125,69 +1001,8 @@ class AccountDynamicFrequencyService:
             "warmup_remaining_days": warmup.remaining_days,
         }
 
-    async def ad_dynamic_daily_limit(
-        self,
-        account_id: int,
-        op_config: AccountOperationConfig | None,
-        campaign: AdCampaign,
-        now: datetime,
-    ) -> int:
-        capacity = await get_ad_capacity_settings(self.db)
-        hard_cap = min(500, max(1, int(capacity.get("account_ad_daily_hard_cap") or AD_DELIVERY_DEFAULT_ACCOUNT_DAILY_LIMIT)))
-        configured_values = [
-            int(value)
-            for value in (
-                op_config.max_messages_per_day if op_config else None,
-                campaign.max_sends_per_account_per_day,
-            )
-            if value is not None and int(value) > 0
-        ]
-        configured_limit = min([hard_cap, *configured_values]) if configured_values else hard_cap
-        account = getattr(op_config, "account", None) if op_config else None
-        account = account or await self.get_account(account_id)
-        join_metrics = await self.account_join_quality_metrics(account_id, now)
-        join_attempts = await self.join_attempt_metrics(account_id, now)
-        asset_policy = await get_account_asset_policy_settings(self.db)
-        warmup_policy = await get_account_warmup_policy_settings(self.db)
-        warmup = account_warmup_context(warmup_policy, account, now, action="ad_delivery")
-        await self.sync_account_warmup_stage(account, warmup.stage, now)
-        health = await self.account_health(
-            account_id,
-            now,
-            account=account,
-            join_metrics=join_metrics,
-            join_attempts=join_attempts,
-        )
-        segment = self.lifecycle_segment(
-            account,
-            now,
-            float(health["health_score"]),
-            join_metrics,
-            join_attempts,
-            config_enabled=bool(getattr(op_config, "enabled", True)),
-            asset_policy=asset_policy,
-            warmup_policy=warmup_policy,
-        )
-        stage = self.business_stage_for_segment(segment)
-        if op_config is not None:
-            await self.apply_business_stage_state(op_config, stage, now)
-
-        risk_multiplier = self.account_risk_limit_multiplier(account, now)
-        if risk_multiplier <= 0 or segment == "cooldown" or warmup.action_multiplier <= 0:
-            return 0
-        health_score = float(health["health_score"])
-        base_limit = self._limit_from_range(self.AD_DAILY_RANGES[segment], health_score, configured_limit)
-        if base_limit <= 0:
-            return 0
-
-        probe_budget = await self.ad_probe_budget_metrics(account_id, now, health_score=health_score, op_config=op_config)
-        probe_limited = int(probe_budget["probe_based_limit"])
-        if probe_limited <= 0:
-            return 0
-        asset_multiplier = self.account_asset_multiplier(asset_policy, account, "ad_multiplier")
-        return max(1, min(int(base_limit * risk_multiplier * asset_multiplier * warmup.action_multiplier), probe_limited))
-
-    async def ad_dynamic_run_limit(self, account_id: int, configured_run_limit: int, now: datetime) -> int:
+    async def growth_ad_health_allowed(self, account_id: int, now: datetime) -> bool:
+        """Evaluate the Growth policy health gate without deriving a send quota."""
         op_config = await self._get_account_operation_config(account_id)
         account = getattr(op_config, "account", None) if op_config else None
         account = account or await self.get_account(account_id)
@@ -1195,7 +1010,12 @@ class AccountDynamicFrequencyService:
         join_attempts = await self.join_attempt_metrics(account_id, now)
         asset_policy = await get_account_asset_policy_settings(self.db)
         warmup_policy = await get_account_warmup_policy_settings(self.db)
-        warmup = account_warmup_context(warmup_policy, account, now, action="ad_run")
+        warmup = account_warmup_context(
+            warmup_policy,
+            account,
+            now,
+            action="ad_delivery",
+        )
         await self.sync_account_warmup_stage(account, warmup.stage, now)
         health = await self.account_health(
             account_id,
@@ -1210,80 +1030,21 @@ class AccountDynamicFrequencyService:
             float(health["health_score"]),
             join_metrics,
             join_attempts,
-            config_enabled=bool(getattr(op_config, "enabled", True)),
+            config_enabled=bool(getattr(op_config, "enabled", False)),
             asset_policy=asset_policy,
             warmup_policy=warmup_policy,
         )
-        if segment == "cooldown" or warmup.action_multiplier <= 0:
-            return 0
-        probe_budget = await self.ad_probe_budget_metrics(
-            account_id,
-            now,
-            health_score=float(health["health_score"]),
-            op_config=op_config,
+        if op_config is not None:
+            await self.apply_business_stage_state(
+                op_config,
+                self.business_stage_for_segment(segment),
+                now,
+            )
+        return bool(
+            segment != "cooldown"
+            and warmup.action_multiplier > 0
+            and self.account_risk_limit_multiplier(account, now) > 0
         )
-        probe_limit = int(probe_budget["probe_based_limit"])
-        if probe_limit <= 0:
-            return 0
-
-        run_range = self.AD_RUN_RANGES[segment]
-        base_limit = min(max(configured_run_limit, run_range.minimum), run_range.maximum)
-        run_multiplier = self.account_asset_multiplier(asset_policy, account, "run_multiplier")
-        windowed = max(1, int(base_limit * self.ad_time_window_multiplier(now) * run_multiplier * warmup.action_multiplier))
-        return min(probe_limit, windowed)
-
-    async def build_policy(
-        self,
-        account_id: int,
-        now: datetime,
-        *,
-        op_config: AccountOperationConfig | None = None,
-        campaign: AdCampaign | None = None,
-        configured_run_limit: int = 10,
-    ) -> FrequencyPolicy:
-        account = getattr(op_config, "account", None) if op_config else None
-        account = account or await self.get_account(account_id)
-        join_metrics = await self.account_join_quality_metrics(account_id, now)
-        join_attempts = await self.join_attempt_metrics(account_id, now)
-        asset_policy = await get_account_asset_policy_settings(self.db)
-        warmup_policy = await get_account_warmup_policy_settings(self.db)
-        warmup = account_warmup_context(warmup_policy, account, now)
-        await self.sync_account_warmup_stage(account, warmup.stage, now)
-        health = await self.account_health(
-            account_id,
-            now,
-            account=account,
-            join_metrics=join_metrics,
-            join_attempts=join_attempts,
-        )
-        segment = self.lifecycle_segment(
-            account,
-            now,
-            float(health["health_score"]),
-            join_metrics,
-            join_attempts,
-            config_enabled=bool(getattr(op_config, "enabled", True)),
-            asset_policy=asset_policy,
-            warmup_policy=warmup_policy,
-        )
-        stage = self.business_stage_for_segment(segment)
-        join_limit = await self.auto_join_dynamic_daily_limit(op_config, now) if op_config else 0
-        ad_limit = await self.ad_dynamic_daily_limit(account_id, op_config, campaign, now) if campaign else 0
-        run_limit = await self.ad_dynamic_run_limit(account_id, configured_run_limit, now)
-        interval_min, interval_max = self.JOIN_INTERVAL_RANGES[segment]
-        return FrequencyPolicy(
-            account_id=account_id,
-            health_score=float(health["health_score"]),
-            business_stage=stage,
-            lifecycle_segment=segment,
-            join_daily_limit=join_limit,
-            ad_daily_limit=ad_limit,
-            ad_run_limit=run_limit,
-            join_interval_min_seconds=interval_min,
-            join_interval_max_seconds=interval_max,
-            pause_reason=getattr(account, "risk_reason", None) if segment == "cooldown" else None,
-        )
-
     async def _get_account_operation_config(self, account_id: int) -> AccountOperationConfig | None:
         row = await self.db.execute(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
         return row.scalar_one_or_none()

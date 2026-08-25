@@ -82,14 +82,14 @@ def test_dynamic_health_diagnostic_reports_health_floor():
         },
         probe_budget={"probe_based_limit": 0, "probe_factor": 0},
         warmup_action_multiplier=1.0,
-        daily_limit=0,
-        run_limit=0,
+        health_gate_applies=True,
+        health_gate_passed=False,
         now=datetime.utcnow(),
     )
 
     assert result["primary_reason"] == "health_score_below_floor"
     assert result["negative_adjustments"][0]["reason"] == "ad_peer_flood"
-    assert any(item["reason"] == "probe_budget_zero" for item in result["reasons"])
+    assert result["health_gate_passed"] is False
 
 
 @pytest.mark.asyncio
@@ -133,8 +133,7 @@ async def test_ad_delivery_diagnostic_reports_pending_probe(test_db):
         op_config=config,
         campaign=campaign,
         now=group.created_at,
-        daily_limit=10,
-        run_limit=2,
+        growth_health_allowed=True,
     )
 
     assert result["primary_block_reason"] == "groups_pending_probe"
@@ -150,8 +149,7 @@ async def test_ad_delivery_diagnostic_reports_pending_probe(test_db):
         op_config=config,
         campaign=campaign,
         now=group.created_at,
-        daily_limit=0,
-        run_limit=0,
+        growth_health_allowed=False,
     )
 
     assert paused_result["probe_execution_allowed"] is True
@@ -160,7 +158,7 @@ async def test_ad_delivery_diagnostic_reports_pending_probe(test_db):
 
 
 @pytest.mark.asyncio
-async def test_ad_delivery_diagnostic_reports_zero_dynamic_limit(test_db):
+async def test_ad_delivery_diagnostic_reports_growth_health_gate(test_db):
     account = TelegramAccount(
         phone="+15550002002",
         identifier="+15550002002",
@@ -182,13 +180,14 @@ async def test_ad_delivery_diagnostic_reports_zero_dynamic_limit(test_db):
         op_config=config,
         campaign=campaign,
         now=campaign.created_at,
-        daily_limit=0,
-        run_limit=0,
+        growth_health_allowed=False,
     )
 
-    assert result["primary_block_reason"] == "dynamic_daily_limit_zero"
+    assert result["primary_block_reason"] == "growth_health_gate_blocked"
     assert result["next_action"] == "recover_account_health"
-    assert any(item["reason"] == "dynamic_run_limit_zero" for item in result["block_reasons"])
+    assert [item["reason"] for item in result["block_reasons"]].count(
+        "growth_health_gate_blocked"
+    ) == 1
 
 
 @pytest.mark.asyncio
@@ -240,7 +239,7 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
 
     monkeypatch.setattr(service, "_list_enabled_ad_bindings_for_account", AsyncMock(return_value=[binding]))
     monkeypatch.setattr(service, "_list_joined_groups_for_account", AsyncMock(return_value=memberships))
-    monkeypatch.setattr(service, "_ad_dynamic_run_limit", AsyncMock(return_value=0))
+    monkeypatch.setattr(service, "_growth_ad_health_allowed", AsyncMock(return_value=False))
     monkeypatch.setattr(service, "_choose_delivery_creative", AsyncMock(return_value=creative))
     monkeypatch.setattr(service, "_campaign_is_active", lambda _campaign: True)
     probe_check = AsyncMock(return_value="ad_probe_waiting")
@@ -323,6 +322,8 @@ async def test_ad_only_account_is_excluded_from_group_ai_warmup(test_db, monkeyp
                 "allowProactiveWarmup": True,
                 "proactiveWarmupMaxPerGroupPerDay": 1,
                 "proactiveWarmupMaxPerAccountPerDay": 1,
+                "proactiveWarmupWindowStartHour": 12,
+                "proactiveWarmupWindowEndHour": 12,
             }
         ),
     )

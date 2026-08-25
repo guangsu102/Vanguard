@@ -271,6 +271,7 @@ class TelegramExecutionService:
         *,
         media_url: Optional[str] = None,
         source: str = "acquisition_ad",
+        delivery_policy: str = "growth",
     ) -> Optional[int]:
         client = self._get_client(account)
         if client is None:
@@ -281,7 +282,12 @@ class TelegramExecutionService:
             AccountRiskAction.AD_DELIVERY,
             target_type="group",
             target_id=target,
-            details={"source": source, "content": content, "media_url": media_url},
+            details={
+                "source": source,
+                "content": content,
+                "media_url": media_url,
+                "delivery_policy": delivery_policy,
+            },
         ):
             if media_url:
                 result = await client.send_file(target, media_url, caption=content)

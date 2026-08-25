@@ -56,6 +56,11 @@ function deliveryLabel(status: AdDynamicStatus | null) {
   return status.delivery_diagnostic.primary_block_label || '投放阻塞'
 }
 
+function healthAdmissionLabel(status: AdDynamicStatus | null) {
+  if (status?.operation_mode === 'ad_only') return '策略绕过'
+  return status?.growth_health_allowed ? '通过' : '暂停'
+}
+
 function nextActionText(status: AdDynamicStatus | null) {
   const item = status?.delivery_diagnostic
   if (!item) return '-'
@@ -99,8 +104,8 @@ function pct(value?: number) {
             <strong>{{ status.ad_eligible_groups }}</strong>
           </div>
           <div>
-            <span>日 / 轮额度</span>
-            <strong>{{ status.dynamic_daily_limit }} / {{ status.dynamic_run_limit }}</strong>
+            <span>Growth 健康准入</span>
+            <strong>{{ healthAdmissionLabel(status) }}</strong>
           </div>
         </div>
       </div>

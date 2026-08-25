@@ -872,7 +872,6 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "group_message": 4,
         "ad_probe": 10,
         "ai_warmup": 1,
-        "ad_delivery": 5,
         "channel_create": 1,
     }
     action_min_cooldowns = {
@@ -880,7 +879,6 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "group_message": 7200,
         "ad_probe": 3600,
         "ai_warmup": 21600,
-        "ad_delivery": 9000,
         "channel_create": 86400,
     }
     for action, default_budget in defaults["actions"].items():
@@ -904,9 +902,7 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
             "cooldown_seconds": max(action_min_cooldowns.get(action, 0), cooldown_seconds),
         }
 
-    redis_fail_closed = raw.get("redis_fail_closed", raw.get("redisFailClosed", defaults["redis_fail_closed"]))
-    if redis_fail_closed is not None:
-        redis_fail_closed = _bool_setting(redis_fail_closed, False)
+    redis_fail_closed = True
 
     thresholds = _normalize_float_map(
         raw.get("level_thresholds", raw.get("levelThresholds", defaults["level_thresholds"])),
@@ -1132,7 +1128,16 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         ),
     }
     return {
-        "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
+        "enabled": True,
+        "account_outbound_message_hard_cap_default": _int_setting(
+            raw.get(
+                "account_outbound_message_hard_cap_default",
+                raw.get("accountOutboundMessageHardCapDefault", defaults["account_outbound_message_hard_cap_default"]),
+            ),
+            defaults["account_outbound_message_hard_cap_default"],
+            min_value=1,
+            max_value=100,
+        ),
         "global_daily_limit": _int_setting(
             raw.get("global_daily_limit", raw.get("globalDailyLimit", defaults["global_daily_limit"])),
             defaults["global_daily_limit"],
@@ -1386,39 +1391,22 @@ async def save_account_warmup_policy_settings(db: AsyncSession, payload: dict[st
 def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS
-    cooldown_min_seconds = _int_setting(
-        raw.get("cooldown_min_seconds", raw.get("cooldownMinSeconds", defaults["cooldown_min_seconds"])),
-        defaults["cooldown_min_seconds"],
-        min_value=9000,
-        max_value=86400,
-    )
-    cooldown_max_seconds = _int_setting(
-        raw.get("cooldown_max_seconds", raw.get("cooldownMaxSeconds", defaults["cooldown_max_seconds"])),
-        defaults["cooldown_max_seconds"],
-        min_value=9000,
-        max_value=86400,
-    )
-    if cooldown_max_seconds < cooldown_min_seconds:
-        cooldown_max_seconds = cooldown_min_seconds
 
+    def interval(name: str) -> int:
+        return _int_setting(
+            raw.get(name, defaults[name]),
+            defaults[name],
+            min_value=3000,
+            max_value=86400,
+        )
+
+    growth_min = interval("growth_min_interval_seconds")
+    growth_max = max(growth_min, interval("growth_max_interval_seconds"))
     return {
         "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
-        "delivery_interval_seconds": _int_setting(
-            raw.get("delivery_interval_seconds", raw.get("deliveryIntervalSeconds", defaults["delivery_interval_seconds"])),
-            defaults["delivery_interval_seconds"],
-            min_value=9000,
-            max_value=86400,
-        ),
-        "batch_window_seconds": _int_setting(
-            raw.get("batch_window_seconds", raw.get("batchWindowSeconds", defaults["batch_window_seconds"])),
-            defaults["batch_window_seconds"],
-            min_value=1,
-            max_value=3600,
-        ),
-        "cooldown_min_seconds": cooldown_min_seconds,
-        "cooldown_max_seconds": cooldown_max_seconds,
+        "growth_min_interval_seconds": growth_min,
+        "growth_max_interval_seconds": growth_max,
     }
-
 
 async def get_ad_delivery_throttle_settings(db: AsyncSession) -> dict[str, Any]:
     return normalize_ad_delivery_throttle_settings(await _read_setting_payload(db, AD_DELIVERY_THROTTLE_SETTING_KEY))
@@ -1438,30 +1426,20 @@ async def save_ad_delivery_throttle_settings(db: AsyncSession, payload: dict[str
 def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS
+    cooldown_seconds = _int_setting(
+        raw.get("growth_group_global_cooldown_seconds", raw.get("growthGroupGlobalCooldownSeconds", defaults["growth_group_global_cooldown_seconds"])),
+        defaults["growth_group_global_cooldown_seconds"],
+        min_value=3600,
+        max_value=604800,
+    )
     return {
         "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
-        "dispatcher_interval_seconds": _int_setting(
-            raw.get("dispatcher_interval_seconds", raw.get("dispatcherIntervalSeconds", defaults["dispatcher_interval_seconds"])),
-            defaults["dispatcher_interval_seconds"],
-            min_value=1,
-            max_value=86400,
-        ),
-        "group_campaign_cooldown_minutes": _int_setting(
-            raw.get("group_campaign_cooldown_minutes", raw.get("groupCampaignCooldownMinutes", defaults["group_campaign_cooldown_minutes"])),
-            defaults["group_campaign_cooldown_minutes"],
-            min_value=4320,
-            max_value=10080,
-        ),
-        "stop_account_after_success": _bool_setting(
-            raw.get("stop_account_after_success", raw.get("stopAccountAfterSuccess", defaults["stop_account_after_success"])),
-            defaults["stop_account_after_success"],
-        ),
-        "stop_account_after_failure": _bool_setting(
-            raw.get("stop_account_after_failure", raw.get("stopAccountAfterFailure", defaults["stop_account_after_failure"])),
-            defaults["stop_account_after_failure"],
-        ),
+        "dispatcher_interval_seconds": _int_setting(raw.get("dispatcher_interval_seconds", raw.get("dispatcherIntervalSeconds", defaults["dispatcher_interval_seconds"])), defaults["dispatcher_interval_seconds"], min_value=10, max_value=3600),
+        "dispatcher_batch_size": _int_setting(raw.get("dispatcher_batch_size", raw.get("dispatcherBatchSize", defaults["dispatcher_batch_size"])), defaults["dispatcher_batch_size"], min_value=1, max_value=1000),
+        "max_parallel_accounts": _int_setting(raw.get("max_parallel_accounts", raw.get("maxParallelAccounts", defaults["max_parallel_accounts"])), defaults["max_parallel_accounts"], min_value=1, max_value=20),
+        "job_lease_seconds": _int_setting(raw.get("job_lease_seconds", raw.get("jobLeaseSeconds", defaults["job_lease_seconds"])), defaults["job_lease_seconds"], min_value=60, max_value=1800),
+        "growth_group_global_cooldown_seconds": cooldown_seconds,
     }
-
 
 async def get_ad_delivery_execution_settings(db: AsyncSession) -> dict[str, Any]:
     return normalize_ad_delivery_execution_settings(await _read_setting_payload(db, AD_DELIVERY_EXECUTION_SETTING_KEY))
@@ -1481,7 +1459,6 @@ async def save_ad_delivery_execution_settings(db: AsyncSession, payload: dict[st
 def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AD_CAPACITY_SETTINGS
-    tier_defaults = defaults["tier_daily_capacities"]
     configured_hour_defaults = defaults["hourly_weights"]
     hour_defaults = {
         str(hour): int(configured_hour_defaults.get(str(hour), 1) or 1)
@@ -1551,30 +1528,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             defaults["survival_retry_base_seconds"],
             min_value=60,
             max_value=3600,
-        ),
-        "account_ad_daily_hard_cap": _int_setting(
-            raw.get("account_ad_daily_hard_cap", raw.get("accountAdDailyHardCap", defaults["account_ad_daily_hard_cap"])),
-            defaults["account_ad_daily_hard_cap"],
-            min_value=1,
-            max_value=5,
-        ),
-        "group_global_daily_hard_cap": _int_setting(
-            raw.get(
-                "group_global_daily_hard_cap",
-                raw.get("groupGlobalDailyHardCap", defaults["group_global_daily_hard_cap"]),
-            ),
-            defaults["group_global_daily_hard_cap"],
-            min_value=1,
-            max_value=400,
-        ),
-        "group_min_interval_seconds": _int_setting(
-            raw.get(
-                "group_min_interval_seconds",
-                raw.get("groupMinIntervalSeconds", defaults["group_min_interval_seconds"]),
-            ),
-            defaults["group_min_interval_seconds"],
-            min_value=259200,
-            max_value=604800,
         ),
         "max_groups_per_account": _int_setting(
             raw.get("max_groups_per_account", raw.get("maxGroupsPerAccount", defaults["max_groups_per_account"])),
@@ -1717,27 +1670,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             min_value=20,
             max_value=5000,
         ),
-        "premium_entry_capacity": _int_setting(
-            raw.get("premium_entry_capacity", raw.get("premiumEntryCapacity", defaults["premium_entry_capacity"])),
-            defaults["premium_entry_capacity"],
-            min_value=1,
-            max_value=defaults["premium_entry_capacity"],
-        ),
-        "premium_growth_capacity": _int_setting(
-            raw.get("premium_growth_capacity", raw.get("premiumGrowthCapacity", defaults["premium_growth_capacity"])),
-            defaults["premium_growth_capacity"],
-            min_value=1,
-            max_value=defaults["premium_growth_capacity"],
-        ),
-        "premium_conversion_capacity_step": _int_setting(
-            raw.get(
-                "premium_conversion_capacity_step",
-                raw.get("premiumConversionCapacityStep", defaults["premium_conversion_capacity_step"]),
-            ),
-            defaults["premium_conversion_capacity_step"],
-            min_value=1,
-            max_value=defaults["premium_conversion_capacity_step"],
-        ),
         "premium_clean_days_auto": _int_setting(
             raw.get("premium_clean_days_auto", raw.get("premiumCleanDaysAuto", defaults["premium_clean_days_auto"])),
             defaults["premium_clean_days_auto"],
@@ -1804,12 +1736,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             min_value=0,
             max_value=100,
         ),
-        "tier_daily_capacities": _normalize_int_map(
-            raw.get("tier_daily_capacities", raw.get("tierDailyCapacities", tier_defaults)),
-            default=tier_defaults,
-            min_value=0,
-            max_value=10000,
-        ),
         "hourly_weights": _normalize_int_map(
             raw.get("hourly_weights", raw.get("hourlyWeights", hour_defaults)),
             default=hour_defaults,
@@ -1822,20 +1748,6 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
         max_key = f"{prefix}_daily_interactions_max"
         if normalized[max_key] < normalized[min_key]:
             normalized[max_key] = normalized[min_key]
-    tier_hard_caps = {
-        "blocked": 0,
-        "observing": 0,
-        "trial": 1,
-        "validated": 20,
-        "stable": 80,
-        "low": 20,
-        "medium": 80,
-        "high": 200,
-        "premium": 400,
-    }
-    for tier, hard_cap in tier_hard_caps.items():
-        current = int(normalized["tier_daily_capacities"].get(tier, hard_cap) or 0)
-        normalized["tier_daily_capacities"][tier] = min(current, hard_cap)
     return normalized
 
 

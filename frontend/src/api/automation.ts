@@ -61,7 +61,7 @@ export interface AccountOperationConfig {
   join_interval_min_seconds: number
   join_interval_max_seconds: number
   next_join_after?: string
-  max_messages_per_day: number
+  max_messages_per_day: number | null
   message_interval_seconds: number
   quiet_hours_start?: string
   quiet_hours_end?: string
@@ -167,6 +167,7 @@ export interface AdCampaign {
   name: string
   enabled: boolean
   status: string
+  delivery_policy: 'growth' | 'ad_only'
   send_mode: 'after_join' | 'interval' | 'scheduled'
   target_group_levels: string[]
   target_group_ids: number[]
@@ -175,8 +176,6 @@ export interface AdCampaign {
   min_wait_after_join_minutes: number
   interval_minutes: number
   scheduled_times: string[]
-  max_sends_per_group_per_day: number
-  max_sends_per_account_per_day: number
   created_at?: string
   updated_at?: string
 }
@@ -185,6 +184,7 @@ export interface AdCampaignCreatePayload {
   name: string
   enabled?: boolean
   status?: string
+  delivery_policy?: 'growth' | 'ad_only'
   send_mode?: 'after_join' | 'interval' | 'scheduled'
   target_group_levels?: string[]
   target_group_ids?: number[]
@@ -193,8 +193,6 @@ export interface AdCampaignCreatePayload {
   min_wait_after_join_minutes?: number
   interval_minutes?: number
   scheduled_times?: string[]
-  max_sends_per_group_per_day?: number
-  max_sends_per_account_per_day?: number
 }
 
 export interface AdFailurePolicy {
@@ -212,9 +210,8 @@ export interface AccountRiskActionBudget {
 
 export interface AccountRiskGuardSettings {
   enabled: boolean
-  global_daily_limit: number
-  group_write_daily_limit: number
-  redis_fail_closed: boolean | null
+  account_outbound_message_hard_cap_default: number
+  redis_fail_closed: boolean
   actions: Record<string, AccountRiskActionBudget>
   level_thresholds: Record<string, number>
   level_budget_multipliers: Record<string, number>
@@ -264,18 +261,17 @@ export interface AccountWarmupPolicySettings {
 
 export interface AdDeliveryThrottleSettings {
   enabled: boolean
-  delivery_interval_seconds: number
-  batch_window_seconds: number
-  cooldown_min_seconds: number
-  cooldown_max_seconds: number
+  growth_min_interval_seconds: number
+  growth_max_interval_seconds: number
 }
 
 export interface AdDeliveryExecutionSettings {
   enabled: boolean
   dispatcher_interval_seconds: number
-  group_campaign_cooldown_minutes: number
-  stop_account_after_success: boolean
-  stop_account_after_failure: boolean
+  dispatcher_batch_size: number
+  max_parallel_accounts: number
+  job_lease_seconds: number
+  growth_group_global_cooldown_seconds: number
 }
 
 export interface AdCapacitySettings {
@@ -289,9 +285,6 @@ export interface AdCapacitySettings {
   survival_check_batch_size: number
   survival_retry_max_attempts: number
   survival_retry_base_seconds: number
-  account_ad_daily_hard_cap: number
-  group_global_daily_hard_cap: number
-  group_min_interval_seconds: number
   max_groups_per_account: number
   max_new_ad_groups_per_day: number
   leave_on_deleted_ad: boolean
@@ -314,19 +307,14 @@ export interface AdCapacitySettings {
   premium_clean_days_verified: number
   premium_growth_samples: number
   premium_full_capacity_samples: number
-  premium_entry_capacity: number
-  premium_growth_capacity: number
-  premium_conversion_capacity_step: number
   deleted_ad_pause_hours: number
   membership_delete_block_count: number
   warmup_daily_interactions_min: number
   warmup_daily_interactions_max: number
   mature_daily_interactions_min: number
   mature_daily_interactions_max: number
-  tier_daily_capacities: Record<string, number>
   hourly_weights: Record<string, number>
 }
-
 export interface GroupAdProfile {
   id: number
   group_id: number
@@ -344,7 +332,7 @@ export interface GroupAdProfile {
   ad_policy_probe_error?: string
   ad_policy_expires_at?: string
   ad_tier: string
-  daily_capacity: number
+
   paused_until?: string
   survival_count: number
   deleted_count: number
@@ -387,10 +375,7 @@ export interface AdDynamicStatus {
   group_control_failed_24h: number
   account_failed_24h: number
   transient_failed_24h: number
-  dynamic_daily_limit: number
-  dynamic_run_limit: number
-  time_window_multiplier: number
-  probe_based_daily_limit: number
+  growth_health_allowed: boolean
   probe_factor: number
   probe_quality_multiplier: number
   recent_probe_success_6h: number
@@ -436,9 +421,11 @@ export interface AdDynamicStatus {
       severity: 'success' | 'warning' | 'danger' | 'info' | string
     }>
     health_score: number
+    health_gate_applies: boolean
+    health_gate_passed: boolean
     risk_score: number
     warmup_action_multiplier: number
-    probe_based_daily_limit: number
+
     probe_factor: number
     writable_rate: number
     probe_success_rate_24h: number
@@ -498,7 +485,7 @@ export interface AdDynamicStatus {
       last_probe_error?: string
       ad_policy_mode?: string
       ad_tier?: string
-      ad_daily_capacity?: number
+
     }>
   }
 }

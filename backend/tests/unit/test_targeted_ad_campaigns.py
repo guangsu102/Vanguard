@@ -33,6 +33,7 @@ from app.modules.acquisition.models import (
     AdCampaign,
     AdCreative,
     AdDeliveryLog,
+    AdDeliveryPolicy,
     AdSendMode,
     DeliveryStatus,
     GroupAdPolicyMode,
@@ -375,19 +376,29 @@ async def test_non_targeted_group_is_rejected_before_delivery_checks(test_db, mo
 
 
 @pytest.mark.asyncio
-async def test_scheduled_time_is_enforced_when_dynamic_capacity_is_enabled(test_db, monkeypatch):
+async def test_ad_only_scheduled_time_is_enforced_without_growth_gates(test_db, monkeypatch):
     service = AcquisitionAutomationService(test_db)
     campaign = AdCampaign(
         id=92,
-        name="capacity still respects schedule",
+        name="ad-only schedule",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
         send_mode=AdSendMode.SCHEDULED.value,
         scheduled_times=json.dumps(["09:00"]),
-        target_group_levels=json.dumps(["A"]),
+        target_group_ids=json.dumps([303]),
     )
     binding = SimpleNamespace(account_id=7)
     membership = SimpleNamespace(
         telegram_group_id=-100456,
-        group=SimpleNamespace(id=303, group_id=-100456, status="active", level=SimpleNamespace(value="A")),
+        join_method="manual_link_join",
+        ad_pause_until=None,
+        ad_status="active",
+        group=SimpleNamespace(
+            id=303,
+            group_id=-100456,
+            status="active",
+            level=SimpleNamespace(value="A"),
+            ad_delivery_account_id=7,
+        ),
     )
 
     monkeypatch.setattr(automation_module, "_now", lambda: datetime(2026, 7, 14, 5, 0))
@@ -398,11 +409,39 @@ async def test_scheduled_time_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
     monkeypatch.setattr(service, "_ad_recent_inflight_delivery_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(service, "_ad_recent_undeliverable_failure_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        service,
+        "_get_account_operation_config",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                account_id=7,
+                operation_mode=AccountOperationMode.AD_ONLY.value,
+                enabled=True,
+                auto_ads_enabled=True,
+                quiet_hours_start=None,
+                quiet_hours_end=None,
+            )
+        ),
+    )
     monkeypatch.setattr(service, "_ad_account_risk_skip_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(service, "_group_can_receive_ads", AsyncMock(return_value=True))
-    monkeypatch.setattr(service, "_ad_warmup_skip_reason", AsyncMock(return_value=None))
-    dynamic_limit = AsyncMock(return_value=10)
-    monkeypatch.setattr(service, "_ad_dynamic_daily_limit", dynamic_limit)
+    monkeypatch.setattr(
+        service,
+        "_get_or_create_group_ad_profile",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                ad_policy_confidence=100,
+                ad_policy_expires_at=None,
+                paused_until=None,
+                ad_tier=GroupAdTier.STABLE.value,
+            )
+        ),
+    )
+    warmup_check = AsyncMock(return_value="warming")
+    monkeypatch.setattr(service, "_ad_warmup_skip_reason", warmup_check)
+    growth_health = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_growth_ad_health_allowed", growth_health)
 
     reason = await service._ad_skip_reason(
         binding,
@@ -412,7 +451,8 @@ async def test_scheduled_time_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
 
     assert reason == "scheduled_time_not_due"
-    dynamic_limit.assert_not_awaited()
+    growth_health.assert_not_awaited()
+    warmup_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -466,7 +506,7 @@ async def test_approval_required_group_is_blocked_before_writable_probe(test_db,
 
 
 @pytest.mark.asyncio
-async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_db, monkeypatch):
+async def test_ad_only_group_interval_is_enforced_without_growth_gates(test_db, monkeypatch):
     now = datetime(2026, 7, 15, 4, 0)
     account = TelegramAccount(
         phone="+15550008801",
@@ -478,25 +518,38 @@ async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
     group = Group(group_id=-10088001, title="Interval target", level=GroupLevel.A, status="active")
     campaign = AdCampaign(
-        name="ten minute target",
+        name="ten minute ad-only target",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
         send_mode=AdSendMode.INTERVAL.value,
         interval_minutes=10,
         target_group_ids="[]",
-        target_group_levels=json.dumps(["A"]),
-        max_sends_per_group_per_day=0,
-        max_sends_per_account_per_day=0,
     )
     test_db.add_all([account, group, campaign])
     await test_db.flush()
-    test_db.add(
-        AdDeliveryLog(
-            account_id=account.id,
-            group_id=group.id,
-            telegram_group_id=group.group_id,
-            ad_campaign_id=campaign.id,
-            status=DeliveryStatus.SUCCESS.value,
-            sent_at=now - timedelta(minutes=5),
-        )
+    campaign.target_group_ids = json.dumps([group.id])
+    group.ad_delivery_account_id = account.id
+    test_db.add_all(
+        [
+            GroupAdProfile(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                ad_policy_confidence=100,
+                ad_policy_source="manual",
+                ad_policy_verified_at=now - timedelta(days=1),
+                ad_policy_expires_at=now + timedelta(days=30),
+                ad_tier=GroupAdTier.STABLE.value,
+                daily_capacity=0,
+            ),
+            AdDeliveryLog(
+                account_id=account.id,
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                ad_campaign_id=campaign.id,
+                status=DeliveryStatus.SUCCESS.value,
+                sent_at=now - timedelta(minutes=5),
+            ),
+        ]
     )
     await test_db.commit()
 
@@ -505,7 +558,10 @@ async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_
     membership = SimpleNamespace(
         telegram_group_id=group.group_id,
         group=group,
+        join_method="manual_link_join",
         joined_at=now - timedelta(days=1),
+        ad_pause_until=None,
+        ad_status="active",
     )
     monkeypatch.setattr(automation_module, "_now", lambda: now)
     monkeypatch.setattr(
@@ -515,10 +571,24 @@ async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
     monkeypatch.setattr(service, "_ad_recent_inflight_delivery_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(service, "_ad_recent_undeliverable_failure_reason", AsyncMock(return_value=None))
-    monkeypatch.setattr(service, "_get_account_operation_config", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        service,
+        "_get_account_operation_config",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                account_id=account.id,
+                operation_mode=AccountOperationMode.AD_ONLY.value,
+                enabled=True,
+                auto_ads_enabled=True,
+                quiet_hours_start=None,
+                quiet_hours_end=None,
+            )
+        ),
+    )
     monkeypatch.setattr(service, "_ad_account_risk_skip_reason", AsyncMock(return_value=None))
     monkeypatch.setattr(service, "_group_can_receive_ads", AsyncMock(return_value=True))
-    monkeypatch.setattr(service, "_ad_warmup_skip_reason", AsyncMock(return_value=None))
+    warmup_check = AsyncMock(return_value="warming")
+    monkeypatch.setattr(service, "_ad_warmup_skip_reason", warmup_check)
 
     reason = await service._ad_skip_reason(
         binding,
@@ -528,6 +598,7 @@ async def test_group_interval_is_enforced_when_dynamic_capacity_is_enabled(test_
     )
 
     assert reason == "interval_not_due"
+    warmup_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -549,13 +620,18 @@ async def test_handed_over_group_rejects_previous_growth_account(test_db, monkey
 
     reason = await service._ad_skip_reason(binding, campaign, None, membership)
 
-    assert reason == "group_assigned_to_other_ad_account"
+    assert reason == "group_reserved_for_ad_only"
 
 
 @pytest.mark.asyncio
 async def test_ad_only_account_rejects_level_based_campaign(test_db, monkeypatch):
     service = AcquisitionAutomationService(test_db)
-    campaign = AdCampaign(id=95, name="level campaign", target_group_ids="[]")
+    campaign = AdCampaign(
+        id=95,
+        name="level campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        target_group_ids="[]",
+    )
     binding = SimpleNamespace(account_id=9)
     membership = SimpleNamespace(
         telegram_group_id=-100405,
@@ -585,7 +661,12 @@ async def test_ad_only_binding_requires_manual_takeover(test_db):
         is_active=True,
     )
     group = Group(group_id=-100406, title="Manual binding group", level=GroupLevel.A)
-    campaign = AdCampaign(name="manual binding campaign")
+    campaign = AdCampaign(
+        name="manual binding campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode=AdSendMode.INTERVAL.value,
+        interval_minutes=180,
+    )
     test_db.add_all([account, group, campaign])
     await test_db.flush()
     campaign.target_group_ids = json.dumps([group.id])
@@ -606,7 +687,7 @@ async def test_ad_only_binding_requires_manual_takeover(test_db):
     )
     await test_db.commit()
 
-    with pytest.raises(HTTPException, match="must manually join and take over"):
+    with pytest.raises(HTTPException, match="must manually join and own"):
         await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)
 
     membership = (
@@ -616,6 +697,19 @@ async def test_ad_only_binding_requires_manual_takeover(test_db):
     ).scalar_one()
     membership.join_method = "manual_link_join"
     group.ad_delivery_account_id = account.id
+    test_db.add(
+        GroupAdProfile(
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+            ad_policy_confidence=100,
+            ad_policy_source="manual",
+            ad_policy_verified_at=datetime.utcnow(),
+            ad_policy_expires_at=datetime.utcnow() + timedelta(days=30),
+            ad_tier=GroupAdTier.STABLE.value,
+            daily_capacity=0,
+        )
+    )
     await test_db.commit()
 
     await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)

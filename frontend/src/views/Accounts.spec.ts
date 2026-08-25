@@ -33,8 +33,7 @@ const {
           risk_score: 42,
           health_score: 71,
           ad_eligible_groups: 3,
-          dynamic_daily_limit: 4,
-          dynamic_run_limit: 1,
+          growth_health_allowed: false,
           recent_errors: [],
           delivery_diagnostic: {
             ad_delivery_allowed: false,

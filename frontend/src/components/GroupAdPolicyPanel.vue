@@ -19,7 +19,9 @@ const adPolicyModeOptions = [
 ]
 
 const sortedProfiles = computed(() =>
-  [...profiles.value].sort((left, right) => Number(right.daily_capacity || 0) - Number(left.daily_capacity || 0)),
+  [...profiles.value].sort(
+    (left, right) => Number(right.ad_policy_confidence || 0) - Number(left.ad_policy_confidence || 0),
+  ),
 )
 const { page, pageSize, total, rows: pagedProfiles } = useClientPagination(sortedProfiles, 20)
 
@@ -71,8 +73,8 @@ onMounted(loadProfiles)
   <section class="group-operation-panel" v-loading="loading">
     <div class="panel-toolbar">
       <div>
-        <h3>群广告许可与档位</h3>
-        <p>维护每个群的广告许可，查看系统根据投放证据计算的档位和日容量。</p>
+        <h3>群广告许可</h3>
+        <p>维护每个群的广告许可，并查看系统根据投放证据计算的可信等级。</p>
       </div>
       <el-button :icon="Refresh" :loading="loading" @click="loadProfiles">刷新</el-button>
     </div>
@@ -88,12 +90,11 @@ onMounted(loadProfiles)
           </el-select>
         </template>
       </el-table-column>
-      <el-table-column label="档位" width="110">
+      <el-table-column label="证据等级" width="110">
         <template #default="{ row }"
           ><el-tag effect="plain">{{ row.ad_tier }}</el-tag></template
         >
       </el-table-column>
-      <el-table-column prop="daily_capacity" label="日容量" width="100" />
       <el-table-column label="24h样本" width="100">
         <template #default="{ row }">{{ row.metrics?.completed_samples || 0 }}</template>
       </el-table-column>

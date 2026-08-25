@@ -118,7 +118,7 @@ async def test_risk_guard_blocks_paused_account(test_db):
 
 
 @pytest.mark.asyncio
-async def test_risk_guard_allows_and_audits_without_redis(test_db):
+async def test_risk_guard_blocks_and_audits_without_redis(test_db):
     account = TelegramAccount(
         phone="+15559990002",
         identifier="+15559990002",
@@ -139,13 +139,12 @@ async def test_risk_guard_allows_and_audits_without_redis(test_db):
 
     decision = await guard.check_and_reserve(wrapper, AccountRiskAction.JOIN, target_type="group", target_id="demo")
 
-    assert decision.allowed is True
+    assert decision.allowed is False
+    assert decision.reason == "risk_budget_unavailable"
     events = (await test_db.execute(select(AccountRiskEvent))).scalars().all()
-    stats = (await test_db.execute(select(AccountRiskDailyStat))).scalars().all()
-    assert events == []
-    assert len(stats) == 1
-    assert stats[0].status == "allow"
-    assert stats[0].action == AccountRiskAction.JOIN.value
+    assert len(events) == 1
+    assert events[0].status == "block"
+    assert events[0].reason == "risk_budget_unavailable"
 
 
 @pytest.mark.asyncio
@@ -499,7 +498,7 @@ async def test_many_group_scoped_write_failures_do_not_freeze_account(test_db):
     await test_db.refresh(account)
 
     wrapper = SimpleNamespace(account_id=account.id, country_code="US")
-    guard = AccountRiskGuard(test_db)
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
     for index in range(10):
         await guard.record_failure(
             wrapper,
@@ -761,7 +760,7 @@ class FakeCache:
         return await self.client.expire(key, ttl)
 
 @pytest.mark.asyncio
-async def test_acquisition_group_writes_share_daily_budget(test_db):
+async def test_acquisition_group_writes_do_not_share_retired_daily_budget(test_db):
     guard = AccountRiskGuard(test_db, cache=FakeCache())
     settings = {"global_daily_limit": 30, "group_write_daily_limit": 8}
     actions = (
@@ -791,8 +790,88 @@ async def test_acquisition_group_writes_share_daily_budget(test_db):
         RiskBudget(daily_limit=100),
         settings,
     )
+    assert allowed is True
+    assert reason == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_account_outbound_messages_share_operation_config_hard_cap(test_db):
+    account = TelegramAccount(
+        identifier="outbound-hard-cap-account",
+        session_name="outbound-hard-cap-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(account)
+    await test_db.flush()
+    test_db.add(
+        AccountOperationConfig(
+            account_id=account.id,
+            max_messages_per_day=3,
+        )
+    )
+    await test_db.commit()
+
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    settings = {"account_outbound_message_hard_cap_default": 30}
+    for _ in range(3):
+        allowed, reason, _ = await guard._reserve_budget(
+            account.id,
+            AccountRiskAction.GROUP_MESSAGE,
+            RiskBudget(daily_limit=100),
+            settings,
+        )
+        assert allowed is True
+        assert reason == "reserved"
+        guard.cache.client.values.pop(
+            f"risk:account:{account.id}:cooldown:group_message",
+            None,
+        )
+
+    allowed, reason, _ = await guard._reserve_budget(
+        account.id,
+        AccountRiskAction.AD_DELIVERY,
+        RiskBudget(daily_limit=100),
+        settings,
+    )
     assert allowed is False
-    assert reason == "acquisition_group_write_daily_budget"
+    assert reason == "account_outbound_message_hard_cap"
+
+
+@pytest.mark.asyncio
+async def test_account_outbound_messages_use_config_center_default(test_db):
+    account = TelegramAccount(
+        identifier="outbound-default-cap-account",
+        session_name="outbound-default-cap-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(account)
+    await test_db.commit()
+
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    settings = {"account_outbound_message_hard_cap_default": 2}
+    for action in (AccountRiskAction.AD_DELIVERY, AccountRiskAction.PRIVATE_MESSAGE):
+        allowed, reason, _ = await guard._reserve_budget(
+            account.id,
+            action,
+            RiskBudget(daily_limit=100),
+            settings,
+        )
+        assert allowed is True
+        assert reason == "reserved"
+
+    allowed, reason, _ = await guard._reserve_budget(
+        account.id,
+        AccountRiskAction.GROUP_MESSAGE,
+        RiskBudget(daily_limit=100),
+        settings,
+    )
+    assert allowed is False
+    assert reason == "account_outbound_message_hard_cap"
+
 
 @pytest.mark.asyncio
 async def test_risk_guard_blocks_repeated_message_content(test_db):
@@ -900,4 +979,4 @@ def test_runtime_risk_guard_parses_redis_fail_closed_string():
 
     settings = normalize_account_risk_guard_settings({"redisFailClosed": "false"})
 
-    assert settings["redis_fail_closed"] is False
+    assert settings["redis_fail_closed"] is True

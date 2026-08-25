@@ -7,7 +7,10 @@ export {}
 
 declare module 'vue' {
   export interface GlobalComponents {
+    AccountDeliveryBlockDrawer: typeof import('./components/AccountDeliveryBlockDrawer.vue')['default']
     AccountLoginDialog: typeof import('./components/AccountLoginDialog.vue')['default']
+    AccountOperationalStatusPanel: typeof import('./components/AccountOperationalStatusPanel.vue')['default']
+    ClientListPagination: typeof import('./components/ClientListPagination.vue')['default']
     ECharts: typeof import('./components/ECharts.vue')['default']
     ElAlert: typeof import('element-plus/es')['ElAlert']
     ElAvatar: typeof import('element-plus/es')['ElAvatar']
@@ -25,6 +28,7 @@ declare module 'vue' {
     ElDialog: typeof import('element-plus/es')['ElDialog']
     ElDivider: typeof import('element-plus/es')['ElDivider']
     ElDrawer: typeof import('element-plus/es')['ElDrawer']
+    ElEmpty: typeof import('element-plus/es')['ElEmpty']
     ElForm: typeof import('element-plus/es')['ElForm']
     ElFormItem: typeof import('element-plus/es')['ElFormItem']
     ElHeader: typeof import('element-plus/es')['ElHeader']
@@ -49,6 +53,8 @@ declare module 'vue' {
     ElTag: typeof import('element-plus/es')['ElTag']
     ElTooltip: typeof import('element-plus/es')['ElTooltip']
     FormDrawer: typeof import('./components/FormDrawer.vue')['default']
+    GroupAdPolicyPanel: typeof import('./components/GroupAdPolicyPanel.vue')['default']
+    GroupFailoverPanel: typeof import('./components/GroupFailoverPanel.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']
     RouterView: typeof import('vue-router')['RouterView']
     SearchBar: typeof import('./components/SearchBar.vue')['default']

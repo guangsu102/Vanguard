@@ -821,6 +821,82 @@ class TestAutoJoinStateHandling:
 
         assert reason == "join_request_pending"
 
+    def test_risk_guard_blocked_join_is_classified_as_internal_skip(self):
+        service = AcquisitionAutomationService(db=MagicMock())
+
+        reason = service._classify_join_error(
+            RuntimeError("risk_guard_blocked:risk_budget_unavailable")
+        )
+
+        assert reason == "risk_guard_blocked:risk_budget_unavailable"
+
+    def test_risk_guard_blocked_ad_is_classified_without_unknown_prefix(self):
+        service = AcquisitionAutomationService(db=MagicMock())
+
+        reason = service._classify_ad_delivery_error(
+            RuntimeError("risk_guard_blocked:ad_delivery_cooldown")
+        )
+
+        assert reason == "risk_guard_blocked:ad_delivery_cooldown"
+
+    def test_rescheduled_probe_ignores_historical_failure_event(self):
+        membership = SimpleNamespace(probe_status="scheduled")
+        blocked_event = {"event": "ad_probe_failed"}
+
+        assert (
+            AcquisitionAutomationService._probe_block_event_is_active(
+                membership,
+                blocked_event,
+            )
+            is False
+        )
+
+        membership.probe_status = "failed"
+        assert (
+            AcquisitionAutomationService._probe_block_event_is_active(
+                membership,
+                blocked_event,
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_ad_probe_risk_guard_block_is_rescheduled_without_failure(self):
+        service = AcquisitionAutomationService(db=MagicMock())
+        service.db.commit = AsyncMock()
+        account = MagicMock()
+        service.account_pool.acquire_by_id = AsyncMock(return_value=account)
+        service.account_pool.release = AsyncMock()
+        service._ad_send_target = AsyncMock(return_value=-100123)
+        service.telegram_execution.send_group_message = AsyncMock(
+            side_effect=RuntimeError("risk_guard_blocked:ad_probe_cooldown")
+        )
+        membership = SimpleNamespace(
+            group=SimpleNamespace(id=1),
+            telegram_group_id=-100123,
+            note=None,
+            warmup_status="probe_scheduled",
+            probe_status="scheduled",
+            ad_status="warming",
+            probe_due_at=datetime.utcnow(),
+            last_probe_at=None,
+            last_probe_error=None,
+            last_checked_at=None,
+            updated_at=None,
+        )
+
+        result = await service._send_ad_probe(1, membership)
+
+        assert result == "ad_probe_risk_guard_skipped"
+        assert membership.warmup_status == "probe_scheduled"
+        assert membership.probe_status == "scheduled"
+        assert membership.ad_status == "warming"
+        assert membership.probe_due_at > datetime.utcnow()
+        assert "ad_probe_skipped" in membership.note
+        account.record_message.assert_not_called()
+        service.db.commit.assert_awaited_once()
+        service.account_pool.release.assert_awaited_once_with(account)
+
     def test_private_banned_evaluation_error_is_group_membership_banned(self):
         service = AcquisitionAutomationService(db=MagicMock())
 
@@ -1558,60 +1634,6 @@ class TestAdDeliveryFailureHandling:
         service._leave_group.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_account_group_ad_daily_capacity_cannot_exceed_internal_cap(self, test_db, monkeypatch):
-        account = TelegramAccount(
-            phone="+15550000002",
-            identifier="+15550000002",
-            session_name="asset_group_cap_account",
-            account_type=AccountType.PROMOTER,
-            status=AccountStatus.ONLINE,
-            is_active=True,
-            asset_tier=AccountAssetTier.YEAR_1.value,
-        )
-        membership = GroupAccountMembership(
-            telegram_group_id=1946699881,
-            account_id=1,
-            status="joined",
-            join_method="manual",
-            account_group_daily_cap=400,
-        )
-        test_db.add(account)
-        await test_db.flush()
-        membership.account_id = account.id
-
-        policy = dict(DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS)
-        policy["tiers"] = {
-            **DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS["tiers"],
-            AccountAssetTier.YEAR_1.value: {
-                **DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS["tiers"][AccountAssetTier.YEAR_1.value],
-                "ad_multiplier": 0.72,
-            },
-        }
-        monkeypatch.setattr(acquisition_automation, "get_account_asset_policy_settings", AsyncMock(return_value=policy))
-
-        service = AcquisitionAutomationService(db=test_db)
-        cap = await service._account_group_ad_daily_capacity(
-            account.id,
-            membership,
-            {"account_group_daily_cap_default": 20},
-        )
-
-        assert cap == 1
-
-    def test_scaled_positive_ad_capacity_preserves_low_multiplier_trial_slot(self):
-        account = SimpleNamespace(asset_tier=AccountAssetTier.MONTH_1.value)
-        multiplier = AccountDynamicFrequencyService.account_asset_multiplier(
-            DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS,
-            account,
-            "ad_multiplier",
-        )
-
-        assert multiplier == 0.25
-        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, multiplier) == 1
-        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, 0.5) == 1
-        assert AccountDynamicFrequencyService.scaled_positive_capacity(1, 0.0) == 0
-
-    @pytest.mark.asyncio
     async def test_recent_successful_probe_enforces_24_hour_ad_wait(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(
@@ -1817,123 +1839,6 @@ class TestAdDeliveryFailureHandling:
             groups[1].group_id,
             groups[3].group_id,
         }
-
-    @pytest.mark.asyncio
-    async def test_ad_daily_limit_uses_recent_probe_formula_and_business_stage(self, test_db):
-        account = TelegramAccount(
-            phone="+15550000901",
-            identifier="+15550000901",
-            session_name="ad_formula_account",
-            account_type=AccountType.PROMOTER,
-            status=AccountStatus.ONLINE,
-            is_active=True,
-            created_at=datetime.utcnow() - timedelta(days=10),
-            asset_tier=AccountAssetTier.YEAR_1.value,
-        )
-        config = AccountOperationConfig(
-            account=account,
-            auto_join_enabled=True,
-            auto_ads_enabled=True,
-            max_groups_per_day=100,
-            max_groups_total=1000,
-            max_messages_per_day=500,
-            business_stage="normal",
-            enabled=True,
-        )
-        campaign = AdCampaign(
-            name="Probe Formula Campaign",
-            enabled=True,
-            status="active",
-            send_mode=AdSendMode.INTERVAL.value,
-            max_sends_per_account_per_day=500,
-        )
-        test_db.add_all([account, config, campaign])
-        await test_db.flush()
-
-        now = datetime.utcnow()
-        for index in range(10):
-            group = Group(
-                group_id=900000 + index,
-                title=f"Formula Group {index}",
-                level=GroupLevel.B,
-                status="active",
-            )
-            test_db.add(group)
-            await test_db.flush()
-            test_db.add(
-                GroupAccountMembership(
-                    group_id=group.id,
-                    telegram_group_id=group.group_id,
-                    account_id=account.id,
-                    status="joined",
-                    join_method="manual",
-                    probe_status="success",
-                    last_probe_at=now - timedelta(minutes=10),
-                    ad_eligible_after=now - timedelta(minutes=1),
-                    note='{"passed": true, "can_send_messages": true}',
-                )
-            )
-            test_db.add(
-                GroupAdProfile(
-                    group_id=group.id,
-                    telegram_group_id=group.group_id,
-                    ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-                    ad_policy_confidence=100,
-                    ad_policy_source="manual",
-                    ad_policy_verified_at=now - timedelta(days=5),
-                    ad_policy_expires_at=now + timedelta(days=30),
-                    ad_tier=GroupAdTier.TRIAL.value,
-                    daily_capacity=1,
-                )
-            )
-        await test_db.commit()
-
-        service = AcquisitionAutomationService(db=test_db)
-        limit = await service._ad_dynamic_daily_limit(account.id, config, campaign, now)
-
-        assert 1 <= limit <= 50
-        assert config.business_stage == "hot"
-
-    @pytest.mark.asyncio
-    async def test_ad_daily_limit_blocks_new_managed_account_observe_stage(self, test_db):
-        now = datetime.utcnow()
-        account = TelegramAccount(
-            phone="+15550000911",
-            identifier="+15550000911",
-            session_name="ad_warmup_observe_account",
-            account_type=AccountType.PROMOTER,
-            status=AccountStatus.ONLINE,
-            is_active=True,
-            created_at=now - timedelta(days=30),
-            managed_started_at=now,
-            asset_tier=AccountAssetTier.YEAR_1.value,
-        )
-        config = AccountOperationConfig(
-            account=account,
-            auto_join_enabled=True,
-            auto_ads_enabled=True,
-            max_groups_per_day=100,
-            max_groups_total=1000,
-            max_messages_per_day=500,
-            business_stage="normal",
-            enabled=True,
-        )
-        campaign = AdCampaign(
-            name="Warmup Observe Campaign",
-            enabled=True,
-            status="active",
-            send_mode=AdSendMode.INTERVAL.value,
-            max_sends_per_account_per_day=500,
-        )
-        test_db.add_all([account, config, campaign])
-        await test_db.commit()
-
-        service = AccountDynamicFrequencyService(test_db)
-        limit = await service.ad_dynamic_daily_limit(account.id, config, campaign, now)
-
-        assert limit == 0
-        assert account.warmup_stage == "observe"
-        assert config.business_stage == "new"
 
     @pytest.mark.asyncio
     async def test_auto_join_dynamic_limit_pauses_risk_frozen_account(self, test_db):
@@ -2189,7 +2094,7 @@ class TestAdDeliveryFailureHandling:
         )
 
         assert segment == "normal"
-        assert service.AD_DAILY_RANGES["normal"].maximum == 18
+
 
     def test_ad_failures_pause_ads_without_pausing_join_lifecycle(self):
         now = datetime(2026, 1, 1, 12, 0, 0)
@@ -2275,6 +2180,80 @@ class TestAdDeliveryFailureHandling:
             item["reason"] in {"join_account_banned", "join_success_rate_low"}
             for item in health["adjustments"]
         )
+
+    @pytest.mark.asyncio
+    async def test_join_quality_ignores_internal_probe_and_ad_blocks(self):
+        db = MagicMock()
+        memberships = MagicMock()
+        memberships.scalars.return_value.all.return_value = []
+        probes = MagicMock()
+        probes.all.return_value = [
+            ("success", None),
+            ("failed", "unknown:risk_guard_blocked:risk_budget_unavailable"),
+            ("failed", "group_control:write forbidden"),
+        ]
+        ads = MagicMock()
+        ads.all.return_value = [
+            (DeliveryStatus.SUCCESS.value, None),
+            (DeliveryStatus.FAILED.value, "risk_guard_blocked:ad_delivery_cooldown"),
+            (DeliveryStatus.FAILED.value, "group_control:write forbidden"),
+        ]
+        db.execute = AsyncMock(side_effect=[memberships, probes, ads])
+        service = AccountDynamicFrequencyService(db)
+
+        metrics = await service.account_join_quality_metrics(1, datetime.utcnow())
+
+        assert metrics["probe_success_24h"] == 1
+        assert metrics["probe_failed_24h"] == 1
+        assert metrics["probe_success_rate_24h"] == 0.5
+        assert metrics["ad_success_24h"] == 1
+        assert metrics["ad_failed_24h"] == 1
+        assert metrics["ad_success_rate_24h"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_dynamic_frequency_ignores_skips_and_internal_risk_blocks(self):
+        db = MagicMock()
+        rows = MagicMock()
+        rows.all.return_value = [
+            (DeliveryStatus.SUCCESS.value, None, None, datetime.utcnow()),
+            (DeliveryStatus.SKIPPED.value, "daily_join_quota", None, None),
+            (
+                DeliveryStatus.FAILED.value,
+                "join_failed",
+                "risk_guard_blocked:risk_budget_unavailable",
+                None,
+            ),
+            (DeliveryStatus.FAILED.value, "join_failed", "telegram request failed", None),
+        ]
+        db.execute = AsyncMock(return_value=rows)
+        service = AccountDynamicFrequencyService(db)
+
+        metrics = await service.join_attempt_metrics(1, datetime.utcnow())
+
+        assert metrics["success"] == 1
+        assert metrics["failed"] == 1
+        assert metrics["skipped"] == 2
+        assert metrics["total"] == 2
+        assert metrics["success_rate"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_ad_health_ignores_internal_risk_guard_blocks(self):
+        db = MagicMock()
+        rows = MagicMock()
+        rows.all.return_value = [
+            (DeliveryStatus.SUCCESS.value, None),
+            (DeliveryStatus.FAILED.value, "risk_guard_blocked:risk_budget_unavailable"),
+            (DeliveryStatus.FAILED.value, "unknown:telegram request failed"),
+        ]
+        db.execute = AsyncMock(return_value=rows)
+        service = AccountDynamicFrequencyService(db)
+
+        metrics = await service.ad_delivery_metrics(1, datetime.utcnow())
+
+        assert metrics["success"] == 1
+        assert metrics["failed"] == 1
+        assert metrics["account_failed"] == 0
+        assert metrics["success_rate"] == 0.5
 
     @pytest.mark.asyncio
     async def test_dynamic_frequency_peer_flood_forces_cooldown(self, test_db):
@@ -2449,21 +2428,28 @@ class TestAdDeliveryFailureHandling:
 
         service = AcquisitionAutomationService(db=test_db)
         service._sync_account_pool = AsyncMock()
+        service._claim_ad_account_worker_lock = AsyncMock(return_value="worker-token")
+        service._release_ad_account_worker_lock = AsyncMock()
         service._send_ad = AsyncMock(side_effect=[RuntimeError("can't write in this chat"), 9001])
         service._handle_group_control_ad_failure = AsyncMock()
         service._ad_account_throttle_skip_reason = AsyncMock(return_value=None)
-        service._ad_dynamic_daily_limit = AsyncMock(return_value=2)
-        service._ad_dynamic_run_limit = AsyncMock(return_value=2)
+        service._ad_window_skip_reason = MagicMock(return_value=None)
+        service._growth_ad_health_allowed = AsyncMock(return_value=True)
         service._ad_weighted_cumulative_cap = MagicMock(return_value=2)
         service._maybe_send_ad_interaction = AsyncMock(return_value=None)
-        service._reserve_group_daily_delivery_slot = AsyncMock(return_value=(True, "reserved", "test-slot"))
-        service._release_group_daily_delivery_slot = AsyncMock()
         service._schedule_next_ad_delivery_after_success = AsyncMock()
+        service._claim_ad_schedule_state = AsyncMock(
+            side_effect=[
+                (1, "schedule-token-1", None),
+                (2, "schedule-token-2", None),
+            ]
+        )
+        service._finish_ad_schedule_state = AsyncMock()
         monkeypatch.setattr(acquisition_automation, "get_ad_delivery_throttle_settings", lambda: {"enabled": False})
 
         result = await service.run_ad_delivery(max_deliveries=2)
 
-        assert result["failed"] == 1
+        assert result["failed"] == 1, [item.get("reason") for item in result["details"]]
         assert result["succeeded"] == 1
         assert service._send_ad.await_count == 2
         logs = (await test_db.execute(select(AdDeliveryLog).order_by(AdDeliveryLog.id))).scalars().all()

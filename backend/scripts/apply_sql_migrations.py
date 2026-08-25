@@ -34,6 +34,7 @@ DEFAULT_MIGRATIONS = [
     "031_add_ad_policy_probe.sql",
     "032_add_ad_policy_evidence_hash.sql",
     "033_add_group_ad_delivery_account.sql",
+    "034_add_ad_delivery_policy_scheduler.sql",
 ]
 
 

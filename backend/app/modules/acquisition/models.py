@@ -86,6 +86,23 @@ class AdSendMode(str, Enum):
     SCHEDULED = "scheduled"
 
 
+class AdDeliveryPolicy(str, Enum):
+    """Business policy used to determine when an advertisement is due."""
+
+    GROWTH = "growth"
+    AD_ONLY = "ad_only"
+
+
+class AdScheduleStatus(str, Enum):
+    """Persistent scheduler state for one campaign/account/group tuple."""
+
+    IDLE = "idle"
+    PENDING = "pending"
+    SENDING = "sending"
+    RETRY = "retry"
+    PAUSED = "paused"
+
+
 class DeliveryStatus(str, Enum):
     """Delivery lifecycle status for automation logs."""
 
@@ -852,6 +869,14 @@ class AdCampaign(Base):
         Boolean, default=False, nullable=False, comment="是否启用"
     )
     status: Mapped[str] = mapped_column(String(30), default="draft", nullable=False, comment="状态")
+    delivery_policy: Mapped[str] = mapped_column(
+        String(20),
+        default=AdDeliveryPolicy.GROWTH.value,
+        server_default=AdDeliveryPolicy.GROWTH.value,
+        nullable=False,
+        comment="delivery policy: growth/ad_only",
+    )
+
     send_mode: Mapped[str] = mapped_column(
         String(30),
         default=AdSendMode.AFTER_JOIN.value,
@@ -902,6 +927,7 @@ class AdCampaign(Base):
     __table_args__ = (
         Index("idx_ad_campaign_enabled", "enabled"),
         Index("idx_ad_campaign_mode", "send_mode"),
+        Index("idx_ad_campaign_delivery_policy", "delivery_policy"),
     )
 
     def get_target_levels(self) -> list[str]:
@@ -986,6 +1012,52 @@ class AccountAdBinding(Base):
         Index("idx_account_ad_binding_account", "account_id"),
         Index("idx_account_ad_binding_campaign", "ad_campaign_id"),
         Index("idx_account_ad_binding_enabled", "enabled"),
+    )
+
+
+class AdDeliveryScheduleState(Base):
+    """Durable scheduler state; one row owns one delivery tuple."""
+
+    __tablename__ = "ad_delivery_schedule_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        ForeignKey("ad_campaign.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="CASCADE"), nullable=False
+    )
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    )
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    next_due_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default=AdScheduleStatus.IDLE.value, nullable=False
+    )
+    lock_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    campaign = relationship("AdCampaign", lazy="joined")
+    account = relationship("TelegramAccount", lazy="joined")
+    group = relationship("Group", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "account_id", "group_id",
+            name="uq_ad_delivery_schedule_tuple",
+        ),
+        Index("idx_ad_delivery_schedule_due", "status", "next_due_at"),
+        Index("idx_ad_delivery_schedule_account", "account_id", "next_due_at"),
+        Index("idx_ad_delivery_schedule_lease", "lease_expires_at"),
     )
 
 

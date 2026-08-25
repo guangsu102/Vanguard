@@ -604,7 +604,12 @@ class AccountOperationConfig(Base):
     next_join_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="下次允许自动加群时间")
     last_group_cleanup_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最近低价值群清理时间")
 
-    max_messages_per_day: Mapped[int] = mapped_column(Integer, default=3, nullable=False, comment="每日最大消息数")
+    max_messages_per_day: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        default=None,
+        nullable=True,
+        comment="Per-account outbound message hard-cap override; null uses central default",
+    )
     message_interval_seconds: Mapped[int] = mapped_column(Integer, default=3600, nullable=False, comment="消息发送间隔")
     quiet_hours_start: Mapped[Optional[str]] = mapped_column(String(5), nullable=True, comment="免打扰开始 HH:MM")
     quiet_hours_end: Mapped[Optional[str]] = mapped_column(String(5), nullable=True, comment="免打扰结束 HH:MM")

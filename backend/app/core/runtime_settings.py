@@ -149,9 +149,10 @@ DEFAULT_PRIVATE_MESSAGING_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
     "enabled": True,
+    "account_outbound_message_hard_cap_default": 30,
     "global_daily_limit": 30,
     "group_write_daily_limit": 8,
-    "redis_fail_closed": None,
+    "redis_fail_closed": True,
     "actions": {
         "search": {"daily_limit": 100, "cooldown_seconds": 30},
         "join": {"daily_limit": 6, "cooldown_seconds": 7200},
@@ -160,7 +161,7 @@ DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
         "ad_probe": {"daily_limit": 10, "cooldown_seconds": 3600},
         "ai_warmup": {"daily_limit": 1, "cooldown_seconds": 21600},
         "moderation": {"daily_limit": 60, "cooldown_seconds": 15},
-        "ad_delivery": {"daily_limit": 5, "cooldown_seconds": 9000},
+        "ad_delivery": {"daily_limit": 100000, "cooldown_seconds": 0},
         "profile_update": {"daily_limit": 5, "cooldown_seconds": 3600},
         "reaction": {"daily_limit": 120, "cooldown_seconds": 10},
         "forward": {"daily_limit": 25, "cooldown_seconds": 120},
@@ -355,17 +356,16 @@ DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "delivery_interval_seconds": 9000,
-    "batch_window_seconds": 3600,
-    "cooldown_min_seconds": 9000,
-    "cooldown_max_seconds": 10800,
+    "growth_min_interval_seconds": 9000,
+    "growth_max_interval_seconds": 10800,
 }
 DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "dispatcher_interval_seconds": 600,
-    "group_campaign_cooldown_minutes": 4320,
-    "stop_account_after_success": True,
-    "stop_account_after_failure": True,
+    "dispatcher_interval_seconds": 60,
+    "dispatcher_batch_size": 100,
+    "max_parallel_accounts": 3,
+    "job_lease_seconds": 300,
+    "growth_group_global_cooldown_seconds": 86400,
 }
 DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -378,9 +378,9 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "survival_check_batch_size": 50,
     "survival_retry_max_attempts": 3,
     "survival_retry_base_seconds": 300,
-    "account_ad_daily_hard_cap": 5,
-    "group_global_daily_hard_cap": 400,
-    "group_min_interval_seconds": 259200,
+
+
+
     "max_groups_per_account": 400,
     "max_new_ad_groups_per_day": 2,
     "leave_on_deleted_ad": True,
@@ -400,9 +400,9 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "premium_min_conversions": 1,
     "premium_growth_samples": 100,
     "premium_full_capacity_samples": 1000,
-    "premium_entry_capacity": 20,
-    "premium_growth_capacity": 50,
-    "premium_conversion_capacity_step": 20,
+
+
+
     "premium_survival_rate_percent": 95,
     "premium_clean_days_auto": 5,
     "premium_clean_days_verified": 3,
@@ -412,17 +412,6 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "warmup_daily_interactions_max": 1,
     "mature_daily_interactions_min": 0,
     "mature_daily_interactions_max": 1,
-    "tier_daily_capacities": {
-        "blocked": 0,
-        "observing": 0,
-        "trial": 1,
-        "validated": 3,
-        "stable": 10,
-        "low": 3,
-        "medium": 10,
-        "high": 20,
-        "premium": 400,
-    },
     "hourly_weights": {
         "9": 16,
         "10": 22,
