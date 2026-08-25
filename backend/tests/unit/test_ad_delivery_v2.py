@@ -499,9 +499,11 @@ async def test_pure_ad_only_worker_does_not_evaluate_growth_health(
 
 def test_production_ad_delivery_sql_migration_is_registered_and_parseable():
     migration_name = "034_add_ad_delivery_policy_scheduler.sql"
-    migration_path = Path(__file__).parents[2] / "migrations" / migration_name
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
 
     assert migration_name in DEFAULT_MIGRATIONS
+    assert all((migrations_dir / name).is_file() for name in DEFAULT_MIGRATIONS)
     statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
     assert len(statements) == 9
     assert any("CREATE TABLE IF NOT EXISTS ad_delivery_schedule_state" in item for item in statements)

@@ -10,22 +10,6 @@ from sqlalchemy import text
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = ROOT / "migrations"
 DEFAULT_MIGRATIONS = [
-    "010_add_telegram_account_session_string.sql",
-    "011_acquisition_message_type_varchar.sql",
-    "012_group_pool_memberships.sql",
-    "013_acquisition_automation_ads.sql",
-    "014_account_keyword_replenish_policy.sql",
-    "015_growth_guardian_refactor.sql",
-    "016_xboard_acquisition_tracking_worker.sql",
-    "017_campaign_execution.sql",
-    "018_group_search_keyword_usage.sql",
-    "019_group_search_keyword_normalized.sql",
-    "020_keyword_trigger_review.sql",
-    "021_account_proxy_policy.sql",
-    "022_ad_warmup_dynamic_state.sql",
-    "023_ad_capacity_survival_profile_bio.sql",
-    "024_add_account_asset_tier.sql",
-    "025_add_account_business_stage.sql",
     "026_add_ad_campaign_target_groups.sql",
     "027_add_qq_official.sql",
     "028_add_group_failover_tasks.sql",
