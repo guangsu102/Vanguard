@@ -215,7 +215,7 @@ class AccountWarmupPolicyUpdate(BaseModel):
 
 class AdDeliveryThrottleUpdate(BaseModel):
     enabled: bool = True
-    growth_min_interval_seconds: int = Field(default=9000, ge=3000, le=86400)
+    growth_min_interval_seconds: int = Field(default=1800, ge=1800, le=86400)
     growth_max_interval_seconds: int = Field(default=10800, ge=3000, le=86400)
 
 class AdDeliveryExecutionUpdate(BaseModel):

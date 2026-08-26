@@ -97,7 +97,7 @@ export const createDefaultAssetPolicy = (): AccountAssetPolicySettings => ({
   },
 })
 export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 3, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
-export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 9000, growth_max_interval_seconds: 10800 })
+export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 1800, growth_max_interval_seconds: 10800 })
 
 export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   enabled: true, timezone_offset_hours: 8, window_start_hour: 9, window_end_hour: 2,

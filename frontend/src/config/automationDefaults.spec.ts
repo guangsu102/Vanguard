@@ -25,7 +25,7 @@ describe('automation configuration defaults', () => {
     expect(execution.max_parallel_accounts).toBe(3)
 
     const throttle = createDefaultAdDeliveryThrottle()
-    expect(throttle.growth_min_interval_seconds).toBe(9000)
+    expect(throttle.growth_min_interval_seconds).toBe(1800)
     expect(throttle.growth_max_interval_seconds).toBe(10800)
   })
 

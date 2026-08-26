@@ -1396,7 +1396,7 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
         return _int_setting(
             raw.get(name, defaults[name]),
             defaults[name],
-            min_value=3000,
+            min_value=1800,
             max_value=86400,
         )
 

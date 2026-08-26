@@ -182,7 +182,7 @@ def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
         }
     )
 
-    assert config["growth_min_interval_seconds"] == 9000
+    assert config["growth_min_interval_seconds"] == 1800
     assert config["growth_max_interval_seconds"] == 10800
     assert "ad_only_min_interval_seconds" not in config
     assert "ad_only_max_interval_seconds" not in config
@@ -192,6 +192,19 @@ def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
     assert "batch_window_seconds" not in config
     assert "cooldown_min_seconds" not in config
     assert "cooldown_max_seconds" not in config
+
+
+def test_normalize_ad_delivery_throttle_settings_accepts_half_hour_minimum():
+    config = normalize_ad_delivery_throttle_settings(
+        {
+            "growth_min_interval_seconds": 1800,
+            "growth_max_interval_seconds": 10800,
+        }
+    )
+
+    assert config["growth_min_interval_seconds"] == 1800
+    assert config["growth_max_interval_seconds"] == 10800
+
 
 def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():
     config = normalize_ad_delivery_execution_settings(

@@ -1284,7 +1284,7 @@ onBeforeUnmount(() => {
                 <el-switch v-model="adThrottleForm.enabled" />
               </el-form-item>
               <el-form-item label="Growth最小间隔秒">
-                <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="3000" :max="86400" />
+                <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="1800" :max="86400" />
               </el-form-item>
               <el-form-item label="Growth最大间隔秒">
                 <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="3000" :max="86400" />

@@ -356,7 +356,7 @@ DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "growth_min_interval_seconds": 9000,
+    "growth_min_interval_seconds": 1800,
     "growth_max_interval_seconds": 10800,
 }
 DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
