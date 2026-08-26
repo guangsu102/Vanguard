@@ -1,3 +1,8 @@
+import asyncio
+from typing import Any
+
+import pytest
+
 from app.core.worker_status import TelegramWorkerStatusValue
 from app.modules.guardian.models import ManagedGroupBindingStatus, ManagedGroupBotRole
 from app.workers.telegram_worker import TelegramWorker, TelegramWorkerRole
@@ -72,3 +77,38 @@ def test_guardian_worker_maps_member_status_to_binding_state():
         ManagedGroupBotRole.MEMBER,
         ManagedGroupBindingStatus.INACTIVE,
     )
+
+
+@pytest.mark.asyncio
+async def test_growth_event_dispatch_is_bounded():
+    worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
+    active = 0
+    peak = 0
+    limit_reached = asyncio.Event()
+    release = asyncio.Event()
+    counter_lock = asyncio.Lock()
+
+    async def handler(_account_id: int, _event: Any) -> None:
+        nonlocal active, peak
+        async with counter_lock:
+            active += 1
+            peak = max(peak, active)
+            if active == worker._growth_event_concurrency:
+                limit_reached.set()
+        try:
+            await release.wait()
+        finally:
+            async with counter_lock:
+                active -= 1
+
+    tasks = [
+        asyncio.create_task(worker._run_growth_event(handler, 1, object()))
+        for _ in range(worker._growth_event_concurrency + 3)
+    ]
+
+    await asyncio.wait_for(limit_reached.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert peak == worker._growth_event_concurrency
+
+    release.set()
+    await asyncio.gather(*tasks)

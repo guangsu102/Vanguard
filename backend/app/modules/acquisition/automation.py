@@ -28,6 +28,7 @@ from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql import Select
 
 from app.core.account.models import (
     AccountBusinessStage,
@@ -347,6 +348,11 @@ AUTO_JOIN_RETRYABLE_GROUP_STATUSES = {
 
 def _now() -> datetime:
     return datetime.utcnow()
+
+
+def _ad_schedule_state_for_update_query() -> Select[tuple[AdDeliveryScheduleState]]:
+    """Lock only the schedule row when joined relationships are eager-loaded."""
+    return select(AdDeliveryScheduleState).with_for_update(of=AdDeliveryScheduleState)
 
 
 def _day_start(now: Optional[datetime] = None) -> datetime:
@@ -5270,13 +5276,12 @@ class AcquisitionAutomationService:
     ) -> tuple[Optional[int], Optional[str], Optional[str]]:
         now = _now()
         row = await self.db.execute(
-            select(AdDeliveryScheduleState)
+            _ad_schedule_state_for_update_query()
             .where(
                 AdDeliveryScheduleState.campaign_id == campaign.id,
                 AdDeliveryScheduleState.account_id == account_id,
                 AdDeliveryScheduleState.group_id == membership.group_id,
             )
-            .with_for_update()
         )
         state = row.scalar_one_or_none()
         if state is None:
@@ -5294,13 +5299,12 @@ class AcquisitionAutomationService:
             except IntegrityError:
                 await self.db.rollback()
                 row = await self.db.execute(
-                    select(AdDeliveryScheduleState)
+                    _ad_schedule_state_for_update_query()
                     .where(
                         AdDeliveryScheduleState.campaign_id == campaign.id,
                         AdDeliveryScheduleState.account_id == account_id,
                         AdDeliveryScheduleState.group_id == membership.group_id,
                     )
-                    .with_for_update()
                 )
                 state = row.scalar_one()
 
@@ -5337,12 +5341,11 @@ class AcquisitionAutomationService:
         if state_id is None or token is None:
             return
         row = await self.db.execute(
-            select(AdDeliveryScheduleState)
+            _ad_schedule_state_for_update_query()
             .where(
                 AdDeliveryScheduleState.id == state_id,
                 AdDeliveryScheduleState.lock_token == token,
             )
-            .with_for_update()
         )
         state = row.scalar_one_or_none()
         if state is None:

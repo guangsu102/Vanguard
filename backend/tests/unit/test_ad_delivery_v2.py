@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import UniqueConstraint
+from sqlalchemy.dialects import postgresql
 
 import app.modules.acquisition.automation as automation_module
 from app.core.account.models import (
@@ -453,6 +454,18 @@ def test_delivery_schedule_tuple_unique_constraint_exists():
         if isinstance(constraint, UniqueConstraint)
     }
     assert "uq_ad_delivery_schedule_tuple" in constraint_names
+
+
+def test_delivery_schedule_lock_targets_only_schedule_table_on_postgresql():
+    statement = automation_module._ad_schedule_state_for_update_query().where(
+        AdDeliveryScheduleState.id == 1
+    )
+
+    sql = " ".join(
+        str(statement.compile(dialect=postgresql.dialect())).split()
+    )
+
+    assert "FOR UPDATE OF ad_delivery_schedule_state" in sql
 
 
 @pytest.mark.asyncio

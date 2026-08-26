@@ -12,6 +12,7 @@ import asyncio
 import json
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, Optional
 
@@ -60,6 +61,8 @@ logger = structlog.get_logger()
 
 ENTITY_NAME_CACHE_TTL_SECONDS = 30 * 60
 ENTITY_NAME_CACHE_MAX_SIZE = 5000
+GROWTH_EVENT_CONCURRENCY_CAP = 8
+GROWTH_EVENT_DB_CONNECTION_RESERVE = 2
 
 
 class TelegramWorker:
@@ -72,6 +75,13 @@ class TelegramWorker:
         self._guardian_update_offsets: dict[int, int] = {}
         self._growth_listener_sessions: dict[int, str] = {}
         self._entity_name_cache: dict[int, tuple[float, str]] = {}
+        self._growth_event_concurrency = min(
+            GROWTH_EVENT_CONCURRENCY_CAP,
+            max(1, settings.DATABASE_POOL_SIZE - GROWTH_EVENT_DB_CONNECTION_RESERVE),
+        )
+        self._growth_event_semaphore = asyncio.BoundedSemaphore(
+            self._growth_event_concurrency
+        )
 
     async def run(self) -> None:
         await init_db(create_tables=not settings.is_production)
@@ -255,6 +265,7 @@ class TelegramWorker:
                 "account_pool_size": self._account_pool.size,
                 "account_pool_synced": synced,
                 "runtime_capable_accounts": len(runtime_accounts),
+                "growth_event_concurrency_limit": self._growth_event_concurrency,
                 "runtime_skipped_accounts": len(accounts) - len(runtime_accounts),
                 **listener_state,
                 "account_pool": pool_stats,
@@ -335,14 +346,27 @@ class TelegramWorker:
         account_id = account.account_id
 
         async def handle_new_message(event: Any) -> None:
-            await self._handle_growth_new_message(account_id, event)
+            await self._run_growth_event(
+                self._handle_growth_new_message, account_id, event
+            )
 
         async def handle_chat_action(event: Any) -> None:
-            await self._handle_growth_chat_action(account_id, event)
+            await self._run_growth_event(
+                self._handle_growth_chat_action, account_id, event
+            )
 
         client.add_event_handler(handle_new_message, telethon_events.NewMessage(incoming=True))
         client.add_event_handler(handle_chat_action, telethon_events.ChatAction())
         logger.info("growth_event_handlers_attached", account_id=account_id, session_name=account.session_name)
+
+    async def _run_growth_event(
+        self,
+        handler: Callable[[int, Any], Awaitable[None]],
+        account_id: int,
+        event: Any,
+    ) -> None:
+        async with self._growth_event_semaphore:
+            await handler(account_id, event)
 
     def _get_cached_entity_name(self, user_id: int) -> Optional[str]:
         cached = self._entity_name_cache.get(int(user_id))
