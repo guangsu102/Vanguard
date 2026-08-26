@@ -543,6 +543,112 @@ export interface CreativePoolEnsurePayload {
   generate_count?: number
 }
 
+export interface AdOnlyRecommendationSettings {
+  recommendation_enabled: boolean
+  handover_execution_enabled: boolean
+  min_consecutive_samples: number
+  required_send_success_percent: number
+  required_survival_24h_percent: number
+  peer_ad_min_messages: number
+  peer_ad_min_senders: number
+  peer_ad_min_survival_hours: number
+  peer_ad_lookback_days: number
+  risk_lookback_days: number
+  recommendation_ttl_days: number
+  evaluation_interval_minutes: number
+}
+
+export interface AdOnlyEvent {
+  id: number
+  group_id: number
+  assessment_id?: number
+  handover_id?: number
+  event_type: string
+  step?: string
+  status?: string
+  actor_user_id?: number
+  message?: string
+  payload: Record<string, any>
+  created_at: string
+}
+
+export interface AdOnlyAssessment {
+  id: number
+  group_id: number
+  telegram_group_id: number
+  group_title?: string
+  source_growth_account_id?: number
+  source_growth_account_label?: string
+  status: 'recommended' | 'observing'
+  rule_version: string
+  completed_sample_count: number
+  consecutive_success_count: number
+  send_success_percent: number
+  survival_24h_percent: number
+  pending_sample_count: number
+  group_failure_count: number
+  deleted_sample_count: number
+  metrics: Record<string, any>
+  blocking_reasons: string[]
+  evidence: Record<string, any>
+  evidence_hash: string
+  sample_window_started_at: string
+  sample_window_ended_at: string
+  valid_until?: string
+  created_at: string
+  decision?: AdOnlyEvent
+}
+
+export interface AdOnlyHandover {
+  id: number
+  assessment_id: number
+  group_id: number
+  telegram_group_id?: number
+  group_title?: string
+  source_growth_account_id: number
+  source_growth_account_label?: string
+  target_ad_only_account_id: number
+  target_ad_only_account_label?: string
+  creative_id: number
+  creative_name?: string
+  campaign_id?: number
+  send_mode: 'interval' | 'scheduled'
+  interval_minutes: number
+  scheduled_times: string[]
+  estimated_daily_sends: number
+  status: string
+  current_step: string
+  retry_count: number
+  last_error?: string
+  invite_secret_expires_at?: string
+  started_at?: string
+  completed_at?: string
+  failed_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AdOnlyHandoverRequest {
+  assessment_id: number
+  target_account_id: number
+  creative_id: number
+  invite_link: string
+  send_mode: 'interval' | 'scheduled'
+  interval_minutes: number
+  scheduled_times: string[]
+}
+
+export interface AdOnlyHandoverOptions {
+  accounts: Array<{
+    id: number
+    label: string
+    status: string
+    risk_level: string
+    max_messages_per_day: number | null
+  }>
+  creatives: Array<{ id: number; name: string }>
+}
+
 export const automationApi = {
   getAutoJoinSchedulerConfig: () => {
     return apiClient.get<{ data: AutoJoinSchedulerConfig }>('/automation/auto-join/scheduler-config')
@@ -788,5 +894,67 @@ export const automationApi = {
     limit?: number
   }) => {
     return apiClient.get<{ data: any[]; total: number; page: number; page_size: number }>('/automation/ads/delivery-logs', { params })
+  },
+
+  getAdOnlySettings: () => {
+    return apiClient.get<{ data: AdOnlyRecommendationSettings }>('/automation/ad-only/settings')
+  },
+
+  updateAdOnlySettings: (data: AdOnlyRecommendationSettings) => {
+    return apiClient.put<{ data: AdOnlyRecommendationSettings }>('/automation/ad-only/settings', data)
+  },
+
+  evaluateAdOnlyCandidates: (params?: { limit?: number; force?: boolean }) => {
+    return apiClient.post<{ data: { task_id: string } }>('/automation/ad-only/evaluations', undefined, { params })
+  },
+
+  getAdOnlyCandidates: (params?: { status?: string; limit?: number }) => {
+    return apiClient.get<{ data: AdOnlyAssessment[] }>('/automation/ad-only/candidates', { params })
+  },
+
+  getAdOnlyHistory: (groupId: number, limit = 100) => {
+    return apiClient.get<{
+      data: { assessments: AdOnlyAssessment[]; events: AdOnlyEvent[] }
+    }>(`/automation/ad-only/groups/${groupId}/history`, { params: { limit } })
+  },
+
+  decideAdOnlyAssessment: (
+    assessmentId: number,
+    data: { decision: 'approve' | 'reject' | 'defer'; note?: string },
+  ) => {
+    return apiClient.post<{ data: AdOnlyEvent }>(
+      `/automation/ad-only/assessments/${assessmentId}/decision`,
+      data,
+    )
+  },
+
+  getAdOnlyHandoverOptions: () => {
+    return apiClient.get<{ data: AdOnlyHandoverOptions }>('/automation/ad-only/options')
+  },
+
+  preflightAdOnlyHandover: (data: AdOnlyHandoverRequest) => {
+    return apiClient.post<{ data: Record<string, any> }>('/automation/ad-only/handovers/preflight', data)
+  },
+
+  createAdOnlyHandover: (data: AdOnlyHandoverRequest & { idempotency_key: string }) => {
+    return apiClient.post<{
+      data: { task_id?: string; created: boolean; handover: AdOnlyHandover }
+    }>('/automation/ad-only/handovers', data)
+  },
+
+  getAdOnlyHandovers: (params?: { group_id?: number; status?: string; limit?: number }) => {
+    return apiClient.get<{ data: AdOnlyHandover[] }>('/automation/ad-only/handovers', { params })
+  },
+
+  retryAdOnlyHandover: (handoverId: number) => {
+    return apiClient.post<{ data: { task_id: string; handover: AdOnlyHandover } }>(
+      `/automation/ad-only/handovers/${handoverId}/retry`,
+    )
+  },
+
+  rollbackAdOnlyHandover: (handoverId: number) => {
+    return apiClient.post<{ data: { task_id: string; handover_id: number } }>(
+      `/automation/ad-only/handovers/${handoverId}/rollback`,
+    )
   },
 }

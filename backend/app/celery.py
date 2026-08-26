@@ -133,6 +133,12 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"limit": 5},
         "options": {"queue": "automation", "rate_limit": "1/h"},
     },
+    "evaluate-ad-only-candidates-hourly": {
+        "task": "app.core.scheduler.tasks.evaluate_ad_only_candidates_task",
+        "schedule": crontab(minute=45),
+        "kwargs": {"limit": 200, "force": False},
+        "options": {"queue": "automation", "rate_limit": "1/h"},
+    },
     "auto-probe-unknown-ad-policies-every-5min": {
         "task": "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task",
         "schedule": crontab(minute="*/5"),
@@ -213,6 +219,9 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.recover_orphaned_groups_task": {"queue": "automation"},
     "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "automation"},
     "app.core.scheduler.tasks.audit_group_ad_policies_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.evaluate_ad_only_candidates_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.execute_ad_only_handover_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.rollback_ad_only_handover_task": {"queue": "automation"},
     "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},
     "app.modules.qq.tasks.cleanup_qq_messages": {"queue": "qq_commands"},
 }

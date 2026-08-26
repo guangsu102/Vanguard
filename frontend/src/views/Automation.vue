@@ -33,6 +33,7 @@ import { createDefaultAdDeliveryExecution, createDefaultAdDeliveryThrottle, crea
 import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS } from '@/api/keywords'
 
 import ClientListPagination from '@/components/ClientListPagination.vue'
+import AdOnlyRecommendationPanel from '@/components/AdOnlyRecommendationPanel.vue'
 import { useClientPagination } from '@/utils/clientPagination'
 type AccountOption = {
   id: number
@@ -577,10 +578,13 @@ const targetGroupMap = computed(() => new Map(targetGroups.value.map((item) => [
 const accountOperationModeMap = computed(() =>
   new Map(dynamicStatuses.value.map((item) => [item.account_id, item.operation_mode])),
 )
-const targetGroupAccountIsAdOnly = computed(() =>
-  targetGroupForm.accountId === selectedAccountId.value
-    ? accountConfigForm.operation_mode === 'ad_only'
-    : accountOperationModeMap.value.get(targetGroupForm.accountId || 0) === 'ad_only',
+const targetGroupJoinAccounts = computed(() =>
+  accounts.value.filter(
+    (account) =>
+      account.is_active !== false
+      && !['banned', 'error'].includes(account.status || '')
+      && accountOperationModeMap.value.get(account.id) !== 'ad_only',
+  ),
 )
 
 const selectedDynamicStatus = computed(() =>
@@ -1222,15 +1226,7 @@ const saveTargetGroup = async () => {
     }
     targetGroupDialogVisible.value = false;
     const groupName = group.title || group.username || group.chatId;
-    if (targetGroupAccountIsAdOnly.value) {
-      if (group.adDeliveryAccountId === targetGroupForm.accountId) {
-        ElMessage.success(`已由专用账号接管 ${groupName}，普通账号退群处理已执行`);
-      } else {
-        ElMessage.warning(`已加入 ${groupName}，但广告许可未达到接管条件，未执行移交和退群`);
-      }
-    } else {
-      ElMessage.success(`已加入并添加 ${groupName}`);
-    }
+    ElMessage.success(`已加入并添加 ${groupName}`);
   } finally {
     savingTargetGroup.value = false;
   }
@@ -1594,6 +1590,19 @@ onBeforeUnmount(() => {
                     <small>04 / 群池资格</small>
                     <strong>{{ adAllowedGroupCount }} 个可投</strong>
                     <em>{{ pendingGroupPolicyCount }} 个待确认</em>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="ad-flow-step"
+                  :class="{ active: adWorkspaceView === 'handovers' }"
+                  @click="adWorkspaceView = 'handovers'"
+                >
+                  <span class="flow-step-icon flow-amber"><Connection /></span>
+                  <span>
+                    <small>05 / 专用交接</small>
+                    <strong>候选审批</strong>
+                    <em>可恢复交接</em>
                   </span>
                 </button>
               </div>
@@ -2203,6 +2212,13 @@ onBeforeUnmount(() => {
               </section>
             </el-tab-pane>
 
+            <el-tab-pane name="handovers" lazy>
+              <template #label>
+                <span class="ad-tab-label"><Connection />专用交接</span>
+              </template>
+              <AdOnlyRecommendationPanel />
+            </el-tab-pane>
+
           </el-tabs>
 
           <el-drawer
@@ -2754,14 +2770,6 @@ onBeforeUnmount(() => {
 
     <el-dialog v-model="targetGroupDialogVisible" title="通过链接加入群" width="520px">
       <el-form label-width="110px">
-        <el-alert
-          v-if="targetGroupAccountIsAdOnly"
-          title="接管成功后，该群中的普通账号将自动退群"
-          type="warning"
-          :closable="false"
-          show-icon
-          class="handover-alert"
-        />
         <el-form-item label="群链接" required>
           <el-input
             v-model="targetGroupForm.groupLink"
@@ -2772,11 +2780,10 @@ onBeforeUnmount(() => {
         <el-form-item label="推广账号" required>
           <el-select v-model="targetGroupForm.accountId" filterable placeholder="选择执行入群的账号">
             <el-option
-              v-for="item in accounts"
+              v-for="item in targetGroupJoinAccounts"
               :key="item.id"
               :label="accountLabel(item.id)"
               :value="item.id"
-              :disabled="!item.is_active || ['error', 'banned'].includes(item.status || '')"
             />
           </el-select>
         </el-form-item>
@@ -2784,7 +2791,7 @@ onBeforeUnmount(() => {
       <template #footer>
         <el-button @click="targetGroupDialogVisible = false">取消</el-button>
         <el-button type="primary" :loading="savingTargetGroup" @click="saveTargetGroup">
-          {{ targetGroupAccountIsAdOnly ? '接管并添加' : '加入并添加' }}
+          加入并添加
         </el-button>
       </template>
     </el-dialog>
@@ -3155,7 +3162,7 @@ onBeforeUnmount(() => {
 
 .ad-flow-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 8px;
   margin-top: 28px;
   padding-top: 18px;

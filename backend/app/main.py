@@ -29,6 +29,7 @@ from app.api import (
     xboard,
     auth,
     automation,
+    ad_only_recommendations,
     group_governance,
     group_search_keywords,
     guardian_bots,
@@ -138,6 +139,7 @@ app.include_router(acquisition, prefix="/api/acquisition", tags=["Acquisition"],
 app.include_router(broadcasts, prefix="/api/broadcasts", tags=["Broadcasts"], dependencies=[Depends(get_current_user)])
 app.include_router(xboard, prefix="/api/v1", tags=["XBoard"])
 app.include_router(automation, prefix="/api/automation", tags=["Automation"], dependencies=[Depends(get_current_user)])
+app.include_router(ad_only_recommendations, prefix="/api/automation", tags=["Ad-only Handover"], dependencies=[Depends(get_current_user)])
 app.include_router(group_search_keywords, prefix="/api/group-search-keywords", tags=["Group Search Keywords"], dependencies=[Depends(get_current_user)])
 app.include_router(guardian_bots, prefix="/api/guardian-bots", tags=["Guardian Bots"], dependencies=[Depends(get_current_user)])
 app.include_router(managed_groups, prefix="/api/managed-groups", tags=["Managed Groups"], dependencies=[Depends(get_current_user)])

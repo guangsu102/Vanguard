@@ -16,6 +16,7 @@ from app.core.runtime_settings import (
     DEFAULT_AD_CAPACITY_SETTINGS,
     DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS,
     DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS,
+    DEFAULT_AD_ONLY_RECOMMENDATION_SETTINGS,
     DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS,
     DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
     DEFAULT_KEYWORD_PRIVATE_REPLY_SETTINGS,
@@ -32,6 +33,7 @@ ACCOUNT_WARMUP_POLICY_SETTING_KEY = "automation.account_warmup_policy"
 AD_DELIVERY_THROTTLE_SETTING_KEY = "automation.ad_delivery_throttle"
 AD_DELIVERY_EXECUTION_SETTING_KEY = "automation.ad_delivery_execution"
 AD_CAPACITY_SETTING_KEY = "automation.ad_capacity"
+AD_ONLY_RECOMMENDATION_SETTING_KEY = "automation.ad_only_recommendation"
 APP_SETTINGS_SETTING_KEY = "app.runtime_settings"
 DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
     "sub2apiAlertsEnabled": False,
@@ -1778,5 +1780,158 @@ async def save_ad_capacity_settings(db: AsyncSession, payload: dict[str, Any]) -
         AD_CAPACITY_SETTING_KEY,
         normalized,
         "Advertisement capacity and survival settings",
+    )
+    return normalized
+
+
+def normalize_ad_only_recommendation_settings(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    defaults = DEFAULT_AD_ONLY_RECOMMENDATION_SETTINGS
+    return {
+        "recommendation_enabled": _bool_setting(
+            raw.get(
+                "recommendation_enabled",
+                raw.get("recommendationEnabled", defaults["recommendation_enabled"]),
+            ),
+            defaults["recommendation_enabled"],
+        ),
+        "handover_execution_enabled": _bool_setting(
+            raw.get(
+                "handover_execution_enabled",
+                raw.get(
+                    "handoverExecutionEnabled",
+                    defaults["handover_execution_enabled"],
+                ),
+            ),
+            defaults["handover_execution_enabled"],
+        ),
+        "min_consecutive_samples": _int_setting(
+            raw.get(
+                "min_consecutive_samples",
+                raw.get("minConsecutiveSamples", defaults["min_consecutive_samples"]),
+            ),
+            defaults["min_consecutive_samples"],
+            min_value=1,
+            max_value=100,
+        ),
+        "required_send_success_percent": _int_setting(
+            raw.get(
+                "required_send_success_percent",
+                raw.get(
+                    "requiredSendSuccessPercent",
+                    defaults["required_send_success_percent"],
+                ),
+            ),
+            defaults["required_send_success_percent"],
+            min_value=50,
+            max_value=100,
+        ),
+        "required_survival_24h_percent": _int_setting(
+            raw.get(
+                "required_survival_24h_percent",
+                raw.get(
+                    "requiredSurvival24hPercent",
+                    defaults["required_survival_24h_percent"],
+                ),
+            ),
+            defaults["required_survival_24h_percent"],
+            min_value=50,
+            max_value=100,
+        ),
+        "peer_ad_min_messages": _int_setting(
+            raw.get(
+                "peer_ad_min_messages",
+                raw.get("peerAdMinMessages", defaults["peer_ad_min_messages"]),
+            ),
+            defaults["peer_ad_min_messages"],
+            min_value=1,
+            max_value=50,
+        ),
+        "peer_ad_min_senders": _int_setting(
+            raw.get(
+                "peer_ad_min_senders",
+                raw.get("peerAdMinSenders", defaults["peer_ad_min_senders"]),
+            ),
+            defaults["peer_ad_min_senders"],
+            min_value=1,
+            max_value=50,
+        ),
+        "peer_ad_min_survival_hours": _int_setting(
+            raw.get(
+                "peer_ad_min_survival_hours",
+                raw.get(
+                    "peerAdMinSurvivalHours",
+                    defaults["peer_ad_min_survival_hours"],
+                ),
+            ),
+            defaults["peer_ad_min_survival_hours"],
+            min_value=1,
+            max_value=168,
+        ),
+        "peer_ad_lookback_days": _int_setting(
+            raw.get(
+                "peer_ad_lookback_days",
+                raw.get("peerAdLookbackDays", defaults["peer_ad_lookback_days"]),
+            ),
+            defaults["peer_ad_lookback_days"],
+            min_value=1,
+            max_value=90,
+        ),
+        "risk_lookback_days": _int_setting(
+            raw.get(
+                "risk_lookback_days",
+                raw.get("riskLookbackDays", defaults["risk_lookback_days"]),
+            ),
+            defaults["risk_lookback_days"],
+            min_value=1,
+            max_value=180,
+        ),
+        "recommendation_ttl_days": _int_setting(
+            raw.get(
+                "recommendation_ttl_days",
+                raw.get(
+                    "recommendationTtlDays",
+                    defaults["recommendation_ttl_days"],
+                ),
+            ),
+            defaults["recommendation_ttl_days"],
+            min_value=1,
+            max_value=30,
+        ),
+        "evaluation_interval_minutes": _int_setting(
+            raw.get(
+                "evaluation_interval_minutes",
+                raw.get(
+                    "evaluationIntervalMinutes",
+                    defaults["evaluation_interval_minutes"],
+                ),
+            ),
+            defaults["evaluation_interval_minutes"],
+            min_value=15,
+            max_value=1440,
+        ),
+    }
+
+
+async def get_ad_only_recommendation_settings(
+    db: AsyncSession,
+) -> dict[str, Any]:
+    return normalize_ad_only_recommendation_settings(
+        await _read_setting_payload(db, AD_ONLY_RECOMMENDATION_SETTING_KEY)
+    )
+
+
+async def save_ad_only_recommendation_settings(
+    db: AsyncSession,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = normalize_ad_only_recommendation_settings(payload)
+    await _save_setting_payload(
+        db,
+        AD_ONLY_RECOMMENDATION_SETTING_KEY,
+        normalized,
+        "Ad-only recommendation and handover settings",
     )
     return normalized

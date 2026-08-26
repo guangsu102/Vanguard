@@ -41,8 +41,6 @@ from app.modules.acquisition.automation import (
 from app.modules.acquisition.models import (
     AcquisitionMessage,
     AcquisitionTracking,
-    GroupAdPolicyMode,
-    GroupAdProfile,
     TriggerAction,
     TriggerRecord,
 )
@@ -681,85 +679,6 @@ async def list_groups(
     )
 
 
-async def _group_is_ready_for_ad_handover(group_id: int, db: AsyncSession) -> bool:
-    profile = (
-        await db.execute(select(GroupAdProfile).where(GroupAdProfile.group_id == group_id))
-    ).scalar_one_or_none()
-    if profile is None:
-        return False
-    if profile.ad_policy_mode not in {
-        GroupAdPolicyMode.SOFT_AD_TRIAL.value,
-        GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
-        GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
-    }:
-        return False
-    if profile.ad_policy_expires_at and profile.ad_policy_expires_at <= datetime.utcnow():
-        return False
-    confidence_floor = 80 if profile.ad_policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value else 90
-    return int(profile.ad_policy_confidence or 0) >= confidence_floor
-
-
-async def _retire_previous_ad_accounts(
-    group: Group,
-    new_account_id: int,
-    db: AsyncSession,
-) -> None:
-    rows = await db.execute(
-        select(GroupAccountMembership, TelegramAccount, AccountOperationConfig.operation_mode)
-        .join(TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id)
-        .outerjoin(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
-        .where(
-            GroupAccountMembership.group_id == group.id,
-            GroupAccountMembership.status == "joined",
-            GroupAccountMembership.account_id != new_account_id,
-        )
-    )
-    account_pool = get_account_pool()
-    telegram_execution = TelegramExecutionService(AccountRiskGuard(db))
-    now = datetime.utcnow()
-
-    for membership, source_account, operation_mode in rows.all():
-        if operation_mode == AccountOperationMode.AD_ONLY.value:
-            continue
-
-        wrapper = None
-        try:
-            await account_pool.add_account_from_db(source_account)
-            wrapper = await account_pool.acquire_by_id(
-                source_account.id,
-                purpose="manual_ad_handover_leave",
-            )
-            if wrapper is None:
-                raise TelegramExecutionError("source account session is unavailable")
-            await telegram_execution.leave_group_by_id(
-                wrapper,
-                group.group_id,
-                source="manual_ad_handover",
-            )
-        except Exception as exc:
-            membership.last_probe_error = f"handover_leave_failed:{exc}"[:1000]
-            membership.last_checked_at = now
-            membership.updated_at = now
-            logger.warning(
-                "manual_ad_handover_leave_failed",
-                extra={"group_id": group.id, "account_id": source_account.id, "error": str(exc)},
-            )
-        else:
-            membership.status = "left"
-            membership.left_at = now
-            membership.last_checked_at = now
-            membership.warmup_status = "blocked"
-            membership.probe_status = "skipped"
-            membership.ad_status = "blocked"
-            membership.last_probe_error = None
-            membership.updated_at = now
-        finally:
-            if wrapper is not None:
-                await account_pool.release(wrapper)
-
-    await db.commit()
-
-
 @router.post("/join-by-link", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
 async def join_group_by_link(
     request: GroupJoinByLinkRequest,
@@ -789,6 +708,11 @@ async def join_group_by_link(
         )
     ).scalar_one_or_none()
     is_ad_only = bool(operation_config and operation_config.operation_mode == AccountOperationMode.AD_ONLY.value)
+    if is_ad_only:
+        raise HTTPException(
+            status_code=409,
+            detail="ad_only_join_requires_handover_workflow",
+        )
 
     account_pool = get_account_pool()
     await account_pool.add_account_from_db(account)
@@ -933,12 +857,6 @@ async def join_group_by_link(
         else:
             group.status = "active"
             await db.commit()
-    if is_ad_only and await _group_is_ready_for_ad_handover(group.id, db):
-        group.ad_delivery_account_id = account.id
-        await db.commit()
-        await _retire_previous_ad_accounts(group, account.id, db)
-        await db.refresh(group)
-
     await db.refresh(group)
     metrics = await _get_group_metrics(db, [group.group_id])
     account_summary = await _get_group_account_summary(db, [group.id])

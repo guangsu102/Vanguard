@@ -1465,6 +1465,82 @@ def auto_probe_unknown_group_ad_policies_task(
         return {"error": str(exc)}
 
 
+@celery_app.task
+def evaluate_ad_only_candidates_task(
+    limit: int = 200,
+    force: bool = False,
+):
+    logger.info(
+        "evaluate_ad_only_candidates_task",
+        task="evaluate_ad_only_candidates_task",
+        limit=limit,
+        force=force,
+    )
+    try:
+        from app.modules.acquisition.ad_only_recommendation import (
+            evaluate_ad_only_candidates_with_db,
+        )
+
+        result = _run_async(
+            evaluate_ad_only_candidates_with_db(limit=limit, force=force)
+        )
+        logger.info(
+            "evaluate_ad_only_candidates_completed",
+            status=result.get("status"),
+            processed=result.get("processed", 0),
+            recommended=result.get("recommended", 0),
+            failed=result.get("failed", 0),
+        )
+        return result
+    except Exception as exc:
+        logger.error("evaluate_ad_only_candidates_failed", error=str(exc))
+        return {"error": str(exc)}
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def execute_ad_only_handover_task(self, handover_id: int):
+    logger.info(
+        "execute_ad_only_handover_task",
+        task="execute_ad_only_handover_task",
+        handover_id=handover_id,
+    )
+    try:
+        from app.modules.acquisition.ad_only_recommendation import (
+            execute_ad_only_handover_with_db,
+        )
+
+        return _run_async(execute_ad_only_handover_with_db(handover_id))
+    except Exception as exc:
+        logger.error(
+            "execute_ad_only_handover_failed",
+            handover_id=handover_id,
+            error=str(exc),
+        )
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def rollback_ad_only_handover_task(self, handover_id: int):
+    logger.info(
+        "rollback_ad_only_handover_task",
+        task="rollback_ad_only_handover_task",
+        handover_id=handover_id,
+    )
+    try:
+        from app.modules.acquisition.ad_only_recommendation import (
+            rollback_ad_only_handover_with_db,
+        )
+
+        return _run_async(rollback_ad_only_handover_with_db(handover_id))
+    except Exception as exc:
+        logger.error(
+            "rollback_ad_only_handover_failed",
+            handover_id=handover_id,
+            error=str(exc),
+        )
+        raise self.retry(exc=exc)
+
+
 # =============================================================================
 # Second-level Precision Tasks
 # =============================================================================

@@ -1290,3 +1290,211 @@ class AdDeliveryLog(Base):
         Index("idx_ad_delivery_survival_due", "survival_status", "survival_check_due_at"),
         Index("idx_ad_delivery_reservation", "reservation_token", unique=True),
     )
+
+
+class GroupAdOnlyAssessment(Base):
+    """Immutable snapshot used to recommend a group for ad-only handover."""
+
+    __tablename__ = "group_ad_only_assessment"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    )
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_growth_account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), default="observing", nullable=False
+    )
+    rule_version: Mapped[str] = mapped_column(
+        String(32), default="ad-only-v1", nullable=False
+    )
+    completed_sample_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    consecutive_success_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    send_success_percent: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    survival_24h_percent: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    pending_sample_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    group_failure_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    deleted_sample_count: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    blocking_reasons_json: Mapped[str] = mapped_column(
+        Text, default="[]", nullable=False
+    )
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    sample_window_started_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False
+    )
+    sample_window_ended_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False
+    )
+    valid_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    group = relationship("Group", lazy="joined")
+    source_growth_account = relationship(
+        "TelegramAccount",
+        foreign_keys=[source_growth_account_id],
+        lazy="joined",
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_group_ad_only_assessment_group",
+            "group_id",
+            "created_at",
+        ),
+        Index(
+            "idx_group_ad_only_assessment_status",
+            "status",
+            "valid_until",
+        ),
+    )
+
+
+class GroupAdHandover(Base):
+    """Durable, idempotent state for one ad-only handover."""
+
+    __tablename__ = "group_ad_handover"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    assessment_id: Mapped[int] = mapped_column(
+        ForeignKey("group_ad_only_assessment.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    )
+    active_group_key: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    source_growth_account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=False
+    )
+    target_ad_only_account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=False
+    )
+    creative_id: Mapped[int] = mapped_column(
+        ForeignKey("ad_creative.id", ondelete="RESTRICT"), nullable=False
+    )
+    campaign_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("ad_campaign.id", ondelete="SET NULL"), nullable=True
+    )
+    invite_link_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    invite_secret_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    send_mode: Mapped[str] = mapped_column(String(30), nullable=False)
+    interval_minutes: Mapped[int] = mapped_column(
+        Integer, default=180, nullable=False
+    )
+    scheduled_times: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    estimated_daily_sends: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(30), default="queued", nullable=False
+    )
+    current_step: Mapped[str] = mapped_column(
+        String(50), default="queued", nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_by_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_by_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    assessment = relationship("GroupAdOnlyAssessment", lazy="joined")
+    group = relationship("Group", lazy="joined")
+    source_growth_account = relationship(
+        "TelegramAccount",
+        foreign_keys=[source_growth_account_id],
+        lazy="joined",
+    )
+    target_ad_only_account = relationship(
+        "TelegramAccount",
+        foreign_keys=[target_ad_only_account_id],
+        lazy="joined",
+    )
+    creative = relationship("AdCreative", lazy="joined")
+    campaign = relationship("AdCampaign", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("active_group_key", name="uq_group_ad_handover_active_group"),
+        UniqueConstraint("idempotency_key", name="uq_group_ad_handover_idempotency"),
+        Index("idx_group_ad_handover_status", "status", "updated_at"),
+        Index("idx_group_ad_handover_group", "group_id", "created_at"),
+    )
+
+
+class GroupAdOnlyEvent(Base):
+    """Append-only audit events for assessments, decisions, and handovers."""
+
+    __tablename__ = "group_ad_only_event"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    )
+    assessment_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group_ad_only_assessment.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    handover_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group_ad_handover.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    step: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    actor_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    message: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_group_ad_only_event_group", "group_id", "created_at"),
+        Index(
+            "idx_group_ad_only_event_assessment",
+            "assessment_id",
+            "created_at",
+        ),
+        Index(
+            "idx_group_ad_only_event_handover",
+            "handover_id",
+            "created_at",
+        ),
+    )

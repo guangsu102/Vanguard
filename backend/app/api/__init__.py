@@ -19,6 +19,7 @@ from app.api.acquisition import router as acquisition
 from app.api.broadcasts import router as broadcasts
 from app.api.xboard import router as xboard
 from app.api.automation import router as automation
+from app.api.ad_only_recommendations import router as ad_only_recommendations
 from app.api.group_governance import router as group_governance
 from app.api.group_search_keywords import router as group_search_keywords
 from app.api.guardian_bots import router as guardian_bots
@@ -47,6 +48,7 @@ __all__ = [
     "broadcasts",
     "xboard",
     "automation",
+    "ad_only_recommendations",
     "group_governance",
     "group_search_keywords",
     "guardian_bots",

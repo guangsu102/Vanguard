@@ -369,6 +369,20 @@ DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "job_lease_seconds": 300,
     "growth_group_global_cooldown_seconds": 86400,
 }
+DEFAULT_AD_ONLY_RECOMMENDATION_SETTINGS: dict[str, Any] = {
+    "recommendation_enabled": False,
+    "handover_execution_enabled": False,
+    "min_consecutive_samples": 10,
+    "required_send_success_percent": 100,
+    "required_survival_24h_percent": 100,
+    "peer_ad_min_messages": 1,
+    "peer_ad_min_senders": 1,
+    "peer_ad_min_survival_hours": 24,
+    "peer_ad_lookback_days": 14,
+    "risk_lookback_days": 30,
+    "recommendation_ttl_days": 7,
+    "evaluation_interval_minutes": 60,
+}
 DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "timezone_offset_hours": 8,
