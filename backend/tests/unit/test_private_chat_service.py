@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -15,6 +16,7 @@ from app.modules.private_chat.service import (
     persist_incoming_private_message,
     queue_outbound_private_message,
 )
+from scripts.apply_sql_migrations import DEFAULT_MIGRATIONS, _split_sql_statements
 
 
 async def _account(test_db, suffix: str) -> TelegramAccount:
@@ -239,3 +241,25 @@ async def test_manual_reply_outbox_is_idempotent_and_tracks_delivery(test_db):
     assert finalized.telegram_message_id == 987
     assert finalized.sent_at is not None
     assert finalized_conversation.last_outbound_at is not None
+
+
+def test_private_chat_sql_migration_is_registered_and_parseable():
+    migration_name = "035_add_telegram_private_inbox.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    assert migration_path.is_file()
+    statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
+    assert any(
+        "ALTER COLUMN version_num TYPE VARCHAR(128)" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS telegram_private_conversation" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS telegram_private_message" in statement
+        for statement in statements
+    )

@@ -19,6 +19,7 @@ DEFAULT_MIGRATIONS = [
     "032_add_ad_policy_evidence_hash.sql",
     "033_add_group_ad_delivery_account.sql",
     "034_add_ad_delivery_policy_scheduler.sql",
+    "035_add_telegram_private_inbox.sql",
 ]
 
 
