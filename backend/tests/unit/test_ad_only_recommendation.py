@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -34,6 +35,7 @@ from app.modules.acquisition.models import (
     GroupAdPolicyMode,
     GroupAdProfile,
 )
+from scripts.apply_sql_migrations import DEFAULT_MIGRATIONS, _split_sql_statements
 
 
 async def _seed_candidate(
@@ -566,3 +568,25 @@ async def test_manual_group_join_rejects_ad_only_account(client, test_db):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "ad_only_join_requires_handover_workflow"
+
+
+def test_production_ad_only_sql_migration_is_registered_and_parseable():
+    migration_name = "036_add_ad_only_recommendations.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    assert migration_path.is_file()
+    statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
+    assert any(
+        "CREATE TABLE IF NOT EXISTS group_ad_only_assessment" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS group_ad_handover" in statement
+        for statement in statements
+    )
+    assert any(
+        "CREATE TABLE IF NOT EXISTS group_ad_only_event" in statement
+        for statement in statements
+    )

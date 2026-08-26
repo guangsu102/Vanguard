@@ -20,6 +20,7 @@ DEFAULT_MIGRATIONS = [
     "033_add_group_ad_delivery_account.sql",
     "034_add_ad_delivery_policy_scheduler.sql",
     "035_add_telegram_private_inbox.sql",
+    "036_add_ad_only_recommendations.sql",
 ]
 
 
