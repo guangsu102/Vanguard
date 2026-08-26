@@ -366,3 +366,24 @@ def test_app_runtime_settings_inherit_environment_telegram_chat_id(monkeypatch):
 
     assert inherited["notification"]["telegramChatId"] == "-1001234567890"
     assert explicitly_cleared["notification"]["telegramChatId"] == ""
+
+def test_private_auto_reply_defaults_off_and_accepts_legacy_switch() -> None:
+    defaults = normalize_app_runtime_settings({})
+    legacy_enabled = normalize_app_runtime_settings(
+        {"privateMessaging": {"inboundRepliesEnabled": True}}
+    )
+    explicit_disabled = normalize_app_runtime_settings(
+        {
+            "privateMessaging": {
+                "autoReplyEnabled": False,
+                "inboundRepliesEnabled": True,
+            }
+        }
+    )
+
+    assert defaults["privateMessaging"]["autoReplyEnabled"] is False
+    assert defaults["privateMessaging"]["manualReplyEnabled"] is True
+    assert legacy_enabled["privateMessaging"]["autoReplyEnabled"] is True
+    assert legacy_enabled["privateMessaging"]["inboundRepliesEnabled"] is True
+    assert explicit_disabled["privateMessaging"]["autoReplyEnabled"] is False
+    assert explicit_disabled["privateMessaging"]["inboundRepliesEnabled"] is False

@@ -32,6 +32,7 @@ def _import_models() -> None:
         "app.api.broadcasts",
         "app.modules.guardian.models",
         "app.modules.acquisition.models",
+        "app.modules.private_chat.models",
         "app.integrations.xboard.models",
     ):
         importlib.import_module(model_module)

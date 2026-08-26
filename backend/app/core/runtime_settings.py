@@ -144,7 +144,9 @@ DEFAULT_GROUP_AI_INTERACTION_SETTINGS: dict[str, Any] = {
     "systemPrompt": "你是一个中文Telegram社群客服助手，回复要简洁、自然、友好，不要提及你是AI。",
 }
 DEFAULT_PRIVATE_MESSAGING_SETTINGS: dict[str, Any] = {
-    "inbound_replies_enabled": True,
+    "auto_reply_enabled": False,
+    "inbound_replies_enabled": False,
+    "manual_reply_enabled": True,
     "proactive_enabled": False,
 }
 DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {

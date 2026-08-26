@@ -125,13 +125,14 @@ async def _redis_bridge_loop() -> None:
     """Fan Redis events into the WebSocket connections owned by this API process."""
     from app.core.redis import get_redis
     from app.modules.qq.service import QQ_WS_CHANNEL
+    from app.modules.private_chat.service import PRIVATE_CHAT_WS_REDIS_CHANNEL
 
     while True:
         pubsub = None
         try:
             client = await get_redis()
             pubsub = client.pubsub()
-            await pubsub.subscribe(QQ_WS_CHANNEL)
+            await pubsub.subscribe(QQ_WS_CHANNEL, PRIVATE_CHAT_WS_REDIS_CHANNEL)
             async for item in pubsub.listen():
                 if item.get("type") != "message":
                     continue
@@ -267,3 +268,4 @@ class Channels:
     USER_ACTIVITY = "user:activity"
     QQ_MESSAGES = "qq:messages"
     QQ_GROUPS = "qq:groups"
+    TELEGRAM_PRIVATE_CHATS = "telegram:private-chats"

@@ -43,7 +43,8 @@ const keywordPrivateReplyForm = reactive({
 })
 
 const privateMessagingForm = reactive({
-  inboundRepliesEnabled: true,
+  autoReplyEnabled: false,
+  manualReplyEnabled: true,
   proactiveEnabled: false,
 })
 
@@ -141,7 +142,8 @@ const fetchSettings = async () => {
       Object.assign(keywordPrivateReplyForm, settingsStore.settings.keywordPrivateReply || {})
       const privateMessaging = settingsStore.settings.privateMessaging || {}
       Object.assign(privateMessagingForm, {
-        inboundRepliesEnabled: privateMessaging.inboundRepliesEnabled ?? true,
+        autoReplyEnabled: privateMessaging.autoReplyEnabled ?? privateMessaging.inboundRepliesEnabled ?? false,
+        manualReplyEnabled: privateMessaging.manualReplyEnabled ?? true,
         proactiveEnabled: privateMessaging.proactiveEnabled ?? false,
       })
       Object.assign(privateReplyTemplatesForm, privateMessaging.templates || {})
@@ -331,16 +333,21 @@ onMounted(() => {
       <el-tab-pane label="AI回复设置" name="aiReply">
         <el-card shadow="never">
           <el-alert
-            title="推广账号不再主动私聊；只有用户先发私聊进来，系统才允许回复。"
+            title="私聊消息始终进入工作台；自动回复与人工回复分别控制。"
             type="warning"
             :closable="false"
             style="margin-bottom: 20px;"
           />
 
           <el-form :model="aiReplyForm" label-width="160px">
-            <el-form-item label="用户私聊后回复">
-              <el-switch v-model="privateMessagingForm.inboundRepliesEnabled" />
-              <span class="form-tip">开启后，仅当用户主动私聊推广账号时才允许回复</span>
+            <el-form-item label="私聊自动回复">
+              <el-switch v-model="privateMessagingForm.autoReplyEnabled" />
+              <span class="form-tip">默认关闭，开启后按下方模板处理未被人工接管的会话</span>
+            </el-form-item>
+
+            <el-form-item label="允许人工回复">
+              <el-switch v-model="privateMessagingForm.manualReplyEnabled" />
+              <span class="form-tip">控制运营人员是否可以在私聊工作台发送回复</span>
             </el-form-item>
 
             <el-form-item label="主动私聊触达">

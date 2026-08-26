@@ -32,6 +32,7 @@ def _import_models() -> None:
         "app.core.settings_models",
         "app.modules.guardian.models",
         "app.modules.acquisition.models",
+        "app.modules.private_chat.models",
         "app.modules.qq.models",
         "app.integrations.xboard.models",
     ):

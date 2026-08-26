@@ -51,7 +51,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "enabled": False,
     },
     "privateMessaging": {
-        "inboundRepliesEnabled": True,
+        "autoReplyEnabled": False,
+        "inboundRepliesEnabled": False,
+        "manualReplyEnabled": True,
         "proactiveEnabled": False,
         "templates": DEFAULT_PRIVATE_REPLY_TEMPLATES,
     },

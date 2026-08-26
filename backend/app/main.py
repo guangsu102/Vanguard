@@ -36,6 +36,7 @@ from app.api import (
     moderation_sensitive_keywords,
     workers,
     qq,
+    private_chats,
     sub2api_alerts,
 )
 from app.api.settings import router as settings_router
@@ -144,6 +145,7 @@ app.include_router(group_governance, prefix="/api/group-governance", tags=["Grou
 app.include_router(moderation_sensitive_keywords, prefix="/api/moderation-sensitive-keywords", tags=["Moderation Sensitive Keywords"], dependencies=[Depends(get_current_user)])
 app.include_router(workers, prefix="/api/workers", tags=["Execution Workers"])
 app.include_router(qq, prefix="/api/qq", tags=["NapCat OneBot"], dependencies=[Depends(get_current_user)])
+app.include_router(private_chats, prefix="/api/private-chats", tags=["Telegram Private Chats"], dependencies=[Depends(get_current_user)])
 app.include_router(sub2api_alerts, prefix="/api/integrations/sub2api", tags=["Sub2API Alerts"])
 
 

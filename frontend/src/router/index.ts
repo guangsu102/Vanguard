@@ -31,6 +31,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '推广账号', icon: 'User' },
       },
       {
+        path: 'private-chats',
+        name: 'PrivateChats',
+        component: () => import('@/views/PrivateChats.vue'),
+        meta: { title: '私聊工作台', icon: 'ChatLineSquare' },
+      },
+      {
         path: 'growth-dashboard',
         name: 'GrowthDashboard',
         component: () => import('@/views/GrowthDashboard.vue'),

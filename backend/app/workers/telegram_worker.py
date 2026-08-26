@@ -13,7 +13,8 @@ import json
 import socket
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import structlog
@@ -36,6 +37,10 @@ from app.core.account.proxy_policy_events import (
 )
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
+from app.core.account.telegram_execution import (
+    TelegramExecutionError,
+    TelegramExecutionService,
+)
 from app.core.config import settings
 from app.core.database import close_db, get_db_session, init_db
 from app.core.redis import close_redis, init_redis
@@ -55,6 +60,16 @@ from app.modules.guardian.sync import (
     ManagedGroupSyncConflict,
     guardian_role_and_status_from_member,
     sync_managed_group_binding,
+)
+from app.modules.private_chat.service import (
+    IncomingPrivateMessage,
+    claim_pending_outbound_message,
+    finalize_outbound_private_message,
+    is_conversation_auto_reply_enabled,
+    persist_incoming_private_message,
+    publish_private_chat_event,
+    serialize_conversation,
+    serialize_private_message,
 )
 
 logger = structlog.get_logger()
@@ -82,6 +97,7 @@ class TelegramWorker:
         self._growth_event_semaphore = asyncio.BoundedSemaphore(
             self._growth_event_concurrency
         )
+        self._private_outbox_task: asyncio.Task[None] | None = None
 
     async def run(self) -> None:
         await init_db(create_tables=not settings.is_production)
@@ -92,6 +108,13 @@ class TelegramWorker:
             await self._heartbeat(TelegramWorkerStatusValue.STARTING.value, {"phase": "startup"})
             while self._running:
                 await self.run_once()
+                if (
+                    self.role == TelegramWorkerRole.GROWTH_USER
+                    and self._private_outbox_task is None
+                ):
+                    self._private_outbox_task = asyncio.create_task(
+                        self._private_outbox_loop()
+                    )
                 await asyncio.sleep(self.heartbeat_interval)
         except asyncio.CancelledError:
             await self._heartbeat(TelegramWorkerStatusValue.OFFLINE.value, {"phase": "cancelled"})
@@ -101,6 +124,11 @@ class TelegramWorker:
             await self._heartbeat(TelegramWorkerStatusValue.ERROR.value, {"phase": "error"}, last_error=str(exc))
             raise
         finally:
+            if self._private_outbox_task is not None:
+                self._private_outbox_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._private_outbox_task
+                self._private_outbox_task = None
             if self._account_pool is not None:
                 await self._account_pool.close_all()
             await stop_account_proxy_policy_listener()
@@ -431,20 +459,143 @@ class TelegramWorker:
         self._cache_entity_name(user_id, name)
         return name
 
+    @staticmethod
+    def _private_sender_metadata(event: Any, sender_id: int) -> tuple[Optional[str], str]:
+        message = getattr(event, "message", None)
+        sender = getattr(event, "sender", None) or getattr(message, "sender", None)
+        username = getattr(sender, "username", None)
+        display_name = " ".join(
+            part
+            for part in (
+                getattr(sender, "first_name", None),
+                getattr(sender, "last_name", None),
+            )
+            if part
+        )
+        return username, display_name or username or str(sender_id)
+
+    @staticmethod
+    def _private_message_media(message: Any) -> tuple[str, Optional[dict[str, Any]]]:
+        if message is None or getattr(message, "media", None) is None:
+            return "text", None
+
+        message_type = "media"
+        media_object = getattr(message, "media", None)
+        for attribute, candidate in (
+            ("photo", "photo"),
+            ("sticker", "sticker"),
+            ("voice", "voice"),
+            ("video", "video"),
+            ("audio", "audio"),
+            ("document", "document"),
+            ("contact", "contact"),
+            ("geo", "geo"),
+        ):
+            value = getattr(message, attribute, None)
+            if value is not None:
+                message_type = candidate
+                media_object = value
+                break
+
+        metadata: dict[str, Any] = {"kind": message_type}
+        media_id = getattr(media_object, "id", None)
+        if media_id is not None:
+            metadata["id"] = str(media_id)
+        file_info = getattr(message, "file", None)
+        for key, attribute in (
+            ("name", "name"),
+            ("mime_type", "mime_type"),
+            ("size", "size"),
+        ):
+            value = getattr(file_info, attribute, None)
+            if value is not None:
+                metadata[key] = value
+        return message_type, metadata
+
     async def _handle_growth_new_message(self, account_id: int, event: Any) -> None:
         text = getattr(event, "raw_text", None) or getattr(event, "text", None) or ""
-        if not text:
-            return
-
         sender_id = getattr(event, "sender_id", None)
         chat_id = getattr(event, "chat_id", None)
-        message_id = getattr(event, "id", None) or getattr(getattr(event, "message", None), "id", 0)
+        telegram_message = getattr(event, "message", None)
+        message_id = getattr(event, "id", None) or getattr(telegram_message, "id", None)
         if sender_id is None or chat_id is None:
             return
 
         sender_name = self._get_cached_entity_name(int(sender_id)) or str(sender_id)
-
         is_private = bool(getattr(event, "is_private", False))
+
+        occurred_at = getattr(telegram_message, "date", None)
+        if not isinstance(occurred_at, datetime):
+            occurred_at = datetime.utcnow()
+        elif occurred_at.tzinfo is not None:
+            occurred_at = occurred_at.astimezone(timezone.utc).replace(tzinfo=None)
+
+        if is_private:
+            if message_id is None:
+                logger.warning(
+                    "private_message_missing_telegram_id",
+                    account_id=account_id,
+                    sender_id=sender_id,
+                )
+                return
+            peer_username, peer_display_name = self._private_sender_metadata(
+                event, int(sender_id)
+            )
+            message_type, media = self._private_message_media(telegram_message)
+            reply_to_message_id = getattr(telegram_message, "reply_to_msg_id", None)
+            should_auto_reply = False
+            created = False
+            try:
+                async with get_db_session() as db:
+                    conversation, private_message, created = (
+                        await persist_incoming_private_message(
+                            db,
+                            IncomingPrivateMessage(
+                                account_id=account_id,
+                                peer_telegram_id=int(sender_id),
+                                telegram_message_id=int(message_id),
+                                content=text or None,
+                                occurred_at=occurred_at,
+                                peer_username=peer_username,
+                                peer_display_name=peer_display_name,
+                                message_type=message_type,
+                                media=media,
+                                reply_to_telegram_message_id=(
+                                    int(reply_to_message_id)
+                                    if reply_to_message_id is not None
+                                    else None
+                                ),
+                            ),
+                        )
+                    )
+                    if created:
+                        should_auto_reply = bool(text.strip()) and (
+                            await is_conversation_auto_reply_enabled(db, conversation)
+                        )
+                        conversation_data = serialize_conversation(conversation)
+                        message_data = serialize_private_message(private_message)
+
+                if not created:
+                    return
+                await publish_private_chat_event(
+                    "telegram:private-conversation", conversation_data
+                )
+                await publish_private_chat_event(
+                    "telegram:private-message", message_data
+                )
+                if not should_auto_reply:
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "private_message_persist_failed",
+                    account_id=account_id,
+                    sender_id=sender_id,
+                    message_id=message_id,
+                    error=str(exc),
+                )
+                return
+        elif not text:
+            return
 
         async def resolve_sender_name() -> str:
             return await self._resolve_sender_name_from_event(event, int(sender_id))
@@ -456,7 +607,7 @@ class TelegramWorker:
             sender_name=sender_name,
             content=text,
             is_group=not is_private,
-            timestamp=datetime.utcnow(),
+            timestamp=occurred_at,
             account_id=account_id,
             sender_name_resolver=resolve_sender_name,
         )
@@ -477,6 +628,103 @@ class TelegramWorker:
                 message_id=message_id,
                 error=str(exc),
             )
+
+    async def _private_outbox_loop(self) -> None:
+        while self._running:
+            try:
+                processed = await self._process_private_outbox_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                processed = False
+                logger.exception(
+                    "private_outbox_loop_failed",
+                    worker_id=self.worker_id,
+                    error=str(exc),
+                )
+            if not processed:
+                await asyncio.sleep(0.5)
+
+    async def _process_private_outbox_once(self) -> bool:
+        if self._account_pool is None:
+            return False
+
+        async with get_db_session() as db:
+            message = await claim_pending_outbound_message(db)
+            if message is None:
+                return False
+            message_id = message.id
+            account_id = message.account_id
+            peer_telegram_id = message.peer_telegram_id
+            content = message.content or ""
+            sending_data = serialize_private_message(message)
+
+        await publish_private_chat_event(
+            "telegram:private-message-status", sending_data
+        )
+
+        final_status = "sent"
+        telegram_message_id = None
+        error_message = None
+        try:
+            account = await self._account_pool.connect_by_id(
+                account_id,
+                purpose="private_chat_operator_reply",
+                require_session=True,
+                keep_connected=True,
+            )
+            if account is None:
+                raise TelegramExecutionError("conversation account is unavailable")
+            async with get_db_session() as db:
+                execution = TelegramExecutionService(AccountRiskGuard(db))
+                result = await execution.send_private_message_result(
+                    account,
+                    peer_telegram_id,
+                    content,
+                    initiated_by_user=True,
+                    source="private_chat_operator",
+                )
+                result_id = getattr(result, "id", None) or getattr(
+                    result, "message_id", None
+                )
+                telegram_message_id = int(result_id) if result_id is not None else None
+        except TelegramExecutionError as exc:
+            final_status = "failed"
+            error_message = str(exc)
+        except Exception as exc:
+            final_status = "unknown"
+            error_message = str(exc)
+            logger.warning(
+                "private_outbox_send_uncertain",
+                message_id=message_id,
+                account_id=account_id,
+                error=str(exc),
+            )
+
+        async with get_db_session() as db:
+            conversation, finalized = await finalize_outbound_private_message(
+                db,
+                message_id,
+                status=final_status,
+                telegram_message_id=telegram_message_id,
+                error_message=error_message,
+            )
+            final_data = serialize_private_message(finalized)
+            conversation_data = serialize_conversation(conversation)
+
+        await publish_private_chat_event(
+            "telegram:private-message-status", final_data
+        )
+        await publish_private_chat_event(
+            "telegram:private-conversation", conversation_data
+        )
+        logger.info(
+            "private_outbox_processed",
+            message_id=message_id,
+            account_id=account_id,
+            status=final_status,
+        )
+        return True
 
     async def _handle_growth_chat_action(self, account_id: int, event: Any) -> None:
         if not self._event_flag(event, "user_joined") and not self._event_flag(event, "user_added"):

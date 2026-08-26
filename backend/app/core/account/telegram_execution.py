@@ -220,9 +220,30 @@ class TelegramExecutionService:
         initiated_by_user: bool = False,
         source: str = "unknown",
     ) -> bool:
+        if self._get_client(account) is None:
+            return False
+        await self.send_private_message_result(
+            account,
+            user_id,
+            message,
+            initiated_by_user=initiated_by_user,
+            source=source,
+        )
+        return True
+
+    async def send_private_message_result(
+        self,
+        account: Any,
+        user_id: int,
+        message: str,
+        *,
+        initiated_by_user: bool = False,
+        source: str = "unknown",
+    ) -> Any:
+        """Send a private message and return Telegram's message object."""
         client = self._get_client(account)
         if client is None:
-            return False
+            raise TelegramExecutionError("telegram client unavailable")
 
         async with self._risk_operation(
             account,
@@ -231,8 +252,7 @@ class TelegramExecutionService:
             target_id=user_id,
             details={"source": source, "initiated_by_user": initiated_by_user, "content": message},
         ):
-            await client.send_message(user_id, message)
-        return True
+            return await client.send_message(user_id, message)
 
     async def send_group_message(
         self,

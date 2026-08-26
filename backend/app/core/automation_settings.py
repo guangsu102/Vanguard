@@ -653,6 +653,26 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
         if isinstance(value, str):
             normalized_templates[key] = value.strip()[:4000]
 
+    auto_reply_enabled = _bool_setting(
+        private_messaging.get(
+            "autoReplyEnabled",
+            private_messaging.get(
+                "inboundRepliesEnabled",
+                private_messaging.get(
+                    "inbound_replies_enabled",
+                    DEFAULT_PRIVATE_MESSAGING_SETTINGS["auto_reply_enabled"],
+                ),
+            ),
+        ),
+        DEFAULT_PRIVATE_MESSAGING_SETTINGS["auto_reply_enabled"],
+    )
+    manual_reply_enabled = _bool_setting(
+        private_messaging.get(
+            "manualReplyEnabled",
+            private_messaging.get("manual_reply_enabled"),
+        ),
+        DEFAULT_PRIVATE_MESSAGING_SETTINGS["manual_reply_enabled"],
+    )
     return {
         "_meta": raw.get("_meta", {}) if isinstance(raw.get("_meta", {}), dict) else {},
         "notification": {
@@ -717,13 +737,9 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
         },
         "privateMessaging": {
-            "inboundRepliesEnabled": _bool_setting(
-                private_messaging.get(
-                    "inboundRepliesEnabled",
-                    private_messaging.get("inbound_replies_enabled", DEFAULT_PRIVATE_MESSAGING_SETTINGS["inbound_replies_enabled"]),
-                ),
-                DEFAULT_PRIVATE_MESSAGING_SETTINGS["inbound_replies_enabled"],
-            ),
+            "autoReplyEnabled": auto_reply_enabled,
+            "inboundRepliesEnabled": auto_reply_enabled,
+            "manualReplyEnabled": manual_reply_enabled,
             "proactiveEnabled": _bool_setting(
                 private_messaging.get(
                     "proactiveEnabled",
@@ -773,7 +789,7 @@ async def get_private_reply_template_settings(db: AsyncSession) -> dict[str, str
 async def is_private_messaging_enabled(db: AsyncSession, *, initiated_by_user: bool = False) -> bool:
     settings = await get_private_messaging_settings(db)
     if initiated_by_user:
-        return bool(settings["inboundRepliesEnabled"])
+        return bool(settings["autoReplyEnabled"])
     return bool(settings["proactiveEnabled"])
 
 

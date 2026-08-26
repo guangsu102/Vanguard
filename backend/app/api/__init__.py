@@ -26,6 +26,7 @@ from app.api.managed_groups import router as managed_groups
 from app.api.moderation_sensitive_keywords import router as moderation_sensitive_keywords
 from app.api.workers import router as workers
 from app.api.qq import router as qq
+from app.api.private_chats import router as private_chats
 from app.api.sub2api_alerts import router as sub2api_alerts
 
 __all__ = [
@@ -53,5 +54,6 @@ __all__ = [
     "moderation_sensitive_keywords",
     "workers",
     "qq",
+    "private_chats",
     "sub2api_alerts",
 ]

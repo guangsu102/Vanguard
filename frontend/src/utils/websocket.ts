@@ -21,6 +21,7 @@ class WebSocketClient {
   private clientId: number = 0
   private token: string = ''
   private handlers: Map<string, Set<MessageHandler>> = new Map()
+  private subscriptions: Set<string> = new Set(['stats:update'])
   private reconnectAttempts: number = 0
   private maxReconnectAttempts: number = 5
   private reconnectDelay: number = 3000
@@ -62,7 +63,9 @@ class WebSocketClient {
           this._status.value = 'connected'
           this.reconnectAttempts = 0
           this.startPing()
-          this.subscribe('stats:update')
+          this.subscriptions.forEach((channel) => {
+            this.send({ type: 'subscribe', channel })
+          })
           resolve()
         }
 
@@ -160,10 +163,12 @@ class WebSocketClient {
   }
 
   subscribe(channel: string): boolean {
+    this.subscriptions.add(channel)
     return this.send({ type: 'subscribe', channel })
   }
 
   unsubscribe(channel: string): boolean {
+    this.subscriptions.delete(channel)
     return this.send({ type: 'unsubscribe', channel })
   }
 

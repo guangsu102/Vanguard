@@ -26,6 +26,7 @@ const menuItems = [
       { path: '/growth-settings', title: '配置中心', icon: Setting },
       { path: '/growth-logs', title: '增长日志', icon: Document },
       { path: '/accounts', title: '推广账号', icon: User },
+      { path: '/private-chats', title: '私聊工作台', icon: ChatLineSquare },
       { path: '/proxies', title: '静态代理IP', icon: Connection },
       { path: '/groups', title: '群池管理', icon: ChatDotRound },
       { path: '/keywords', title: '关键词管理', icon: Key },

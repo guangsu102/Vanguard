@@ -95,7 +95,9 @@ export interface PrivateReplyTemplatesSettings {
 }
 
 export interface PrivateMessagingSettings {
-  inboundRepliesEnabled: boolean
+  autoReplyEnabled: boolean
+  inboundRepliesEnabled?: boolean
+  manualReplyEnabled: boolean
   proactiveEnabled: boolean
   templates?: Partial<PrivateReplyTemplatesSettings>
 }
