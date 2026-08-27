@@ -6,6 +6,7 @@ export type AccountAssetTier = 'unknown' | 'month_1' | 'month_3_6' | 'year_1' | 
 export type AccountWarmupStage = 'observe' | 'seed' | 'soft' | 'ramp' | 'normal' | 'cooldown'
 export type ProxyMode = 'dynamic' | 'static' | 'none'
 export type AccountRiskLevel = 'normal' | 'watch' | 'limited' | 'frozen' | 'quarantined'
+export type AccountOperationMode = 'growth' | 'ad_only'
 
 export interface Account {
   id: number
@@ -15,6 +16,7 @@ export interface Account {
   profile_bio?: string
   profile_bio_synced_at?: string
   account_type: AccountType
+  operation_mode: AccountOperationMode
   asset_tier: AccountAssetTier
   registered_at?: string
   asset_verified_at?: string
@@ -59,6 +61,7 @@ export interface AccountFormData {
   display_name?: string
   profile_bio?: string
   account_type?: AccountType
+  operation_mode?: AccountOperationMode
   asset_tier?: AccountAssetTier
   registered_at?: string
   asset_note?: string
@@ -185,6 +188,7 @@ const normalizeAccount = (item: any): Account => ({
   profile_bio: item.profile_bio || undefined,
   profile_bio_synced_at: item.profile_bio_synced_at || undefined,
   account_type: item.account_type || 'promoter',
+  operation_mode: item.operation_mode || 'growth',
   asset_tier: item.asset_tier || 'unknown',
   registered_at: item.registered_at || undefined,
   asset_verified_at: item.asset_verified_at || undefined,

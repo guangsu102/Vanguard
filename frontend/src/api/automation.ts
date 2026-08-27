@@ -75,7 +75,7 @@ export interface AccountOperationConfig {
 
 export type AccountOperationConfigUpdatePayload = Partial<
   Omit<AccountOperationConfig, 'id' | 'account_id' | 'risk_level' | 'business_stage'>
->
+> & { force_transition?: boolean }
 
 export interface AutoJoinSchedulerConfig {
   enabled: boolean
@@ -560,7 +560,7 @@ export interface AdOnlyRecommendationSettings {
 
 export interface AdOnlyEvent {
   id: number
-  group_id: number
+  group_id?: number
   assessment_id?: number
   handover_id?: number
   event_type: string
@@ -601,11 +601,12 @@ export interface AdOnlyAssessment {
 
 export interface AdOnlyHandover {
   id: number
-  assessment_id: number
-  group_id: number
+  workflow_type: 'assessment' | 'direct'
+  assessment_id?: number
+  group_id?: number
   telegram_group_id?: number
   group_title?: string
-  source_growth_account_id: number
+  source_growth_account_id?: number
   source_growth_account_label?: string
   target_ad_only_account_id: number
   target_ad_only_account_label?: string
@@ -616,6 +617,9 @@ export interface AdOnlyHandover {
   interval_minutes: number
   scheduled_times: string[]
   estimated_daily_sends: number
+  permission_mode?: 'soft_ad_allowed' | 'high_volume_ad_allowed'
+  permission_note?: string
+  permission_expires_at?: string
   status: string
   current_step: string
   retry_count: number
@@ -636,6 +640,18 @@ export interface AdOnlyHandoverRequest {
   send_mode: 'interval' | 'scheduled'
   interval_minutes: number
   scheduled_times: string[]
+}
+
+export interface AdOnlyDirectAssignmentRequest {
+  target_account_id: number
+  creative_id: number
+  invite_link: string
+  send_mode: 'interval' | 'scheduled'
+  interval_minutes: number
+  scheduled_times: string[]
+  permission_mode: 'soft_ad_allowed' | 'high_volume_ad_allowed'
+  permission_note: string
+  permission_expires_at: string
 }
 
 export interface AdOnlyHandoverOptions {
@@ -940,6 +956,21 @@ export const automationApi = {
     return apiClient.post<{
       data: { task_id?: string; created: boolean; handover: AdOnlyHandover }
     }>('/automation/ad-only/handovers', data)
+  },
+
+  preflightAdOnlyDirectAssignment: (data: AdOnlyDirectAssignmentRequest) => {
+    return apiClient.post<{ data: Record<string, any> }>(
+      '/automation/ad-only/direct-assignments/preflight',
+      data,
+    )
+  },
+
+  createAdOnlyDirectAssignment: (
+    data: AdOnlyDirectAssignmentRequest & { idempotency_key: string },
+  ) => {
+    return apiClient.post<{
+      data: { task_id?: string; created: boolean; handover: AdOnlyHandover }
+    }>('/automation/ad-only/direct-assignments', data)
   },
 
   getAdOnlyHandovers: (params?: { group_id?: number; status?: string; limit?: number }) => {

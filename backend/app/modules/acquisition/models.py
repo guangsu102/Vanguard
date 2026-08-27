@@ -1376,18 +1376,21 @@ class GroupAdHandover(Base):
     __tablename__ = "group_ad_handover"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    assessment_id: Mapped[int] = mapped_column(
-        ForeignKey("group_ad_only_assessment.id", ondelete="RESTRICT"),
-        nullable=False,
+    workflow_type: Mapped[str] = mapped_column(
+        String(20), default="assessment", server_default="assessment", nullable=False
     )
-    group_id: Mapped[int] = mapped_column(
-        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    assessment_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group_ad_only_assessment.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    group_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=True
     )
     active_group_key: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True
     )
-    source_growth_account_id: Mapped[int] = mapped_column(
-        ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=False
+    source_growth_account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=True
     )
     target_ad_only_account_id: Mapped[int] = mapped_column(
         ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=False
@@ -1409,6 +1412,17 @@ class GroupAdHandover(Base):
     scheduled_times: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     estimated_daily_sends: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False
+    )
+    permission_mode: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    permission_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    permission_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    permission_previous_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    membership_previous_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
     )
     status: Mapped[str] = mapped_column(
         String(30), default="queued", nullable=False
@@ -1455,6 +1469,12 @@ class GroupAdHandover(Base):
         UniqueConstraint("idempotency_key", name="uq_group_ad_handover_idempotency"),
         Index("idx_group_ad_handover_status", "status", "updated_at"),
         Index("idx_group_ad_handover_group", "group_id", "created_at"),
+        Index(
+            "idx_group_ad_handover_workflow",
+            "workflow_type",
+            "status",
+            "updated_at",
+        ),
     )
 
 
@@ -1464,8 +1484,8 @@ class GroupAdOnlyEvent(Base):
     __tablename__ = "group_ad_only_event"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    group_id: Mapped[int] = mapped_column(
-        ForeignKey("group.id", ondelete="CASCADE"), nullable=False
+    group_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group.id", ondelete="CASCADE"), nullable=True
     )
     assessment_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("group_ad_only_assessment.id", ondelete="CASCADE"),

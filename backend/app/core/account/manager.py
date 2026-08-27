@@ -23,7 +23,16 @@ from app.core.account.exceptions import (
     AccountNotFoundError,
     InvalidAPIConfigError,
 )
-from app.core.account.models import AccountAssetTier, AccountStatus, AccountType, ProxyMode, TelegramAccount, TelegramAPIConfig
+from app.core.account.models import (
+    AccountAssetTier,
+    AccountOperationConfig,
+    AccountOperationMode,
+    AccountStatus,
+    AccountType,
+    ProxyMode,
+    TelegramAccount,
+    TelegramAPIConfig,
+)
 from app.core.config import get_settings
 from app.core.network.fingerprint import FingerprintManager
 
@@ -158,6 +167,7 @@ class AccountManager:
         warmup_hold_until: Optional[datetime] = None,
         warmup_note: Optional[str] = None,
         account_type: AccountType = AccountType.PROMOTER,
+        operation_mode: AccountOperationMode = AccountOperationMode.GROWTH,
         proxy_mode: ProxyMode = ProxyMode.DYNAMIC,
         static_proxy_id: Optional[int] = None,
     ) -> TelegramAccount:
@@ -225,6 +235,13 @@ class AccountManager:
         )
 
         self.db.add(account)
+        if account_type == AccountType.PROMOTER:
+            account.operation_config = AccountOperationConfig(
+                operation_mode=operation_mode.value,
+                auto_join_enabled=False,
+                auto_ads_enabled=True,
+                keyword_auto_replenish_enabled=False,
+            )
         
         config.account_count += 1
         self.db.add(config)

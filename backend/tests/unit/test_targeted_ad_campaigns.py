@@ -13,6 +13,7 @@ from app.api.automation import (
     AccountAdBindingCreate,
     AccountAdBindingUpdate,
     AdCampaignCreate,
+    _apply_operation_mode_transition_side_effects,
     _validate_ad_only_binding_scope,
     create_account_ad_binding,
     create_account_ad_bindings_batch,
@@ -40,6 +41,101 @@ from app.modules.acquisition.models import (
     GroupAdProfile,
     GroupAdTier,
 )
+
+
+@pytest.mark.asyncio
+async def test_operation_mode_transition_requires_force_and_disables_incompatible_bindings(
+    test_db,
+):
+    account = TelegramAccount(
+        identifier="mode-transition-account",
+        session_name="mode-transition-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    config = AccountOperationConfig(
+        account=account,
+        operation_mode=AccountOperationMode.GROWTH.value,
+    )
+    campaign = AdCampaign(
+        name="growth campaign before role transition",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    creative = AdCreative(
+        name="transition creative",
+        content="transition ad",
+        enabled=True,
+    )
+    test_db.add_all([account, config, campaign, creative])
+    await test_db.flush()
+    binding = AccountAdBinding(
+        account_id=account.id,
+        ad_campaign_id=campaign.id,
+        creative_id=creative.id,
+        enabled=True,
+    )
+    test_db.add(binding)
+    await test_db.commit()
+
+    with pytest.raises(
+        HTTPException, match="operation_mode_transition_requires_force"
+    ):
+        await _apply_operation_mode_transition_side_effects(
+            config,
+            {"operation_mode": AccountOperationMode.AD_ONLY.value},
+            test_db,
+        )
+
+    assert binding.enabled is True
+    await _apply_operation_mode_transition_side_effects(
+        config,
+        {
+            "operation_mode": AccountOperationMode.AD_ONLY.value,
+            "force_transition": True,
+        },
+        test_db,
+    )
+    assert binding.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_ad_only_account_with_owned_group_cannot_switch_back_to_growth(
+    test_db,
+):
+    account = TelegramAccount(
+        identifier="owned-group-ad-only-account",
+        session_name="owned-group-ad-only-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    config = AccountOperationConfig(
+        account=account,
+        operation_mode=AccountOperationMode.AD_ONLY.value,
+    )
+    test_db.add_all([account, config])
+    await test_db.flush()
+    group = Group(
+        group_id=-100900000777,
+        title="Owned ad-only group",
+        level=GroupLevel.A,
+        ad_delivery_account_id=account.id,
+    )
+    test_db.add(group)
+    await test_db.commit()
+
+    with pytest.raises(
+        HTTPException, match="operation_mode_transition_blocked"
+    ):
+        await _apply_operation_mode_transition_side_effects(
+            config,
+            {
+                "operation_mode": AccountOperationMode.GROWTH.value,
+                "force_transition": True,
+            },
+            test_db,
+        )
 
 
 @pytest.mark.asyncio

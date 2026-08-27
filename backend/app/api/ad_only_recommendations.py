@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -71,6 +72,22 @@ class HandoverCreateRequest(HandoverPreflightRequest):
     idempotency_key: str = Field(..., min_length=8, max_length=64)
 
 
+class DirectAssignmentPreflightRequest(BaseModel):
+    target_account_id: int = Field(..., gt=0)
+    creative_id: int = Field(..., gt=0)
+    invite_link: str = Field(..., min_length=4, max_length=512)
+    send_mode: Literal["interval", "scheduled"]
+    interval_minutes: int = Field(180, ge=1, le=10080)
+    scheduled_times: list[str] = Field(default_factory=list, max_length=24)
+    permission_mode: Literal["soft_ad_allowed", "high_volume_ad_allowed"]
+    permission_note: str = Field(..., min_length=3, max_length=500)
+    permission_expires_at: datetime
+
+
+class DirectAssignmentCreateRequest(DirectAssignmentPreflightRequest):
+    idempotency_key: str = Field(..., min_length=8, max_length=64)
+
+
 def _workflow_error(exc: AdOnlyWorkflowError) -> HTTPException:
     detail = str(exc)
     if detail.endswith("_not_found") or detail in {
@@ -88,6 +105,7 @@ def _workflow_error(exc: AdOnlyWorkflowError) -> HTTPException:
         "handover_not_retryable",
         "completed_handover_cannot_be_rolled_back",
         "handover_execution_disabled",
+        "direct_assignment_conflict",
     }
     return HTTPException(
         status_code=409 if detail in conflicts else 400,
@@ -304,6 +322,74 @@ async def create_handover(
     return {
         "code": 0,
         "message": "Ad-only handover queued" if created else "Idempotent replay",
+        "data": {
+            "task_id": task_id,
+            "created": created,
+            "handover": service.handover_payload(handover),
+        },
+    }
+
+
+@router.post("/direct-assignments/preflight")
+async def preflight_direct_assignment(
+    request: DirectAssignmentPreflightRequest,
+    _current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        values = await AdOnlyRecommendationService(
+            db
+        ).preflight_direct_assignment(**request.model_dump())
+    except AdOnlyWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return {
+        "code": 0,
+        "message": "Direct assignment preflight passed",
+        "data": {
+            "target_account_id": values["target"].id,
+            "creative_id": values["creative"].id,
+            "send_mode": values["send_mode"],
+            "interval_minutes": values["interval_minutes"],
+            "scheduled_times": values["scheduled_times"],
+            "estimated_daily_sends": values["estimated_daily_sends"],
+            "existing_daily_sends": values["existing_daily_sends"],
+            "hard_cap": values["hard_cap"],
+            "invite_kind": values["invite_kind"],
+            "permission_mode": values["permission_mode"],
+            "permission_expires_at": values[
+                "permission_expires_at"
+            ].isoformat(),
+        },
+    }
+
+
+@router.post("/direct-assignments", status_code=status.HTTP_202_ACCEPTED)
+async def create_direct_assignment(
+    request: DirectAssignmentCreateRequest,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    service = AdOnlyRecommendationService(db)
+    try:
+        handover, created = await service.create_direct_assignment(
+            **request.model_dump(),
+            requested_by_user_id=int(current_user["id"]),
+        )
+    except AdOnlyWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    task_id = None
+    if created or handover.status == "queued":
+        task_id = _queue(
+            execute_ad_only_handover_task,
+            kwargs={"handover_id": handover.id},
+        )
+    return {
+        "code": 0,
+        "message": (
+            "Direct Ad-only assignment queued"
+            if created
+            else "Idempotent replay"
+        ),
         "data": {
             "task_id": task_id,
             "created": created,

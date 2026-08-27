@@ -68,6 +68,7 @@ from app.modules.acquisition.models import (
     AdSendMode,
     AutoJoinAttempt,
     GroupAdPolicyEvent,
+    GroupAdHandover,
     GroupAdPolicyMode,
     GroupAdProfile,
     GroupFailoverStatus,
@@ -1499,6 +1500,7 @@ async def update_ad_failure_policy(
 
 class AccountOperationConfigUpdate(BaseModel):
     operation_mode: Optional[str] = Field(None, pattern="^(growth|ad_only)$")
+    force_transition: bool = False
     auto_join_enabled: Optional[bool] = None
     auto_ads_enabled: Optional[bool] = None
     max_groups_per_day: Optional[int] = Field(None, ge=0, le=1000)
@@ -1586,6 +1588,7 @@ def _prepare_operation_config_update(
     config: AccountOperationConfig, payload: dict[str, Any]
 ) -> dict[str, Any]:
     data = dict(payload)
+    data.pop("force_transition", None)
     if "keyword_types" in data:
         data["keyword_types"] = json.dumps(data["keyword_types"], ensure_ascii=False)
 
@@ -1602,6 +1605,75 @@ def _prepare_operation_config_update(
         data["auto_join_enabled"] = False
         data["keyword_auto_replenish_enabled"] = False
     return data
+
+
+async def _apply_operation_mode_transition_side_effects(
+    config: AccountOperationConfig,
+    payload: dict[str, Any],
+    db: AsyncSession,
+) -> None:
+    target_mode = payload.get("operation_mode")
+    current_mode = (
+        getattr(config, "operation_mode", None)
+        or AccountOperationMode.GROWTH.value
+    )
+    if not target_mode or target_mode == current_mode:
+        return
+
+    force_transition = bool(payload.get("force_transition"))
+    binding_rows = await db.execute(
+        select(AccountAdBinding)
+        .join(AdCampaign, AdCampaign.id == AccountAdBinding.ad_campaign_id)
+        .where(
+            AccountAdBinding.account_id == config.account_id,
+            AccountAdBinding.enabled.is_(True),
+            AdCampaign.delivery_policy != target_mode,
+        )
+    )
+    incompatible_bindings = list(binding_rows.scalars().all())
+
+    if target_mode == AccountOperationMode.GROWTH.value:
+        owner_rows = await db.execute(
+            select(Group.id).where(
+                Group.ad_delivery_account_id == config.account_id
+            )
+        )
+        owned_group_ids = list(owner_rows.scalars().all())
+        active_handover_rows = await db.execute(
+            select(GroupAdHandover.id).where(
+                GroupAdHandover.target_ad_only_account_id == config.account_id,
+                GroupAdHandover.status.in_(
+                    [
+                        "queued",
+                        "running",
+                        "failed",
+                        "cleanup_pending",
+                        "rollback_pending",
+                    ]
+                ),
+            )
+        )
+        active_handover_ids = list(active_handover_rows.scalars().all())
+        if owned_group_ids or active_handover_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "operation_mode_transition_blocked: transfer or roll back "
+                    f"owned_groups={owned_group_ids}, active_handovers={active_handover_ids}"
+                ),
+            )
+
+    if incompatible_bindings and not force_transition:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "operation_mode_transition_requires_force: incompatible_bindings="
+                f"{[binding.id for binding in incompatible_bindings]}"
+            ),
+        )
+    if force_transition:
+        for binding in incompatible_bindings:
+            binding.enabled = False
 
 
 def _apply_operation_config_update(config: AccountOperationConfig, data: dict[str, Any]) -> None:
@@ -1622,7 +1694,9 @@ async def update_account_operation_config(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     config = await _get_or_create_operation_config(db, account_id)
-    data = _prepare_operation_config_update(config, request.model_dump(exclude_unset=True))
+    payload = request.model_dump(exclude_unset=True)
+    await _apply_operation_mode_transition_side_effects(config, payload, db)
+    data = _prepare_operation_config_update(config, payload)
     _apply_operation_config_update(config, data)
 
     await db.commit()
@@ -1645,6 +1719,9 @@ async def update_account_operation_configs_batch(
     for account_id in account_ids:
         try:
             config = await _get_or_create_operation_config(db, account_id)
+            await _apply_operation_mode_transition_side_effects(
+                config, data, db
+            )
             prepared = _prepare_operation_config_update(config, data)
             _apply_operation_config_update(config, prepared)
             updated.append(_operation_config_to_dict(config))

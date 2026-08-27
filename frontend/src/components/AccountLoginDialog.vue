@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch } from 'vue'
-import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload, ElAlert } from 'element-plus'
+import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload, ElAlert, ElRadioGroup, ElRadioButton } from 'element-plus'
 import type { FormInstance, FormRules, UploadRawFile } from 'element-plus'
-import type { AccountAssetTier } from '@/api/accounts'
+import type { AccountAssetTier, AccountOperationMode } from '@/api/accounts'
 import { proxiesApi, type Proxy } from '@/api/proxies'
 import { accountAssetTierOptions } from '@/config/accountAssetTiers'
 
@@ -69,6 +69,7 @@ const formData = reactive({
   countryCode: 'US',
   countryName: '美国',
   assetTier: 'unknown' as AccountAssetTier,
+  operationMode: 'growth' as AccountOperationMode,
   profileBio: '',
   code: '',
   password: '',
@@ -86,6 +87,7 @@ const sessionImportData = reactive({
   countryCode: 'US',
   countryName: '美国',
   assetTier: 'unknown' as AccountAssetTier,
+  operationMode: 'growth' as AccountOperationMode,
   profileBio: '',
   sessionFile: null as File | null,
   proxyMode: 'dynamic' as 'dynamic' | 'static' | 'none',
@@ -212,6 +214,7 @@ const resetForm = () => {
     countryCode: 'US',
     countryName: '美国',
     assetTier: 'unknown',
+    operationMode: 'growth',
     profileBio: '',
     code: '',
     password: '',
@@ -227,6 +230,7 @@ const resetForm = () => {
     countryCode: 'US',
     countryName: '美国',
     assetTier: 'unknown',
+    operationMode: 'growth',
     profileBio: '',
     sessionFile: null,
     proxyMode: 'dynamic',
@@ -408,6 +412,7 @@ const completeLogin = async () => {
         country_code: formData.countryCode,
         country_name: formData.countryName,
         asset_tier: formData.assetTier,
+        operation_mode: formData.operationMode,
         profile_bio: formData.profileBio.trim() || undefined,
         session_string: formData.sessionString,
         proxy_mode: formData.proxyMode,
@@ -459,6 +464,7 @@ const handleImportSession = async () => {
         formDataToSend.append('country_name', sessionImportData.countryName)
       }
       formDataToSend.append('asset_tier', sessionImportData.assetTier)
+      formDataToSend.append('operation_mode', sessionImportData.operationMode)
       if (sessionImportData.profileBio.trim()) {
         formDataToSend.append('profile_bio', sessionImportData.profileBio.trim())
       }
@@ -582,6 +588,12 @@ const handleNext = () => {
                 :value="option.value"
               />
             </el-select>
+          </el-form-item>
+          <el-form-item label="账号职责" prop="operationMode">
+            <el-radio-group v-model="formData.operationMode">
+              <el-radio-button value="growth">Growth 增长</el-radio-button>
+              <el-radio-button value="ad_only">Ad-only 广告专用</el-radio-button>
+            </el-radio-group>
           </el-form-item>
           <el-form-item label="账号简介" prop="profileBio">
             <el-input
@@ -707,6 +719,12 @@ const handleNext = () => {
               :value="option.value"
             />
           </el-select>
+        </el-form-item>
+        <el-form-item label="账号职责" prop="operationMode">
+          <el-radio-group v-model="sessionImportData.operationMode">
+            <el-radio-button value="growth">Growth 增长</el-radio-button>
+            <el-radio-button value="ad_only">Ad-only 广告专用</el-radio-button>
+          </el-radio-group>
         </el-form-item>
         <el-form-item label="账号简介" prop="profileBio">
           <el-input

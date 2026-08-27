@@ -39,7 +39,7 @@ from app.core.ephemeral_secret import (
     decrypt_ephemeral_secret,
     encrypt_ephemeral_secret,
 )
-from app.core.group.models import Group, GroupAccountMembership
+from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AdCampaign,
@@ -57,6 +57,7 @@ from app.modules.acquisition.models import (
     GroupAdPolicyEvent,
     GroupAdPolicyMode,
     GroupAdProfile,
+    GroupAdTier,
 )
 
 logger = structlog.get_logger()
@@ -85,6 +86,8 @@ ACTIVE_HANDOVER_STATUSES = {
     "rollback_pending",
 }
 TERMINAL_HANDOVER_STATUSES = {"completed", "rolled_back", "cancelled"}
+DIRECT_WORKFLOW_TYPE = "direct"
+ASSESSMENT_WORKFLOW_TYPE = "assessment"
 
 
 class AdOnlyWorkflowError(ValueError):
@@ -161,7 +164,7 @@ class AdOnlyRecommendationService:
     async def _add_event(
         self,
         *,
-        group_id: int,
+        group_id: int | None,
         event_type: str,
         assessment_id: int | None = None,
         handover_id: int | None = None,
@@ -775,6 +778,204 @@ class AdOnlyRecommendationService:
             for campaign in rows.scalars().unique().all()
         )
 
+    async def preflight_direct_assignment(
+        self,
+        *,
+        target_account_id: int,
+        creative_id: int,
+        invite_link: str,
+        send_mode: str,
+        interval_minutes: int,
+        scheduled_times: list[str] | None,
+        permission_mode: str,
+        permission_note: str,
+        permission_expires_at: datetime,
+    ) -> dict[str, Any]:
+        now = _now()
+        settings = await get_ad_only_recommendation_settings(self.db)
+        if not settings["handover_execution_enabled"]:
+            raise AdOnlyWorkflowError("handover_execution_disabled")
+
+        target = await self.db.get(TelegramAccount, target_account_id)
+        if target is None:
+            raise AdOnlyWorkflowError("target_account_not_found")
+        if (
+            target.account_type != AccountType.PROMOTER
+            or not target.is_active
+            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            or target.risk_level
+            not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}
+        ):
+            raise AdOnlyWorkflowError("target_account_unavailable")
+        target_config = (
+            await self.db.execute(
+                select(AccountOperationConfig).where(
+                    AccountOperationConfig.account_id == target.id
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            target_config is None
+            or not target_config.enabled
+            or not target_config.auto_ads_enabled
+            or target_config.operation_mode != AccountOperationMode.AD_ONLY.value
+        ):
+            raise AdOnlyWorkflowError("target_account_not_enabled_ad_only")
+
+        creative = await self.db.get(AdCreative, creative_id)
+        if creative is None or not creative.enabled:
+            raise AdOnlyWorkflowError("creative_not_enabled")
+        try:
+            parsed_link = parse_telegram_group_link(invite_link)
+        except TelegramExecutionError as exc:
+            raise AdOnlyWorkflowError(f"invalid_invite_link:{exc}") from exc
+
+        mode, interval, times, estimated = self._validate_schedule(
+            send_mode, interval_minutes, scheduled_times
+        )
+        allowed_permission_modes = {
+            GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+            GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+        }
+        normalized_permission_mode = str(permission_mode or "").strip()
+        if normalized_permission_mode not in allowed_permission_modes:
+            raise AdOnlyWorkflowError("invalid_direct_permission_mode")
+        normalized_note = str(permission_note or "").strip()
+        if len(normalized_note) < 3:
+            raise AdOnlyWorkflowError("direct_permission_note_required")
+        if permission_expires_at <= now:
+            raise AdOnlyWorkflowError("direct_permission_expiry_required")
+        if permission_expires_at > now + timedelta(days=365):
+            raise AdOnlyWorkflowError("direct_permission_expiry_too_far")
+
+        risk_settings = await get_account_risk_guard_settings(self.db)
+        hard_cap = await AccountRiskGuard(self.db)._outbound_message_hard_cap(
+            target.id, risk_settings
+        )
+        existing_daily_sends = await self._existing_daily_sends(target.id)
+        if existing_daily_sends + estimated > hard_cap:
+            raise AdOnlyWorkflowError("target_account_daily_capacity_exceeded")
+        return {
+            "target": target,
+            "creative": creative,
+            "invite_link": invite_link,
+            "invite_kind": parsed_link.kind,
+            "send_mode": mode,
+            "interval_minutes": interval,
+            "scheduled_times": times,
+            "estimated_daily_sends": estimated,
+            "existing_daily_sends": existing_daily_sends,
+            "hard_cap": hard_cap,
+            "permission_mode": normalized_permission_mode,
+            "permission_note": normalized_note,
+            "permission_expires_at": permission_expires_at,
+        }
+
+    async def create_direct_assignment(
+        self,
+        *,
+        target_account_id: int,
+        creative_id: int,
+        invite_link: str,
+        send_mode: str,
+        interval_minutes: int,
+        scheduled_times: list[str] | None,
+        permission_mode: str,
+        permission_note: str,
+        permission_expires_at: datetime,
+        idempotency_key: str,
+        requested_by_user_id: int,
+    ) -> tuple[GroupAdHandover, bool]:
+        key = str(idempotency_key or "").strip()
+        if not 8 <= len(key) <= 64:
+            raise AdOnlyWorkflowError("invalid_idempotency_key")
+        existing = (
+            await self.db.execute(
+                select(GroupAdHandover).where(
+                    GroupAdHandover.idempotency_key == key
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return existing, False
+
+        values = await self.preflight_direct_assignment(
+            target_account_id=target_account_id,
+            creative_id=creative_id,
+            invite_link=invite_link,
+            send_mode=send_mode,
+            interval_minutes=interval_minutes,
+            scheduled_times=scheduled_times,
+            permission_mode=permission_mode,
+            permission_note=permission_note,
+            permission_expires_at=permission_expires_at,
+        )
+        now = _now()
+        handover = GroupAdHandover(
+            workflow_type=DIRECT_WORKFLOW_TYPE,
+            assessment_id=None,
+            group_id=None,
+            active_group_key=None,
+            source_growth_account_id=None,
+            target_ad_only_account_id=values["target"].id,
+            creative_id=values["creative"].id,
+            invite_link_encrypted=encrypt_ephemeral_secret(invite_link),
+            invite_secret_expires_at=now + timedelta(hours=24),
+            send_mode=values["send_mode"],
+            interval_minutes=values["interval_minutes"],
+            scheduled_times=_json_dump(values["scheduled_times"]),
+            estimated_daily_sends=values["estimated_daily_sends"],
+            permission_mode=values["permission_mode"],
+            permission_note=values["permission_note"],
+            permission_expires_at=values["permission_expires_at"],
+            status="queued",
+            current_step="queued",
+            idempotency_key=key,
+            requested_by_user_id=requested_by_user_id,
+            approved_by_user_id=requested_by_user_id,
+            approved_at=now,
+        )
+        self.db.add(handover)
+        try:
+            await self.db.flush()
+        except IntegrityError as exc:
+            await self.db.rollback()
+            replay = (
+                await self.db.execute(
+                    select(GroupAdHandover).where(
+                        GroupAdHandover.idempotency_key == key
+                    )
+                )
+            ).scalar_one_or_none()
+            if replay is not None:
+                return replay, False
+            raise AdOnlyWorkflowError("direct_assignment_conflict") from exc
+        await self._add_event(
+            group_id=None,
+            handover_id=handover.id,
+            event_type="direct_assignment_queued",
+            step="queued",
+            status="queued",
+            actor_user_id=requested_by_user_id,
+            message="Direct Ad-only assignment queued after successful preflight",
+            payload={
+                "target_account_id": target_account_id,
+                "creative_id": creative_id,
+                "send_mode": values["send_mode"],
+                "interval_minutes": values["interval_minutes"],
+                "scheduled_times": values["scheduled_times"],
+                "estimated_daily_sends": values["estimated_daily_sends"],
+                "existing_daily_sends": values["existing_daily_sends"],
+                "hard_cap": values["hard_cap"],
+                "invite_kind": values["invite_kind"],
+                "permission_mode": values["permission_mode"],
+                "permission_expires_at": _iso(values["permission_expires_at"]),
+            },
+        )
+        await self.db.commit()
+        await self.db.refresh(handover)
+        return handover, True
+
     async def preflight_handover(
         self,
         *,
@@ -1036,6 +1237,7 @@ class AdOnlyRecommendationService:
     def handover_payload(handover: GroupAdHandover) -> dict[str, Any]:
         return {
             "id": handover.id,
+            "workflow_type": handover.workflow_type or ASSESSMENT_WORKFLOW_TYPE,
             "assessment_id": handover.assessment_id,
             "group_id": handover.group_id,
             "telegram_group_id": handover.group.group_id if handover.group else None,
@@ -1055,6 +1257,9 @@ class AdOnlyRecommendationService:
             "interval_minutes": handover.interval_minutes,
             "scheduled_times": _json_load(handover.scheduled_times, []),
             "estimated_daily_sends": handover.estimated_daily_sends,
+            "permission_mode": handover.permission_mode,
+            "permission_note": handover.permission_note,
+            "permission_expires_at": _iso(handover.permission_expires_at),
             "status": handover.status,
             "current_step": handover.current_step,
             "retry_count": handover.retry_count,
@@ -1188,6 +1393,64 @@ class AdOnlyRecommendationService:
             )
         return group, source, target, creative
 
+    async def _runtime_direct_values(
+        self, handover: GroupAdHandover
+    ) -> tuple[TelegramAccount, AdCreative]:
+        settings = await get_ad_only_recommendation_settings(self.db)
+        if not settings["handover_execution_enabled"]:
+            raise AdOnlyWorkflowError("handover_execution_disabled")
+        target = await self.db.get(
+            TelegramAccount, handover.target_ad_only_account_id
+        )
+        creative = await self.db.get(AdCreative, handover.creative_id)
+        if target is None or creative is None:
+            raise AdOnlyWorkflowError("handover_reference_missing")
+        if not creative.enabled:
+            raise AdOnlyWorkflowError("creative_not_enabled")
+        if (
+            not target.is_active
+            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            or target.risk_level
+            not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}
+        ):
+            raise AdOnlyWorkflowError("target_account_unavailable")
+        target_config = (
+            await self.db.execute(
+                select(AccountOperationConfig).where(
+                    AccountOperationConfig.account_id == target.id
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            target_config is None
+            or not target_config.enabled
+            or not target_config.auto_ads_enabled
+            or target_config.operation_mode != AccountOperationMode.AD_ONLY.value
+        ):
+            raise AdOnlyWorkflowError("target_account_not_enabled_ad_only")
+        now = _now()
+        if (
+            handover.permission_mode
+            not in {
+                GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+            }
+            or not str(handover.permission_note or "").strip()
+            or handover.permission_expires_at is None
+            or handover.permission_expires_at <= now
+        ):
+            raise AdOnlyWorkflowError("direct_permission_expired_or_missing")
+        risk_settings = await get_account_risk_guard_settings(self.db)
+        hard_cap = await AccountRiskGuard(self.db)._outbound_message_hard_cap(
+            target.id, risk_settings
+        )
+        current_daily_sends = await self._existing_daily_sends(
+            target.id, exclude_campaign_id=handover.campaign_id
+        )
+        if current_daily_sends + handover.estimated_daily_sends > hard_cap:
+            raise AdOnlyWorkflowError("target_account_daily_capacity_changed")
+        return target, creative
+
     @staticmethod
     def _telegram_group_matches(expected: int, actual: int) -> bool:
         expected_abs = abs(int(expected))
@@ -1211,6 +1474,244 @@ class AdOnlyRecommendationService:
                 )
             )
         ).scalar_one_or_none()
+
+    async def _confirm_direct_permission(
+        self,
+        handover: GroupAdHandover,
+        group: Group,
+    ) -> GroupAdProfile:
+        profile = await self._group_profile(group.id)
+        profile_existed = profile is not None
+        if profile is None:
+            profile = GroupAdProfile(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+            )
+            self.db.add(profile)
+            await self.db.flush()
+        if handover.permission_previous_json is None:
+            handover.permission_previous_json = _json_dump(
+                {
+                    "existed": profile_existed,
+                    "mode": profile.ad_policy_mode,
+                    "confidence": profile.ad_policy_confidence,
+                    "source": profile.ad_policy_source,
+                    "verified_at": _iso(profile.ad_policy_verified_at),
+                    "expires_at": _iso(profile.ad_policy_expires_at),
+                    "evidence_hash": profile.ad_policy_evidence_hash,
+                    "tier": profile.ad_tier,
+                    "daily_capacity": profile.daily_capacity,
+                    "blocked_at": _iso(profile.blocked_at),
+                    "blocked_reason": profile.blocked_reason,
+                }
+            )
+        previous_mode = profile.ad_policy_mode
+        evidence = {
+            "handover_id": handover.id,
+            "confirmed_by_user_id": handover.approved_by_user_id,
+            "note": handover.permission_note,
+            "expires_at": _iso(handover.permission_expires_at),
+        }
+        evidence_hash = hashlib.sha256(
+            _json_dump(evidence).encode("utf-8")
+        ).hexdigest()
+        already_confirmed = (
+            profile.ad_policy_source == "manual_ad_only_direct"
+            and profile.ad_policy_evidence_hash == evidence_hash
+        )
+        now = _now()
+        profile.telegram_group_id = group.group_id
+        profile.ad_policy_mode = str(handover.permission_mode)
+        profile.ad_policy_confidence = 100
+        profile.ad_policy_source = "manual_ad_only_direct"
+        profile.ad_policy_verified_at = now
+        profile.ad_policy_expires_at = handover.permission_expires_at
+        profile.ad_policy_evidence_hash = evidence_hash
+        profile.ad_tier = (
+            GroupAdTier.HIGH.value
+            if handover.permission_mode
+            == GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value
+            else GroupAdTier.STABLE.value
+        )
+        profile.daily_capacity = max(
+            int(profile.daily_capacity or 0),
+            int(handover.estimated_daily_sends or 1),
+        )
+        profile.blocked_at = None
+        profile.blocked_reason = None
+        profile.updated_at = now
+        if not already_confirmed:
+            self.db.add(
+                GroupAdPolicyEvent(
+                    group_id=group.id,
+                    account_id=handover.target_ad_only_account_id,
+                    telegram_group_id=group.group_id,
+                    previous_mode=previous_mode,
+                    new_mode=str(handover.permission_mode),
+                    confidence=100,
+                    source="manual_ad_only_direct",
+                    reason="admin_confirmed_direct_ad_only_permission",
+                    evidence=_json_dump(evidence),
+                    changed_by_user_id=handover.approved_by_user_id,
+                )
+            )
+        await self.db.commit()
+        return profile
+
+    async def _join_direct_target(
+        self,
+        handover: GroupAdHandover,
+        target: TelegramAccount,
+    ) -> Group:
+        if handover.group_id is not None:
+            group = await self.db.get(Group, handover.group_id)
+            if group is None:
+                raise AdOnlyWorkflowError("group_not_found")
+            await self._join_target(handover, group, target)
+            await self._claim_direct_group(handover, group, target)
+            await self._confirm_direct_permission(handover, group)
+            return group
+
+        if (
+            handover.invite_secret_expires_at is None
+            or handover.invite_secret_expires_at <= _now()
+        ):
+            handover.invite_link_encrypted = None
+            await self.db.commit()
+            raise AdOnlyWorkflowError("invite_secret_expired")
+        try:
+            invite_link = decrypt_ephemeral_secret(
+                handover.invite_link_encrypted
+            )
+        except EphemeralSecretError as exc:
+            raise AdOnlyWorkflowError("invite_secret_unavailable") from exc
+        if not invite_link:
+            raise AdOnlyWorkflowError("invite_secret_unavailable")
+
+        pool = get_account_pool()
+        await pool.add_account_from_db(target)
+        wrapper = await pool.acquire_by_id(
+            target.id, purpose="ad_only_direct_join"
+        )
+        if wrapper is None:
+            raise AdOnlyWorkflowError("target_account_session_unavailable")
+        try:
+            resolved = await TelegramExecutionService(
+                AccountRiskGuard(self.db)
+            ).join_group_by_link(
+                wrapper,
+                invite_link,
+                source="ad_only_direct_assignment",
+            )
+        finally:
+            await pool.release(wrapper)
+
+        telegram_group_id = int(resolved.get("id") or 0)
+        if not telegram_group_id:
+            raise AdOnlyWorkflowError("direct_join_group_identity_missing")
+        title = str(resolved.get("title") or "").strip() or None
+        username = str(resolved.get("username") or "").strip().lstrip("@") or None
+        member_count = max(0, int(resolved.get("participants_count") or 0))
+        now = _now()
+        group = (
+            await self.db.execute(
+                select(Group)
+                .where(Group.group_id == telegram_group_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if group is None:
+            group = Group(
+                group_id=telegram_group_id,
+                title=title,
+                username=username,
+                member_count=member_count,
+                status="active",
+                discovery_source="manual_link_join",
+                level=GroupLevel.A,
+            )
+            self.db.add(group)
+            await self.db.flush()
+        else:
+            if title:
+                group.title = title
+            if username:
+                group.username = username
+            if member_count:
+                group.member_count = member_count
+            group.status = "active"
+            group.updated_at = now
+        handover.group_id = group.id
+
+        membership = (
+            await self.db.execute(
+                select(GroupAccountMembership).where(
+                    GroupAccountMembership.group_id == group.id,
+                    GroupAccountMembership.account_id == target.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if handover.membership_previous_json is None:
+            handover.membership_previous_json = _json_dump(
+                {
+                    "existed": membership is not None,
+                    "status": membership.status if membership else None,
+                    "join_method": membership.join_method if membership else None,
+                    "joined_at": _iso(membership.joined_at) if membership else None,
+                    "left_at": _iso(membership.left_at) if membership else None,
+                    "warmup_status": membership.warmup_status if membership else None,
+                    "probe_status": membership.probe_status if membership else None,
+                    "ad_status": membership.ad_status if membership else None,
+                }
+            )
+        if membership is None:
+            membership = GroupAccountMembership(
+                group_id=group.id,
+                telegram_group_id=telegram_group_id,
+                account_id=target.id,
+            )
+            self.db.add(membership)
+        membership.telegram_group_id = telegram_group_id
+        membership.status = "joined"
+        membership.join_method = "manual_link_join"
+        membership.joined_at = membership.joined_at or now
+        membership.left_at = None
+        membership.last_checked_at = now
+        membership.warmup_status = "writable_verified"
+        membership.probe_status = "not_started"
+        membership.ad_status = "warming"
+        membership.updated_at = now
+        await self.db.commit()
+
+        await self._claim_direct_group(handover, group, target)
+        await self._confirm_direct_permission(handover, group)
+        return group
+
+    async def _claim_direct_group(
+        self,
+        handover: GroupAdHandover,
+        group: Group,
+        target: TelegramAccount,
+    ) -> None:
+        if group.ad_delivery_account_id not in {None, target.id}:
+            raise AdOnlyWorkflowError("group_already_handed_over")
+        competing = (
+            await self.db.execute(
+                select(GroupAdHandover).where(
+                    GroupAdHandover.id != handover.id,
+                    GroupAdHandover.active_group_key == group.id,
+                )
+            )
+        ).scalar_one_or_none()
+        if competing is not None:
+            raise AdOnlyWorkflowError("active_handover_already_exists")
+        handover.group_id = group.id
+        handover.active_group_key = group.id
+        try:
+            await self.db.commit()
+        except IntegrityError as exc:
+            await self.db.rollback()
+            raise AdOnlyWorkflowError("active_handover_already_exists") from exc
 
     async def _join_target(
         self,
@@ -1467,6 +1968,11 @@ class AdOnlyRecommendationService:
             await pool.release(wrapper)
 
         now = _now()
+        if (
+            group.ad_delivery_account_id is not None
+            and group.ad_delivery_account_id != target.id
+        ):
+            raise AdOnlyWorkflowError("group_already_handed_over")
         group.ad_delivery_account_id = target.id
         membership.warmup_status = "ad_eligible"
         membership.probe_status = "success"
@@ -1566,7 +2072,11 @@ class AdOnlyRecommendationService:
             event_type="handover_completed",
             step="completed",
             status="completed",
-            message="Ad-only takeover verified and Growth account retired",
+            message=(
+                "Direct Ad-only assignment verified"
+                if handover.workflow_type == DIRECT_WORKFLOW_TYPE
+                else "Ad-only takeover verified and Growth account retired"
+            ),
         )
         await self.db.commit()
         return {
@@ -1603,7 +2113,8 @@ class AdOnlyRecommendationService:
                 "handover": self.handover_payload(handover),
             }
 
-        cleanup_only = (
+        is_direct = handover.workflow_type == DIRECT_WORKFLOW_TYPE
+        cleanup_only = not is_direct and (
             handover.status == "cleanup_pending"
             or handover.current_step == "growth_leave"
         )
@@ -1645,18 +2156,29 @@ class AdOnlyRecommendationService:
             await self._record_step(
                 handover,
                 "preflight",
-                message="Runtime handover preflight started",
+                message=(
+                    "Runtime direct assignment preflight started"
+                    if is_direct
+                    else "Runtime handover preflight started"
+                ),
             )
-            group, source, target, _creative = (
-                await self._runtime_handover_values(handover)
-            )
+            source: TelegramAccount | None = None
+            if is_direct:
+                target, _creative = await self._runtime_direct_values(handover)
+            else:
+                group, source, target, _creative = (
+                    await self._runtime_handover_values(handover)
+                )
 
             await self._record_step(
                 handover,
                 "target_join",
                 message="Joining target ad-only account",
             )
-            await self._join_target(handover, group, target)
+            if is_direct:
+                group = await self._join_direct_target(handover, target)
+            else:
+                await self._join_target(handover, group, target)
 
             await self._record_step(
                 handover,
@@ -1707,18 +2229,19 @@ class AdOnlyRecommendationService:
                 schedule,
             )
 
-            await self._record_step(
-                handover,
-                "growth_leave",
-                message="Retiring source Growth account from group",
-            )
-            leave_error = await self._leave_source_growth(
-                handover, group, source
-            )
-            if leave_error is not None:
-                return await self._mark_cleanup_pending(
-                    handover, leave_error
+            if source is not None:
+                await self._record_step(
+                    handover,
+                    "growth_leave",
+                    message="Retiring source Growth account from group",
                 )
+                leave_error = await self._leave_source_growth(
+                    handover, group, source
+                )
+                if leave_error is not None:
+                    return await self._mark_cleanup_pending(
+                        handover, leave_error
+                    )
             return await self._mark_completed(handover)
         except Exception as exc:
             await self.db.rollback()
@@ -1783,6 +2306,68 @@ class AdOnlyRecommendationService:
         await self.db.refresh(handover)
         return handover
 
+    async def _restore_direct_permission(
+        self,
+        handover: GroupAdHandover,
+        group: Group,
+    ) -> None:
+        previous = _json_load(handover.permission_previous_json, {})
+        if not previous:
+            return
+        profile = await self._group_profile(group.id)
+        if (
+            profile is None
+            or profile.ad_policy_source != "manual_ad_only_direct"
+        ):
+            return
+        current_mode = profile.ad_policy_mode
+
+        def parse_datetime(value: Any) -> datetime | None:
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+
+        if previous.get("existed"):
+            profile.ad_policy_mode = str(
+                previous.get("mode") or GroupAdPolicyMode.UNKNOWN.value
+            )
+            profile.ad_policy_confidence = int(previous.get("confidence") or 0)
+            profile.ad_policy_source = previous.get("source")
+            profile.ad_policy_verified_at = parse_datetime(
+                previous.get("verified_at")
+            )
+            profile.ad_policy_expires_at = parse_datetime(
+                previous.get("expires_at")
+            )
+            profile.ad_policy_evidence_hash = previous.get("evidence_hash")
+            profile.ad_tier = str(
+                previous.get("tier") or GroupAdTier.OBSERVING.value
+            )
+            profile.daily_capacity = int(previous.get("daily_capacity") or 0)
+            profile.blocked_at = parse_datetime(previous.get("blocked_at"))
+            profile.blocked_reason = previous.get("blocked_reason")
+            profile.updated_at = _now()
+            restored_mode = profile.ad_policy_mode
+        else:
+            restored_mode = GroupAdPolicyMode.UNKNOWN.value
+            await self.db.delete(profile)
+        self.db.add(
+            GroupAdPolicyEvent(
+                group_id=group.id,
+                account_id=handover.target_ad_only_account_id,
+                telegram_group_id=group.group_id,
+                previous_mode=current_mode,
+                new_mode=restored_mode,
+                confidence=int(previous.get("confidence") or 0),
+                source="manual_ad_only_direct_rollback",
+                reason="direct_assignment_rolled_back",
+                changed_by_user_id=handover.requested_by_user_id,
+            )
+        )
+
     async def rollback_handover(self, handover_id: int) -> dict[str, Any]:
         handover = (
             await self.db.execute(
@@ -1801,16 +2386,45 @@ class AdOnlyRecommendationService:
         if handover.status in {"completed", "cancelled"}:
             raise AdOnlyWorkflowError("completed_handover_cannot_be_rolled_back")
 
+        is_direct = handover.workflow_type == DIRECT_WORKFLOW_TYPE
+        if is_direct and handover.group_id is None:
+            completed_at = _now()
+            handover.status = "rolled_back"
+            handover.current_step = "rolled_back"
+            handover.active_group_key = None
+            handover.invite_link_encrypted = None
+            handover.invite_secret_expires_at = None
+            handover.completed_at = completed_at
+            handover.last_error = None
+            handover.updated_at = completed_at
+            await self._add_event(
+                group_id=None,
+                handover_id=handover.id,
+                event_type="direct_assignment_rolled_back",
+                step="rolled_back",
+                status="rolled_back",
+                message="Direct assignment cancelled before Telegram group resolution",
+            )
+            await self.db.commit()
+            return {
+                "status": "rolled_back",
+                "handover": self.handover_payload(handover),
+            }
+
         group = await self.db.get(Group, handover.group_id)
         target = await self.db.get(
             TelegramAccount, handover.target_ad_only_account_id
         )
-        source_membership = await self._joined_membership(
-            handover.group_id, handover.source_growth_account_id
+        source_membership = (
+            None
+            if is_direct
+            else await self._joined_membership(
+                handover.group_id, handover.source_growth_account_id
+            )
         )
         if group is None or target is None:
             raise AdOnlyWorkflowError("handover_reference_missing")
-        if source_membership is None:
+        if not is_direct and source_membership is None:
             raise AdOnlyWorkflowError("source_growth_not_joined_for_rollback")
 
         handover.status = "rollback_pending"
@@ -1846,11 +2460,21 @@ class AdOnlyRecommendationService:
                 schedule.last_reason = "ad_only_handover_rollback"
         if group.ad_delivery_account_id == target.id:
             group.ad_delivery_account_id = None
+        if is_direct:
+            await self._restore_direct_permission(handover, group)
         await self.db.commit()
 
         target_membership = await self._joined_membership(group.id, target.id)
+        membership_previous = _json_load(
+            handover.membership_previous_json, {}
+        )
+        preserve_joined_membership = bool(
+            is_direct
+            and membership_previous.get("existed")
+            and membership_previous.get("status") == "joined"
+        )
         leave_error: str | None = None
-        if target_membership is not None:
+        if target_membership is not None and not preserve_joined_membership:
             pool = get_account_pool()
             await pool.add_account_from_db(target)
             wrapper = await pool.acquire_by_id(
@@ -1891,7 +2515,26 @@ class AdOnlyRecommendationService:
                 "handover": self.handover_payload(handover),
             }
 
-        if target_membership is not None:
+        if target_membership is not None and preserve_joined_membership:
+            target_membership.status = "joined"
+            target_membership.join_method = membership_previous.get("join_method")
+            target_membership.joined_at = (
+                datetime.fromisoformat(membership_previous["joined_at"])
+                if membership_previous.get("joined_at")
+                else target_membership.joined_at
+            )
+            target_membership.left_at = None
+            target_membership.warmup_status = membership_previous.get(
+                "warmup_status"
+            ) or target_membership.warmup_status
+            target_membership.probe_status = membership_previous.get(
+                "probe_status"
+            ) or target_membership.probe_status
+            target_membership.ad_status = membership_previous.get(
+                "ad_status"
+            ) or target_membership.ad_status
+            target_membership.updated_at = _now()
+        elif target_membership is not None:
             now = _now()
             target_membership.status = "left"
             target_membership.left_at = now
@@ -1916,7 +2559,11 @@ class AdOnlyRecommendationService:
             event_type="handover_rolled_back",
             step="rolled_back",
             status="rolled_back",
-            message="Ad-only handover rolled back; Growth membership retained",
+            message=(
+                "Direct Ad-only assignment rolled back"
+                if is_direct
+                else "Ad-only handover rolled back; Growth membership retained"
+            ),
         )
         await self.db.commit()
         return {

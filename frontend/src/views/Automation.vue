@@ -917,7 +917,23 @@ const saveAccountConfig = async () => {
 
   savingAccountConfig.value = true
   try {
-    const response = await automationApi.updateAccountOperationConfig(selectedAccount.id, accountConfigPayload())
+    const payload = accountConfigPayload()
+    let response
+    try {
+      response = await automationApi.updateAccountOperationConfig(selectedAccount.id, payload)
+    } catch (error: any) {
+      const detail = String(error?.response?.data?.detail || '')
+      if (!detail.startsWith('operation_mode_transition_requires_force:')) throw error
+      await ElMessageBox.confirm(
+        '该账号存在与新职责不兼容的启用广告绑定。继续切换会自动停用这些绑定，是否继续？',
+        '确认切换账号职责',
+        { type: 'warning', confirmButtonText: '停用并切换' },
+      )
+      response = await automationApi.updateAccountOperationConfig(selectedAccount.id, {
+        ...payload,
+        force_transition: true,
+      })
+    }
     fillAccountConfigForm(response.data.data)
     ElMessage.success('账号自动化配置已保存')
   } finally {

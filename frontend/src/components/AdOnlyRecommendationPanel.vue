@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Check, Clock, Refresh, RefreshLeft, VideoPlay } from '@element-plus/icons-vue'
+import { Check, Clock, Plus, Refresh, RefreshLeft, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
 import {
   automationApi,
   type AdOnlyAssessment,
+  type AdOnlyDirectAssignmentRequest,
   type AdOnlyEvent,
   type AdOnlyHandover,
   type AdOnlyHandoverOptions,
@@ -39,8 +40,11 @@ const handovers = ref<AdOnlyHandover[]>([])
 const options = ref<AdOnlyHandoverOptions>({ accounts: [], creatives: [] })
 const handoverDialogVisible = ref(false)
 const handoverSubmitting = ref(false)
+const directDialogVisible = ref(false)
+const directSubmitting = ref(false)
 const selectedAssessment = ref<AdOnlyAssessment | null>(null)
 const scheduleTimesText = ref('09:00,18:00')
+const directScheduleTimesText = ref('09:00,18:00')
 const historyVisible = ref(false)
 const historyLoading = ref(false)
 const historyAssessments = ref<AdOnlyAssessment[]>([])
@@ -54,6 +58,21 @@ const form = reactive<AdOnlyHandoverRequest>({
   send_mode: 'interval',
   interval_minutes: 180,
   scheduled_times: [],
+})
+
+const defaultPermissionExpiry = () =>
+  new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 19)
+
+const directForm = reactive<AdOnlyDirectAssignmentRequest>({
+  target_account_id: 0,
+  creative_id: 0,
+  invite_link: '',
+  send_mode: 'interval',
+  interval_minutes: 180,
+  scheduled_times: [],
+  permission_mode: 'soft_ad_allowed',
+  permission_note: '',
+  permission_expires_at: defaultPermissionExpiry(),
 })
 
 const recommendedCount = computed(
@@ -231,6 +250,68 @@ const createHandover = async () => {
   }
 }
 
+const openDirectAssignment = () => {
+  Object.assign(directForm, {
+    target_account_id: options.value.accounts[0]?.id || 0,
+    creative_id: options.value.creatives[0]?.id || 0,
+    invite_link: '',
+    send_mode: 'interval',
+    interval_minutes: 180,
+    scheduled_times: [],
+    permission_mode: 'soft_ad_allowed',
+    permission_note: '',
+    permission_expires_at: defaultPermissionExpiry(),
+  })
+  directScheduleTimesText.value = '09:00,18:00'
+  directDialogVisible.value = true
+}
+
+const createDirectAssignment = async () => {
+  if (!directForm.target_account_id || !directForm.creative_id || !directForm.invite_link.trim()) {
+    ElMessage.warning('请选择专用账号、素材并填写群邀请链接')
+    return
+  }
+  if (directForm.permission_note.trim().length < 3 || !directForm.permission_expires_at) {
+    ElMessage.warning('请填写广告权限依据和有效期')
+    return
+  }
+  directForm.scheduled_times =
+    directForm.send_mode === 'scheduled'
+      ? directScheduleTimesText.value
+          .split(/[,，\s]+/)
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : []
+  try {
+    await ElMessageBox.confirm(
+      '确认已获得该群广告投放权限，并按填写的有效期记录到审计日志？',
+      '确认广告权限',
+      { type: 'warning', confirmButtonText: '确认并启动' },
+    )
+  } catch {
+    return
+  }
+  const idempotencyKey =
+    globalThis.crypto?.randomUUID?.() ||
+    `direct-${Date.now()}-${Math.random().toString(16).slice(2)}`
+  directSubmitting.value = true
+  try {
+    await automationApi.createAdOnlyDirectAssignment({
+      ...directForm,
+      invite_link: directForm.invite_link.trim(),
+      permission_note: directForm.permission_note.trim(),
+      idempotency_key: idempotencyKey,
+    })
+    directForm.invite_link = ''
+    directDialogVisible.value = false
+    activeView.value = 'handovers'
+    ElMessage.success('直接指定已通过预检并进入队列')
+    await loadData()
+  } finally {
+    directSubmitting.value = false
+  }
+}
+
 const retryHandover = async (handover: any) => {
   actionId.value = `retry-${handover.id}`
   try {
@@ -303,6 +384,14 @@ onMounted(loadData)
         <el-button :icon="Refresh" :loading="loading" @click="loadData" />
         <el-button :icon="VideoPlay" :loading="evaluating" @click="evaluateCandidates">
           立即评估
+        </el-button>
+        <el-button
+          type="warning"
+          :icon="Plus"
+          :disabled="!settings.handover_execution_enabled"
+          @click="openDirectAssignment"
+        >
+          直接指定群
         </el-button>
         <el-button type="primary" :icon="Check" :loading="savingSettings" @click="saveSettings">
           保存设置
@@ -434,17 +523,24 @@ onMounted(loadData)
 
       <el-tab-pane label="交接任务" name="handovers">
         <el-table :data="handovers" row-key="id">
+          <el-table-column label="类型" width="100">
+            <template #default="{ row }">
+              <el-tag :type="row.workflow_type === 'direct' ? 'warning' : 'info'" effect="plain">
+                {{ row.workflow_type === 'direct' ? '直接指定' : '评估接管' }}
+              </el-tag>
+            </template>
+          </el-table-column>
           <el-table-column label="群" min-width="180">
             <template #default="{ row }">
               <div class="primary-cell">
-                <strong>{{ row.group_title || row.telegram_group_id }}</strong>
+                <strong>{{ row.group_title || row.telegram_group_id || '等待解析群链接' }}</strong>
                 <small>交接 #{{ row.id }}</small>
               </div>
             </template>
           </el-table-column>
           <el-table-column label="账号交接" min-width="240">
             <template #default="{ row }">
-              {{ row.source_growth_account_label || row.source_growth_account_id }}
+              {{ row.workflow_type === 'direct' ? '管理员指定' : (row.source_growth_account_label || row.source_growth_account_id) }}
               →
               {{ row.target_ad_only_account_label || row.target_ad_only_account_id }}
             </template>
@@ -552,6 +648,101 @@ onMounted(loadData)
           :icon="VideoPlay"
           :loading="handoverSubmitting"
           @click="createHandover"
+        >
+          预检并启动
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="directDialogVisible"
+      title="直接指定 Ad-only 群"
+      width="min(680px, calc(100vw - 32px))"
+    >
+      <el-form label-position="top">
+        <div class="dialog-grid">
+          <el-form-item label="Ad-only 账号" required>
+            <el-select v-model="directForm.target_account_id" filterable>
+              <el-option
+                v-for="account in options.accounts"
+                :key="account.id"
+                :label="account.label"
+                :value="account.id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="广告素材" required>
+            <el-select v-model="directForm.creative_id" filterable>
+              <el-option
+                v-for="creative in options.creatives"
+                :key="creative.id"
+                :label="creative.name"
+                :value="creative.id"
+              />
+            </el-select>
+          </el-form-item>
+        </div>
+        <el-form-item label="群邀请链接" required>
+          <el-input
+            v-model="directForm.invite_link"
+            type="password"
+            show-password
+            autocomplete="off"
+            placeholder="t.me 公共群或私有邀请链接"
+          />
+        </el-form-item>
+        <div class="dialog-grid">
+          <el-form-item label="广告权限" required>
+            <el-select v-model="directForm.permission_mode">
+              <el-option label="允许常规软广" value="soft_ad_allowed" />
+              <el-option label="允许高频广告" value="high_volume_ad_allowed" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="权限有效期" required>
+            <el-date-picker
+              v-model="directForm.permission_expires_at"
+              type="datetime"
+              value-format="YYYY-MM-DDTHH:mm:ss"
+              placeholder="选择失效时间"
+            />
+          </el-form-item>
+        </div>
+        <el-form-item label="权限依据" required>
+          <el-input
+            v-model="directForm.permission_note"
+            type="textarea"
+            :rows="2"
+            maxlength="500"
+            show-word-limit
+            placeholder="管理员授权、群规或合作约定"
+          />
+        </el-form-item>
+        <el-form-item label="发送模式">
+          <el-radio-group v-model="directForm.send_mode">
+            <el-radio-button value="interval">固定间隔</el-radio-button>
+            <el-radio-button value="scheduled">每日定时</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="directForm.send_mode === 'interval'" label="发送间隔">
+          <el-input-number
+            v-model="directForm.interval_minutes"
+            :min="30"
+            :max="10080"
+            :step="30"
+          />
+          <span class="unit-label">分钟</span>
+        </el-form-item>
+        <el-form-item v-else label="每日时间">
+          <el-input v-model="directScheduleTimesText" placeholder="09:00,18:00" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="directDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :icon="VideoPlay"
+          :loading="directSubmitting"
+          @click="createDirectAssignment"
         >
           预检并启动
         </el-button>

@@ -387,6 +387,14 @@ class TelegramAccount(Base):
         foreign_keys=[static_proxy_id],
         lazy="selectin",
     )
+    operation_config: Mapped[Optional["AccountOperationConfig"]] = relationship(
+        "AccountOperationConfig",
+        back_populates="account",
+        uselist=False,
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        single_parent=True,
+    )
     
     __table_args__ = (
         Index("idx_status", "status"),
@@ -647,7 +655,11 @@ class AccountOperationConfig(Base):
         nullable=False,
     )
 
-    account = relationship("TelegramAccount", lazy="joined")
+    account = relationship(
+        "TelegramAccount",
+        back_populates="operation_config",
+        lazy="joined",
+    )
 
     __table_args__ = (
         UniqueConstraint("account_id", name="uq_account_operation_config_account"),

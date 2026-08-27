@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status, Uplo
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, desc, or_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.database import get_db
 from app.core.config import settings
@@ -23,6 +24,8 @@ from app.core.account.auth_helper import TelegramAuthHelper
 from app.core.account.models import (
     AccountAssetTier,
     AccountEnvironmentEvent,
+    AccountOperationConfig,
+    AccountOperationMode,
     AccountRiskDailyStat,
     AccountRiskEvent,
     AccountStatus,
@@ -113,6 +116,43 @@ def _apply_auth_asset_tier(account: TelegramAccount, value: Optional[str]) -> No
     account.asset_tier = normalized
 
 
+async def _apply_onboarding_operation_mode(
+    db: AsyncSession,
+    account: TelegramAccount,
+    operation_mode: str,
+) -> AccountOperationConfig | None:
+    """Create the selected role for legacy accounts without silently changing existing roles."""
+    if account.account_type != AccountType.PROMOTER:
+        return None
+    mode = AccountOperationMode(operation_mode)
+    config = (
+        await db.execute(
+            select(AccountOperationConfig).where(
+                AccountOperationConfig.account_id == account.id
+            )
+        )
+    ).scalar_one_or_none()
+    if config is None:
+        config = AccountOperationConfig(
+            account_id=account.id,
+            operation_mode=mode.value,
+            auto_join_enabled=False,
+            auto_ads_enabled=True,
+            keyword_auto_replenish_enabled=False,
+        )
+        db.add(config)
+    elif config.operation_mode != mode.value:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "existing_account_operation_mode_conflict: change the account role "
+                "from the automation account configuration"
+            ),
+        )
+    set_committed_value(account, "operation_config", config)
+    return config
+
+
 # =============================================================================
 # Request/Response Models
 # =============================================================================
@@ -124,6 +164,11 @@ class AccountCreate(BaseModel):
     display_name: Optional[str] = Field(None, description="Display name")
     profile_bio: Optional[str] = Field(None, max_length=70, description="Telegram public bio")
     account_type: str = Field(default="promoter", description="Account type: promoter/guardian_bot")
+    operation_mode: str = Field(
+        default=AccountOperationMode.GROWTH.value,
+        pattern="^(growth|ad_only)$",
+        description="Promoter operation mode: growth/ad_only",
+    )
     asset_tier: Optional[str] = Field(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus")
     registered_at: Optional[datetime] = Field(None, description="Known Telegram account registration time")
     asset_note: Optional[str] = Field(None, max_length=255, description="Asset source or batch note")
@@ -185,6 +230,7 @@ class AccountResponse(BaseModel):
     profile_bio: Optional[str] = None
     profile_bio_synced_at: Optional[str] = None
     account_type: str
+    operation_mode: str = AccountOperationMode.GROWTH.value
     asset_tier: str = AccountAssetTier.UNKNOWN.value
     registered_at: Optional[str] = None
     asset_verified_at: Optional[str] = None
@@ -310,6 +356,11 @@ def _account_to_response(account: TelegramAccount) -> AccountResponse:
         profile_bio=account.profile_bio,
         profile_bio_synced_at=account.profile_bio_synced_at.isoformat() if account.profile_bio_synced_at else None,
         account_type=account.account_type.value,
+        operation_mode=(
+            account.operation_config.operation_mode
+            if account.__dict__.get("operation_config") is not None
+            else AccountOperationMode.GROWTH.value
+        ),
         asset_tier=account.asset_tier or AccountAssetTier.UNKNOWN.value,
         registered_at=account.registered_at.isoformat() if account.registered_at else None,
         asset_verified_at=account.asset_verified_at.isoformat() if account.asset_verified_at else None,
@@ -649,6 +700,7 @@ async def create_account(
             warmup_hold_until=account.warmup_hold_until,
             warmup_note=(account.warmup_note or "").strip()[:255] or None,
             account_type=account_type,
+            operation_mode=AccountOperationMode(account.operation_mode),
             api_config_name=account.api_config_name,
             country_code=account.country_code,
             country_name=account.country_name,
@@ -1237,6 +1289,7 @@ async def batch_import_accounts(
                 warmup_hold_until=acc.warmup_hold_until,
                 warmup_note=(acc.warmup_note or "").strip()[:255] or None,
                 account_type=account_type,
+                operation_mode=AccountOperationMode(acc.operation_mode),
                 api_config_name=acc.api_config_name,
                 country_code=acc.country_code,
                 country_name=acc.country_name,
@@ -1739,6 +1792,9 @@ async def complete_account_login(
                 )
             account.status = AccountStatus.ONLINE
             account.last_connected_at = datetime.utcnow()
+            await _apply_onboarding_operation_mode(
+                db, account, account_data.operation_mode
+            )
             await db.commit()
             await db.refresh(account)
         else:
@@ -1770,6 +1826,7 @@ async def complete_account_login(
                 warmup_hold_until=account_data.warmup_hold_until,
                 warmup_note=(account_data.warmup_note or "").strip()[:255] or None,
                 account_type=AccountType(account_data.account_type),
+                operation_mode=AccountOperationMode(account_data.operation_mode),
                 api_config_name=account_data.api_config_name,
                 country_code=account_data.country_code,
                 country_name=account_data.country_name,
@@ -1813,6 +1870,11 @@ async def import_session_file(
     country_name: Optional[str] = Form(None, description="Country name"),
     asset_tier: Optional[str] = Form(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus"),
     profile_bio: Optional[str] = Form(None, description="Telegram public bio"),
+    operation_mode: str = Form(
+        default=AccountOperationMode.GROWTH.value,
+        pattern="^(growth|ad_only)$",
+        description="Promoter operation mode: growth/ad_only",
+    ),
     proxy_mode: str = Form(default="dynamic", description="Proxy mode: dynamic/static/none"),
     static_proxy_id: Optional[int] = Form(None, description="Static proxy ID"),
     session_file: UploadFile = File(..., description="Session file (.session)"),
@@ -1899,6 +1961,7 @@ async def import_session_file(
                 existing.managed_started_at = datetime.utcnow()
             existing.status = AccountStatus.ONLINE
             existing.last_connected_at = datetime.utcnow()
+            await _apply_onboarding_operation_mode(db, existing, operation_mode)
             await db.commit()
             await db.refresh(existing)
             account = existing
@@ -1911,6 +1974,7 @@ async def import_session_file(
                 display_name=phone,
                 profile_bio=(profile_bio or "").strip()[:70] or None,
                 account_type=AccountType.PROMOTER,
+                operation_mode=AccountOperationMode(operation_mode),
                 asset_tier=normalized_asset_tier,
                 api_config_name=api_config_name,
                 country_code=country_code,

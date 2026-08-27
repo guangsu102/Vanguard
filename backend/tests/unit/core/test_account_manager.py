@@ -18,7 +18,12 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.manager import AccountManager
-from app.core.account.models import AccountStatus, TelegramAccount, TelegramAPIConfig
+from app.core.account.models import (
+    AccountOperationMode,
+    AccountStatus,
+    TelegramAccount,
+    TelegramAPIConfig,
+)
 from app.core.account.exceptions import (
     AccountAlreadyExistsError,
     AccountNotFoundError,
@@ -150,6 +155,27 @@ class TestAccountCreation:
         assert account.api_config_name == "default"
         assert account.status == AccountStatus.OFFLINE
         assert account.country_code == "US"
+        assert account.operation_config is not None
+        assert (
+            account.operation_config.operation_mode
+            == AccountOperationMode.GROWTH.value
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_ad_only_account_with_atomic_operation_config(self, manager):
+        account = await manager.create_account(
+            phone="+1234567891",
+            operation_mode=AccountOperationMode.AD_ONLY,
+        )
+
+        assert account.operation_config is not None
+        assert (
+            account.operation_config.operation_mode
+            == AccountOperationMode.AD_ONLY.value
+        )
+        assert account.operation_config.auto_join_enabled is False
+        assert account.operation_config.auto_ads_enabled is True
+        assert account.operation_config.keyword_auto_replenish_enabled is False
 
     @pytest.mark.asyncio
     async def test_create_account_with_custom_config(self, manager):

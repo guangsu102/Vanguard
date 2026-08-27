@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import func, select
 
+import app.modules.acquisition.ad_only_recommendation as ad_only_module
 from app.core.account.models import (
     AccountOperationConfig,
     AccountOperationMode,
@@ -22,10 +25,12 @@ from app.modules.acquisition.ad_only_recommendation import (
     AdOnlyWorkflowError,
 )
 from app.modules.acquisition.models import (
+    AccountAdBinding,
     AdCampaign,
     AdCreative,
     AdDeliveryLog,
     AdDeliveryPolicy,
+    AdDeliveryScheduleState,
     AdSurvivalStatus,
     DeliveryStatus,
     GroupAdHandover,
@@ -135,6 +140,116 @@ async def _seed_candidate(
         "membership": membership,
         "profile": profile,
     }
+
+
+async def _seed_direct_target(test_db, *, suffix: str) -> dict:
+    target = TelegramAccount(
+        identifier=f"direct-target-{suffix}",
+        display_name=f"Direct target {suffix}",
+        session_name=f"direct-target-{suffix}",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        risk_level="normal",
+        is_active=True,
+    )
+    operation = AccountOperationConfig(
+        account=target,
+        operation_mode=AccountOperationMode.AD_ONLY.value,
+        enabled=True,
+        auto_ads_enabled=True,
+        max_messages_per_day=100,
+    )
+    creative = AdCreative(
+        name=f"Direct creative {suffix}",
+        content=f"direct ad {suffix}",
+        enabled=True,
+    )
+    test_db.add_all([target, operation, creative])
+    await test_db.commit()
+    await save_ad_only_recommendation_settings(
+        test_db,
+        {
+            "recommendation_enabled": True,
+            "handover_execution_enabled": True,
+        },
+    )
+    return {"target": target, "creative": creative}
+
+
+def _allow_direct_capacity(monkeypatch, hard_cap: int = 100) -> None:
+    async def fixed_hard_cap(_guard, _account_id, _settings):
+        return hard_cap
+
+    monkeypatch.setattr(
+        ad_only_module.AccountRiskGuard,
+        "_outbound_message_hard_cap",
+        fixed_hard_cap,
+    )
+
+
+def _patch_direct_telegram(
+    monkeypatch,
+    *,
+    telegram_group_id: int,
+    title: str = "Direct target group",
+    username: str | None = "direct_target_group",
+):
+    raw_id = abs(telegram_group_id)
+    if raw_id > 1_000_000_000_000:
+        raw_id -= 1_000_000_000_000
+    wrapper = SimpleNamespace(
+        account_id=0,
+        client=SimpleNamespace(
+            get_entity=AsyncMock(return_value=SimpleNamespace(id=raw_id))
+        ),
+    )
+    pool = SimpleNamespace(
+        add_account_from_db=AsyncMock(),
+        acquire_by_id=AsyncMock(return_value=wrapper),
+        release=AsyncMock(),
+    )
+    execution = SimpleNamespace(
+        join_group_by_link=AsyncMock(
+            return_value={
+                "id": telegram_group_id,
+                "title": title,
+                "username": username,
+                "participants_count": 321,
+            }
+        ),
+        leave_group_by_id=AsyncMock(),
+    )
+    monkeypatch.setattr(ad_only_module, "get_account_pool", lambda: pool)
+    monkeypatch.setattr(
+        ad_only_module,
+        "TelegramExecutionService",
+        lambda _risk_guard: execution,
+    )
+    return pool, execution
+
+
+async def _create_direct_assignment(
+    service: AdOnlyRecommendationService,
+    seeded: dict,
+    *,
+    suffix: str,
+    invite_link: str,
+) -> GroupAdHandover:
+    handover, created = await service.create_direct_assignment(
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_link=invite_link,
+        send_mode="interval",
+        interval_minutes=180,
+        scheduled_times=[],
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed advertising is allowed",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key=f"direct-assignment-{suffix}",
+        requested_by_user_id=31,
+    )
+    assert created is True
+    return handover
 
 
 @pytest.mark.asyncio
@@ -588,5 +703,252 @@ def test_production_ad_only_sql_migration_is_registered_and_parseable():
     )
     assert any(
         "CREATE TABLE IF NOT EXISTS group_ad_only_event" in statement
+        for statement in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_assignment_accepts_public_and_private_links_and_is_idempotent(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="links")
+    _allow_direct_capacity(monkeypatch)
+    service = AdOnlyRecommendationService(test_db)
+    public_handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="public-link",
+        invite_link="https://t.me/direct_public_group",
+    )
+    replay, replay_created = await service.create_direct_assignment(
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_link="https://t.me/direct_public_group",
+        send_mode="interval",
+        interval_minutes=180,
+        scheduled_times=[],
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed advertising is allowed",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="direct-assignment-public-link",
+        requested_by_user_id=31,
+    )
+    private_values = await service.preflight_direct_assignment(
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_link="https://t.me/+AbCdEfGh123",
+        send_mode="scheduled",
+        interval_minutes=1440,
+        scheduled_times=["09:30", "18:00"],
+        permission_mode=GroupAdPolicyMode.HIGH_VOLUME_AD_ALLOWED.value,
+        permission_note="group administrator granted high-volume permission",
+        permission_expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+
+    assert replay_created is False
+    assert replay.id == public_handover.id
+    assert private_values["invite_kind"] == "private"
+    assert private_values["estimated_daily_sends"] == 2
+    assert "direct_public_group" not in public_handover.invite_link_encrypted
+
+
+@pytest.mark.asyncio
+async def test_direct_assignment_creates_campaign_binding_schedule_and_ownership(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="success")
+    _allow_direct_capacity(monkeypatch)
+    telegram_group_id = -1_000_000_007_777
+    _patch_direct_telegram(
+        monkeypatch,
+        telegram_group_id=telegram_group_id,
+        username="direct_success_group",
+    )
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="success",
+        invite_link="https://t.me/direct_success_group",
+    )
+
+    result = await service.execute_handover(handover.id)
+
+    await test_db.refresh(handover)
+    group = await test_db.get(Group, handover.group_id)
+    campaign = await test_db.get(AdCampaign, handover.campaign_id)
+    binding = (
+        await test_db.execute(
+            select(AccountAdBinding).where(
+                AccountAdBinding.account_id == seeded["target"].id,
+                AccountAdBinding.ad_campaign_id == campaign.id,
+            )
+        )
+    ).scalar_one()
+    schedule = (
+        await test_db.execute(
+            select(AdDeliveryScheduleState).where(
+                AdDeliveryScheduleState.account_id == seeded["target"].id,
+                AdDeliveryScheduleState.campaign_id == campaign.id,
+                AdDeliveryScheduleState.group_id == group.id,
+            )
+        )
+    ).scalar_one()
+
+    assert result["status"] == "completed"
+    assert handover.workflow_type == "direct"
+    assert group.group_id == telegram_group_id
+    assert group.ad_delivery_account_id == seeded["target"].id
+    assert campaign.enabled is True
+    assert campaign.status == "active"
+    assert campaign.delivery_policy == AdDeliveryPolicy.AD_ONLY.value
+    assert campaign.get_target_group_ids() == [group.id]
+    assert binding.enabled is True
+    assert schedule.status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_direct_ownership_conflict_persists_join_state_and_can_roll_back(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="conflict")
+    _allow_direct_capacity(monkeypatch)
+    owner = TelegramAccount(
+        identifier="existing-direct-owner",
+        session_name="existing-direct-owner",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(owner)
+    await test_db.flush()
+    owner_id = owner.id
+    group = Group(
+        group_id=-1_000_000_008_888,
+        title="Already owned direct group",
+        level=GroupLevel.A,
+        status="active",
+        ad_delivery_account_id=owner_id,
+    )
+    test_db.add(group)
+    await test_db.commit()
+    _pool, execution = _patch_direct_telegram(
+        monkeypatch,
+        telegram_group_id=group.group_id,
+        title=group.title,
+        username=None,
+    )
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="conflict",
+        invite_link="https://t.me/+ConflictInvite123",
+    )
+
+    first_result = await service.execute_handover(handover.id)
+    await test_db.refresh(handover)
+    membership = await service._joined_membership(
+        group.id, seeded["target"].id
+    )
+
+    assert first_result["status"] == "failed"
+    assert "group_already_handed_over" in first_result["error"]
+    assert handover.group_id == group.id
+    assert handover.active_group_key is None
+    assert membership is not None
+    assert '"existed":false' in handover.membership_previous_json
+
+    await service.prepare_retry(handover.id, actor_user_id=31)
+    retry_result = await service.execute_handover(handover.id)
+    rollback_result = await service.rollback_handover(handover.id)
+    await test_db.refresh(group)
+    await test_db.refresh(membership)
+
+    assert retry_result["status"] == "failed"
+    assert "group_already_handed_over" in retry_result["error"]
+    assert execution.join_group_by_link.await_count == 1
+    assert rollback_result["status"] == "rolled_back"
+    execution.leave_group_by_id.assert_awaited_once()
+    assert membership.status == "left"
+    assert group.ad_delivery_account_id == owner_id
+
+
+@pytest.mark.asyncio
+async def test_direct_rollback_preserves_membership_that_existed_before_assignment(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="preserve")
+    _allow_direct_capacity(monkeypatch)
+    group = Group(
+        group_id=-1_000_000_009_999,
+        title="Existing membership group",
+        level=GroupLevel.A,
+        status="active",
+    )
+    test_db.add(group)
+    await test_db.flush()
+    membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        account_id=seeded["target"].id,
+        status="joined",
+        join_method="manual",
+    )
+    test_db.add(membership)
+    await test_db.commit()
+    _pool, execution = _patch_direct_telegram(
+        monkeypatch,
+        telegram_group_id=group.group_id,
+        title=group.title,
+        username=None,
+    )
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="preserve",
+        invite_link="https://t.me/+PreserveInvite123",
+    )
+    monkeypatch.setattr(
+        service,
+        "_ensure_campaign",
+        AsyncMock(side_effect=RuntimeError("stop after direct join")),
+    )
+
+    failed_result = await service.execute_handover(handover.id)
+    rollback_result = await service.rollback_handover(handover.id)
+    await test_db.refresh(membership)
+    profile = (
+        await test_db.execute(
+            select(GroupAdProfile).where(GroupAdProfile.group_id == group.id)
+        )
+    ).scalar_one_or_none()
+
+    assert failed_result["status"] == "failed"
+    assert rollback_result["status"] == "rolled_back"
+    execution.leave_group_by_id.assert_not_awaited()
+    assert membership.status == "joined"
+    assert membership.join_method == "manual"
+    assert profile is None
+
+
+def test_production_direct_assignment_sql_migration_is_registered_and_parseable():
+    migration_name = "037_add_direct_ad_only_assignments.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
+    assert any(
+        "ADD COLUMN IF NOT EXISTS workflow_type" in statement
+        for statement in statements
+    )
+    assert any(
+        "ALTER COLUMN group_id DROP NOT NULL" in statement
         for statement in statements
     )

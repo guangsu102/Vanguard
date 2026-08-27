@@ -140,6 +140,7 @@ const assetTierOptions = accountAssetTierOptions
 
 const columns = [
   { prop: 'identifier', label: '账号标识', minWidth: '220', slot: 'identifier' },
+  { prop: 'operation_mode', label: '账号职责', width: '130', slot: 'operationMode' },
   { prop: 'asset_tier', label: '资产等级', width: '110', slot: 'assetTier' },
   { prop: 'warmup_stage', label: '托管暖号', width: '130', slot: 'warmupStage' },
   { prop: 'status', label: '状态', width: '110', slot: 'status' },
@@ -573,6 +574,12 @@ onMounted(() => {
             {{ row.profile_bio }}
           </div>
         </div>
+      </template>
+
+      <template #operationMode="{ row }">
+        <el-tag :type="row.operation_mode === 'ad_only' ? 'warning' : 'success'" effect="plain">
+          {{ row.operation_mode === 'ad_only' ? 'Ad-only 专用' : 'Growth 增长' }}
+        </el-tag>
       </template>
 
       <template #assetTier="{ row }">
