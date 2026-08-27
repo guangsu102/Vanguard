@@ -6,6 +6,8 @@ Structured logging with structlog.
 
 import logging
 import sys
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -15,10 +17,43 @@ from app.core.config import settings
 
 def setup_logging() -> None:
     """Configure structured logging."""
-    
-    # Determine log level
+
     log_level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-    
+    stdout_level = getattr(
+        logging,
+        settings.LOG_STDOUT_LEVEL.upper(),
+        log_level,
+    )
+
+    handlers: list[logging.Handler] = []
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setLevel(stdout_level)
+    handlers.append(stdout_handler)
+
+    if settings.LOG_FILE:
+        log_path = Path(settings.LOG_FILE)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = TimedRotatingFileHandler(
+            log_path,
+            when="midnight",
+            interval=1,
+            backupCount=settings.LOG_RETENTION_DAYS,
+            encoding="utf-8",
+            delay=True,
+            utc=True,
+        )
+        file_handler.setLevel(log_level)
+        handlers.append(file_handler)
+
+    root_level = min(handler.level for handler in handlers)
+
+    logging.basicConfig(
+        format="%(message)s",
+        handlers=handlers,
+        level=root_level,
+        force=True,
+    )
+
     # Configure structlog
     structlog.configure(
         processors=[
@@ -38,14 +73,7 @@ def setup_logging() -> None:
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
-    
-    # Configure standard logging
-    logging.basicConfig(
-        format="%(message)s",
-        stream=sys.stdout,
-        level=log_level,
-    )
-    
+
     # Set levels for third-party loggers
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

@@ -90,7 +90,7 @@ class KeywordEngine:
                 if compiled:
                     self._keywords[kw.id] = compiled
 
-            self.logger.info("keywords_loaded", count=len(self._keywords))
+            self.logger.debug("keywords_loaded", count=len(self._keywords))
 
             return len(self._keywords)
 

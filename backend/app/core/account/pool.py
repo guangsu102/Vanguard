@@ -657,8 +657,10 @@ class AccountPool:
             try:
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
+                connected_now = False
                 if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
                     selected.client = await self._create_client(selected)
+                    connected_now = True
                 selected.keep_connected = keep_connected
                 selected.status = AccountStatus.IDLE
             except Exception as e:
@@ -671,12 +673,13 @@ class AccountPool:
                 )
                 raise
 
-            self.logger.info(
+            log = self.logger.info if connected_now else self.logger.debug
+            log(
                 "account_connected_by_id",
                 account_id=account_id,
-                session_name=selected.session_name,
                 purpose=purpose,
                 keep_connected=keep_connected,
+                reused=not connected_now,
             )
             return selected
 

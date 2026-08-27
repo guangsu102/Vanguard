@@ -163,6 +163,10 @@ services:
     container_name: vanguard-telegram-growth-worker
     env_file:
       - .env.test001
+    environment:
+      LOG_FILE: /app/logs/telegram-growth-worker.log
+      LOG_RETENTION_DAYS: "15"
+      LOG_STDOUT_LEVEL: WARNING
     mem_limit: 512m
     pids_limit: 128
     restart: on-failure:3
@@ -184,6 +188,11 @@ services:
       - ./sessions:/app/sessions
     networks:
       - vanguard-internal
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       disable: true
 

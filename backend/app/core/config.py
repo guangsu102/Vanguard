@@ -182,6 +182,20 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = Field(default="INFO", description="Logging level")
+    LOG_STDOUT_LEVEL: str = Field(
+        default="INFO",
+        description="Minimum level written to stdout",
+    )
+    LOG_FILE: str | None = Field(
+        default=None,
+        description="Optional application log file path",
+    )
+    LOG_RETENTION_DAYS: int = Field(
+        default=15,
+        ge=1,
+        le=365,
+        description="Daily application log files to retain",
+    )
 
     @property
     def is_production(self) -> bool:

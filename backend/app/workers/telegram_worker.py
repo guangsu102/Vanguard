@@ -43,6 +43,8 @@ from app.core.account.telegram_execution import (
 )
 from app.core.config import settings
 from app.core.database import close_db, get_db_session, init_db
+from app.core.keyword.models import Keyword, KeywordStatus
+from app.core.logging import setup_logging
 from app.core.redis import close_redis, init_redis
 from app.core.worker_status import TelegramWorkerRole, TelegramWorkerStatus, TelegramWorkerStatusValue
 from app.integrations.telegram.client import TelegramClient, TelegramConfig
@@ -90,6 +92,8 @@ class TelegramWorker:
         self._guardian_update_offsets: dict[int, int] = {}
         self._growth_listener_sessions: dict[int, str] = {}
         self._entity_name_cache: dict[int, tuple[float, str]] = {}
+        self._growth_handler_init_options: dict[str, bool] = {}
+        self._last_daily_health_log_date: str | None = None
         self._growth_event_concurrency = min(
             GROWTH_EVENT_CONCURRENCY_CAP,
             max(1, settings.DATABASE_POOL_SIZE - GROWTH_EVENT_DB_CONNECTION_RESERVE),
@@ -141,11 +145,36 @@ class TelegramWorker:
 
     async def run_once(self) -> dict[str, Any]:
         snapshot = await self._load_configuration_snapshot()
+        self._update_growth_handler_init_options(snapshot)
         cycle_metadata = await self._run_role_cycle(snapshot)
         snapshot.update(cycle_metadata)
         status = self._status_for_snapshot(snapshot)
         await self._heartbeat(status, snapshot)
+        self._log_daily_health(status, snapshot)
         return {"status": status, "metadata": snapshot}
+
+    def _update_growth_handler_init_options(self, snapshot: dict[str, Any]) -> None:
+        if self.role != TelegramWorkerRole.GROWTH_USER:
+            return
+        self._growth_handler_init_options = {
+            "load_keywords": snapshot.get("active_keywords", 0) > 0,
+            "load_triggers": snapshot.get("enabled_keyword_triggers", 0) > 0,
+            "load_templates": snapshot.get("enabled_message_templates", 0) > 0,
+        }
+
+    def _log_daily_health(self, status: str, snapshot: dict[str, Any]) -> None:
+        current_date = datetime.now(timezone.utc).date().isoformat()
+        if self._last_daily_health_log_date == current_date:
+            return
+        self._last_daily_health_log_date = current_date
+        logger.info(
+            "telegram_worker_daily_health",
+            worker_id=self.worker_id,
+            role=self.role.value,
+            status=status,
+            enabled_accounts=snapshot.get("enabled_accounts"),
+            enabled_bots=snapshot.get("enabled_bots"),
+        )
 
     async def _heartbeat(self, status: str, metadata: dict[str, Any], last_error: Optional[str] = None) -> None:
         async with get_db_session() as db:
@@ -211,6 +240,15 @@ class TelegramWorker:
                 enabled_triggers = (
                     await db.execute(select(func.count(KeywordTrigger.id)).where(KeywordTrigger.enabled == True))
                 ).scalar() or 0
+                active_keywords = (
+                    await db.execute(
+                        select(func.count(Keyword.id)).where(
+                            Keyword.status.in_(
+                                [KeywordStatus.APPROVED, KeywordStatus.EXECUTING]
+                            )
+                        )
+                    )
+                ).scalar() or 0
                 enabled_templates = (
                     await db.execute(select(func.count(MessageTemplate.id)).where(MessageTemplate.enabled == True))
                 ).scalar() or 0
@@ -223,6 +261,7 @@ class TelegramWorker:
                     "auto_join_enabled_accounts": auto_join_enabled,
                     "auto_ads_enabled_accounts": auto_ads_enabled,
                     "approved_search_keywords": approved_search_keywords,
+                    "active_keywords": active_keywords,
                     "enabled_keyword_triggers": enabled_triggers,
                     "enabled_message_templates": enabled_templates,
                     "enabled_ad_campaigns": enabled_ad_campaigns,
@@ -615,7 +654,7 @@ class TelegramWorker:
         try:
             async with get_db_session() as db:
                 handler = AcquisitionEventHandler(db=db, account_pool=self._account_pool)
-                await handler.initialize()
+                await handler.initialize(**self._growth_handler_init_options)
                 if text.strip().startswith("/"):
                     await handler.on_command(message_event)
                 else:
@@ -771,7 +810,7 @@ class TelegramWorker:
             try:
                 async with get_db_session() as db:
                     handler = AcquisitionEventHandler(db=db, account_pool=self._account_pool)
-                    await handler.initialize()
+                    await handler.initialize(**self._growth_handler_init_options)
                     await handler.on_member_joined(join_event)
             except Exception as exc:
                 logger.warning(
@@ -1095,4 +1134,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    setup_logging()
     asyncio.run(main())

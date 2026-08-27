@@ -35,6 +35,55 @@ def test_growth_worker_status_online_with_enabled_account():
     assert worker._status_for_snapshot({"enabled_accounts": 1}) == TelegramWorkerStatusValue.ONLINE.value
 
 
+def test_growth_worker_uses_snapshot_for_handler_initialization():
+    worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
+
+    worker._update_growth_handler_init_options(
+        {
+            "active_keywords": 0,
+            "enabled_keyword_triggers": 2,
+            "enabled_message_templates": 0,
+        }
+    )
+
+    assert worker._growth_handler_init_options == {
+        "load_keywords": False,
+        "load_triggers": True,
+        "load_templates": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_acquisition_handler_initializes_only_enabled_resources():
+    handler = object.__new__(telegram_worker_module.AcquisitionEventHandler)
+    handler.keyword_engine = SimpleNamespace(
+        load_keywords=AsyncMock(return_value=2)
+    )
+    handler.keyword_matcher = SimpleNamespace(
+        load_triggers=AsyncMock(return_value=3)
+    )
+    handler.template_engine = SimpleNamespace(
+        load_templates=AsyncMock(return_value=4)
+    )
+    handler.logger = MagicMock()
+
+    await handler.initialize(
+        load_keywords=False,
+        load_triggers=True,
+        load_templates=False,
+    )
+
+    handler.keyword_engine.load_keywords.assert_not_awaited()
+    handler.keyword_matcher.load_triggers.assert_awaited_once()
+    handler.template_engine.load_templates.assert_not_awaited()
+    handler.logger.debug.assert_called_once_with(
+        "acquisition_handler_initialized",
+        keyword_count=0,
+        trigger_count=3,
+        template_count=0,
+    )
+
+
 def test_guardian_worker_status_degraded_when_all_bots_fail():
     worker = TelegramWorker(TelegramWorkerRole.GUARDIAN_BOT, worker_id="test-guardian")
 

@@ -175,12 +175,29 @@ class AcquisitionEventHandler:
         # 上下文管理
         self.context_manager = ContextManager(self.db)
 
-    async def initialize(self) -> None:
+    async def initialize(
+        self,
+        *,
+        load_keywords: bool = True,
+        load_triggers: bool = True,
+        load_templates: bool = True,
+    ) -> None:
         """Initialize components that need async setup."""
-        await self.keyword_engine.load_keywords()
-        await self.keyword_matcher.load_triggers()
-        await self.template_engine.load_templates()
-        self.logger.info("acquisition_handler_initialized")
+        keyword_count = (
+            await self.keyword_engine.load_keywords() if load_keywords else 0
+        )
+        trigger_count = (
+            await self.keyword_matcher.load_triggers() if load_triggers else 0
+        )
+        template_count = (
+            await self.template_engine.load_templates() if load_templates else 0
+        )
+        self.logger.debug(
+            "acquisition_handler_initialized",
+            keyword_count=keyword_count,
+            trigger_count=trigger_count,
+            template_count=template_count,
+        )
 
     async def on_message(self, event: MessageEvent) -> None:
         """
@@ -189,7 +206,7 @@ class AcquisitionEventHandler:
         Args:
             event: Message event
         """
-        self.logger.info(
+        self.logger.debug(
             "processing_message",
             message_id=event.message_id,
             chat_id=event.chat_id,

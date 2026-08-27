@@ -80,7 +80,7 @@ class KeywordMatcher:
                 key = trigger.keyword_id if trigger.keyword_id is not None else -trigger.id
                 self._triggers[key] = trigger
 
-            self.logger.info("triggers_loaded", count=len(self._triggers))
+            self.logger.debug("triggers_loaded", count=len(self._triggers))
             return len(self._triggers)
 
     async def match(

@@ -67,7 +67,7 @@ class TemplateEngine:
             for tmpl in templates:
                 self._cache[tmpl.id] = tmpl
 
-            self.logger.info("templates_loaded", count=len(self._cache))
+            self.logger.debug("templates_loaded", count=len(self._cache))
             return len(self._cache)
 
     async def get_template(self, template_id: int) -> Optional[MessageTemplate]:
