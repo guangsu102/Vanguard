@@ -33,7 +33,12 @@ from app.modules.acquisition.ad_only_recommendation import (
     AdOnlyRecommendationService,
     AdOnlyWorkflowError,
 )
-from app.modules.acquisition.models import AdCreative, GroupAdHandover
+from app.modules.acquisition.models import (
+    AdCampaign,
+    AdCreative,
+    AdDeliveryPolicy,
+    GroupAdHandover,
+)
 
 router = APIRouter(prefix="/ad-only")
 
@@ -88,6 +93,26 @@ class DirectAssignmentCreateRequest(DirectAssignmentPreflightRequest):
     idempotency_key: str = Field(..., min_length=8, max_length=64)
 
 
+class DirectAssignmentBatchPreflightRequest(BaseModel):
+    campaign_id: int = Field(..., gt=0)
+    target_account_id: int = Field(..., gt=0)
+    creative_id: int = Field(..., gt=0)
+    invite_links: list[str] = Field(..., min_length=1, max_length=100)
+    join_interval_min_minutes: int = Field(1, ge=1, le=30)
+    join_interval_max_minutes: int = Field(30, ge=1, le=30)
+    permission_mode: Literal[
+        "soft_ad_allowed", "high_volume_ad_allowed"
+    ]
+    permission_note: str = Field(..., min_length=3, max_length=500)
+    permission_expires_at: datetime
+
+
+class DirectAssignmentBatchCreateRequest(
+    DirectAssignmentBatchPreflightRequest
+):
+    idempotency_key: str = Field(..., min_length=8, max_length=64)
+
+
 def _workflow_error(exc: AdOnlyWorkflowError) -> HTTPException:
     detail = str(exc)
     if detail.endswith("_not_found") or detail in {
@@ -106,6 +131,8 @@ def _workflow_error(exc: AdOnlyWorkflowError) -> HTTPException:
         "completed_handover_cannot_be_rolled_back",
         "handover_execution_disabled",
         "direct_assignment_conflict",
+        "direct_assignment_batch_conflict",
+        "handover_not_cancellable",
     }
     return HTTPException(
         status_code=409 if detail in conflicts else 400,
@@ -243,6 +270,18 @@ async def get_handover_options(
         .where(AdCreative.enabled)
         .order_by(AdCreative.name.asc(), AdCreative.id.asc())
     )
+    campaign_rows = await db.execute(
+        select(AdCampaign)
+        .where(
+            AdCampaign.delivery_policy == AdDeliveryPolicy.AD_ONLY.value,
+            AdCampaign.status != "cancelled",
+        )
+        .order_by(
+            AdCampaign.enabled.desc(),
+            AdCampaign.name.asc(),
+            AdCampaign.id.asc(),
+        )
+    )
     return {
         "code": 0,
         "message": "success",
@@ -263,6 +302,21 @@ async def get_handover_options(
             "creatives": [
                 {"id": creative.id, "name": creative.name}
                 for creative in creative_rows.scalars().all()
+            ],
+            "campaigns": [
+                {
+                    "id": campaign.id,
+                    "name": campaign.name,
+                    "enabled": campaign.enabled,
+                    "status": campaign.status,
+                    "send_mode": campaign.send_mode,
+                    "interval_minutes": campaign.interval_minutes,
+                    "scheduled_times": campaign.get_scheduled_times(),
+                    "target_group_count": len(
+                        campaign.get_target_group_ids()
+                    ),
+                }
+                for campaign in campaign_rows.scalars().all()
             ],
         },
     }
@@ -398,6 +452,87 @@ async def create_direct_assignment(
     }
 
 
+@router.post("/direct-assignments/batch/preflight")
+async def preflight_direct_assignment_batch(
+    request: DirectAssignmentBatchPreflightRequest,
+    _current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        values = await AdOnlyRecommendationService(
+            db
+        ).preflight_direct_assignment_batch(**request.model_dump())
+    except AdOnlyWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return {
+        "code": 0,
+        "message": "Paced join queue preflight passed",
+        "data": {
+            "campaign_id": values["campaign"].id,
+            "campaign_name": values["campaign"].name,
+            "target_account_id": values["target"].id,
+            "creative_id": values["creative"].id,
+            "invite_count": values["invite_count"],
+            "join_interval_min_minutes": values[
+                "join_interval_min_minutes"
+            ],
+            "join_interval_max_minutes": values[
+                "join_interval_max_minutes"
+            ],
+            "estimated_queue_minutes": values["estimated_queue_minutes"],
+            "send_mode": values["send_mode"],
+            "interval_minutes": values["interval_minutes"],
+            "scheduled_times": values["scheduled_times"],
+            "estimated_daily_sends": values["estimated_daily_sends"],
+            "total_daily_sends": values["total_daily_sends"],
+            "hard_cap": values["hard_cap"],
+            "capacity_warning": values["capacity_warning"],
+        },
+    }
+
+
+@router.post(
+    "/direct-assignments/batch",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_direct_assignment_batch(
+    request: DirectAssignmentBatchCreateRequest,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    service = AdOnlyRecommendationService(db)
+    try:
+        handovers, created, values = (
+            await service.create_direct_assignment_batch(
+                **request.model_dump(),
+                requested_by_user_id=int(current_user["id"]),
+            )
+        )
+    except AdOnlyWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return {
+        "code": 0,
+        "message": (
+            "Group links added to the paced join queue"
+            if created
+            else "Idempotent replay"
+        ),
+        "data": {
+            "created": created,
+            "batch_id": request.idempotency_key,
+            "invite_count": values["invite_count"],
+            "estimated_queue_minutes": values[
+                "estimated_queue_minutes"
+            ],
+            "capacity_warning": values["capacity_warning"],
+            "handovers": [
+                service.handover_payload(handover)
+                for handover in handovers
+            ],
+        },
+    }
+
+
 @router.get("/handovers")
 async def list_handovers(
     group_id: int | None = Query(default=None, gt=0),
@@ -427,10 +562,12 @@ async def retry_handover(
         )
     except AdOnlyWorkflowError as exc:
         raise _workflow_error(exc) from exc
-    task_id = _queue(
-        execute_ad_only_handover_task,
-        kwargs={"handover_id": handover.id},
-    )
+    task_id = None
+    if not handover.batch_id:
+        task_id = _queue(
+            execute_ad_only_handover_task,
+            kwargs={"handover_id": handover.id},
+        )
     return {
         "code": 0,
         "message": "Handover retry queued",
@@ -438,6 +575,27 @@ async def retry_handover(
             "task_id": task_id,
             "handover": service.handover_payload(handover),
         },
+    }
+
+
+@router.post("/handovers/{handover_id}/cancel")
+async def cancel_queued_handover(
+    handover_id: int,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    service = AdOnlyRecommendationService(db)
+    try:
+        handover = await service.cancel_queued_handover(
+            handover_id,
+            actor_user_id=int(current_user["id"]),
+        )
+    except AdOnlyWorkflowError as exc:
+        raise _workflow_error(exc) from exc
+    return {
+        "code": 0,
+        "message": "Queued group link cancelled",
+        "data": {"handover": service.handover_payload(handover)},
     }
 
 

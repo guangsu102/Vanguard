@@ -51,3 +51,47 @@ async def test_health_check_accounts_excludes_inactive_accounts(monkeypatch):
     assert result["healthy"] == 1
     assert result["unhealthy"] == 0
     assert result["skipped_inactive"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_stale_worker_statuses_marks_only_expired_workers_offline(
+    monkeypatch,
+    test_db,
+):
+    from datetime import datetime, timedelta
+
+    from app.core.scheduler import tasks
+    from app.core.worker_status import (
+        TelegramWorkerRole,
+        TelegramWorkerStatus,
+        TelegramWorkerStatusValue,
+    )
+
+    now = datetime.utcnow()
+    stale = TelegramWorkerStatus(
+        worker_id="qq_official_worker:test001",
+        role=TelegramWorkerRole.QQ_ONEBOT.value,
+        status=TelegramWorkerStatusValue.ONLINE.value,
+        last_heartbeat_at=now - timedelta(minutes=5),
+    )
+    current = TelegramWorkerStatus(
+        worker_id="growth_user_worker:test001",
+        role=TelegramWorkerRole.GROWTH_USER.value,
+        status=TelegramWorkerStatusValue.ONLINE.value,
+        last_heartbeat_at=now,
+    )
+    test_db.add_all([stale, current])
+    await test_db.commit()
+
+    async def run_with_test_db(handler):
+        return await handler(test_db)
+
+    monkeypatch.setattr(tasks, "_run_with_db", run_with_test_db)
+
+    result = await tasks._reconcile_stale_worker_statuses_async(90)
+
+    await test_db.refresh(stale)
+    await test_db.refresh(current)
+    assert result["reconciled"] == 1
+    assert stale.status == TelegramWorkerStatusValue.OFFLINE.value
+    assert current.status == TelegramWorkerStatusValue.ONLINE.value

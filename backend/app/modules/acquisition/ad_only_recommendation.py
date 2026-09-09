@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any
@@ -80,6 +81,7 @@ ALLOWED_POLICY_MODES = {
 }
 ACTIVE_HANDOVER_STATUSES = {
     "queued",
+    "dispatching",
     "running",
     "failed",
     "cleanup_pending",
@@ -976,6 +978,244 @@ class AdOnlyRecommendationService:
         await self.db.refresh(handover)
         return handover, True
 
+    @staticmethod
+    def _normalize_invite_links(invite_links: Iterable[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_value in invite_links:
+            value = str(raw_value or "").strip()
+            if not value or value in seen:
+                continue
+            try:
+                parse_telegram_group_link(value)
+            except TelegramExecutionError as exc:
+                raise AdOnlyWorkflowError(f"invalid_invite_link:{exc}") from exc
+            seen.add(value)
+            normalized.append(value)
+        if not normalized:
+            raise AdOnlyWorkflowError("invite_links_required")
+        if len(normalized) > 100:
+            raise AdOnlyWorkflowError("invite_links_limit_exceeded")
+        return normalized
+
+    async def preflight_direct_assignment_batch(
+        self,
+        *,
+        campaign_id: int,
+        target_account_id: int,
+        creative_id: int,
+        invite_links: list[str],
+        join_interval_min_minutes: int,
+        join_interval_max_minutes: int,
+        permission_mode: str,
+        permission_note: str,
+        permission_expires_at: datetime,
+    ) -> dict[str, Any]:
+        links = self._normalize_invite_links(invite_links)
+        minimum = int(join_interval_min_minutes)
+        maximum = int(join_interval_max_minutes)
+        if minimum < 1 or maximum > 30 or minimum > maximum:
+            raise AdOnlyWorkflowError("invalid_join_interval_range")
+
+        campaign = await self.db.get(AdCampaign, campaign_id)
+        if campaign is None:
+            raise AdOnlyWorkflowError("campaign_not_found")
+        if campaign.delivery_policy != AdDeliveryPolicy.AD_ONLY.value:
+            raise AdOnlyWorkflowError("campaign_not_ad_only")
+
+        binding_accounts = set(
+            (
+                await self.db.execute(
+                    select(AccountAdBinding.account_id).where(
+                        AccountAdBinding.ad_campaign_id == campaign.id,
+                        AccountAdBinding.enabled.is_(True),
+                    )
+                )
+            ).scalars().all()
+        )
+        if binding_accounts - {target_account_id}:
+            raise AdOnlyWorkflowError("campaign_bound_to_other_ad_only_account")
+
+        values = await self.preflight_direct_assignment(
+            target_account_id=target_account_id,
+            creative_id=creative_id,
+            invite_link=links[0],
+            send_mode=campaign.send_mode,
+            interval_minutes=campaign.interval_minutes,
+            scheduled_times=campaign.get_scheduled_times(),
+            permission_mode=permission_mode,
+            permission_note=permission_note,
+            permission_expires_at=permission_expires_at,
+        )
+        total_daily_sends = values["existing_daily_sends"] + (
+            values["estimated_daily_sends"] * len(links)
+        )
+        return {
+            **values,
+            "campaign": campaign,
+            "invite_links": links,
+            "invite_count": len(links),
+            "join_interval_min_minutes": minimum,
+            "join_interval_max_minutes": maximum,
+            "estimated_queue_minutes": max(
+                0, math.ceil((len(links) - 1) * (minimum + maximum) / 2)
+            ),
+            "total_daily_sends": total_daily_sends,
+            "capacity_warning": total_daily_sends > values["hard_cap"],
+        }
+
+    async def create_direct_assignment_batch(
+        self,
+        *,
+        campaign_id: int,
+        target_account_id: int,
+        creative_id: int,
+        invite_links: list[str],
+        join_interval_min_minutes: int,
+        join_interval_max_minutes: int,
+        permission_mode: str,
+        permission_note: str,
+        permission_expires_at: datetime,
+        idempotency_key: str,
+        requested_by_user_id: int,
+    ) -> tuple[list[GroupAdHandover], bool, dict[str, Any]]:
+        batch_id = str(idempotency_key or "").strip()
+        if not 8 <= len(batch_id) <= 64:
+            raise AdOnlyWorkflowError("invalid_idempotency_key")
+        replay_rows = await self.db.execute(
+            select(GroupAdHandover)
+            .where(GroupAdHandover.batch_id == batch_id)
+            .order_by(GroupAdHandover.queue_position.asc())
+        )
+        replay = list(replay_rows.scalars().unique().all())
+        if replay:
+            return replay, False, {
+                "invite_count": len(replay),
+                "estimated_queue_minutes": 0,
+                "capacity_warning": False,
+            }
+
+        values = await self.preflight_direct_assignment_batch(
+            campaign_id=campaign_id,
+            target_account_id=target_account_id,
+            creative_id=creative_id,
+            invite_links=invite_links,
+            join_interval_min_minutes=join_interval_min_minutes,
+            join_interval_max_minutes=join_interval_max_minutes,
+            permission_mode=permission_mode,
+            permission_note=permission_note,
+            permission_expires_at=permission_expires_at,
+        )
+        await self.db.execute(
+            select(TelegramAccount.id)
+            .where(TelegramAccount.id == target_account_id)
+            .with_for_update()
+        )
+        now = _now()
+        active_count = int(
+            (
+                await self.db.execute(
+                    select(func.count(GroupAdHandover.id)).where(
+                        GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                        GroupAdHandover.batch_id.is_not(None),
+                        GroupAdHandover.target_ad_only_account_id
+                        == target_account_id,
+                        GroupAdHandover.status.in_(
+                            {"queued", "dispatching", "running"}
+                        ),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+        retention_days = min(
+            30,
+            max(
+                7,
+                math.ceil(
+                    len(values["invite_links"])
+                    * values["join_interval_max_minutes"]
+                    / 1440
+                )
+                + 2,
+            ),
+        )
+        handovers: list[GroupAdHandover] = []
+        for position, invite_link in enumerate(values["invite_links"], start=1):
+            is_first_due = active_count == 0 and position == 1
+            child_key = hashlib.sha256(
+                f"{batch_id}:{position}:{invite_link}".encode()
+            ).hexdigest()
+            handover = GroupAdHandover(
+                workflow_type=DIRECT_WORKFLOW_TYPE,
+                assessment_id=None,
+                group_id=None,
+                active_group_key=None,
+                source_growth_account_id=None,
+                target_ad_only_account_id=values["target"].id,
+                creative_id=values["creative"].id,
+                campaign_id=values["campaign"].id,
+                batch_id=batch_id,
+                queue_position=position,
+                join_interval_min_minutes=values[
+                    "join_interval_min_minutes"
+                ],
+                join_interval_max_minutes=values[
+                    "join_interval_max_minutes"
+                ],
+                next_attempt_at=now if is_first_due else None,
+                invite_link_encrypted=encrypt_ephemeral_secret(invite_link),
+                invite_secret_expires_at=now + timedelta(days=retention_days),
+                send_mode=values["send_mode"],
+                interval_minutes=values["interval_minutes"],
+                scheduled_times=_json_dump(values["scheduled_times"]),
+                estimated_daily_sends=values["estimated_daily_sends"],
+                permission_mode=values["permission_mode"],
+                permission_note=values["permission_note"],
+                permission_expires_at=values["permission_expires_at"],
+                status="queued",
+                current_step="queued" if is_first_due else "waiting_interval",
+                idempotency_key=child_key,
+                requested_by_user_id=requested_by_user_id,
+                approved_by_user_id=requested_by_user_id,
+                approved_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(handover)
+            handovers.append(handover)
+        try:
+            await self.db.flush()
+        except IntegrityError as exc:
+            await self.db.rollback()
+            raise AdOnlyWorkflowError("direct_assignment_batch_conflict") from exc
+
+        for handover in handovers:
+            await self._add_event(
+                group_id=None,
+                handover_id=handover.id,
+                event_type="direct_assignment_join_queued",
+                step=handover.current_step,
+                status="queued",
+                actor_user_id=requested_by_user_id,
+                message="Direct Ad-only group link added to the paced join queue",
+                payload={
+                    "batch_id": batch_id,
+                    "queue_position": handover.queue_position,
+                    "campaign_id": campaign_id,
+                    "join_interval_min_minutes": values[
+                        "join_interval_min_minutes"
+                    ],
+                    "join_interval_max_minutes": values[
+                        "join_interval_max_minutes"
+                    ],
+                },
+            )
+        await self.db.commit()
+        for handover in handovers:
+            await self.db.refresh(handover)
+        return handovers, True, values
+
     async def preflight_handover(
         self,
         *,
@@ -1253,6 +1493,12 @@ class AdOnlyRecommendationService:
             "creative_id": handover.creative_id,
             "creative_name": handover.creative.name if handover.creative else None,
             "campaign_id": handover.campaign_id,
+            "campaign_name": handover.campaign.name if handover.campaign else None,
+            "batch_id": handover.batch_id,
+            "queue_position": handover.queue_position,
+            "join_interval_min_minutes": handover.join_interval_min_minutes,
+            "join_interval_max_minutes": handover.join_interval_max_minutes,
+            "next_attempt_at": _iso(handover.next_attempt_at),
             "send_mode": handover.send_mode,
             "interval_minutes": handover.interval_minutes,
             "scheduled_times": _json_load(handover.scheduled_times, []),
@@ -1805,11 +2051,19 @@ class AdOnlyRecommendationService:
         group: Group,
     ) -> AdCampaign:
         campaign = (
-            await self.db.get(AdCampaign, handover.campaign_id)
+            (
+                await self.db.execute(
+                    select(AdCampaign)
+                    .where(AdCampaign.id == handover.campaign_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if handover.campaign_id is not None
             else None
         )
         if campaign is None:
+            if handover.campaign_previous_json is None:
+                handover.campaign_previous_json = _json_dump({"existed": False})
             campaign = AdCampaign(
                 name=f"Ad-only handover {handover.id} group {group.id}",
                 enabled=False,
@@ -1833,6 +2087,20 @@ class AdOnlyRecommendationService:
             await self.db.commit()
         elif campaign.delivery_policy != AdDeliveryPolicy.AD_ONLY.value:
             raise AdOnlyWorkflowError("handover_campaign_policy_mismatch")
+        else:
+            target_group_ids = campaign.get_target_group_ids()
+            if handover.campaign_previous_json is None:
+                handover.campaign_previous_json = _json_dump(
+                    {
+                        "existed": True,
+                        "enabled": campaign.enabled,
+                        "status": campaign.status,
+                        "target_group_ids": target_group_ids,
+                    }
+                )
+            if group.id not in target_group_ids:
+                target_group_ids.append(group.id)
+                campaign.target_group_ids = _json_dump(target_group_ids)
         return campaign
 
     async def _ensure_binding(
@@ -1939,7 +2207,7 @@ class AdOnlyRecommendationService:
             or not binding.enabled
             or schedule.status
             not in {AdScheduleStatus.IDLE.value, AdScheduleStatus.RETRY.value}
-            or campaign.get_target_group_ids() != [group.id]
+            or group.id not in campaign.get_target_group_ids()
         ):
             raise AdOnlyWorkflowError("takeover_database_verification_failed")
         membership = await self._joined_membership(group.id, target.id)
@@ -2063,6 +2331,7 @@ class AdOnlyRecommendationService:
         handover.active_group_key = None
         handover.invite_link_encrypted = None
         handover.invite_secret_expires_at = None
+        handover.next_attempt_at = None
         handover.last_error = None
         handover.updated_at = completed_at
         await self._add_event(
@@ -2078,6 +2347,11 @@ class AdOnlyRecommendationService:
                 else "Ad-only takeover verified and Growth account retired"
             ),
         )
+        if handover.batch_id:
+            await self._schedule_next_join_queue_item(
+                handover.target_ad_only_account_id,
+                now=completed_at,
+            )
         await self.db.commit()
         return {
             "status": "completed",
@@ -2098,6 +2372,12 @@ class AdOnlyRecommendationService:
             return {
                 "status": "skipped",
                 "reason": "handover_already_terminal",
+                "handover": self.handover_payload(handover),
+            }
+        if handover.batch_id and handover.status != "dispatching":
+            return {
+                "status": "skipped",
+                "reason": "paced_join_not_dispatched",
                 "handover": self.handover_payload(handover),
             }
         if handover.status == "running":
@@ -2186,8 +2466,17 @@ class AdOnlyRecommendationService:
                 message="Creating disabled ad-only campaign",
             )
             campaign = await self._ensure_campaign(handover, group)
-            campaign.enabled = False
-            campaign.status = "draft"
+            previous_campaign = _json_load(
+                handover.campaign_previous_json, {}
+            )
+            campaign_was_active = bool(
+                previous_campaign.get("existed")
+                and previous_campaign.get("enabled")
+                and previous_campaign.get("status") == "active"
+            )
+            if not campaign_was_active:
+                campaign.enabled = False
+                campaign.status = "draft"
             await self.db.commit()
 
             await self._record_step(
@@ -2253,6 +2542,7 @@ class AdOnlyRecommendationService:
             failed.failed_at = _now()
             failed.last_error = error
             failed.retry_count = int(failed.retry_count or 0) + 1
+            failed.next_attempt_at = None
             failed.updated_at = _now()
             if (
                 failed.invite_secret_expires_at is not None
@@ -2270,6 +2560,11 @@ class AdOnlyRecommendationService:
                 message="Handover step failed and can be retried or rolled back",
                 payload={"error": error},
             )
+            if failed.batch_id:
+                await self._schedule_next_join_queue_item(
+                    failed.target_ad_only_account_id,
+                    now=failed.updated_at,
+                )
             await self.db.commit()
             return {
                 "status": "failed",
@@ -2292,6 +2587,9 @@ class AdOnlyRecommendationService:
         handover.failed_at = None
         handover.last_error = None
         handover.updated_at = _now()
+        if handover.batch_id:
+            handover.current_step = "waiting_interval"
+            handover.next_attempt_at = None
         await self._add_event(
             group_id=handover.group_id,
             assessment_id=handover.assessment_id,
@@ -2301,6 +2599,59 @@ class AdOnlyRecommendationService:
             status="queued",
             actor_user_id=actor_user_id,
             message="Admin queued handover retry",
+        )
+        if handover.batch_id:
+            await self._schedule_next_join_queue_item(
+                handover.target_ad_only_account_id,
+                now=handover.updated_at,
+            )
+        await self.db.commit()
+        await self.db.refresh(handover)
+        return handover
+
+    async def cancel_queued_handover(
+        self,
+        handover_id: int,
+        *,
+        actor_user_id: int,
+    ) -> GroupAdHandover:
+        handover = (
+            await self.db.execute(
+                select(GroupAdHandover)
+                .where(GroupAdHandover.id == handover_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if handover is None:
+            raise AdOnlyWorkflowError("handover_not_found")
+        if (
+            not handover.batch_id
+            or handover.group_id is not None
+            or handover.status not in {"queued", "failed"}
+        ):
+            raise AdOnlyWorkflowError("handover_not_cancellable")
+
+        cancelled_at = _now()
+        handover.status = "cancelled"
+        handover.current_step = "cancelled"
+        handover.next_attempt_at = None
+        handover.invite_link_encrypted = None
+        handover.invite_secret_expires_at = None
+        handover.completed_at = cancelled_at
+        handover.last_error = None
+        handover.updated_at = cancelled_at
+        await self._add_event(
+            group_id=None,
+            handover_id=handover.id,
+            event_type="direct_assignment_join_cancelled",
+            step="cancelled",
+            status="cancelled",
+            actor_user_id=actor_user_id,
+            message="Queued Ad-only group link cancelled before joining",
+        )
+        await self._schedule_next_join_queue_item(
+            handover.target_ad_only_account_id,
+            now=cancelled_at,
         )
         await self.db.commit()
         await self.db.refresh(handover)
@@ -2394,6 +2745,7 @@ class AdOnlyRecommendationService:
             handover.active_group_key = None
             handover.invite_link_encrypted = None
             handover.invite_secret_expires_at = None
+            handover.next_attempt_at = None
             handover.completed_at = completed_at
             handover.last_error = None
             handover.updated_at = completed_at
@@ -2405,6 +2757,11 @@ class AdOnlyRecommendationService:
                 status="rolled_back",
                 message="Direct assignment cancelled before Telegram group resolution",
             )
+            if handover.batch_id:
+                await self._schedule_next_join_queue_item(
+                    handover.target_ad_only_account_id,
+                    now=completed_at,
+                )
             await self.db.commit()
             return {
                 "status": "rolled_back",
@@ -2435,17 +2792,31 @@ class AdOnlyRecommendationService:
             if handover.campaign_id
             else None
         )
+        previous_campaign = _json_load(handover.campaign_previous_json, {})
         if campaign is not None:
-            campaign.enabled = False
-            campaign.status = "cancelled"
-            bindings = await self.db.execute(
-                select(AccountAdBinding).where(
-                    AccountAdBinding.ad_campaign_id == campaign.id,
-                    AccountAdBinding.account_id == target.id,
+            if previous_campaign.get("existed"):
+                campaign.target_group_ids = _json_dump(
+                    [
+                        group_id
+                        for group_id in campaign.get_target_group_ids()
+                        if group_id != group.id
+                    ]
                 )
-            )
-            for binding in bindings.scalars().all():
-                binding.enabled = False
+                campaign.enabled = bool(previous_campaign.get("enabled"))
+                campaign.status = str(
+                    previous_campaign.get("status") or "draft"
+                )
+            else:
+                campaign.enabled = False
+                campaign.status = "cancelled"
+                bindings = await self.db.execute(
+                    select(AccountAdBinding).where(
+                        AccountAdBinding.ad_campaign_id == campaign.id,
+                        AccountAdBinding.account_id == target.id,
+                    )
+                )
+                for binding in bindings.scalars().all():
+                    binding.enabled = False
             schedules = await self.db.execute(
                 select(AdDeliveryScheduleState).where(
                     AdDeliveryScheduleState.campaign_id == campaign.id,
@@ -2565,6 +2936,11 @@ class AdOnlyRecommendationService:
                 else "Ad-only handover rolled back; Growth membership retained"
             ),
         )
+        if handover.batch_id:
+            await self._schedule_next_join_queue_item(
+                handover.target_ad_only_account_id,
+                now=completed_at,
+            )
         await self.db.commit()
         return {
             "status": "rolled_back",
@@ -2580,6 +2956,8 @@ class AdOnlyRecommendationService:
     ) -> list[dict[str, Any]]:
         query = select(GroupAdHandover).order_by(
             desc(GroupAdHandover.created_at),
+            desc(GroupAdHandover.batch_id),
+            GroupAdHandover.queue_position.asc(),
             desc(GroupAdHandover.id),
         )
         if group_id is not None:
@@ -2592,6 +2970,127 @@ class AdOnlyRecommendationService:
             self.handover_payload(handover)
             for handover in rows.scalars().unique().all()
         ]
+
+    async def _schedule_next_join_queue_item(
+        self,
+        account_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> GroupAdHandover | None:
+        scheduled_count = int(
+            (
+                await self.db.execute(
+                    select(func.count(GroupAdHandover.id)).where(
+                        GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                        GroupAdHandover.batch_id.is_not(None),
+                        GroupAdHandover.target_ad_only_account_id == account_id,
+                        GroupAdHandover.status == "queued",
+                        GroupAdHandover.next_attempt_at.is_not(None),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+        if scheduled_count:
+            return None
+        next_row = (
+            await self.db.execute(
+                select(GroupAdHandover)
+                .where(
+                    GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                    GroupAdHandover.batch_id.is_not(None),
+                    GroupAdHandover.target_ad_only_account_id == account_id,
+                    GroupAdHandover.status == "queued",
+                    GroupAdHandover.next_attempt_at.is_(None),
+                )
+                .order_by(
+                    GroupAdHandover.created_at.asc(),
+                    GroupAdHandover.batch_id.asc(),
+                    GroupAdHandover.queue_position.asc(),
+                )
+                .limit(1)
+                .with_for_update(skip_locked=True, of=GroupAdHandover)
+            )
+        ).scalar_one_or_none()
+        if next_row is None:
+            return None
+        minimum = max(1, min(30, int(next_row.join_interval_min_minutes or 1)))
+        maximum = max(
+            minimum,
+            min(30, int(next_row.join_interval_max_minutes or minimum)),
+        )
+        delay_minutes = random.randint(minimum, maximum)
+        next_row.next_attempt_at = (now or _now()) + timedelta(
+            minutes=delay_minutes
+        )
+        next_row.current_step = "waiting_interval"
+        next_row.updated_at = now or _now()
+        return next_row
+
+    async def claim_due_direct_assignment_queue(
+        self,
+        *,
+        limit: int = 10,
+    ) -> list[int]:
+        now = _now()
+        stale_before = now - timedelta(minutes=15)
+        stale_rows = await self.db.execute(
+            select(GroupAdHandover)
+            .where(
+                GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                GroupAdHandover.batch_id.is_not(None),
+                GroupAdHandover.status == "dispatching",
+                GroupAdHandover.updated_at < stale_before,
+            )
+            .with_for_update(skip_locked=True, of=GroupAdHandover)
+        )
+        for stale in stale_rows.scalars().all():
+            stale.status = "queued"
+            stale.current_step = "dispatch_retry"
+            stale.next_attempt_at = now
+            stale.updated_at = now
+
+        active_accounts = set(
+            (
+                await self.db.execute(
+                    select(GroupAdHandover.target_ad_only_account_id).where(
+                        GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                        GroupAdHandover.batch_id.is_not(None),
+                        GroupAdHandover.status.in_({"dispatching", "running"}),
+                    )
+                )
+            ).scalars().all()
+        )
+        due_rows = await self.db.execute(
+            select(GroupAdHandover)
+            .where(
+                GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
+                GroupAdHandover.batch_id.is_not(None),
+                GroupAdHandover.status == "queued",
+                GroupAdHandover.next_attempt_at.is_not(None),
+                GroupAdHandover.next_attempt_at <= now,
+            )
+            .order_by(
+                GroupAdHandover.next_attempt_at.asc(),
+                GroupAdHandover.created_at.asc(),
+                GroupAdHandover.queue_position.asc(),
+            )
+            .limit(max(1, min(int(limit), 100)))
+            .with_for_update(skip_locked=True, of=GroupAdHandover)
+        )
+        claimed: list[int] = []
+        for handover in due_rows.scalars().all():
+            account_id = handover.target_ad_only_account_id
+            if account_id in active_accounts:
+                continue
+            handover.status = "dispatching"
+            handover.current_step = "dispatching"
+            handover.next_attempt_at = None
+            handover.updated_at = now
+            active_accounts.add(account_id)
+            claimed.append(handover.id)
+        await self.db.commit()
+        return claimed
 
     async def clear_expired_invite_secrets(self) -> int:
         now = _now()
@@ -2648,6 +3147,20 @@ async def execute_ad_only_handover_with_db(
         return await AdOnlyRecommendationService(db).execute_handover(
             handover_id
         )
+
+
+async def claim_due_ad_only_join_queue_with_db(
+    *,
+    limit: int = 10,
+) -> list[int]:
+    from app.core import database as db_module
+
+    if db_module.async_session_factory is None:
+        await db_module.init_db(create_tables=False)
+    async with db_module.get_db_session() as db:
+        return await AdOnlyRecommendationService(
+            db
+        ).claim_due_direct_assignment_queue(limit=limit)
 
 
 async def rollback_ad_only_handover_with_db(

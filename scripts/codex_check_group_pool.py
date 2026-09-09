@@ -8,12 +8,13 @@ import paramiko
 import socks
 
 
-SSH_HOST = "137.175.65.47"
-SSH_PORT = 58243
+SSH_HOST = "168.110.23.229"
+SSH_PORT = 22
 SSH_USER = "root"
-SSH_KEY = Path(r"D:\tanxuan\proxy-app\sshkey\id_rsa")
+SSH_KEY = Path("E:/sshkey/sshkey/id_rsa")
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7897
+API_BASE_URL = "http://127.0.0.1:18080"
 
 
 def connect() -> paramiko.SSHClient:
@@ -58,10 +59,10 @@ def main() -> int:
     try:
         commands = [
             "docker ps --format '{{.Names}} {{.Status}}' | grep vanguard",
-            "curl -sS http://127.0.0.1:8000/health",
+            f"curl -sS {API_BASE_URL}/health",
             "docker logs --tail=200 vanguard-backend",
             "docker logs --tail=100 vanguard-frontend",
-            "curl -sS 'http://127.0.0.1:8000/api/groups?page=1&page_size=5'",
+            f"curl -sS '{API_BASE_URL}/api/groups?page=1&page_size=5'",
         ]
         exit_code = 0
         for command in commands:

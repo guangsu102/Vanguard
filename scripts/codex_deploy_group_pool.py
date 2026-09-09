@@ -12,13 +12,14 @@ import socks
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REMOTE_ROOT = "/root/Vanguard"
-SSH_HOST = "137.175.65.47"
-SSH_PORT = 58243
+REMOTE_ROOT = "/opt/vanguard"
+SSH_HOST = "168.110.23.229"
+SSH_PORT = 22
 SSH_USER = "root"
-SSH_KEY = Path(r"D:\tanxuan\proxy-app\sshkey\id_rsa")
+SSH_KEY = Path("E:/sshkey/sshkey/id_rsa")
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7897
+API_BASE_URL = "http://127.0.0.1:18080"
 
 FILES = [
     "backend/app/core/group/models.py",
@@ -159,10 +160,10 @@ def main() -> int:
         )
 
         run(client, "docker ps --format '{{.Names}} {{.Status}}' | grep vanguard", timeout=120)
-        run(client, "curl -fsS http://127.0.0.1:8000/health", timeout=120)
+        run(client, f"curl -fsS {API_BASE_URL}/health", timeout=120)
         run(
             client,
-            "curl -fsS 'http://127.0.0.1:8000/api/groups?page=1&page_size=5' | python -m json.tool | head -80",
+            f"curl -fsS '{API_BASE_URL}/api/groups?page=1&page_size=5' | python -m json.tool | head -80",
             timeout=120,
         )
         print(f"\ndeploy completed in {time.time() - started:.1f}s", flush=True)

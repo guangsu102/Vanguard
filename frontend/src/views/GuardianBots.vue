@@ -8,7 +8,7 @@ import { useClientPagination } from '@/utils/clientPagination'
 const loading = ref(false)
 const dialogVisible = ref(false)
 const bots = ref<GuardianBot[]>([])
-const botPagination = useClientPagination(bots, 20)
+const botPagination = useClientPagination(bots)
 
 const form = reactive({
   identifier: '',

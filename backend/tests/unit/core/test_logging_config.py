@@ -2,7 +2,22 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 
 from app.core.config import settings
-from app.core.logging import setup_logging
+from app.core.logging import TelegramAccountLogContextFilter, setup_logging
+
+
+def test_telethon_account_logs_include_account_id():
+    record = logging.LogRecord(
+        name="vanguard.telethon.account.7.telethon.network.mtprotosender",
+        level=logging.WARNING,
+        pathname=__file__,
+        lineno=1,
+        msg="Server closed the connection: %s",
+        args=("EOF",),
+        exc_info=None,
+    )
+
+    assert TelegramAccountLogContextFilter().filter(record) is True
+    assert record.getMessage() == "[telegram account_id=7] Server closed the connection: EOF"
 
 
 def test_setup_logging_configures_daily_retention(tmp_path):

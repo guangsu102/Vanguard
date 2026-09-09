@@ -149,6 +149,7 @@ async def test_capacity_cleanup_leaves_only_old_zero_conversion_group(test_db, m
     await test_db.refresh(converted_membership)
     assert result["left"] == 1
     assert zero_membership.status == "left"
+    assert zero_membership.ad_status == "blocked"
     assert "capacity_cleanup_no_recent_conversion" in zero_membership.note
     assert converted_membership.status == "joined"
 

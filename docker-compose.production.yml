@@ -1,9 +1,53 @@
 # ===========================================
 # Vanguard Production Docker Compose
-# 使用服务器现有的 PostgreSQL 和 Redis
+# Target: oracle4c24g / vanguard.pipenai.xyz
+# This stack owns its PostgreSQL and Redis volumes and does not touch the
+# co-located Sub2API stack.
 # ===========================================
 
+name: vanguard
+
 services:
+  # ==================== PostgreSQL ====================
+  postgres:
+    image: postgres:15-alpine
+    container_name: vanguard-postgres
+    env_file:
+      - .env.production
+    environment:
+      TZ: Asia/Shanghai
+    restart: unless-stopped
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - vanguard-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-vanguard} -d $${POSTGRES_DB:-vanguard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7-alpine
+    container_name: vanguard-redis
+    env_file:
+      - .env.production
+    command:
+      ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\" --maxmemory 512mb --maxmemory-policy allkeys-lru"]
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+    networks:
+      - vanguard-internal
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   # ==================== Backend API ====================
   backend:
     build:
@@ -12,18 +56,35 @@ services:
     container_name: vanguard-backend
     env_file:
       - .env.production
+    environment:
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:18080:8000"
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
       - ./sessions:/app/sessions
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
 
-  # ==================== Celery Worker ====================
+  # ==================== Celery Workers ====================
   celery-worker:
     build:
       context: .
@@ -31,13 +92,24 @@ services:
     container_name: vanguard-celery-worker
     env_file:
       - .env.production
-    restart: unless-stopped
+    environment:
+      CELERY_WORKER_CONCURRENCY: "2"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
+      CELERY_WORKER_MAX_TASKS_PER_CHILD: "50"
+      CELERY_OWNED_GROUP_CONCURRENCY: ${CELERY_OWNED_GROUP_CONCURRENCY:-1}
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
+    restart: on-failure:3
     command: ["python", "-m", "app.core.scheduler.worker", "multi"]
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -45,7 +117,32 @@ services:
     healthcheck:
       disable: true
 
-  # ==================== Celery Beat ====================
+  resource-search-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-resource-search-worker
+    env_file:
+      - .env.production
+    environment:
+      CELERY_WORKER_CONCURRENCY: "1"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
+      CELERY_WORKER_MAX_TASKS_PER_CHILD: "20"
+    restart: on-failure:3
+    command:
+      ["python", "-m", "app.core.scheduler.worker", "worker", "-Q", "resource_search", "-H", "resource-search-worker@oracle4c24g"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - vanguard-internal
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/uploads:/app/uploads
+      - ./sessions:/app/sessions
+    healthcheck:
+      disable: true
+
   celery-beat:
     build:
       context: .
@@ -53,20 +150,27 @@ services:
     container_name: vanguard-celery-beat
     env_file:
       - .env.production
+    environment:
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     restart: unless-stopped
     command: ["python", "-m", "app.core.scheduler.worker", "beat"]
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
     healthcheck:
       disable: true
 
-  # ==================== Telegram Growth Worker ====================
+  # ==================== Telegram Workers ====================
   telegram-growth-worker:
     build:
       context: .
@@ -76,20 +180,12 @@ services:
       - .env.production
     restart: unless-stopped
     command:
-      [
-        "python",
-        "-m",
-        "app.workers.telegram_worker",
-        "--role",
-        "growth_user_worker",
-        "--worker-id",
-        "growth_user_worker:production",
-      ]
+      ["python", "-m", "app.workers.telegram_worker", "--role", "growth_user_worker", "--worker-id", "growth_user_worker:oracle4c24g"]
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
@@ -97,7 +193,6 @@ services:
     healthcheck:
       disable: true
 
-  # ==================== Telegram Guardian Worker ====================
   telegram-guardian-worker:
     build:
       context: .
@@ -107,31 +202,26 @@ services:
       - .env.production
     restart: unless-stopped
     command:
-      [
-        "python",
-        "-m",
-        "app.workers.telegram_worker",
-        "--role",
-        "guardian_bot_worker",
-        "--worker-id",
-        "guardian_bot_worker:production",
-      ]
+      ["python", "-m", "app.workers.telegram_worker", "--role", "guardian_bot_worker", "--worker-id", "guardian_bot_worker:oracle4c24g"]
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
     healthcheck:
       disable: true
 
-  # ==================== NapCatQQ OneBot 11 ====================
+  # ==================== Optional NapCatQQ ====================
   napcat:
+    profiles: ["qq"]
     image: ${NAPCAT_IMAGE:-mlikiowa/napcat-docker:latest}
     container_name: vanguard-napcat
     restart: unless-stopped
+    env_file:
+      - .env.production
     environment:
       NAPCAT_UID: ${NAPCAT_UID:-1000}
       NAPCAT_GID: ${NAPCAT_GID:-1000}
@@ -141,14 +231,14 @@ services:
       - "3000"
       - "3001"
     networks:
-      - default
+      - vanguard-internal
     volumes:
       - napcat_qq_data:/app/.config/QQ
       - napcat_config:/app/napcat/config
       - napcat_plugins:/app/napcat/plugins
 
-  # ==================== QQ OneBot Event Worker ====================
   qq-onebot-worker:
+    profiles: ["qq"]
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -156,20 +246,14 @@ services:
     env_file:
       - .env.production
     restart: on-failure:3
-    command:
-      [
-        "python",
-        "-m",
-        "app.workers.qq_onebot_worker",
-        "--worker-id",
-        "qq_onebot_worker:production",
-      ]
+    command: ["python", "-m", "app.workers.qq_onebot_worker", "--worker-id", "qq_onebot_worker:oracle4c24g"]
     depends_on:
-      - backend
-      - napcat
+      backend:
+        condition: service_healthy
+      napcat:
+        condition: service_started
     networks:
-      - default
-      - xboard_internal
+      - vanguard-internal
     volumes:
       - ./data/logs:/app/logs
     healthcheck:
@@ -180,17 +264,21 @@ services:
     build:
       context: .
       dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
     container_name: vanguard-frontend
     restart: unless-stopped
     ports:
-      - "3000:80"
+      - "127.0.0.1:13000:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    networks:
+      - vanguard-internal
 
-  # ==================== Bot Matrix (Legacy Reference) ====================
+  # ==================== Legacy Bot Matrix (optional) ====================
   bot:
-    profiles:
-      - legacy-bot-matrix
+    profiles: ["legacy-bot-matrix"]
     build:
       context: .
       dockerfile: Dockerfile.bot
@@ -199,15 +287,49 @@ services:
     env_file:
       - .env.production
     environment:
-      - API_BASE_URL=http://localhost:8000
-    network_mode: host
+      API_BASE_URL: http://backend:8000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    networks:
+      - vanguard-internal
+
+  # Run with: docker compose --profile bootstrap run --rm db-init/admin-init
+  db-init:
+    profiles: ["bootstrap"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-db-init
+    env_file:
+      - .env.production
+    command: ["sh", "-c", "PYTHONPATH=/app python /app/scripts/initialize_database.py && PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vanguard-internal
+    restart: "no"
+
+  admin-init:
+    profiles: ["bootstrap"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-admin-init
+    env_file:
+      - .env.production
+    command: ["sh", "-c", "PYTHONPATH=/app python /app/scripts/init_admin.py"]
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    networks:
+      - vanguard-internal
+    restart: "no"
 
 networks:
-  xboard_internal:
-    external: true
-    name: xboard_xboard_internal
+  vanguard-internal:
+    driver: bridge
 
 volumes:
   napcat_qq_data:

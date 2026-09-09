@@ -200,6 +200,25 @@ async def test_create_campaign_rejects_unknown_target_group(test_db):
 
 
 @pytest.mark.asyncio
+async def test_create_ad_only_campaign_draft_without_target_groups(test_db):
+    response = await create_ad_campaign(
+        AdCampaignCreate(
+            name="Ad-only draft without groups",
+            enabled=False,
+            status="draft",
+            delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+            send_mode=AdSendMode.INTERVAL.value,
+            interval_minutes=180,
+            target_group_ids=[],
+        ),
+        db=test_db,
+    )
+
+    assert response["data"]["delivery_policy"] == AdDeliveryPolicy.AD_ONLY.value
+    assert response["data"]["target_group_ids"] == []
+
+
+@pytest.mark.asyncio
 async def test_create_campaign_rejects_group_with_only_left_membership(test_db):
     account = TelegramAccount(
         phone='+15550009002',
@@ -223,6 +242,7 @@ async def test_create_campaign_rejects_group_with_only_left_membership(test_db):
             telegram_group_id=group.group_id,
             account_id=account.id,
             status='left',
+            ad_status='blocked',
             left_at=datetime.utcnow(),
         )
     )
@@ -809,3 +829,62 @@ async def test_ad_only_binding_requires_manual_takeover(test_db):
     await test_db.commit()
 
     await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)
+
+
+@pytest.mark.asyncio
+async def test_ad_only_binding_allows_campaign_without_groups(test_db):
+    account = TelegramAccount(
+        identifier="group-less-ad-only-account",
+        session_name="group-less-ad-only-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    campaign = AdCampaign(
+        name="Group-less Ad-only campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode=AdSendMode.INTERVAL.value,
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add_all([account, campaign])
+    await test_db.flush()
+    test_db.add(
+        AccountOperationConfig(
+            account_id=account.id,
+            operation_mode=AccountOperationMode.AD_ONLY.value,
+        )
+    )
+    await test_db.commit()
+
+    await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)
+
+
+@pytest.mark.asyncio
+async def test_ad_only_binding_rejects_growth_account_without_groups(test_db):
+    account = TelegramAccount(
+        identifier="growth-account-for-ad-only-campaign",
+        session_name="growth-account-for-ad-only-campaign",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    campaign = AdCampaign(
+        name="Ad-only campaign rejects Growth account",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode=AdSendMode.INTERVAL.value,
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add_all([account, campaign])
+    await test_db.flush()
+    test_db.add(
+        AccountOperationConfig(
+            account_id=account.id,
+            operation_mode=AccountOperationMode.GROWTH.value,
+        )
+    )
+    await test_db.commit()
+
+    with pytest.raises(HTTPException, match="does not match accounts"):
+        await _validate_ad_only_binding_scope([account.id], campaign.id, test_db)

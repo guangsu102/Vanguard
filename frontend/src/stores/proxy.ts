@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { proxiesApi, type Proxy, type ProxyListParams, type ProxyFormData } from '@/api/proxies'
-import { normalizeListPayload } from '@/utils/pagination'
+import { DEFAULT_PAGE_SIZE, normalizeListPayload, normalizePageSize } from '@/utils/pagination'
 
 export const useProxyStore = defineStore('proxy', () => {
   const list = ref<Proxy[]>([])
@@ -10,7 +10,7 @@ export const useProxyStore = defineStore('proxy', () => {
   const currentProxy = ref<Proxy | null>(null)
 
   const page = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(DEFAULT_PAGE_SIZE)
   const params = ref<ProxyListParams>({})
 
   const fetchList = async (newParams?: ProxyListParams) => {
@@ -99,7 +99,7 @@ export const useProxyStore = defineStore('proxy', () => {
   }
 
   const setPageSize = (newPageSize: number) => {
-    pageSize.value = newPageSize
+    pageSize.value = normalizePageSize(newPageSize)
     page.value = 1
   }
 

@@ -26,7 +26,7 @@ export const createDefaultAutoJoinScheduler = (): CompleteAutoJoinSchedulerConfi
     post_action_wait_seconds: 8,
     post_action_recheck_attempts: 3,
     post_action_extra_wait_seconds: 12,
-    message_limit: 20,
+    message_limit: 100,
     ai_timeout_seconds: 45,
     action_timeout_seconds: 5,
     pending_sync_min_age_seconds: 120,
@@ -45,10 +45,9 @@ export const createDefaultRiskGuard = (): AccountRiskGuardSettings => ({
   redis_fail_closed: true,
   actions: {
     search: { daily_limit: 100, cooldown_seconds: 30 },
-    join: { daily_limit: 6, cooldown_seconds: 7200 },
+    join: { daily_limit: 10, cooldown_seconds: 7200 },
     private_message: { daily_limit: 20, cooldown_seconds: 300 },
     group_message: { daily_limit: 4, cooldown_seconds: 7200 },
-    ad_probe: { daily_limit: 10, cooldown_seconds: 3600 },
     ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
     moderation: { daily_limit: 60, cooldown_seconds: 15 },
     profile_update: { daily_limit: 5, cooldown_seconds: 3600 },
@@ -96,7 +95,7 @@ export const createDefaultAssetPolicy = (): AccountAssetPolicySettings => ({
     year_3_plus: { join_multiplier: 1.3, ad_multiplier: 1.35, run_multiplier: 1.25, probe_multiplier: 1.15, age_floor_days: 1095 },
   },
 })
-export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 3, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
+export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 10, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
 export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 1800, growth_max_interval_seconds: 10800 })
 
 export const createDefaultAdCapacity = (): AdCapacitySettings => ({
@@ -106,7 +105,7 @@ export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   max_groups_per_account: 400, max_new_ad_groups_per_day: 2,
   leave_on_deleted_ad: true, block_group_on_probe_failure: true, ad_policy_ai_enabled: true,
   ad_policy_ai_model: 'gpt-5.6-terra', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
-  ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: false, ad_policy_auto_probe_daily_limit: 1,
+  ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: true,
   ad_policy_auto_probe_daily_limit_per_account: 10, ad_policy_auto_probe_interval_hours: 24, ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30, premium_min_samples: 20, premium_min_conversions: 1, premium_survival_rate_percent: 95,
   premium_clean_days_auto: 5, premium_clean_days_verified: 3, premium_growth_samples: 100, premium_full_capacity_samples: 1000,
@@ -115,4 +114,4 @@ export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   hourly_weights: {},
 })
 
-export const createDefaultAdFailurePolicy = (): AdFailurePolicy => ({ enabled: true, leave_on_group_control_failure: true, group_control_failure_limit: 1, group_control_failure_window_hours: 720, levels: ['A', 'B', 'C', 'UNRATED'] })
+export const createDefaultAdFailurePolicy = (): AdFailurePolicy => ({ enabled: true, leave_on_group_control_failure: true, group_control_failure_limit: 2, group_control_failure_window_hours: 48, levels: ['A', 'B', 'C', 'UNRATED'] })

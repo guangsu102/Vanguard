@@ -5,38 +5,55 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
-from codex_deploy_automation import REMOTE_ROOT, connect, run
+from codex_deploy_automation import (
+    HEALTH_URL,
+    REMOTE_ARCHIVE_ROOT,
+    REMOTE_BACKUP_ROOT,
+    REMOTE_ROOT,
+    connect,
+    run,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_COMPOSE = ROOT / "docker-compose.production.yml"
 
-REDIS_SETTINGS = {
-    "REDIS_PASSWORD": "",
-    "REDIS_URL": "redis://redis:6379/1",
-    "CELERY_BROKER_URL": "redis://redis:6379/1",
-    "CELERY_RESULT_BACKEND": "redis://redis:6379/2",
+REDIS_DATABASES = {
+    "REDIS_URL": 1,
+    "CELERY_BROKER_URL": 1,
+    "CELERY_RESULT_BACKEND": 2,
 }
 
 SERVICES = [
     "backend",
     "celery-worker",
     "celery-beat",
+    "resource-search-worker",
     "telegram-growth-worker",
     "telegram-guardian-worker",
 ]
 
 
 def update_env_command() -> str:
-    assignments = "\n".join(f"    {key!r}: {value!r}," for key, value in REDIS_SETTINGS.items())
     return (
         f"cd {shlex.quote(REMOTE_ROOT)} && python3 - <<'PY'\n"
         "from pathlib import Path\n"
+        "from urllib.parse import quote\n"
         "path = Path('.env.production')\n"
-        "updates = {\n"
-        f"{assignments}\n"
-        "}\n"
         "lines = path.read_text(encoding='utf-8').splitlines()\n"
+        "values = {}\n"
+        "for line in lines:\n"
+        "    stripped = line.strip()\n"
+        "    if not stripped or stripped.startswith('#') or '=' not in line:\n"
+        "        continue\n"
+        "    key, value = line.split('=', 1)\n"
+        "    values[key.strip()] = value.strip().strip(chr(34)).strip(chr(39))\n"
+        "password = values.get('REDIS_PASSWORD', '').strip()\n"
+        "if not password:\n"
+        "    raise SystemExit('REDIS_PASSWORD must be configured in .env.production')\n"
+        f"databases = {REDIS_DATABASES!r}\n"
+        "encoded_password = quote(password, safe='')\n"
+        "updates = {name: f'redis://:{encoded_password}@redis:6379/{db}' for name, db in databases.items()}\n"
         "seen = set()\n"
         "output = []\n"
         "for line in lines:\n"
@@ -64,11 +81,11 @@ def verify_redis_command() -> str:
         "import redis\n"
         "from app.core.config import settings\n"
         "for name in ('REDIS_URL', 'CELERY_BROKER_URL', 'CELERY_RESULT_BACKEND'):\n"
-        "    parsed = urlparse(getattr(settings, name))\n"
-        "    print(f'{name}: host={parsed.hostname} db={parsed.path.lstrip(\"/\")}')\n"
-        "for db in (1, 2):\n"
-        "    client = redis.Redis.from_url(f'redis://redis:6379/{db}', socket_connect_timeout=2, socket_timeout=2)\n"
-        "    print(f'redis_db_{db}_ping=' + str(client.ping()))\n"
+        "    value = getattr(settings, name)\n"
+        "    parsed = urlparse(value)\n"
+        "    print(f'{name}: host={parsed.hostname} db={parsed.path.lstrip(\"/\")} password_set={bool(parsed.password)}')\n"
+        "    client = redis.Redis.from_url(value, socket_connect_timeout=2, socket_timeout=2)\n"
+        "    print(f'{name}_ping=' + str(client.ping()))\n"
         "PY"
     )
 
@@ -90,13 +107,13 @@ def main() -> int:
         raise FileNotFoundError(LOCAL_COMPOSE)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_dir = f"/root/Vanguard.file-backups/{timestamp}_redis_fix"
-    remote_tmp = f"/root/docker-compose.production.yml.redis-fix.{timestamp}.tmp"
+    backup_dir = f"{REMOTE_BACKUP_ROOT}/{timestamp}_redis_fix"
+    remote_tmp = f"{REMOTE_ARCHIVE_ROOT}/docker-compose.production.yml.redis-fix.{timestamp}.tmp"
     services = " ".join(SERVICES)
 
     client = connect()
     try:
-        run(client, "docker ps -a --format '{{.Names}} {{.Status}} {{.Networks}}' | grep -E 'vanguard|xboard-redis' || true", timeout=120)
+        run(client, "docker ps -a --format '{{.Names}} {{.Status}} {{.Networks}}' | grep -E 'vanguard|redis' || true", timeout=120)
         run(
             client,
             (
@@ -130,7 +147,7 @@ def main() -> int:
         )
         run(
             client,
-            "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && exit 0; sleep 2; done; curl -v --max-time 10 http://127.0.0.1:8000/health",
+            f"for i in $(seq 1 30); do curl -fsS {HEALTH_URL} && exit 0; sleep 2; done; curl -v --max-time 10 {HEALTH_URL}",
             timeout=180,
         )
         run(client, verify_redis_command(), timeout=180)

@@ -74,6 +74,14 @@ services:
     container_name: vanguard-backend
     env_file:
       - .env.test001
+    environment:
+      # Keep real owned-group Telegram side effects opt-in on test001.
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     mem_limit: 1g
     pids_limit: 256
     restart: unless-stopped
@@ -104,6 +112,12 @@ services:
       CELERY_WORKER_CONCURRENCY: "2"
       CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
       CELERY_WORKER_MAX_TASKS_PER_CHILD: "50"
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     mem_limit: 768m
     pids_limit: 128
     restart: on-failure:3
@@ -135,6 +149,84 @@ services:
     healthcheck:
       disable: true
 
+  owned-group-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-owned-group-worker
+    env_file:
+      - .env.test001
+    environment:
+      CELERY_WORKER_CONCURRENCY: "1"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
+      CELERY_WORKER_MAX_TASKS_PER_CHILD: "20"
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
+    mem_limit: 512m
+    pids_limit: 96
+    restart: on-failure:3
+    command:
+      [
+        "python",
+        "-m",
+        "app.core.scheduler.worker",
+        "worker",
+        "-Q",
+        "owned_group",
+        "-H",
+        "owned-group-worker@test001",
+      ]
+    depends_on:
+      - backend
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/uploads:/app/uploads
+      - ./sessions:/app/sessions
+    networks:
+      - vanguard-internal
+    healthcheck:
+      disable: true
+
+  resource-search-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vanguard-resource-search-worker
+    env_file:
+      - .env.test001
+    environment:
+      CELERY_WORKER_CONCURRENCY: "1"
+      CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
+      CELERY_WORKER_MAX_TASKS_PER_CHILD: "20"
+    mem_limit: 512m
+    pids_limit: 96
+    restart: on-failure:3
+    command:
+      [
+        "python",
+        "-m",
+        "app.core.scheduler.worker",
+        "worker",
+        "-Q",
+        "resource_search",
+        "-H",
+        "resource-search-worker@test001",
+      ]
+    depends_on:
+      - backend
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/uploads:/app/uploads
+      - ./sessions:/app/sessions
+    networks:
+      - vanguard-internal
+    healthcheck:
+      disable: true
+
   celery-beat:
     build:
       context: .
@@ -142,6 +234,13 @@ services:
     container_name: vanguard-celery-beat
     env_file:
       - .env.test001
+    environment:
+      P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
+      P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
+      OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
+      OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
+      OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     mem_limit: 256m
     pids_limit: 64
     restart: on-failure:3

@@ -21,6 +21,50 @@ def test_production_still_rejects_missing_secret():
         _production_settings(JWT_SECRET=DEFAULT_DEV_SECRET)
 
 
+def test_owned_group_execution_defaults_off_and_kill_switch_is_available():
+    configured = Settings(_env_file=None)
+
+    assert configured.OWNED_GROUP_EXECUTION_ENABLED is False
+    assert configured.P0_SAFETY_GATE_ENABLED is True
+    assert configured.P0_SAFETY_GATE_FAIL_CLOSED is False
+    assert configured.OWNED_GROUP_KILL_SWITCH_ENABLED is False
+
+
+def test_production_owned_group_execution_requires_fail_closed_safety_gate():
+    with pytest.raises(ValueError, match="P0_SAFETY_GATE_FAIL_CLOSED"):
+        _production_settings(OWNED_GROUP_EXECUTION_ENABLED=True)
+
+
+def test_production_owned_group_execution_requires_enabled_safety_gate():
+    with pytest.raises(ValueError, match="P0_SAFETY_GATE_ENABLED"):
+        _production_settings(
+            OWNED_GROUP_EXECUTION_ENABLED=True,
+            P0_SAFETY_GATE_ENABLED=False,
+            P0_SAFETY_GATE_FAIL_CLOSED=True,
+        )
+
+
+def test_production_owned_group_execution_requires_module_enabled():
+    with pytest.raises(ValueError, match="OWNED_GROUP_MODULE_ENABLED"):
+        _production_settings(
+            OWNED_GROUP_EXECUTION_ENABLED=True,
+            OWNED_GROUP_MODULE_ENABLED=False,
+            P0_SAFETY_GATE_FAIL_CLOSED=True,
+        )
+
+
+def test_production_owned_group_execution_can_start_with_static_kill_switch_engaged():
+    configured = _production_settings(
+        OWNED_GROUP_EXECUTION_ENABLED=True,
+        P0_SAFETY_GATE_ENABLED=True,
+        P0_SAFETY_GATE_FAIL_CLOSED=True,
+        OWNED_GROUP_KILL_SWITCH_ENABLED=True,
+    )
+
+    assert configured.OWNED_GROUP_EXECUTION_ENABLED is True
+    assert configured.OWNED_GROUP_KILL_SWITCH_ENABLED is True
+
+
 def test_onebot_requires_numeric_account_and_strong_token():
     with pytest.raises(ValueError, match="numeric QQ account"):
         Settings(

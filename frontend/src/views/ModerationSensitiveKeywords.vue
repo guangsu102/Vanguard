@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { ElButton, ElDialog, ElForm, ElFormItem, ElInput, ElInputNumber, ElMessage, ElSelect, ElOption, ElSwitch, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { guardianApi, type ManagedGroupBinding, type ModerationSensitiveKeyword } from '@/api/guardian'
 import ClientListPagination from '@/components/ClientListPagination.vue'
+import { DEFAULT_PAGE_SIZE } from '@/utils/pagination'
 
 const route = useRoute()
 const loading = ref(false)
@@ -11,7 +12,7 @@ const dialogVisible = ref(false)
 const keywords = ref<ModerationSensitiveKeyword[]>([])
 const keywordTotal = ref(0)
 const keywordPage = ref(1)
-const keywordPageSize = ref(20)
+const keywordPageSize = ref(DEFAULT_PAGE_SIZE)
 const managedGroups = ref<ManagedGroupBinding[]>([])
 const currentGroupId = ref<number | undefined>()
 

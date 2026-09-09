@@ -74,9 +74,12 @@ class RiskDecision:
 
 DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.SEARCH: RiskBudget(daily_limit=100, cooldown_seconds=30),
-    AccountRiskAction.JOIN: RiskBudget(daily_limit=6, cooldown_seconds=7200),
+    AccountRiskAction.JOIN: RiskBudget(daily_limit=10, cooldown_seconds=7200),
     AccountRiskAction.PRIVATE_MESSAGE: RiskBudget(daily_limit=40, cooldown_seconds=45),
     AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=4, cooldown_seconds=7200),
+    # AD_PROBE is a system-owned safety valve.  It is intentionally absent
+    # from the editable account-risk settings and always falls back to this
+    # fixed 10/day, 1-hour cooldown budget.
     AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=10, cooldown_seconds=3600),
     AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=1, cooldown_seconds=21600),
     AccountRiskAction.MODERATION: RiskBudget(daily_limit=60, cooldown_seconds=15),
@@ -173,6 +176,7 @@ if outbound_limit > 0 then redis.call("INCR", KEYS[2]); redis.call("EXPIRE", KEY
 if cooldown_seconds > 0 then redis.call("SET", KEYS[3], now + cooldown_seconds, "EX", cooldown_seconds) end
 return {1, 0, 0}
 """
+
 
 class AccountRiskGuard:
     """Central risk gate for account-level Telegram operations."""
@@ -617,11 +621,13 @@ class AccountRiskGuard:
                 db_account, datetime.utcnow(), risk_settings=risk_settings, commit=False
             )
         group_scoped_write_failure = (
-            status == "failure"
-            and reason == "group_write_forbidden"
-            and target_type == "group"
+            status == "failure" and reason == "group_write_forbidden" and target_type == "group"
         )
-        if db_account is not None and status in {"failure", "freeze"} and not group_scoped_write_failure:
+        if (
+            db_account is not None
+            and status in {"failure", "freeze"}
+            and not group_scoped_write_failure
+        ):
             now = datetime.utcnow()
             db_account.last_risk_event_at = now
             db_account.last_risk_decay_at = now
@@ -641,9 +647,7 @@ class AccountRiskGuard:
             self.db.add(db_account)
         await self.db.commit()
 
-    async def should_leave_group_after_write_forbidden(
-        self, account: Any, target_id: Any
-    ) -> bool:
+    async def should_leave_group_after_write_forbidden(self, account: Any, target_id: Any) -> bool:
         """Return whether repeated write failures require leaving this group."""
         account_id = self._account_id(account)
         canonical_target_id = self._canonical_group_target_id(target_id)
@@ -833,7 +837,9 @@ class AccountRiskGuard:
             else 0
         )
         action_limit = 0 if action == AccountRiskAction.AD_DELIVERY else int(budget.daily_limit)
-        cooldown_seconds = 0 if action == AccountRiskAction.AD_DELIVERY else int(budget.cooldown_seconds)
+        cooldown_seconds = (
+            0 if action == AccountRiskAction.AD_DELIVERY else int(budget.cooldown_seconds)
+        )
         now = int(datetime.utcnow().timestamp())
         ttl = 48 * 3600
 
@@ -842,8 +848,14 @@ class AccountRiskGuard:
             result = await client.eval(
                 ATOMIC_BUDGET_RESERVATION_LUA,
                 3,
-                action_key, outbound_key, cooldown_key,
-                action_limit, outbound_limit, cooldown_seconds, now, ttl,
+                action_key,
+                outbound_key,
+                cooldown_key,
+                action_limit,
+                outbound_limit,
+                cooldown_seconds,
+                now,
+                ttl,
             )
             allowed, reason_code, retry_after = (int(value) for value in result)
             if allowed:
@@ -1042,9 +1054,12 @@ class AccountRiskGuard:
         await self.db.refresh(account)
         return account
 
-
     @staticmethod
     def _budget_for_action(action: AccountRiskAction, risk_settings: dict[str, Any]) -> RiskBudget:
+        if action == AccountRiskAction.AD_PROBE:
+            # Never trust a stale database row or an old client payload for
+            # this system-owned safety valve.
+            return DEFAULT_ACTION_BUDGETS[action]
         raw = risk_settings.get("actions", {}).get(action.value, {})
         default = DEFAULT_ACTION_BUDGETS[action]
         return RiskBudget(

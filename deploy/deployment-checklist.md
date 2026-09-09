@@ -32,7 +32,7 @@
 - [ ] 已在 Sub2API 后台轮换 Admin API Key；本次排查中使用过的旧 Key 不再继续使用
 - [ ] Vanguard 已配置 `SUB2API_ENABLED=true`、`SUB2API_BASE_URL=https://api.pipenai.xyz`、新 `SUB2API_ADMIN_API_KEY` 和合理的 `SUB2API_TIMEOUT`
 - [ ] 已生成独立的 32 字符以上随机 HMAC Secret，Vanguard 的 `SUB2API_ALERT_WEBHOOK_SECRET` 与 Sub2API 的 `VANGUARD_WEBHOOK_SECRET` 完全一致
-- [ ] Sub2API 已配置 `VANGUARD_WEBHOOK_BASE_URL=https://www.dh113.xyz/api/integrations/sub2api`、稳定且唯一的 `VANGUARD_WEBHOOK_INSTANCE_ID`、正确的 `VANGUARD_WEBHOOK_SOURCE_URL`
+- [ ] Sub2API 已配置 `VANGUARD_WEBHOOK_BASE_URL=https://vanguard.pipenai.xyz/api/integrations/sub2api`、稳定且唯一的 `VANGUARD_WEBHOOK_INSTANCE_ID`、正确的 `VANGUARD_WEBHOOK_SOURCE_URL`
 - [ ] Sub2API 已配置 `OPS_ENABLED=true`，并已启用需要转发的告警规则
 - [ ] 两台服务器时间已通过 NTP 同步，时钟偏差小于 `SUB2API_ALERT_TIMESTAMP_TOLERANCE`（默认 300 秒）
 - [ ] Vanguard 通知设置已明确：是否开启 Sub2API 告警/恢复通知、公告通知、Telegram/QQ 目标群

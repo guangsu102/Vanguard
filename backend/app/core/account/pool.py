@@ -16,21 +16,28 @@ import asyncio
 import time
 import weakref
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import structlog
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from app.core.account.decodo import DecodoClient, get_decodo_client
+from app.core.account.environment_guard import AccountEnvironmentGuard
 from app.core.account.evomi import EvomiClient, ProxyInfo, get_evomi_client
 from app.core.account.models import AccountStatus, AccountType, ProxyMode
+from app.core.account.operation_lease import (
+    AccountOperationLeaseBusy,
+    AccountOperationLeaseHandle,
+    AccountOperationLeaseManager,
+    AccountOperationLeaseUnavailable,
+)
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
 from app.core.account.session_crypto import decrypt_session_string
-from app.core.account.environment_guard import AccountEnvironmentGuard
 from app.core.network.fingerprint import FingerprintManager
 
 if TYPE_CHECKING:
@@ -40,6 +47,10 @@ StaticProxyResolver = Callable[[int], Awaitable[ResolvedProxy]]
 
 logger = structlog.get_logger()
 _ACCOUNT_POOLS = weakref.WeakSet()
+
+TELEGRAM_CONNECTION_RETRIES = 10
+TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS = 2
+TELEGRAM_CONNECTION_TIMEOUT_SECONDS = 20
 
 
 def _resolve_account_api_credentials(account: "TelegramAccount") -> tuple[str, str]:
@@ -100,6 +111,9 @@ class TelegramAccountWrapper:
     current_proxy: Optional[ProxyInfo] = field(default=None, repr=False)
     current_proxy_country: Optional[str] = field(default=None, repr=False)
     keep_connected: bool = field(default=False, repr=False)
+    operation_lease: Optional[AccountOperationLeaseHandle] = field(default=None, repr=False)
+    operation_lease_renewal_task: Optional[asyncio.Task[None]] = field(default=None, repr=False)
+    operation_lease_lost: bool = field(default=False, repr=False)
 
     def get_client(self) -> Optional[TelegramClient]:
         """Get the bound Telegram client."""
@@ -178,6 +192,7 @@ class AccountPool:
         self,
         strategy: str = "least_used",
         static_proxy_resolver: Optional[StaticProxyResolver] = None,
+        operation_lease_manager: Optional[AccountOperationLeaseManager] = None,
     ):
         """
         Initialize AccountPool.
@@ -193,8 +208,100 @@ class AccountPool:
         self._decodo_client: Optional[DecodoClient] = None
         self._session_dir: Optional[Path] = None
         self._static_proxy_resolver = static_proxy_resolver
+        self._operation_lease_manager = operation_lease_manager or AccountOperationLeaseManager()
         self.logger = logger.bind(module="account_pool")
         _ACCOUNT_POOLS.add(self)
+
+    async def _claim_operation_lease(
+        self,
+        account: TelegramAccountWrapper,
+        purpose: str,
+        *,
+        raise_on_failure: bool = False,
+    ) -> bool:
+        try:
+            handle = await self._operation_lease_manager.acquire(
+                account.account_id,
+                owner=f"account-pool:{purpose}",
+                ttl_seconds=600,
+            )
+        except AccountOperationLeaseUnavailable as exc:
+            self.logger.warning(
+                "account_operation_lease_unavailable",
+                account_id=account.account_id,
+                purpose=purpose,
+                error=str(exc),
+            )
+            if raise_on_failure:
+                raise
+            return False
+        if handle is None:
+            self.logger.info(
+                "account_operation_lease_busy",
+                account_id=account.account_id,
+                purpose=purpose,
+            )
+            if raise_on_failure:
+                raise AccountOperationLeaseBusy(
+                    f"account operation lease busy: account_id={account.account_id} purpose={purpose}"
+                )
+            return False
+        account.operation_lease = handle
+        account.operation_lease_lost = False
+        account.operation_lease_renewal_task = asyncio.create_task(
+            self._renew_operation_lease(account, handle),
+            name=f"account-operation-lease-{account.account_id}",
+        )
+        return True
+
+    async def _renew_operation_lease(
+        self,
+        account: TelegramAccountWrapper,
+        handle: AccountOperationLeaseHandle,
+    ) -> None:
+        interval = max(10.0, min(60.0, handle.ttl_seconds / 3))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if account.operation_lease is not handle:
+                    return
+                try:
+                    renewed = await self._operation_lease_manager.refresh(handle)
+                except AccountOperationLeaseUnavailable as exc:
+                    renewed = False
+                    error = str(exc)
+                else:
+                    error = "账号操作租约所有权已丢失" if not renewed else None
+                if renewed:
+                    continue
+
+                account.operation_lease_lost = True
+                account.status = AccountStatus.ERROR
+                self.logger.error(
+                    "account_operation_lease_lost",
+                    account_id=account.account_id,
+                    owner=handle.owner,
+                    error=error,
+                )
+                if account.client is not None:
+                    with suppress(Exception):
+                        if account.client.is_connected():
+                            await account.client.disconnect()
+                    account.client = None
+                return
+        except asyncio.CancelledError:
+            raise
+
+    async def _release_operation_lease(self, account: TelegramAccountWrapper) -> None:
+        renewal_task = account.operation_lease_renewal_task
+        account.operation_lease_renewal_task = None
+        if renewal_task is not None and renewal_task is not asyncio.current_task():
+            renewal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal_task
+        handle = account.operation_lease
+        account.operation_lease = None
+        await self._operation_lease_manager.release(handle)
 
     def set_static_proxy_resolver(self, resolver: Optional[StaticProxyResolver]) -> None:
         """Set a fallback resolver for static proxies not preloaded from DB."""
@@ -239,6 +346,7 @@ class AccountPool:
             return
 
         await self._disconnect_account_client(account, reason="proxy_policy_generation_mismatch")
+        await self._release_operation_lease(account)
         self._accounts.pop(account.session_name, None)
         raise RuntimeError(
             f"Proxy policy changed for account {account.account_id}; reload the account before reconnecting"
@@ -254,6 +362,7 @@ class AccountPool:
             if account is None:
                 return False
             await self._disconnect_account_client(account, reason=reason)
+            await self._release_operation_lease(account)
             self._accounts.pop(account.session_name, None)
             self.logger.info(
                 "account_invalidated",
@@ -450,6 +559,8 @@ class AccountPool:
                     session_name=session_name,
                 )
 
+            await self._disconnect_account_client(account, reason="account_removed")
+            await self._release_operation_lease(account)
             del self._accounts[session_name]
             self.logger.info(
                 "account_removed",
@@ -515,7 +626,17 @@ class AccountPool:
                 if filtered:
                     available = filtered
 
-            selected = self._select_account(available)
+            selected = None
+            while available:
+                candidate = self._select_account(available)
+                if await self._claim_operation_lease(candidate, purpose):
+                    selected = candidate
+                    break
+                available.remove(candidate)
+            if selected is None:
+                self.logger.warning("no_unlocked_accounts", purpose=purpose)
+                return None
+            previous_status = selected.status
             selected.status = AccountStatus.WORKING
 
             try:
@@ -529,8 +650,13 @@ class AccountPool:
                     country=selected.country_code,
                     proxy_host=selected.current_proxy.host if selected.current_proxy else None,
                 )
+            except asyncio.CancelledError:
+                selected.status = previous_status
+                await self._release_operation_lease(selected)
+                raise
             except Exception as e:
                 selected.status = AccountStatus.ERROR
+                await self._release_operation_lease(selected)
                 self.logger.warning(
                     "account_acquire_failed",
                     session_name=selected.session_name,
@@ -555,6 +681,8 @@ class AccountPool:
         account_id: int,
         purpose: str = "default",
         require_session: bool = True,
+        operation_lease: Optional[AccountOperationLeaseHandle] = None,
+        raise_on_lease_failure: bool = False,
     ) -> Optional[TelegramAccountWrapper]:
         """
         Acquire a specific account by database ID.
@@ -563,6 +691,7 @@ class AccountPool:
             account_id: Telegram account database ID
             purpose: Purpose for logging/debugging
             require_session: If True, only return accounts with a session
+            raise_on_lease_failure: Surface lease contention/backend failures to opted-in callers
 
         Returns:
             TelegramAccountWrapper if available, None otherwise
@@ -585,12 +714,27 @@ class AccountPool:
                     status=selected.status.value,
                     purpose=purpose,
                 )
+                if raise_on_lease_failure and selected.status == AccountStatus.WORKING:
+                    raise AccountOperationLeaseBusy(
+                        f"account operation lease busy: account_id={account_id} purpose={purpose}"
+                    )
                 return None
 
             if require_session and not selected.session_exists:
                 self.logger.warning("account_session_missing", account_id=account_id, purpose=purpose)
                 return None
 
+            if operation_lease is not None:
+                if operation_lease.account_id != account_id:
+                    raise ValueError("账号租约与指定账号不匹配")
+            elif not await self._claim_operation_lease(
+                selected,
+                purpose,
+                raise_on_failure=raise_on_lease_failure,
+            ):
+                return None
+
+            previous_status = selected.status
             selected.status = AccountStatus.WORKING
 
             try:
@@ -598,8 +742,15 @@ class AccountPool:
                 await self._ensure_proxy(selected)
                 if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
                     selected.client = await self._create_client(selected)
+            except asyncio.CancelledError:
+                selected.status = previous_status
+                if operation_lease is None:
+                    await self._release_operation_lease(selected)
+                raise
             except Exception as e:
                 selected.status = AccountStatus.ERROR
+                if operation_lease is None:
+                    await self._release_operation_lease(selected)
                 self.logger.warning(
                     "account_acquire_by_id_failed",
                     account_id=account_id,
@@ -743,6 +894,11 @@ class AccountPool:
             app_version=app_version,
             lang_code=lang_code,
             system_lang_code=lang_code,
+            auto_reconnect=True,
+            connection_retries=TELEGRAM_CONNECTION_RETRIES,
+            retry_delay=TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS,
+            timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
+            base_logger=f"vanguard.telethon.account.{account.account_id}",
         )
         await client.connect()
         if not await client.is_user_authorized():
@@ -896,7 +1052,10 @@ class AccountPool:
                     )
             if not account.keep_connected:
                 account.client = None
-            account.status = AccountStatus.IDLE
+            await self._release_operation_lease(account)
+            account.status = (
+                AccountStatus.ERROR if account.operation_lease_lost else AccountStatus.IDLE
+            )
 
             self.logger.debug(
                 "account_released",
@@ -1053,6 +1212,9 @@ class AccountPool:
                 "banned": 0,
                 "working": 0,
                 "idle": 0,
+                "healthy": 0,
+                "schedulable": 0,
+                "connected": 0,
                 "healthy_ratio": 0.0,
                 "with_session": 0,
             }
@@ -1068,11 +1230,18 @@ class AccountPool:
                     results["with_session"] += 1
 
                 if account.status not in [AccountStatus.ERROR, AccountStatus.BANNED]:
-                    results["online"] += 1
+                    results["healthy"] += 1
                     total_health += account.health_score
 
-            if results["online"] > 0:
-                results["healthy_ratio"] = total_health / results["online"]
+                if account.is_available and account.session_exists:
+                    results["schedulable"] += 1
+
+                client = account.client
+                if client is not None and getattr(client, "is_connected", lambda: False)():
+                    results["connected"] += 1
+
+            if results["healthy"] > 0:
+                results["healthy_ratio"] = total_health / results["healthy"]
 
             return results
 
@@ -1229,6 +1398,7 @@ class AccountPool:
                         )
                     finally:
                         account.client = None
+                await self._release_operation_lease(account)
 
             self._accounts.clear()
             self.logger.info("pool_cleared")

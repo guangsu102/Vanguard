@@ -23,7 +23,7 @@ const {
   pageSize: statusPageSize,
   total: statusTotal,
   rows: pagedStatuses,
-} = useClientPagination(statusSource, 10)
+} = useClientPagination(statusSource)
 
 function pct(value?: number) {
   return `${Math.round(Number(value || 0) * 100)}%`

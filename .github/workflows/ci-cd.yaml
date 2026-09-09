@@ -211,7 +211,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment:
       name: production
-      url: https://vanguard.example.com
+      url: https://vanguard.pipenai.xyz
 
     steps:
       - uses: actions/checkout@v4
@@ -241,7 +241,7 @@ jobs:
             docker-compose up -d --no-deps
 
             # Smoke tests
-            curl -f https://vanguard.example.com/health || (docker-compose logs && exit 1)
+            curl -f https://vanguard.pipenai.xyz/health || (docker-compose logs && exit 1)
 
   # ==================== Security Scan ====================
   security-scan:

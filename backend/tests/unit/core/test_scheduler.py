@@ -5,8 +5,8 @@ Tests for tasks, alerts, and worker management.
 """
 
 import asyncio
+import subprocess
 import sys
-
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -185,12 +185,15 @@ class TestCeleryConfig:
 
         beat_schedule = celery_app.conf.beat_schedule
 
+        assert celery_app.conf.timezone == "Asia/Shanghai"
+
         # Check for 30-second task
         assert "campaign-check-every-30s" in beat_schedule
         assert beat_schedule["campaign-check-every-30s"]["schedule"] == 30.0
         assert "auto-join-groups-dispatcher-every-5min" in beat_schedule
         auto_join_schedule = beat_schedule["auto-join-groups-dispatcher-every-5min"]
         assert str(auto_join_schedule["schedule"]) == "<crontab: */5 * * * * (m/h/dM/MY/d)>"
+        assert set(auto_join_schedule["schedule"].minute) == set(range(0, 60, 5))
         assert auto_join_schedule["kwargs"] == {
             "scheduled": True,
             "keywords_per_account": 10,
@@ -202,6 +205,23 @@ class TestCeleryConfig:
         assert beat_schedule["check-ad-survival-every-2min"]["schedule"] == 120.0
         assert "group-ai-warmup-dispatcher-every-30min" in beat_schedule
         ad_policy_audit_schedule = beat_schedule["audit-group-ad-policies-hourly"]
+        ad_policy_probe_schedule = beat_schedule["auto-probe-unknown-ad-policies-every-5min"]
+        assert set(ad_policy_probe_schedule["schedule"].minute) == set(range(2, 60, 5))
+        assert set(ad_policy_audit_schedule["schedule"].minute) == {19}
+        assert {
+            str(schedule["schedule"].tz)
+            for schedule in (
+                auto_join_schedule,
+                ad_policy_probe_schedule,
+                ad_policy_audit_schedule,
+            )
+        } == {"Asia/Shanghai"}
+        assert set(auto_join_schedule["schedule"].minute).isdisjoint(
+            ad_policy_probe_schedule["schedule"].minute
+        )
+        assert 19 not in auto_join_schedule["schedule"].minute
+        assert 19 not in ad_policy_probe_schedule["schedule"].minute
+        assert ad_policy_audit_schedule["kwargs"] == {"limit": 20}
         assert ad_policy_audit_schedule["options"]["rate_limit"] == "1/h"
 
     def test_ad_delivery_runtime_interval_is_not_shortened(self):
@@ -233,7 +253,11 @@ class TestCeleryConfig:
                     }
                 ),
             ),
-            patch.object(tasks, "_new_scheduler_redis_client", new=AsyncMock(return_value=redis_client)),
+            patch.object(
+                tasks,
+                "_new_scheduler_redis_client",
+                new=AsyncMock(return_value=redis_client),
+            ),
             patch.object(tasks.time, "time", return_value=1000.0),
         ):
             reservation = asyncio.run(tasks._reserve_ad_delivery_execution())
@@ -251,7 +275,11 @@ class TestCeleryConfig:
         redis_client.delete = AsyncMock()
         redis_client.aclose = AsyncMock()
 
-        with patch.object(tasks, "_new_scheduler_redis_client", new=AsyncMock(return_value=redis_client)):
+        with patch.object(
+            tasks,
+            "_new_scheduler_redis_client",
+            new=AsyncMock(return_value=redis_client),
+        ):
             asyncio.run(tasks._finish_ad_delivery_execution(1234.5))
 
         redis_client.set.assert_awaited_once_with(tasks.AD_DELIVERY_LAST_RUN_KEY, "1234.5")
@@ -375,6 +403,25 @@ class TestTaskDefinitions:
 
         assert get_task_status is not None
 
+    def test_auto_probe_unknown_group_task_propagates_failures(self):
+        from app.core.scheduler import tasks
+        from app.modules.acquisition import automation as acquisition_automation
+
+        with (
+            patch.object(
+                acquisition_automation,
+                "run_auto_group_ad_policy_probe_with_db",
+                new=MagicMock(return_value=object()),
+            ),
+            patch.object(
+                tasks,
+                "_run_async",
+                side_effect=RuntimeError("probe workflow failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="^probe workflow failed$"):
+                tasks.auto_probe_unknown_group_ad_policies_task.run()
+
     def test_result_skip_reasons_counts_only_skip_details(self):
         from app.core.scheduler.tasks import _result_skip_reasons
 
@@ -401,9 +448,9 @@ class TestSchedulerModuleExports:
     def test_scheduler_exports_tasks(self):
         """Test __init__.py exports tasks."""
         from app.core.scheduler import (
+            campaign_check_task,
             health_check_accounts,
             send_bulk_messages,
-            campaign_check_task,
         )
 
         assert health_check_accounts is not None
@@ -414,8 +461,8 @@ class TestSchedulerModuleExports:
         """Test __init__.py exports alert components."""
         from app.core.scheduler import (
             AlertManager,
-            TaskAlertManager,
             AlertSeverity,
+            TaskAlertManager,
         )
 
         assert AlertManager is not None
@@ -425,11 +472,11 @@ class TestSchedulerModuleExports:
     def test_scheduler_exports_worker(self):
         """Test __init__.py exports worker functions."""
         from app.core.scheduler import (
-            start_worker,
+            QUEUE_CONFIGS,
+            get_worker_status,
             start_beat,
             start_flower,
-            get_worker_status,
-            QUEUE_CONFIGS,
+            start_worker,
         )
 
         assert start_worker is not None
@@ -437,6 +484,17 @@ class TestSchedulerModuleExports:
         assert start_flower is not None
         assert get_worker_status is not None
         assert QUEUE_CONFIGS is not None
+
+    def test_worker_cli_help_has_no_runpy_reimport_warning(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "app.core.scheduler.worker", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert "found in sys.modules after import of package" not in result.stderr
 
     def test_all_tasks_in_exports(self):
         """Test all tasks are in __all__."""

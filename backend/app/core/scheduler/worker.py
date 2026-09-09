@@ -36,7 +36,13 @@ QUEUE_CONFIGS = {
     "bulk_import": {"concurrency": _env_int("CELERY_BULK_IMPORT_CONCURRENCY", 2), "prefetch_multiplier": 1},
     "broadcast": {"concurrency": _env_int("CELERY_BROADCAST_CONCURRENCY", 3), "prefetch_multiplier": 1},
     "automation": {"concurrency": _env_int("CELERY_AUTOMATION_CONCURRENCY", 3), "prefetch_multiplier": 1},
+    "resource_search": {"concurrency": 1, "prefetch_multiplier": 1},
     "qq_commands": {"concurrency": _env_int("CELERY_QQ_COMMANDS_CONCURRENCY", 2), "prefetch_multiplier": 1},
+    # Owned-group operations are deliberately isolated from the general
+    # automation queues.  They can hold a Telegram account lease while waiting
+    # for a remote verification result, so sharing the queue makes the safety
+    # and stop controls difficult to reason about.
+    "owned_group": {"concurrency": _env_int("CELERY_OWNED_GROUP_CONCURRENCY", 1), "prefetch_multiplier": 1},
 }
 
 
@@ -115,6 +121,7 @@ def start_multi_workers() -> None:
         ("worker-default", ["default", "bulk_import", "proxy_validation"], "default-worker@%h"),
         ("worker-automation", ["automation"], "automation-worker@%h"),
         ("worker-qq", ["qq_commands"], "qq-worker@%h"),
+        ("worker-owned-group", ["owned_group"], "owned-group-worker@%h"),
     ]
 
     processes = []

@@ -177,6 +177,26 @@ class SearchKeywordSource(str, Enum):
     AUTOMATION = "automation"
 
 
+class ResourceSearchStatus(str, Enum):
+    """Lifecycle of a manual, read-only resource search."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ResourceReviewStatus(str, Enum):
+    """Manual analysis status for a discovered group resource."""
+
+    PENDING = "pending"
+    SHORTLISTED = "shortlisted"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
 # =============================================================================
 # Search & Tracking Models
 # =============================================================================
@@ -300,6 +320,12 @@ class AutoJoinAttempt(Base):
         String(255), nullable=True, comment="跳过/失败原因"
     )
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True, comment="错误详情")
+    telegram_action_attempted: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        comment="是否已实际调用 Telegram 加群请求",
+    )
     attempted_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
@@ -310,6 +336,12 @@ class AutoJoinAttempt(Base):
 
     __table_args__ = (
         Index("idx_auto_join_account_status", "account_id", "status"),
+        Index(
+            "idx_auto_join_account_action_attempted",
+            "account_id",
+            "telegram_action_attempted",
+            "attempted_at",
+        ),
         Index("idx_auto_join_attempted_at", "attempted_at"),
         Index("idx_auto_join_tg_group", "telegram_group_id"),
     )
@@ -709,6 +741,10 @@ class ConversationContext(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 
+    __table_args__ = (
+        Index("idx_acquisition_conversation_context_expires", "expires_at"),
+    )
+
     def get_context(self) -> dict:
         """Get context data as dict."""
         if not self.context_data:
@@ -743,10 +779,136 @@ class ConversationContext(Base):
         history.append(
             {"role": role, "content": content, "timestamp": datetime.utcnow().isoformat()}
         )
-        # Keep only last 10 messages
         if len(history) > 10:
             history = history[-10:]
         self.message_history = json.dumps(history, ensure_ascii=False)
+
+
+class ResourceSearchRun(Base):
+    """One manually requested, multi-account Telegram resource search."""
+
+    __tablename__ = "acquisition_resource_search_run"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    keywords_json: Mapped[str] = mapped_column(Text, nullable=False, comment="搜索关键词JSON")
+    account_ids_json: Mapped[str] = mapped_column(Text, nullable=False, comment="搜索账号ID JSON")
+    max_results_per_keyword: Mapped[int] = mapped_column(
+        Integer, default=20, nullable=False, comment="每账号每关键词最大结果数"
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default=ResourceSearchStatus.QUEUED.value, nullable=False
+    )
+    total_accounts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    completed_accounts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    successful_accounts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_accounts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    raw_result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unique_result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    account_tasks = relationship(
+        "ResourceSearchAccountTask",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    results = relationship(
+        "ResourceSearchResult",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        lazy="noload",
+    )
+
+    __table_args__ = (
+        Index("idx_resource_search_run_status_created", "status", "created_at"),
+    )
+
+
+class ResourceSearchAccountTask(Base):
+    """Per-account execution state within a resource search run."""
+
+    __tablename__ = "acquisition_resource_search_account"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("acquisition_resource_search_run.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"), nullable=True
+    )
+    account_identifier: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default=ResourceSearchStatus.QUEUED.value, nullable=False
+    )
+    keywords_completed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    successful_keywords: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    flood_wait_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    run = relationship("ResourceSearchRun", back_populates="account_tasks")
+    account = relationship("TelegramAccount", lazy="joined")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "account_id", name="uq_resource_search_run_account"),
+        Index("idx_resource_search_account_run_status", "run_id", "status"),
+    )
+
+
+class ResourceSearchResult(Base):
+    """Deduplicated group resource discovered during a manual search run."""
+
+    __tablename__ = "acquisition_resource_search_result"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("acquisition_resource_search_run.id", ondelete="CASCADE"), nullable=False
+    )
+    dedupe_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    telegram_group_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    title: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    username: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    invite_link: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    member_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_private: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    matched_keywords_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    discovered_by_account_ids_json: Mapped[str] = mapped_column(
+        Text, default="[]", nullable=False
+    )
+    discovery_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    review_status: Mapped[str] = mapped_column(
+        String(20), default=ResourceReviewStatus.PENDING.value, nullable=False
+    )
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    first_found_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    last_found_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reviewed_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    run = relationship("ResourceSearchRun", back_populates="results")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "dedupe_key", name="uq_resource_search_run_dedupe"),
+        Index("idx_resource_search_result_run_review", "run_id", "review_status"),
+        Index("idx_resource_search_result_group", "telegram_group_id"),
+        Index("idx_resource_search_result_members", "member_count"),
+    )
 
 
 # =============================================================================
@@ -910,7 +1072,7 @@ class AdCampaign(Base):
         Integer, default=1, nullable=False, comment="单群每日上限"
     )
     max_sends_per_account_per_day: Mapped[int] = mapped_column(
-        Integer, default=3, nullable=False, comment="单账号每日上限"
+        Integer, default=10, nullable=False, comment="单账号每日上限"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
@@ -1401,6 +1563,17 @@ class GroupAdHandover(Base):
     campaign_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("ad_campaign.id", ondelete="SET NULL"), nullable=True
     )
+    batch_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    queue_position: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    join_interval_min_minutes: Mapped[int] = mapped_column(
+        Integer, default=1, server_default="1", nullable=False
+    )
+    join_interval_max_minutes: Mapped[int] = mapped_column(
+        Integer, default=30, server_default="30", nullable=False
+    )
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     invite_link_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     invite_secret_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True
@@ -1424,6 +1597,7 @@ class GroupAdHandover(Base):
     membership_previous_json: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )
+    campaign_previous_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
         String(30), default="queued", nullable=False
     )
@@ -1475,6 +1649,19 @@ class GroupAdHandover(Base):
             "status",
             "updated_at",
         ),
+        Index(
+            "idx_group_ad_handover_join_queue",
+            "workflow_type",
+            "status",
+            "next_attempt_at",
+        ),
+        Index(
+            "idx_group_ad_handover_account_queue",
+            "target_ad_only_account_id",
+            "status",
+            "next_attempt_at",
+        ),
+        Index("idx_group_ad_handover_batch", "batch_id", "queue_position"),
     )
 
 

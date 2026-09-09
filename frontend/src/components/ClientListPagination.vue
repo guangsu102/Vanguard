@@ -1,5 +1,8 @@
 <script setup lang="ts">
-withDefaults(
+import { computed } from 'vue'
+import { normalizePageSize, normalizePageSizeOptions, PAGE_SIZE_OPTIONS } from '@/utils/pagination'
+
+const props = withDefaults(
   defineProps<{
     page: number
     pageSize: number
@@ -7,7 +10,7 @@ withDefaults(
     pageSizes?: number[]
   }>(),
   {
-    pageSizes: () => [10, 20, 50, 100],
+    pageSizes: () => [...PAGE_SIZE_OPTIONS],
   },
 )
 
@@ -15,6 +18,8 @@ const emit = defineEmits<{
   (event: 'update:page', value: number): void
   (event: 'update:pageSize', value: number): void
 }>()
+
+const normalizedPageSizes = computed(() => normalizePageSizeOptions(props.pageSizes))
 </script>
 
 <template>
@@ -22,12 +27,12 @@ const emit = defineEmits<{
     <el-pagination
       :current-page="page"
       :page-size="pageSize"
-      :page-sizes="pageSizes"
+      :page-sizes="normalizedPageSizes"
       :total="total"
       background
       layout="total, sizes, prev, pager, next, jumper"
       @update:current-page="emit('update:page', $event)"
-      @update:page-size="emit('update:pageSize', $event)"
+      @update:page-size="emit('update:pageSize', normalizePageSize($event))"
     />
   </div>
 </template>

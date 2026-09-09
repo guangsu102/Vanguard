@@ -8,6 +8,7 @@ import {
   type AccountType,
   type AccountUpdateData,
 } from '@/api/accounts'
+import { DEFAULT_PAGE_SIZE, normalizePageSize } from '@/utils/pagination'
 
 export const useAccountStore = defineStore('account', () => {
   const list = ref<Account[]>([])
@@ -17,7 +18,7 @@ export const useAccountStore = defineStore('account', () => {
   const nextCursor = ref<string | null>(null)
 
   const page = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(DEFAULT_PAGE_SIZE)
   const params = ref<AccountListParams>({})
 
   const hasMore = computed(() => Boolean(nextCursor.value))
@@ -136,7 +137,7 @@ export const useAccountStore = defineStore('account', () => {
   }
 
   const setPageSize = (newPageSize: number) => {
-    pageSize.value = newPageSize
+    pageSize.value = normalizePageSize(newPageSize)
     page.value = 1
   }
 

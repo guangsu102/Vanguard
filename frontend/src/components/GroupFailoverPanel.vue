@@ -6,6 +6,7 @@ import dayjs from 'dayjs'
 
 import { accountsApi, type Account } from '@/api/accounts'
 import { automationApi, type GroupFailoverStatus, type GroupFailoverTask } from '@/api/automation'
+import { DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from '@/utils/pagination'
 
 const loading = ref(false)
 const running = ref('')
@@ -15,7 +16,7 @@ const summary = ref<Partial<Record<GroupFailoverStatus, number>>>({})
 const total = ref(0)
 const statusFilter = ref<GroupFailoverStatus | ''>('')
 const page = ref(1)
-const pageSize = ref(20)
+const pageSize = ref(DEFAULT_PAGE_SIZE)
 const form = reactive({
   max_tasks: 20,
   dry_run: false,
@@ -260,7 +261,7 @@ onMounted(() => Promise.all([loadAccounts(), loadTasks()]))
         v-model:current-page="page"
         v-model:page-size="pageSize"
         :total="total"
-        :page-sizes="[10, 20, 50, 100]"
+        :page-sizes="PAGE_SIZE_OPTIONS"
         background
         layout="total, sizes, prev, pager, next, jumper"
         @current-change="handlePageChange"

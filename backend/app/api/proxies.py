@@ -10,19 +10,21 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
 from app.core.account.models import Proxy, ProxyMode, ProxyType, TelegramAccount
 from app.core.account.pool import invalidate_account_in_all_pools
 from app.core.account.proxy_policy_events import publish_account_proxy_policy_changed
+from app.core.database import get_db
 from app.core.network.proxy_pool import ProxyPool
 from app.core.scheduler.tasks import validate_proxy_batch
 
 
 router = APIRouter()
-MAX_STATIC_PROXY_BINDINGS = 3
+# A single healthy static proxy may safely serve up to ten accounts. Keep the
+# limit centralized so API responses and account-binding validation agree.
+MAX_STATIC_PROXY_BINDINGS = 10
 
 
 async def _bound_static_accounts(db: AsyncSession, proxy_id: int) -> list[TelegramAccount]:
@@ -132,14 +134,13 @@ def _proxy_to_response(proxy: Proxy, bound_accounts: Optional[list[TelegramAccou
     """Convert Proxy model to response."""
     bound_accounts = bound_accounts or []
     first_bound_account = bound_accounts[0] if bound_accounts else None
-    # Health failures take precedence over a manual inactive state because the
-    # health checker also disables proxies after repeated failures.
-    if proxy.consecutive_failures >= 3:
-        status = "error"
-    elif proxy.is_active:
-        status = "active"
-    else:
+    # A manually disabled proxy is inventory, not an operational health error.
+    if not proxy.is_active:
         status = "inactive"
+    elif proxy.consecutive_failures >= 3:
+        status = "error"
+    else:
+        status = "active"
 
     return ProxyResponse(
         id=proxy.id,
@@ -217,14 +218,23 @@ async def list_proxies(
 
     if status:
         if status == "active":
-            query = query.where(Proxy.is_active == True, Proxy.consecutive_failures < 3)
-            count_query = count_query.where(Proxy.is_active == True, Proxy.consecutive_failures < 3)
+            query = query.where(Proxy.is_active.is_(True), Proxy.consecutive_failures < 3)
+            count_query = count_query.where(
+                Proxy.is_active.is_(True),
+                Proxy.consecutive_failures < 3,
+            )
         elif status == "inactive":
-            query = query.where(Proxy.is_active == False)
-            count_query = count_query.where(Proxy.is_active == False)
+            query = query.where(Proxy.is_active.is_(False))
+            count_query = count_query.where(Proxy.is_active.is_(False))
         elif status == "error":
-            query = query.where(Proxy.consecutive_failures >= 3)
-            count_query = count_query.where(Proxy.consecutive_failures >= 3)
+            query = query.where(
+                Proxy.is_active.is_(True),
+                Proxy.consecutive_failures >= 3,
+            )
+            count_query = count_query.where(
+                Proxy.is_active.is_(True),
+                Proxy.consecutive_failures >= 3,
+            )
 
     if keyword:
         search_pattern = f"%{keyword}%"
@@ -672,18 +682,41 @@ async def proxy_health(
     total = total_result.scalar() or 0
 
     active_result = await db.execute(
-        select(func.count(Proxy.id)).where(Proxy.is_active == True)
+        select(func.count(Proxy.id)).where(
+            Proxy.is_active.is_(True),
+            Proxy.consecutive_failures < 3,
+        )
     )
     active = active_result.scalar() or 0
 
+    error_result = await db.execute(
+        select(func.count(Proxy.id)).where(
+            Proxy.is_active.is_(True),
+            Proxy.consecutive_failures >= 3,
+        )
+    )
+    error = error_result.scalar() or 0
+
+    inactive_result = await db.execute(
+        select(func.count(Proxy.id)).where(Proxy.is_active.is_(False))
+    )
+    inactive = inactive_result.scalar() or 0
+
     # Average metrics
     avg_latency_result = await db.execute(
-        select(func.avg(Proxy.avg_latency)).where(Proxy.avg_latency > 0)
+        select(func.avg(Proxy.avg_latency)).where(
+            Proxy.is_active.is_(True),
+            Proxy.consecutive_failures < 3,
+            Proxy.avg_latency > 0,
+        )
     )
     avg_latency = avg_latency_result.scalar() or 0
 
     avg_success_result = await db.execute(
-        select(func.avg(Proxy.success_rate))
+        select(func.avg(Proxy.success_rate)).where(
+            Proxy.is_active.is_(True),
+            Proxy.consecutive_failures < 3,
+        )
     )
     avg_success = avg_success_result.scalar() or 0
 
@@ -710,7 +743,8 @@ async def proxy_health(
         data={
             "total": total,
             "active": active,
-            "inactive": total - active,
+            "inactive": inactive,
+            "error": error,
             "avg_latency_ms": round(avg_latency, 2),
             "avg_success_rate": round(avg_success * 100, 2),
             "by_type": type_counts,
@@ -731,7 +765,7 @@ async def proxy_stats(
     # Health breakdown
     healthy_result = await db.execute(
         select(func.count(Proxy.id)).where(
-            Proxy.is_active == True,
+            Proxy.is_active.is_(True),
             Proxy.consecutive_failures < 3
         )
     )
@@ -739,18 +773,22 @@ async def proxy_stats(
 
     unhealthy_result = await db.execute(
         select(func.count(Proxy.id)).where(
+            Proxy.is_active.is_(True),
             Proxy.consecutive_failures >= 3
         )
     )
     unhealthy = unhealthy_result.scalar() or 0
+    enabled = healthy + unhealthy
 
     return {
         "code": 0,
         "message": "success",
         "data": {
             "total": total,
+            "active": enabled,
+            "inactive": total - enabled,
             "healthy": healthy,
             "unhealthy": unhealthy,
-            "health_rate": round(healthy / total * 100, 2) if total > 0 else 0,
+            "health_rate": round(healthy / enabled * 100, 2) if enabled > 0 else 0,
         }
     }

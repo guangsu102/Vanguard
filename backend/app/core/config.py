@@ -28,9 +28,42 @@ class Settings(BaseSettings):
     # Application
     APP_ENV: str = Field(default="development", description="Application environment")
     DEBUG: bool = Field(default=True, description="Debug mode")
-    JWT_SECRET: str = Field(default=DEFAULT_DEV_SECRET, description="JWT secret key (minimum 64 characters for HS256)")
+    JWT_SECRET: str = Field(
+        default=DEFAULT_DEV_SECRET,
+        description="JWT secret key (minimum 64 characters for HS256)",
+    )
     JWT_ALGORITHM: str = Field(default="HS256", description="JWT algorithm")
-    JWT_EXPIRATION_HOURS: int = Field(default=24, ge=1, le=720, description="JWT expiration in hours")
+    JWT_EXPIRATION_HOURS: int = Field(
+        default=24, ge=1, le=720, description="JWT expiration in hours"
+    )
+
+    # Self-owned promotional group orchestration (P0 safety controls)
+    P0_SAFETY_GATE_ENABLED: bool = Field(
+        default=True,
+        description="Enable P0 resource and global-stop safety checks",
+    )
+    P0_SAFETY_GATE_FAIL_CLOSED: bool = Field(
+        default=False,
+        description="Block owned-group execution when Redis safety state is unavailable",
+    )
+    OWNED_GROUP_MODULE_ENABLED: bool = Field(
+        default=True,
+        description="Enable the self-owned group orchestration module and write API",
+    )
+    OWNED_GROUP_EXECUTION_ENABLED: bool = Field(
+        default=False,
+        description="Allow the owned-group worker to perform Telegram side effects",
+    )
+    OWNED_GROUP_KILL_SWITCH_ENABLED: bool = Field(
+        default=False,
+        description="Static emergency stop for all owned-group execution",
+    )
+    OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Maximum promoter accounts in one owned-group rollout (1-5)",
+    )
 
     @field_validator("JWT_SECRET")
     @classmethod
@@ -106,7 +139,10 @@ class Settings(BaseSettings):
     EVOMI_PROXY_PASSWORD: str | None = Field(default=None, description="Static Evomi proxy password")
     EVOMI_PRODUCT_CODE: str = Field(default="rp", description="Evomi product code for generated proxies")
     EVOMI_PROTOCOL: str = Field(default="http", description="Evomi proxy protocol")
-    EVOMI_SESSION_TYPE: str = Field(default="sticky", description="Evomi session type")
+    EVOMI_SESSION_TYPE: str = Field(
+        default="hard",
+        description="Evomi session type; hard keeps a stable Telegram proxy exit without a timed rotation",
+    )
     EVOMI_SESSION_LIFETIME_MINUTES: int = Field(default=30, description="Evomi sticky session lifetime in minutes")
     EVOMI_SESSION_NAMESPACE: str = Field(default="vanguard", description="Evomi sticky session namespace")
     EVOMI_ADBLOCK: bool = Field(default=False, description="Enable Evomi adblock where supported")
@@ -228,6 +264,27 @@ class Settings(BaseSettings):
             return self
 
         errors: list[str] = []
+        # Real owned-group Telegram side effects are an explicit opt-in. When
+        # enabled in production, startup must prove that an enabled,
+        # fail-closed safety gate protects the operation. The static kill
+        # switch remains a runtime control, so operators may start in an
+        # emergency-stopped state without removing the execution flag.
+        if self.OWNED_GROUP_EXECUTION_ENABLED:
+            if not self.OWNED_GROUP_MODULE_ENABLED:
+                errors.append(
+                    "OWNED_GROUP_MODULE_ENABLED must be true when "
+                    "OWNED_GROUP_EXECUTION_ENABLED is enabled in production"
+                )
+            if not self.P0_SAFETY_GATE_ENABLED:
+                errors.append(
+                    "P0_SAFETY_GATE_ENABLED must be true when "
+                    "OWNED_GROUP_EXECUTION_ENABLED is enabled in production"
+                )
+            if not self.P0_SAFETY_GATE_FAIL_CLOSED:
+                errors.append(
+                    "P0_SAFETY_GATE_FAIL_CLOSED must be true when "
+                    "OWNED_GROUP_EXECUTION_ENABLED is enabled in production"
+                )
         if self.JWT_SECRET == DEFAULT_DEV_SECRET:
             errors.append("JWT_SECRET must be set explicitly in production")
         if "change_me_in_production" in self.DATABASE_URL:

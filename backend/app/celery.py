@@ -31,6 +31,7 @@ celery_app = Celery(
     include=[
         "app.core.scheduler.tasks",
         "app.modules.qq.tasks",
+        "app.modules.owned_group.tasks",
     ],
 )
 
@@ -44,7 +45,9 @@ TASK_CONCURRENCY = {
     "campaign_check": 2,
     "bulk_import": 2,
     "automation": 3,
+    "resource_search": 1,
     "qq_commands": 2,
+    "owned_group": 1,
 }
 
 # =============================================================================
@@ -80,6 +83,12 @@ celery_app.conf.beat_schedule = {
     "user-state-check-every-minute": {
         "task": "app.core.scheduler.tasks.check_user_states",
         "schedule": 60.0,  # Every minute
+        "options": {"queue": "default"},
+    },
+    "reconcile-stale-worker-statuses-every-minute": {
+        "task": "app.core.scheduler.tasks.reconcile_stale_worker_statuses",
+        "schedule": 60.0,
+        "kwargs": {"stale_after_seconds": 90},
         "options": {"queue": "default"},
     },
     # -------------------------------------------------------------------------
@@ -129,8 +138,9 @@ celery_app.conf.beat_schedule = {
     },
     "audit-group-ad-policies-hourly": {
         "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
-        "schedule": crontab(minute=15),
-        "kwargs": {"limit": 5},
+        # Keep the hourly audit off both auto-join (:00/:05/...) and probe (:02/:07/...).
+        "schedule": crontab(minute=19),
+        "kwargs": {"limit": 20},
         "options": {"queue": "automation", "rate_limit": "1/h"},
     },
     "evaluate-ad-only-candidates-hourly": {
@@ -139,9 +149,16 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"limit": 200, "force": False},
         "options": {"queue": "automation", "rate_limit": "1/h"},
     },
+    "dispatch-ad-only-join-queue-every-minute": {
+        "task": "app.core.scheduler.tasks.dispatch_ad_only_join_queue_task",
+        "schedule": 60.0,
+        "kwargs": {"limit": 10},
+        "options": {"queue": "automation", "rate_limit": "1/m"},
+    },
     "auto-probe-unknown-ad-policies-every-5min": {
         "task": "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task",
-        "schedule": crontab(minute="*/5"),
+        # Offset from auto-join's 5-minute boundary to avoid account lease contention.
+        "schedule": crontab(minute="2-59/5"),
         "options": {"queue": "automation", "rate_limit": "12/h"},
     },
     "group-ai-warmup-dispatcher-every-30min": {
@@ -165,9 +182,22 @@ celery_app.conf.beat_schedule = {
     # -------------------------------------------------------------------------
     # Daily Tasks
     # -------------------------------------------------------------------------
-    "cleanup-old-messages-daily": {
+    "cleanup-old-messages-hourly": {
         "task": "app.core.scheduler.tasks.cleanup_old_messages",
-        "schedule": crontab(hour=3, minute=0),  # Daily at 3:00 AM
+        "schedule": crontab(minute=20),
+        "kwargs": {"batch_size": 1000, "max_batches": 5},
+        "options": {"queue": "default"},
+    },
+    "reconcile-resource-searches-every-5min": {
+        "task": "app.core.scheduler.tasks.reconcile_resource_searches_task",
+        "schedule": crontab(minute="*/5"),
+        "kwargs": {"stale_after_seconds": 1800},
+        "options": {"queue": "default"},
+    },
+    "cleanup-resource-search-history-daily": {
+        "task": "app.core.scheduler.tasks.cleanup_resource_search_history_task",
+        "schedule": crontab(hour=3, minute=15),
+        "kwargs": {"retention_days": 90},
         "options": {"queue": "default"},
     },
     "generate-daily-report-at-2am": {
@@ -198,6 +228,12 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=30),
         "options": {"queue": "qq_commands"},
     },
+    "owned-group-worker-every-30s": {
+        "task": "app.modules.owned_group.tasks.owned_group_worker_tick",
+        "schedule": 30.0,
+        "kwargs": {"limit": 10, "stale_after_seconds": 900},
+        "options": {"queue": "owned_group"},
+    },
 }
 
 # =============================================================================
@@ -220,10 +256,15 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "automation"},
     "app.core.scheduler.tasks.audit_group_ad_policies_task": {"queue": "automation"},
     "app.core.scheduler.tasks.evaluate_ad_only_candidates_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.dispatch_ad_only_join_queue_task": {"queue": "automation"},
     "app.core.scheduler.tasks.execute_ad_only_handover_task": {"queue": "automation"},
     "app.core.scheduler.tasks.rollback_ad_only_handover_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.resource_search_task": {"queue": "resource_search"},
+    "app.core.scheduler.tasks.reconcile_resource_searches_task": {"queue": "default"},
+    "app.core.scheduler.tasks.cleanup_resource_search_history_task": {"queue": "default"},
     "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},
     "app.modules.qq.tasks.cleanup_qq_messages": {"queue": "qq_commands"},
+    "app.modules.owned_group.tasks.owned_group_worker_tick": {"queue": "owned_group"},
 }
 
 # =============================================================================
@@ -262,9 +303,17 @@ celery_app.conf.task_queues = {
         "exchange": "automation",
         "routing_key": "automation",
     },
+    "resource_search": {
+        "exchange": "resource_search",
+        "routing_key": "resource_search",
+    },
     "qq_commands": {
         "exchange": "qq_commands",
         "routing_key": "qq_commands",
+    },
+    "owned_group": {
+        "exchange": "owned_group",
+        "routing_key": "owned_group",
     },
 }
 

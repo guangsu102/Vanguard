@@ -565,6 +565,7 @@ async def test_growth_leave_failure_retains_both_accounts_as_cleanup_pending(
     async def fake_leave_success(_handover, group, source):
         membership = await service._joined_membership(group.id, source.id)
         membership.status = "left"
+        membership.ad_status = "blocked"
         membership.left_at = datetime.utcnow()
         await test_db.commit()
         return None
@@ -952,3 +953,347 @@ def test_production_direct_assignment_sql_migration_is_registered_and_parseable(
         "ALTER COLUMN group_id DROP NOT NULL" in statement
         for statement in statements
     )
+
+
+def test_production_ad_only_join_queue_migration_is_registered_and_parseable():
+    migration_name = "038_add_ad_only_join_queue.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    statements = _split_sql_statements(
+        migration_path.read_text(encoding="utf-8")
+    )
+    assert any(
+        "ADD COLUMN IF NOT EXISTS batch_id" in statement
+        for statement in statements
+    )
+    assert any(
+        "idx_group_ad_handover_account_queue" in statement
+        for statement in statements
+    )
+
+
+def test_runtime_health_consistency_sql_migration_is_registered_and_parseable():
+    migration_name = "039_repair_runtime_health_consistency.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    statements = _split_sql_statements(
+        migration_path.read_text(encoding="utf-8")
+    )
+    assert any(
+        "idx_acquisition_conversation_context_expires" in statement
+        for statement in statements
+    )
+    assert any(
+        "ck_group_membership_inactive_ad_blocked" in statement
+        for statement in statements
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_assignment_batch_deduplicates_and_paces_links(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="batch")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    campaign = AdCampaign(
+        name="Paced Ad-only campaign",
+        enabled=True,
+        status="active",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+    service = AdOnlyRecommendationService(test_db)
+
+    handovers, created, values = await service.create_direct_assignment_batch(
+        campaign_id=campaign.id,
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_links=[
+            "https://t.me/batch_group_one",
+            "https://t.me/batch_group_one",
+            "  https://t.me/+BatchInviteTwo  ",
+        ],
+        join_interval_min_minutes=3,
+        join_interval_max_minutes=11,
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed batch advertising permission",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="paced-batch-test",
+        requested_by_user_id=31,
+    )
+
+    assert created is True
+    assert values["invite_count"] == 2
+    assert [item.queue_position for item in handovers] == [1, 2]
+    assert handovers[0].next_attempt_at is not None
+    assert handovers[1].next_attempt_at is None
+    assert all(item.batch_id == "paced-batch-test" for item in handovers)
+    assert all("t.me" not in item.invite_link_encrypted for item in handovers)
+
+    with pytest.raises(AdOnlyWorkflowError, match="invite_links_limit_exceeded"):
+        service._normalize_invite_links(
+            [f"https://t.me/batch_limit_{index}" for index in range(101)]
+        )
+
+
+@pytest.mark.asyncio
+async def test_batch_assignment_api_returns_campaign_options_and_paced_rows(
+    client,
+    test_db,
+    monkeypatch,
+):
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": 31,
+        "username": "admin",
+        "role": "admin",
+    }
+    seeded = await _seed_direct_target(test_db, suffix="batch-api")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    campaign = AdCampaign(
+        name="Batch API campaign",
+        enabled=True,
+        status="active",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+
+    options_response = await client.get("/api/automation/ad-only/options")
+    create_response = await client.post(
+        "/api/automation/ad-only/direct-assignments/batch",
+        json={
+            "campaign_id": campaign.id,
+            "target_account_id": seeded["target"].id,
+            "creative_id": seeded["creative"].id,
+            "invite_links": [
+                "https://t.me/batch_api_one",
+                "https://t.me/batch_api_two",
+            ],
+            "join_interval_min_minutes": 2,
+            "join_interval_max_minutes": 8,
+            "permission_mode": GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+            "permission_note": "admin confirmed API batch permission",
+            "permission_expires_at": (
+                datetime.utcnow() + timedelta(days=30)
+            ).isoformat(),
+            "idempotency_key": "paced-batch-api-test",
+        },
+    )
+
+    assert options_response.status_code == 200
+    campaign_options = options_response.json()["data"]["campaigns"]
+    assert any(item["id"] == campaign.id for item in campaign_options)
+    assert create_response.status_code == 202
+    payload = create_response.json()["data"]
+    assert payload["invite_count"] == 2
+    assert payload["created"] is True
+    assert len(payload["handovers"]) == 2
+    assert payload["handovers"][0]["next_attempt_at"] is not None
+    assert payload["handovers"][1]["next_attempt_at"] is None
+    assert "task_id" not in payload
+
+
+@pytest.mark.asyncio
+async def test_direct_assignment_queue_claims_only_one_item_per_account(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="claim")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    campaign = AdCampaign(
+        name="Claim serialization campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+    service = AdOnlyRecommendationService(test_db)
+    handovers, _created, _values = await service.create_direct_assignment_batch(
+        campaign_id=campaign.id,
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_links=[
+            "https://t.me/claim_group_one",
+            "https://t.me/claim_group_two",
+        ],
+        join_interval_min_minutes=1,
+        join_interval_max_minutes=30,
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed claim serialization",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="paced-claim-test",
+        requested_by_user_id=31,
+    )
+    handovers[1].next_attempt_at = datetime.utcnow()
+    await test_db.commit()
+
+    claimed = await service.claim_due_direct_assignment_queue(limit=10)
+
+    assert len(claimed) == 1
+    assert claimed[0] == handovers[0].id
+
+
+@pytest.mark.asyncio
+async def test_join_queue_releases_next_item_with_random_interval(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="interval")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    campaign = AdCampaign(
+        name="Random interval campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+    service = AdOnlyRecommendationService(test_db)
+    handovers, _created, _values = await service.create_direct_assignment_batch(
+        campaign_id=campaign.id,
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_links=[
+            "https://t.me/interval_group_one",
+            "https://t.me/interval_group_two",
+        ],
+        join_interval_min_minutes=4,
+        join_interval_max_minutes=9,
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed random interval",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="paced-interval-test",
+        requested_by_user_id=31,
+    )
+    handovers[0].status = "completed"
+    handovers[0].next_attempt_at = None
+    await test_db.commit()
+    monkeypatch.setattr(ad_only_module.random, "randint", lambda _min, _max: 7)
+    now = datetime.utcnow().replace(microsecond=0)
+
+    scheduled = await service._schedule_next_join_queue_item(
+        seeded["target"].id,
+        now=now,
+    )
+
+    assert scheduled is not None
+    assert scheduled.id == handovers[1].id
+    assert scheduled.next_attempt_at == now + timedelta(minutes=7)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queue_item_releases_next_without_joining(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="cancel")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    campaign = AdCampaign(
+        name="Cancellation campaign",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids="[]",
+    )
+    test_db.add(campaign)
+    await test_db.commit()
+    service = AdOnlyRecommendationService(test_db)
+    handovers, _created, _values = await service.create_direct_assignment_batch(
+        campaign_id=campaign.id,
+        target_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        invite_links=[
+            "https://t.me/cancel_group_one",
+            "https://t.me/cancel_group_two",
+        ],
+        join_interval_min_minutes=1,
+        join_interval_max_minutes=1,
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed cancellation test",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="paced-cancel-test",
+        requested_by_user_id=31,
+    )
+
+    cancelled = await service.cancel_queued_handover(
+        handovers[0].id,
+        actor_user_id=31,
+    )
+    await test_db.refresh(handovers[1])
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.invite_link_encrypted is None
+    assert handovers[1].next_attempt_at is not None
+
+
+@pytest.mark.asyncio
+async def test_existing_active_campaign_stays_active_when_group_is_appended(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="active-campaign")
+    _allow_direct_capacity(monkeypatch, hard_cap=1000)
+    existing_group = Group(
+        group_id=-1_000_000_011_001,
+        title="Existing active group",
+        level=GroupLevel.A,
+    )
+    new_group = Group(
+        group_id=-1_000_000_011_002,
+        title="New queued group",
+        level=GroupLevel.A,
+    )
+    test_db.add_all([existing_group, new_group])
+    await test_db.flush()
+    campaign = AdCampaign(
+        name="Already active campaign",
+        enabled=True,
+        status="active",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+        send_mode="interval",
+        interval_minutes=180,
+        target_group_ids=f"[{existing_group.id}]",
+    )
+    test_db.add(campaign)
+    await test_db.flush()
+    handover = GroupAdHandover(
+        workflow_type="direct",
+        target_ad_only_account_id=seeded["target"].id,
+        creative_id=seeded["creative"].id,
+        campaign_id=campaign.id,
+        invite_link_encrypted="test",
+        send_mode="interval",
+        interval_minutes=180,
+        scheduled_times="[]",
+        permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        permission_note="admin confirmed active campaign append",
+        permission_expires_at=datetime.utcnow() + timedelta(days=30),
+        idempotency_key="active-campaign-append",
+        requested_by_user_id=31,
+        approved_by_user_id=31,
+        approved_at=datetime.utcnow(),
+    )
+    test_db.add(handover)
+    await test_db.commit()
+    service = AdOnlyRecommendationService(test_db)
+
+    ensured = await service._ensure_campaign(handover, new_group)
+
+    assert ensured.enabled is True
+    assert ensured.status == "active"
+    assert ensured.get_target_group_ids() == [existing_group.id, new_group.id]

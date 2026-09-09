@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Connection,
@@ -35,6 +35,8 @@ import { DEFAULT_GROUP_SEARCH_KEYWORD_TYPES, GROUP_SEARCH_KEYWORD_TYPE_OPTIONS }
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import AdOnlyRecommendationPanel from '@/components/AdOnlyRecommendationPanel.vue'
 import { useClientPagination } from '@/utils/clientPagination'
+import { filterAccountsByDeliveryPolicy } from '@/utils/adBindingAccountEligibility'
+
 type AccountOption = {
   id: number
   identifier?: string
@@ -167,6 +169,8 @@ const campaignForm = reactive({
   end_at: '',
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
+  max_sends_per_group_per_day: 1,
+  max_sends_per_account_per_day: 10,
 })
 
 const emptyCampaignForm = () => ({
@@ -181,6 +185,8 @@ const emptyCampaignForm = () => ({
   end_at: '',
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
+  max_sends_per_group_per_day: 1,
+  max_sends_per_account_per_day: 10,
 })
 
 const scheduledTimesText = ref('')
@@ -199,6 +205,9 @@ const bindingForm = reactive({
 })
 
 const adWorkspaceView = ref("campaigns");
+const adOnlyPanelRef = ref<{
+  openGroupAssignment: (campaignId?: number) => Promise<void> | void
+} | null>(null)
 const campaignDrawerVisible = ref(false);
 const creativeDrawerVisible = ref(false);
 const bindingDrawerVisible = ref(false);
@@ -220,8 +229,8 @@ const accountConfigForm = reactive({
   enabled: true,
   auto_join_enabled: false,
   auto_ads_enabled: true,
-  max_groups_per_day: 100,
-  max_groups_total: 100,
+  max_groups_per_day: 10,
+  max_groups_total: 400,
   join_interval_min_seconds: 60,
   join_interval_max_seconds: 900,
   max_messages_per_day: null as number | null,
@@ -476,19 +485,19 @@ const {
   pageSize: campaignPageSize,
   total: campaignTotal,
   rows: pagedCampaigns,
-} = useClientPagination(campaignPaginationSource, 10)
+} = useClientPagination(campaignPaginationSource)
 const {
   page: creativePage,
   pageSize: creativePageSize,
   total: creativeTotal,
   rows: pagedCreatives,
-} = useClientPagination(creativePaginationSource, 10)
+} = useClientPagination(creativePaginationSource)
 const {
   page: bindingPage,
   pageSize: bindingPageSize,
   total: bindingTotal,
   rows: pagedBindingGroups,
-} = useClientPagination(bindingPaginationSource, 10)
+} = useClientPagination(bindingPaginationSource)
 
 const adReadinessRows = computed(() =>
   accounts.value
@@ -578,6 +587,41 @@ const targetGroupMap = computed(() => new Map(targetGroups.value.map((item) => [
 const accountOperationModeMap = computed(() =>
   new Map(dynamicStatuses.value.map((item) => [item.account_id, item.operation_mode])),
 )
+const batchAccountOptions = computed(() =>
+  filterAccountsByDeliveryPolicy(
+    adBindingAccounts.value.filter((account) => account.id !== selectedAccountId.value),
+    accountOperationModeMap.value,
+    accountConfigForm.operation_mode,
+  ),
+)
+const batchAccountModeLabel = computed(() =>
+  isAdOnlyAccount.value ? '手动投放专用账号' : '增长运营账号',
+)
+const selectedBindingCampaign = computed(() =>
+  campaigns.value.find((campaign) => campaign.id === bindingForm.ad_campaign_id),
+)
+const bindingAccountOptions = computed(() =>
+  filterAccountsByDeliveryPolicy(
+    adBindingAccounts.value,
+    accountOperationModeMap.value,
+    selectedBindingCampaign.value?.delivery_policy,
+  ),
+)
+const bindingAccountModeLabel = computed(() =>
+  selectedBindingCampaign.value?.delivery_policy === 'ad_only'
+    ? 'Ad-only 专属账号'
+    : 'Growth 推广账号',
+)
+const bindingAccountPlaceholder = computed(() =>
+  selectedBindingCampaign.value
+    ? '选择' + bindingAccountModeLabel.value
+    : '请先选择广告计划',
+)
+const bindingAccountEmptyText = computed(() =>
+  selectedBindingCampaign.value
+    ? '暂无可用的' + bindingAccountModeLabel.value
+    : '请先选择广告计划',
+)
 const targetGroupJoinAccounts = computed(() =>
   accounts.value.filter(
     (account) =>
@@ -617,6 +661,7 @@ const campaignTargetLabel = (campaign: any) => {
   if (campaign.target_group_ids?.length) {
     return campaign.target_group_ids.map(targetGroupLabel).join('、')
   }
+  if (campaign.delivery_policy === 'ad_only') return '在 Ad-only 专属账号中持续添加'
   return `等级 ${campaign.target_group_levels?.join('/') || '-'}`
 }
 
@@ -867,23 +912,26 @@ const editCampaign = (campaign: any) => {
     end_at: campaign.end_at || "",
     min_wait_after_join_minutes: campaign.min_wait_after_join_minutes,
     interval_minutes: campaign.interval_minutes,
+    max_sends_per_group_per_day: campaign.max_sends_per_group_per_day ?? 1,
+    max_sends_per_account_per_day: campaign.max_sends_per_account_per_day ?? 10,
   });
   scheduledTimesText.value = campaign.scheduled_times?.join(",") || "";
   campaignDrawerVisible.value = true;
 };
 
 const resetBindingForm = (campaignId?: number) => {
-  const preferredAccount = adBindingAccounts.value.find(
-    (account) => account.id === selectedAccountId.value,
-  );
-  const fallbackAccount = preferredAccount || adBindingAccounts.value[0];
   Object.assign(bindingForm, {
-    account_ids: fallbackAccount ? [fallbackAccount.id] : [],
+    account_ids: [],
     ad_campaign_id: campaignId,
     creative_ids: [],
     enabled: true,
     priority: 0,
   });
+  const preferredAccount = bindingAccountOptions.value.find(
+    (account) => account.id === selectedAccountId.value,
+  )
+  const fallbackAccount = preferredAccount || bindingAccountOptions.value[0]
+  bindingForm.account_ids = fallbackAccount ? [fallbackAccount.id] : []
   creativePoolStatus.value = null;
 };
 
@@ -891,6 +939,19 @@ const openBindingDrawer = (campaign?: any) => {
   resetBindingForm(campaign?.id);
   bindingDrawerVisible.value = true;
 };
+
+const openAdOnlyGroupAssignment = async (campaignId?: number) => {
+  adWorkspaceView.value = 'handovers'
+  await nextTick()
+  await adOnlyPanelRef.value?.openGroupAssignment(campaignId)
+}
+
+const handleBindingCampaignChange = () => {
+  const eligibleIds = new Set(bindingAccountOptions.value.map((account) => account.id))
+  bindingForm.account_ids = bindingForm.account_ids.filter((accountId) => eligibleIds.has(accountId))
+  bindingForm.creative_ids = []
+  creativePoolStatus.value = null
+}
 
 const openAccountConfig = async (accountId?: number) => {
   const fallbackAccount = adBindingAccounts.value[0]
@@ -946,10 +1007,17 @@ const saveBatchAccountConfig = async () => {
     ElMessage.warning('请选择要批量套用的账号')
     return
   }
+  const eligibleIds = new Set(batchAccountOptions.value.map((account) => account.id))
+  const invalidIds = batchAccountIds.value.filter((accountId) => !eligibleIds.has(accountId))
+  if (invalidIds.length) {
+    batchAccountIds.value = batchAccountIds.value.filter((accountId) => eligibleIds.has(accountId))
+    ElMessage.warning('只能批量套用到相同账号模式')
+    return
+  }
   if (!validateAccountConfigForm()) return
 
   await ElMessageBox.confirm(
-    `确认将当前账号配置套用到 ${batchAccountIds.value.length} 个账号？`,
+    `确认将当前配置套用到 ${batchAccountIds.value.length} 个${batchAccountModeLabel.value}？`,
     '批量套用配置',
     { type: 'warning' },
   )
@@ -970,7 +1038,7 @@ const saveBatchAccountConfig = async () => {
 }
 
 const selectAllBatchAccounts = () => {
-  batchAccountIds.value = adBindingAccounts.value.map((item) => item.id)
+  batchAccountIds.value = batchAccountOptions.value.map((item) => item.id)
 }
 
 const clearBatchAccounts = () => {
@@ -1168,10 +1236,6 @@ const saveCampaign = async () => {
     return;
   }
   const scheduledTimes = parseScheduledTimes();
-  if (campaignForm.delivery_policy === "ad_only" && !campaignForm.target_group_ids.length) {
-    ElMessage.warning("Ad-only 活动必须指定目标群");
-    return;
-  }
   if (
     campaignForm.delivery_policy === "ad_only"
     && !["interval", "scheduled"].includes(campaignForm.send_mode)
@@ -1399,13 +1463,35 @@ watch(() => campaignForm.delivery_policy, (policy) => {
   if (policy === 'ad_only' && campaignForm.send_mode === 'after_join') {
     campaignForm.send_mode = 'interval'
   }
+  if (policy === 'ad_only' && !editingCampaignId.value) {
+    campaignForm.target_group_ids = []
+  }
+})
+
+watch(bindingAccountOptions, (options) => {
+  const eligibleIds = new Set(options.map((account) => account.id))
+  const eligibleSelection = bindingForm.account_ids.filter((accountId) => eligibleIds.has(accountId))
+  if (eligibleSelection.length !== bindingForm.account_ids.length) {
+    bindingForm.account_ids = eligibleSelection
+  }
+})
+
+watch(batchAccountOptions, (options) => {
+  const eligibleIds = new Set(options.map((account) => account.id))
+  batchAccountIds.value = batchAccountIds.value.filter((accountId) => eligibleIds.has(accountId))
 })
 
 watch(selectedAccountId, async (accountId) => {
   if (!accountId) return
   const selectedAccount = adBindingAccounts.value.find((account) => account.id === accountId)
   if (!selectedAccount) return
-  bindingForm.account_ids = [accountId]
+  batchAccountIds.value = []
+  if (
+    !bindingForm.ad_campaign_id
+    || bindingAccountOptions.value.some((account) => account.id === accountId)
+  ) {
+    bindingForm.account_ids = [accountId]
+  }
   await loadAccountConfig(accountId)
 })
 
@@ -1616,9 +1702,9 @@ onBeforeUnmount(() => {
                 >
                   <span class="flow-step-icon flow-amber"><Connection /></span>
                   <span>
-                    <small>05 / 专用交接</small>
-                    <strong>候选审批</strong>
-                    <em>可恢复交接</em>
+                    <small>05 / 群与专属账号</small>
+                    <strong>批量添加群</strong>
+                    <em>1-30 分钟串行</em>
                   </span>
                 </button>
               </div>
@@ -1677,7 +1763,7 @@ onBeforeUnmount(() => {
             <div>
               <span>Growth 群全局冷却</span>
               <strong>{{ Math.round(adDeliveryExecutionForm.growth_group_global_cooldown_seconds / 3600) }} 小时</strong>
-              <small>失败退群 {{ adFailurePolicyForm.leave_on_group_control_failure ? "开启" : "关闭" }}</small>
+              <small>群控失败达到阈值后退群 {{ adFailurePolicyForm.leave_on_group_control_failure ? "开启" : "关闭" }}</small>
             </div>
           </section>
 <el-tabs v-model="adWorkspaceView" class="ad-workspace-tabs">
@@ -1711,6 +1797,10 @@ onBeforeUnmount(() => {
                       <el-option label="已停止" value="paused" />
                       <el-option label="草稿" value="draft" />
                     </el-select>
+                    <el-button type="warning" @click="openAdOnlyGroupAssignment()">
+                      <el-icon><Connection /></el-icon>
+                      配置群和专属账号
+                    </el-button>
                     <el-button type="primary" @click="openCreateCampaign">
                       <el-icon><Plus /></el-icon>
                       新建计划
@@ -1743,6 +1833,11 @@ onBeforeUnmount(() => {
                               {{ group.accountCount }}个账号在群
                             </el-tag>
                           </div>
+                          <strong
+                            v-else-if="row.delivery_policy === 'ad_only'"
+                            class="text-warning"
+                            >在“群与专属账号”中持续添加</strong
+                          >
                           <strong v-else
                             >按等级
                             {{
@@ -1834,6 +1929,9 @@ onBeforeUnmount(() => {
                         <strong v-if="row.target_group_ids?.length"
                           >指定 {{ row.target_group_ids.length }} 个群</strong
                         >
+                        <strong v-else-if="row.delivery_policy === 'ad_only'"
+                          >等待添加群</strong
+                        >
                         <strong v-else
                           >等级
                           {{
@@ -1873,6 +1971,14 @@ onBeforeUnmount(() => {
                   <el-table-column label="操作" width="286" fixed="right">
                     <template #default="{ row }">
                       <el-button
+                        v-if="row.delivery_policy === 'ad_only'"
+                        link
+                        type="warning"
+                        @click="openAdOnlyGroupAssignment(row.id)"
+                        >添加群</el-button
+                      >
+                      <el-button
+                        v-else
                         link
                         type="primary"
                         @click="openBindingDrawer(row)"
@@ -2230,9 +2336,9 @@ onBeforeUnmount(() => {
 
             <el-tab-pane name="handovers" lazy>
               <template #label>
-                <span class="ad-tab-label"><Connection />专用交接</span>
+                <span class="ad-tab-label"><Connection />群与专属账号</span>
               </template>
-              <AdOnlyRecommendationPanel />
+              <AdOnlyRecommendationPanel ref="adOnlyPanelRef" />
             </el-tab-pane>
 
           </el-tabs>
@@ -2275,6 +2381,26 @@ onBeforeUnmount(() => {
                 />
               </el-form-item>
 
+              <template v-if="campaignForm.delivery_policy === 'growth'">
+              <div class="drawer-section-title">每日额度</div>
+              <div class="drawer-form-grid">
+                <el-form-item label="每账号每天最多发送">
+                  <el-input-number
+                    v-model="campaignForm.max_sends_per_account_per_day"
+                    :min="1"
+                    :max="1000"
+                  />
+                  <span class="input-suffix">条</span>
+                </el-form-item>
+                <el-form-item label="每群每天最多发送">
+                  <el-input-number
+                    v-model="campaignForm.max_sends_per_group_per_day"
+                    :min="1"
+                    :max="1000"
+                  />
+                  <span class="input-suffix">条</span>
+                </el-form-item>
+              </div>
               <div class="drawer-section-title">目标群</div>
               <el-form-item label="指定群">
                 <div class="target-group-control">
@@ -2330,6 +2456,12 @@ onBeforeUnmount(() => {
                   )
                 }}
                 个账号群席位
+              </div>
+              </template>
+
+              <div v-else class="ad-only-assignment-note">
+                <strong>群与专属账号在计划保存后配置</strong>
+                <span>先保存发送节奏，再到“Ad-only 专属账号”批量导入群链接；计划运行中也能继续追加。</span>
               </div>
 
               <template v-if="campaignForm.delivery_policy === 'ad_only'">
@@ -2473,7 +2605,7 @@ onBeforeUnmount(() => {
                 <el-select
                   v-model="bindingForm.ad_campaign_id"
                   filterable
-                  @change="bindingForm.creative_ids = []"
+                  @change="handleBindingCampaignChange"
                 >
                   <el-option
                     v-for="campaign in campaigns"
@@ -2499,10 +2631,12 @@ onBeforeUnmount(() => {
                   collapse-tags
                   collapse-tags-tooltip
                   clearable
-                  placeholder="选择一个或多个可用账号"
+                  :disabled="!bindingForm.ad_campaign_id"
+                  :placeholder="bindingAccountPlaceholder"
+                  :no-data-text="bindingAccountEmptyText"
                 >
                   <el-option
-                    v-for="account in adBindingAccounts"
+                    v-for="account in bindingAccountOptions"
                     :key="account.id"
                     :label="accountLabel(account.id)"
                     :value="account.id"
@@ -2510,7 +2644,7 @@ onBeforeUnmount(() => {
                     <div class="rich-option">
                       <span>{{ accountLabel(account.id) }}</span>
                       <small
-                        >{{ accountStatusText(account.status) }} · ID
+                        >{{ bindingAccountModeLabel }} · {{ accountStatusText(account.status) }} · ID
                         {{ account.id }}</small
                       >
                     </div>
@@ -2651,7 +2785,7 @@ onBeforeUnmount(() => {
                     <el-switch v-model="accountConfigForm.auto_ads_enabled" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="每日最大加群数">
-                    <el-input-number v-model="accountConfigForm.max_groups_per_day" :min="0" :max="1000" />
+                    <el-input-number v-model="accountConfigForm.max_groups_per_day" :min="0" :max="10" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="账号总群上限">
                     <el-input-number v-model="accountConfigForm.max_groups_total" :min="0" :max="10000" />
@@ -2715,28 +2849,36 @@ onBeforeUnmount(() => {
                 </el-form-item>
               </el-form>
 
-              <el-divider content-position="left">批量套用</el-divider>
-              <div class="batch-toolbar">
-                <el-select
-                  v-model="batchAccountIds"
-                  multiple
-                  filterable
-                  collapse-tags
-                  collapse-tags-tooltip
-                  placeholder="选择可用推广账号"
-                  class="batch-account-select"
-                >
-                  <el-option
-                    v-for="item in adBindingAccounts"
-                    :key="item.id"
-                    :label="accountLabel(item.id)"
-                    :value="item.id"
-                  />
-                </el-select>
-                <el-button @click="selectAllBatchAccounts">全选</el-button>
-                <el-button @click="clearBatchAccounts">清空</el-button>
-                <el-button :loading="savingBatchAccountConfig" @click="saveBatchAccountConfig">批量套用</el-button>
-              </div>
+              <template v-if="batchAccountOptions.length">
+                <el-divider content-position="left">批量套用到{{ batchAccountModeLabel }}</el-divider>
+                <div class="batch-toolbar">
+                  <el-select
+                    v-model="batchAccountIds"
+                    multiple
+                    filterable
+                    collapse-tags
+                    collapse-tags-tooltip
+                    :placeholder="`选择${batchAccountModeLabel}`"
+                    class="batch-account-select"
+                  >
+                    <el-option
+                      v-for="item in batchAccountOptions"
+                      :key="item.id"
+                      :label="accountLabel(item.id)"
+                      :value="item.id"
+                    />
+                  </el-select>
+                  <el-button @click="selectAllBatchAccounts">全选</el-button>
+                  <el-button @click="clearBatchAccounts">清空</el-button>
+                  <el-button
+                    :disabled="!batchAccountIds.length"
+                    :loading="savingBatchAccountConfig"
+                    @click="saveBatchAccountConfig"
+                  >
+                    批量套用
+                  </el-button>
+                </div>
+              </template>
             </div>
             <template #footer>
               <el-button @click="accountConfigDialogVisible = false">取消</el-button>
@@ -3886,6 +4028,24 @@ onBeforeUnmount(() => {
   background: #e3fafc;
   border: 1px solid #bee3e8;
   border-radius: 6px;
+}
+
+.ad-only-assignment-note {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 14px 0 20px;
+  padding: 12px 14px;
+  border-left: 3px solid #d97706;
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ad-only-assignment-note strong {
+  color: var(--el-text-color-primary);
+  font-size: 14px;
 }
 
 .rich-option {

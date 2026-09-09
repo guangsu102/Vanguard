@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ElTable, ElTableColumn, ElPagination, ElEmpty, ElCard } from 'element-plus'
+import { DEFAULT_PAGE_SIZE, normalizePageSize, normalizePageSizeOptions, PAGE_SIZE_OPTIONS } from '@/utils/pagination'
 
 interface Column<T = any> {
   prop?: string
@@ -21,6 +22,7 @@ interface Props {
   loading?: boolean
   page?: number
   pageSize?: number
+  pageSizes?: number[]
   emptyText?: string
   stripe?: boolean
   border?: boolean
@@ -31,7 +33,8 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   loading: false,
   page: 1,
-  pageSize: 20,
+  pageSize: DEFAULT_PAGE_SIZE,
+  pageSizes: () => [...PAGE_SIZE_OPTIONS],
   emptyText: '暂无数据',
   stripe: true,
   border: true,
@@ -46,14 +49,15 @@ const emit = defineEmits<{
 }>()
 
 const currentPage = ref(props.page)
-const currentPageSize = ref(props.pageSize)
+const currentPageSize = ref(normalizePageSize(props.pageSize))
+const paginationPageSizes = computed(() => normalizePageSizeOptions(props.pageSizes))
 
 watch(() => props.page, (val) => {
   currentPage.value = val
 })
 
 watch(() => props.pageSize, (val) => {
-  currentPageSize.value = val
+  currentPageSize.value = normalizePageSize(val)
 })
 
 const handlePageChange = (page: number) => {
@@ -61,8 +65,9 @@ const handlePageChange = (page: number) => {
 }
 
 const handlePageSizeChange = (pageSize: number) => {
-  currentPageSize.value = pageSize
-  emit('page-size-change', pageSize)
+  const normalized = normalizePageSize(pageSize)
+  currentPageSize.value = normalized
+  emit('page-size-change', normalized)
 }
 
 const handleSelectionChange = (selection: any[]) => {
@@ -114,7 +119,7 @@ defineExpose({
       <el-pagination
         v-model:current-page="currentPage"
         v-model:page-size="currentPageSize"
-        :page-sizes="[10, 20, 50, 100]"
+        :page-sizes="paginationPageSizes"
         :total="total"
         layout="total, sizes, prev, pager, next, jumper"
         @current-change="handlePageChange"

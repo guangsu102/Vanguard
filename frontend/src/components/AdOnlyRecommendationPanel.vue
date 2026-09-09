@@ -6,13 +6,14 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   automationApi,
   type AdOnlyAssessment,
-  type AdOnlyDirectAssignmentRequest,
+  type AdOnlyDirectAssignmentBatchRequest,
   type AdOnlyEvent,
   type AdOnlyHandover,
   type AdOnlyHandoverOptions,
   type AdOnlyHandoverRequest,
   type AdOnlyRecommendationSettings,
 } from '@/api/automation'
+import { estimatePacedJoinMinutes, parsePacedJoinLinks } from '@/utils/adOnlyJoinQueue'
 
 const defaultSettings = (): AdOnlyRecommendationSettings => ({
   recommendation_enabled: false,
@@ -37,14 +38,14 @@ const activeView = ref<'candidates' | 'handovers'>('candidates')
 const settings = reactive(defaultSettings())
 const candidates = ref<AdOnlyAssessment[]>([])
 const handovers = ref<AdOnlyHandover[]>([])
-const options = ref<AdOnlyHandoverOptions>({ accounts: [], creatives: [] })
+const options = ref<AdOnlyHandoverOptions>({ accounts: [], creatives: [], campaigns: [] })
 const handoverDialogVisible = ref(false)
 const handoverSubmitting = ref(false)
 const directDialogVisible = ref(false)
 const directSubmitting = ref(false)
 const selectedAssessment = ref<AdOnlyAssessment | null>(null)
 const scheduleTimesText = ref('09:00,18:00')
-const directScheduleTimesText = ref('09:00,18:00')
+const directLinksText = ref('')
 const historyVisible = ref(false)
 const historyLoading = ref(false)
 const historyAssessments = ref<AdOnlyAssessment[]>([])
@@ -63,17 +64,31 @@ const form = reactive<AdOnlyHandoverRequest>({
 const defaultPermissionExpiry = () =>
   new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 19)
 
-const directForm = reactive<AdOnlyDirectAssignmentRequest>({
+const directForm = reactive<AdOnlyDirectAssignmentBatchRequest>({
+  campaign_id: 0,
   target_account_id: 0,
   creative_id: 0,
-  invite_link: '',
-  send_mode: 'interval',
-  interval_minutes: 180,
-  scheduled_times: [],
+  invite_links: [],
+  join_interval_min_minutes: 1,
+  join_interval_max_minutes: 30,
   permission_mode: 'soft_ad_allowed',
   permission_note: '',
   permission_expires_at: defaultPermissionExpiry(),
 })
+
+const parsedDirectLinks = computed(() => parsePacedJoinLinks(directLinksText.value))
+const directInviteLinks = computed(() => parsedDirectLinks.value.links)
+const duplicateLinkCount = computed(() => parsedDirectLinks.value.duplicateCount)
+const estimatedQueueMinutes = computed(() =>
+  estimatePacedJoinMinutes(
+    directInviteLinks.value.length,
+    directForm.join_interval_min_minutes,
+    directForm.join_interval_max_minutes,
+  ),
+)
+const selectedCampaign = computed(() =>
+  options.value.campaigns.find((item) => item.id === directForm.campaign_id),
+)
 
 const recommendedCount = computed(
   () => candidates.value.filter((item) => item.status === 'recommended').length,
@@ -87,11 +102,32 @@ const approvedCount = computed(
 const activeHandoverCount = computed(
   () =>
     handovers.value.filter((item) =>
-      ['queued', 'running', 'cleanup_pending', 'rollback_pending'].includes(item.status),
+      ['queued', 'dispatching', 'running', 'cleanup_pending', 'rollback_pending'].includes(
+        item.status,
+      ),
     ).length,
 )
 
 const formatTime = (value?: string) => (value ? value.replace('T', ' ').slice(0, 19) : '-')
+
+const formatDuration = (minutes: number) => {
+  if (minutes < 60) return `${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  if (hours < 24) return remainder ? `${hours} 小时 ${remainder} 分钟` : `${hours} 小时`
+  const days = Math.floor(hours / 24)
+  const remainingHours = hours % 24
+  return remainingHours ? `${days} 天 ${remainingHours} 小时` : `${days} 天`
+}
+
+const campaignFrequency = (campaign = selectedCampaign.value) => {
+  if (!campaign) return '-'
+  return campaign.send_mode === 'scheduled'
+    ? campaign.scheduled_times.join('、') || '未设置定时时点'
+    : `每 ${campaign.interval_minutes} 分钟`
+}
+
+const shortBatch = (value?: string) => (value ? value.slice(0, 8) : '-')
 
 const statusType = (value: string) => {
   if (['completed', 'recommended', 'approved'].includes(value)) return 'success'
@@ -105,12 +141,14 @@ const statusLabel = (value: string) =>
     recommended: '可移交',
     observing: '观察中',
     queued: '已排队',
+    dispatching: '调度中',
     running: '执行中',
     cleanup_pending: '待清理',
     rollback_pending: '回滚待处理',
     failed: '失败',
     completed: '已完成',
     rolled_back: '已回滚',
+    cancelled: '已取消',
   })[value] || value
 
 const decisionLabel = (assessment: any) => {
@@ -250,62 +288,89 @@ const createHandover = async () => {
   }
 }
 
-const openDirectAssignment = () => {
+const openDirectAssignment = (campaignId?: number) => {
+  if (!settings.handover_execution_enabled) {
+    ElMessage.warning('请先开启“允许执行加群与交接”并保存设置')
+    return
+  }
+  const campaign = options.value.campaigns.find((item) => item.id === campaignId)
+    || options.value.campaigns[0]
   Object.assign(directForm, {
+    campaign_id: campaign?.id || 0,
     target_account_id: options.value.accounts[0]?.id || 0,
     creative_id: options.value.creatives[0]?.id || 0,
-    invite_link: '',
-    send_mode: 'interval',
-    interval_minutes: 180,
-    scheduled_times: [],
+    invite_links: [],
+    join_interval_min_minutes: 1,
+    join_interval_max_minutes: 30,
     permission_mode: 'soft_ad_allowed',
     permission_note: '',
     permission_expires_at: defaultPermissionExpiry(),
   })
-  directScheduleTimesText.value = '09:00,18:00'
+  directLinksText.value = ''
   directDialogVisible.value = true
 }
 
+const openGroupAssignment = async (campaignId?: number) => {
+  await loadData()
+  openDirectAssignment(campaignId)
+}
+
+defineExpose({ openGroupAssignment })
+
 const createDirectAssignment = async () => {
-  if (!directForm.target_account_id || !directForm.creative_id || !directForm.invite_link.trim()) {
-    ElMessage.warning('请选择专用账号、素材并填写群邀请链接')
+  if (!directForm.campaign_id || !directForm.target_account_id || !directForm.creative_id) {
+    ElMessage.warning('请选择计划、专用账号和广告素材')
+    return
+  }
+  if (!directInviteLinks.value.length || directInviteLinks.value.length > 100) {
+    ElMessage.warning('请填写 1-100 个有效的群邀请链接')
+    return
+  }
+  if (
+    directForm.join_interval_min_minutes > directForm.join_interval_max_minutes
+  ) {
+    ElMessage.warning('最小加群间隔不能大于最大间隔')
     return
   }
   if (directForm.permission_note.trim().length < 3 || !directForm.permission_expires_at) {
     ElMessage.warning('请填写广告权限依据和有效期')
     return
   }
-  directForm.scheduled_times =
-    directForm.send_mode === 'scheduled'
-      ? directScheduleTimesText.value
-          .split(/[,，\s]+/)
-          .map((item) => item.trim())
-          .filter(Boolean)
-      : []
+  const payload = {
+    ...directForm,
+    invite_links: directInviteLinks.value,
+    permission_note: directForm.permission_note.trim(),
+  }
+  directSubmitting.value = true
   try {
+    const preflight = await automationApi.preflightAdOnlyDirectAssignmentBatch(payload)
+    const warning = preflight.data.data.capacity_warning
+      ? ' 系统检测到计划日发送量可能超过账号安全上限，请先降低计划频率或提高账号限额。'
+      : ''
     await ElMessageBox.confirm(
-      '确认已获得该群广告投放权限，并按填写的有效期记录到审计日志？',
-      '确认广告权限',
-      { type: 'warning', confirmButtonText: '确认并启动' },
+      `将 ${directInviteLinks.value.length} 个链接加入队列，每次仅处理 1 个，间隔 ${directForm.join_interval_min_minutes}-${directForm.join_interval_max_minutes} 分钟，预计 ${formatDuration(estimatedQueueMinutes.value)} 完成。现有群投放不会停止。${warning}`,
+      '确认添加群队列',
+      {
+        type: warning ? 'warning' : 'info',
+        confirmButtonText: warning ? '仍然添加' : '确认添加',
+      },
     )
   } catch {
+    directSubmitting.value = false
     return
   }
   const idempotencyKey =
     globalThis.crypto?.randomUUID?.() ||
-    `direct-${Date.now()}-${Math.random().toString(16).slice(2)}`
-  directSubmitting.value = true
+    `direct-batch-${Date.now()}-${Math.random().toString(16).slice(2)}`
   try {
-    await automationApi.createAdOnlyDirectAssignment({
-      ...directForm,
-      invite_link: directForm.invite_link.trim(),
-      permission_note: directForm.permission_note.trim(),
+    await automationApi.createAdOnlyDirectAssignmentBatch({
+      ...payload,
       idempotency_key: idempotencyKey,
     })
-    directForm.invite_link = ''
+    directLinksText.value = ''
     directDialogVisible.value = false
     activeView.value = 'handovers'
-    ElMessage.success('直接指定已通过预检并进入队列')
+    ElMessage.success(`${payload.invite_links.length} 个群链接已加入节流队列`)
     await loadData()
   } finally {
     directSubmitting.value = false
@@ -317,6 +382,26 @@ const retryHandover = async (handover: any) => {
   try {
     await automationApi.retryAdOnlyHandover(handover.id)
     ElMessage.success('重试已进入队列')
+    await loadData()
+  } finally {
+    actionId.value = null
+  }
+}
+
+const cancelHandover = async (handover: any) => {
+  try {
+    await ElMessageBox.confirm(
+      '取消后将删除尚未使用的邀请链接，并按原节奏释放下一条。',
+      '取消排队项',
+      { type: 'warning', confirmButtonText: '确认取消' },
+    )
+  } catch {
+    return
+  }
+  actionId.value = `cancel-${handover.id}`
+  try {
+    await automationApi.cancelAdOnlyHandover(handover.id)
+    ElMessage.success('排队项已取消')
     await loadData()
   } finally {
     actionId.value = null
@@ -367,7 +452,7 @@ onMounted(loadData)
           <el-switch v-model="settings.recommendation_enabled" />
         </div>
         <div class="setting-control">
-          <span>允许执行交接</span>
+          <span>允许执行加群与交接</span>
           <el-switch v-model="settings.handover_execution_enabled" />
         </div>
         <div class="setting-control numeric">
@@ -388,10 +473,9 @@ onMounted(loadData)
         <el-button
           type="warning"
           :icon="Plus"
-          :disabled="!settings.handover_execution_enabled"
-          @click="openDirectAssignment"
+          @click="openDirectAssignment()"
         >
-          直接指定群
+          批量添加群
         </el-button>
         <el-button type="primary" :icon="Check" :loading="savingSettings" @click="saveSettings">
           保存设置
@@ -523,25 +607,25 @@ onMounted(loadData)
 
       <el-tab-pane label="交接任务" name="handovers">
         <el-table :data="handovers" row-key="id">
-          <el-table-column label="类型" width="100">
+          <el-table-column label="任务" min-width="170">
             <template #default="{ row }">
-              <el-tag :type="row.workflow_type === 'direct' ? 'warning' : 'info'" effect="plain">
-                {{ row.workflow_type === 'direct' ? '直接指定' : '评估接管' }}
-              </el-tag>
+              <div class="primary-cell">
+                <strong>{{ row.campaign_name || (row.workflow_type === 'direct' ? '直接指定' : '评估接管') }}</strong>
+                <small v-if="row.batch_id">批次 {{ shortBatch(row.batch_id) }} · 第 {{ row.queue_position }} 条</small>
+                <small v-else>交接 #{{ row.id }}</small>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="群" min-width="180">
             <template #default="{ row }">
               <div class="primary-cell">
                 <strong>{{ row.group_title || row.telegram_group_id || '等待解析群链接' }}</strong>
-                <small>交接 #{{ row.id }}</small>
+                <small>{{ row.group_id ? `群记录 #${row.group_id}` : '邀请链接已加密保存' }}</small>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="账号交接" min-width="240">
+          <el-table-column label="专属账号" min-width="170">
             <template #default="{ row }">
-              {{ row.workflow_type === 'direct' ? '管理员指定' : (row.source_growth_account_label || row.source_growth_account_id) }}
-              →
               {{ row.target_ad_only_account_label || row.target_ad_only_account_id }}
             </template>
           </el-table-column>
@@ -552,18 +636,22 @@ onMounted(loadData)
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="当前步骤" min-width="150" prop="current_step" />
-          <el-table-column label="频率" width="130">
+          <el-table-column label="加群节奏" min-width="150">
             <template #default="{ row }">
-              {{ row.send_mode === 'scheduled' ? row.scheduled_times.join(', ') : `${row.interval_minutes} 分钟` }}
+              <div v-if="row.batch_id" class="primary-cell">
+                <strong>{{ row.join_interval_min_minutes }}-{{ row.join_interval_max_minutes }} 分钟</strong>
+                <small>
+                  {{ row.next_attempt_at ? `下次 ${formatTime(row.next_attempt_at)}` : (row.status === 'queued' ? '等待前序任务' : row.current_step) }}
+                </small>
+              </div>
+              <span v-else>{{ row.current_step }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="重试" width="70" align="center" prop="retry_count" />
           <el-table-column label="错误" min-width="190" show-overflow-tooltip prop="last_error" />
           <el-table-column label="更新时间" width="170">
             <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
           </el-table-column>
-          <el-table-column label="操作" width="165" fixed="right">
+          <el-table-column label="操作" width="150" fixed="right">
             <template #default="{ row }">
               <el-button
                 v-if="['failed', 'cleanup_pending'].includes(row.status)"
@@ -576,7 +664,16 @@ onMounted(loadData)
                 重试
               </el-button>
               <el-button
-                v-if="!['completed', 'rolled_back', 'cancelled', 'running'].includes(row.status)"
+                v-if="row.batch_id && !row.group_id && ['queued', 'failed'].includes(row.status)"
+                link
+                type="danger"
+                :loading="actionId === `cancel-${row.id}`"
+                @click="cancelHandover(row)"
+              >
+                取消
+              </el-button>
+              <el-button
+                v-if="(!row.batch_id || row.group_id) && !['completed', 'rolled_back', 'cancelled', 'running', 'dispatching'].includes(row.status)"
                 link
                 type="warning"
                 :loading="actionId === `rollback-${row.id}`"
@@ -656,10 +753,31 @@ onMounted(loadData)
 
     <el-dialog
       v-model="directDialogVisible"
-      title="直接指定 Ad-only 群"
-      width="min(680px, calc(100vw - 32px))"
+      title="向 Ad-only 专属账号添加群"
+      width="min(820px, calc(100vw - 32px))"
+      destroy-on-close
     >
-      <el-form label-position="top">
+      <el-form label-position="top" class="queue-form">
+        <el-form-item label="广告计划" required>
+          <el-select v-model="directForm.campaign_id" filterable placeholder="选择已创建的 Ad-only 计划">
+            <el-option
+              v-for="campaign in options.campaigns"
+              :key="campaign.id"
+              :value="campaign.id"
+              :label="campaign.name"
+            >
+              <div class="rich-option">
+                <span>{{ campaign.name }}</span>
+                <small>{{ campaign.enabled ? '运行中' : '未启用' }} · 已有 {{ campaign.target_group_count }} 个群</small>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <div v-if="selectedCampaign" class="campaign-context-band">
+          <div><span>计划状态</span><strong>{{ selectedCampaign.enabled ? '运行中' : '未启用' }}</strong></div>
+          <div><span>发送节奏</span><strong>{{ campaignFrequency() }}</strong></div>
+          <div><span>当前群数</span><strong>{{ selectedCampaign.target_group_count }}</strong></div>
+        </div>
         <div class="dialog-grid">
           <el-form-item label="Ad-only 账号" required>
             <el-select v-model="directForm.target_account_id" filterable>
@@ -682,17 +800,48 @@ onMounted(loadData)
             </el-select>
           </el-form-item>
         </div>
-        <el-form-item label="群邀请链接" required>
+        <el-form-item label="群邀请链接（每行一个，最多 100 个）" required>
           <el-input
-            v-model="directForm.invite_link"
-            type="password"
-            show-password
+            v-model="directLinksText"
+            type="textarea"
+            :rows="8"
             autocomplete="off"
-            placeholder="t.me 公共群或私有邀请链接"
+            resize="vertical"
+            placeholder="https://t.me/group_one&#10;https://t.me/+privateInviteTwo"
           />
         </el-form-item>
+        <div class="queue-preview-band" :class="{ 'is-over-limit': directInviteLinks.length > 100 }">
+          <div><span>有效链接</span><strong>{{ directInviteLinks.length }} / 100</strong></div>
+          <div><span>自动去重</span><strong>{{ duplicateLinkCount }} 条</strong></div>
+          <div><span>预计完成</span><strong>{{ formatDuration(estimatedQueueMinutes) }}</strong></div>
+        </div>
+        <div class="drawer-section-title">加群节奏</div>
         <div class="dialog-grid">
-          <el-form-item label="广告权限" required>
+          <el-form-item label="最小间隔" required>
+            <el-input-number
+              v-model="directForm.join_interval_min_minutes"
+              :min="1"
+              :max="30"
+              controls-position="right"
+            />
+            <span class="unit-label">分钟</span>
+          </el-form-item>
+          <el-form-item label="最大间隔" required>
+            <el-input-number
+              v-model="directForm.join_interval_max_minutes"
+              :min="1"
+              :max="30"
+              controls-position="right"
+            />
+            <span class="unit-label">分钟</span>
+          </el-form-item>
+        </div>
+        <div class="queue-behavior-note">
+          系统每次只让该账号处理一个链接；成功、失败或取消后，才会按随机间隔释放下一条。已加入群的广告投放继续运行。
+        </div>
+        <div class="drawer-section-title">广告权限</div>
+        <div class="dialog-grid">
+          <el-form-item label="权限级别" required>
             <el-select v-model="directForm.permission_mode">
               <el-option label="允许常规软广" value="soft_ad_allowed" />
               <el-option label="允许高频广告" value="high_volume_ad_allowed" />
@@ -717,24 +866,6 @@ onMounted(loadData)
             placeholder="管理员授权、群规或合作约定"
           />
         </el-form-item>
-        <el-form-item label="发送模式">
-          <el-radio-group v-model="directForm.send_mode">
-            <el-radio-button value="interval">固定间隔</el-radio-button>
-            <el-radio-button value="scheduled">每日定时</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-        <el-form-item v-if="directForm.send_mode === 'interval'" label="发送间隔">
-          <el-input-number
-            v-model="directForm.interval_minutes"
-            :min="30"
-            :max="10080"
-            :step="30"
-          />
-          <span class="unit-label">分钟</span>
-        </el-form-item>
-        <el-form-item v-else label="每日时间">
-          <el-input v-model="directScheduleTimesText" placeholder="09:00,18:00" />
-        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="directDialogVisible = false">取消</el-button>
@@ -744,7 +875,7 @@ onMounted(loadData)
           :loading="directSubmitting"
           @click="createDirectAssignment"
         >
-          预检并启动
+          确认添加群队列
         </el-button>
       </template>
     </el-dialog>
@@ -880,6 +1011,80 @@ onMounted(loadData)
   gap: 16px;
 }
 
+.queue-form :deep(.el-select),
+.queue-form :deep(.el-date-editor) {
+  width: 100%;
+}
+
+.drawer-section-title {
+  margin: 20px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  color: var(--el-text-color-primary);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.campaign-context-band,
+.queue-preview-band {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: -4px 0 18px;
+  overflow: hidden;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-border-color-lighter);
+}
+
+.campaign-context-band > div,
+.queue-preview-band > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+  padding: 11px 14px;
+  background: var(--el-bg-color);
+}
+
+.campaign-context-band span,
+.queue-preview-band span {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.campaign-context-band strong,
+.queue-preview-band strong {
+  overflow-wrap: anywhere;
+  color: var(--el-text-color-primary);
+  font-size: 14px;
+}
+
+.queue-preview-band.is-over-limit {
+  border-color: var(--el-color-danger);
+}
+
+.queue-behavior-note {
+  padding: 10px 12px;
+  border-left: 3px solid var(--el-color-warning);
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-regular);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.rich-option {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.rich-option small {
+  color: var(--el-text-color-secondary);
+}
+
 .unit-label {
   margin-left: 10px;
   color: var(--el-text-color-secondary);
@@ -925,6 +1130,11 @@ onMounted(loadData)
 
   .evidence-detail,
   .dialog-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .campaign-context-band,
+  .queue-preview-band {
     grid-template-columns: 1fr;
   }
 }

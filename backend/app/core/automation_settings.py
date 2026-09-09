@@ -52,8 +52,8 @@ DEFAULT_AI_REPLY_SETTINGS: dict[str, Any] = {"enabled": False}
 DEFAULT_AD_FAILURE_POLICY: dict[str, Any] = {
     "enabled": True,
     "leave_on_group_control_failure": True,
-    "group_control_failure_limit": 1,
-    "group_control_failure_window_hours": 720,
+    "group_control_failure_limit": 2,
+    "group_control_failure_window_hours": 48,
     "levels": ["A", "B", "C", "UNRATED"],
 }
 
@@ -120,7 +120,9 @@ def _normalize_string_list(
     return result
 
 
-def _normalize_group_ai_overrides(value: Any, *, defaults: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _normalize_group_ai_overrides(
+    value: Any, *, defaults: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
     raw = value if isinstance(value, dict) else {}
     result: dict[str, dict[str, Any]] = {}
     for group_id, item in raw.items():
@@ -130,13 +132,18 @@ def _normalize_group_ai_overrides(value: Any, *, defaults: dict[str, Any]) -> di
         if not key:
             continue
         topics = _normalize_string_list(
-            item.get("topics", item.get("proactiveWarmupTopics", defaults["proactiveWarmupTopics"])),
+            item.get(
+                "topics", item.get("proactiveWarmupTopics", defaults["proactiveWarmupTopics"])
+            ),
             default=defaults["proactiveWarmupTopics"],
             max_items=30,
             max_length=80,
         )
         templates = _normalize_string_list(
-            item.get("templates", item.get("proactiveWarmupTemplates", defaults["proactiveWarmupTemplates"])),
+            item.get(
+                "templates",
+                item.get("proactiveWarmupTemplates", defaults["proactiveWarmupTemplates"]),
+            ),
             default=defaults["proactiveWarmupTemplates"],
             max_items=50,
             max_length=240,
@@ -153,24 +160,40 @@ def _normalize_group_ai_overrides(value: Any, *, defaults: dict[str, Any]) -> di
     return result
 
 
-def _normalize_int_map(value: Any, *, default: dict[str, int], min_value: int, max_value: int) -> dict[str, int]:
+def _normalize_int_map(
+    value: Any, *, default: dict[str, int], min_value: int, max_value: int
+) -> dict[str, int]:
     raw = value if isinstance(value, dict) else default
     result: dict[str, int] = {}
     for key, fallback in default.items():
-        result[str(key)] = _int_setting(raw.get(str(key), raw.get(key, fallback)), fallback, min_value=min_value, max_value=max_value)
+        result[str(key)] = _int_setting(
+            raw.get(str(key), raw.get(key, fallback)),
+            fallback,
+            min_value=min_value,
+            max_value=max_value,
+        )
     return result
 
 
-def _normalize_float_map(value: Any, *, default: dict[str, float], min_value: float, max_value: float) -> dict[str, float]:
+def _normalize_float_map(
+    value: Any, *, default: dict[str, float], min_value: float, max_value: float
+) -> dict[str, float]:
     raw = value if isinstance(value, dict) else default
     result: dict[str, float] = {}
     for key, fallback in default.items():
-        result[str(key)] = _float_setting(raw.get(str(key), raw.get(key, fallback)), fallback, min_value=min_value, max_value=max_value)
+        result[str(key)] = _float_setting(
+            raw.get(str(key), raw.get(key, fallback)),
+            fallback,
+            min_value=min_value,
+            max_value=max_value,
+        )
     return result
 
 
 async def _read_setting_payload(db: AsyncSession, key: str) -> dict[str, Any]:
-    setting = (await db.execute(select(SystemSetting).where(SystemSetting.key == key))).scalar_one_or_none()
+    setting = (
+        await db.execute(select(SystemSetting).where(SystemSetting.key == key))
+    ).scalar_one_or_none()
     if setting is None:
         return {}
     try:
@@ -180,8 +203,12 @@ async def _read_setting_payload(db: AsyncSession, key: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-async def _save_setting_payload(db: AsyncSession, key: str, payload: dict[str, Any], description: str) -> None:
-    setting = (await db.execute(select(SystemSetting).where(SystemSetting.key == key))).scalar_one_or_none()
+async def _save_setting_payload(
+    db: AsyncSession, key: str, payload: dict[str, Any], description: str
+) -> None:
+    setting = (
+        await db.execute(select(SystemSetting).where(SystemSetting.key == key))
+    ).scalar_one_or_none()
     if setting is None:
         setting = SystemSetting(key=key, description=description)
         db.add(setting)
@@ -193,14 +220,18 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS
 
-    verification = raw.get("join_verification", raw.get("joinVerification", defaults["join_verification"]))
+    verification = raw.get(
+        "join_verification", raw.get("joinVerification", defaults["join_verification"])
+    )
     if not isinstance(verification, dict):
         verification = {}
     default_verification = defaults["join_verification"]
     unknown_action = str(
         verification.get(
             "unknown_challenge_action",
-            verification.get("unknownChallengeAction", default_verification["unknown_challenge_action"]),
+            verification.get(
+                "unknownChallengeAction", default_verification["unknown_challenge_action"]
+            ),
         )
         or default_verification["unknown_challenge_action"]
     ).strip()
@@ -212,7 +243,10 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
         search_filter = {}
     default_filter = defaults["search_filter"]
 
-    cleanup = raw.get("group_capacity_cleanup", raw.get("groupCapacityCleanup", defaults["group_capacity_cleanup"]))
+    cleanup = raw.get(
+        "group_capacity_cleanup",
+        raw.get("groupCapacityCleanup", defaults["group_capacity_cleanup"]),
+    )
     if not isinstance(cleanup, dict):
         cleanup = {}
     default_cleanup = defaults["group_capacity_cleanup"]
@@ -220,7 +254,10 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
     return {
         "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
         "scan_interval_minutes": _int_setting(
-            raw.get("scan_interval_minutes", raw.get("scanIntervalMinutes", defaults["scan_interval_minutes"])),
+            raw.get(
+                "scan_interval_minutes",
+                raw.get("scanIntervalMinutes", defaults["scan_interval_minutes"]),
+            ),
             defaults["scan_interval_minutes"],
             min_value=1,
             max_value=1440,
@@ -229,25 +266,37 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "title_blacklist_enabled": _bool_setting(
                 search_filter.get(
                     "title_blacklist_enabled",
-                    search_filter.get("titleBlacklistEnabled", default_filter["title_blacklist_enabled"]),
+                    search_filter.get(
+                        "titleBlacklistEnabled", default_filter["title_blacklist_enabled"]
+                    ),
                 ),
                 default_filter["title_blacklist_enabled"],
             ),
             "title_blacklist": _normalize_string_list(
-                search_filter.get("title_blacklist", search_filter.get("titleBlacklist", default_filter["title_blacklist"])),
+                search_filter.get(
+                    "title_blacklist",
+                    search_filter.get("titleBlacklist", default_filter["title_blacklist"]),
+                ),
                 default=default_filter["title_blacklist"],
             ),
         },
         "join_verification": {
-            "enabled": _bool_setting(verification.get("enabled", default_verification["enabled"]), default_verification["enabled"]),
+            "enabled": _bool_setting(
+                verification.get("enabled", default_verification["enabled"]),
+                default_verification["enabled"],
+            ),
             "ai_enabled": _bool_setting(
-                verification.get("ai_enabled", verification.get("aiEnabled", default_verification["ai_enabled"])),
+                verification.get(
+                    "ai_enabled", verification.get("aiEnabled", default_verification["ai_enabled"])
+                ),
                 default_verification["ai_enabled"],
             ),
             "confidence_threshold": _float_setting(
                 verification.get(
                     "confidence_threshold",
-                    verification.get("confidenceThreshold", default_verification["confidence_threshold"]),
+                    verification.get(
+                        "confidenceThreshold", default_verification["confidence_threshold"]
+                    ),
                 ),
                 float(default_verification["confidence_threshold"]),
                 min_value=0.0,
@@ -256,7 +305,9 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "post_action_wait_seconds": _int_setting(
                 verification.get(
                     "post_action_wait_seconds",
-                    verification.get("postActionWaitSeconds", default_verification["post_action_wait_seconds"]),
+                    verification.get(
+                        "postActionWaitSeconds", default_verification["post_action_wait_seconds"]
+                    ),
                 ),
                 default_verification["post_action_wait_seconds"],
                 min_value=0,
@@ -265,7 +316,10 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "post_action_recheck_attempts": _int_setting(
                 verification.get(
                     "post_action_recheck_attempts",
-                    verification.get("postActionRecheckAttempts", default_verification["post_action_recheck_attempts"]),
+                    verification.get(
+                        "postActionRecheckAttempts",
+                        default_verification["post_action_recheck_attempts"],
+                    ),
                 ),
                 default_verification["post_action_recheck_attempts"],
                 min_value=1,
@@ -274,20 +328,31 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "post_action_extra_wait_seconds": _float_setting(
                 verification.get(
                     "post_action_extra_wait_seconds",
-                    verification.get("postActionExtraWaitSeconds", default_verification["post_action_extra_wait_seconds"]),
+                    verification.get(
+                        "postActionExtraWaitSeconds",
+                        default_verification["post_action_extra_wait_seconds"],
+                    ),
                 ),
                 float(default_verification["post_action_extra_wait_seconds"]),
                 min_value=0.0,
                 max_value=30.0,
             ),
             "message_limit": _int_setting(
-                verification.get("message_limit", verification.get("messageLimit", default_verification["message_limit"])),
+                verification.get(
+                    "message_limit",
+                    verification.get("messageLimit", default_verification["message_limit"]),
+                ),
                 default_verification["message_limit"],
                 min_value=5,
-                max_value=50,
+                max_value=100,
             ),
             "ai_timeout_seconds": _float_setting(
-                verification.get("ai_timeout_seconds", verification.get("aiTimeoutSeconds", default_verification["ai_timeout_seconds"])),
+                verification.get(
+                    "ai_timeout_seconds",
+                    verification.get(
+                        "aiTimeoutSeconds", default_verification["ai_timeout_seconds"]
+                    ),
+                ),
                 float(default_verification["ai_timeout_seconds"]),
                 min_value=1.0,
                 max_value=45.0,
@@ -295,7 +360,9 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "action_timeout_seconds": _float_setting(
                 verification.get(
                     "action_timeout_seconds",
-                    verification.get("actionTimeoutSeconds", default_verification["action_timeout_seconds"]),
+                    verification.get(
+                        "actionTimeoutSeconds", default_verification["action_timeout_seconds"]
+                    ),
                 ),
                 float(default_verification["action_timeout_seconds"]),
                 min_value=1.0,
@@ -304,54 +371,89 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             "pending_sync_min_age_seconds": _int_setting(
                 verification.get(
                     "pending_sync_min_age_seconds",
-                    verification.get("pendingSyncMinAgeSeconds", default_verification["pending_sync_min_age_seconds"]),
+                    verification.get(
+                        "pendingSyncMinAgeSeconds",
+                        default_verification["pending_sync_min_age_seconds"],
+                    ),
                 ),
                 default_verification["pending_sync_min_age_seconds"],
                 min_value=30,
                 max_value=3600,
             ),
             "pending_sync_limit": _int_setting(
-                verification.get("pending_sync_limit", verification.get("pendingSyncLimit", default_verification["pending_sync_limit"])),
+                verification.get(
+                    "pending_sync_limit",
+                    verification.get(
+                        "pendingSyncLimit", default_verification["pending_sync_limit"]
+                    ),
+                ),
                 default_verification["pending_sync_limit"],
                 min_value=1,
                 max_value=20,
             ),
             "unknown_challenge_action": unknown_action,
             "allow_button_clicks": _bool_setting(
-                verification.get("allow_button_clicks", verification.get("allowButtonClicks", default_verification["allow_button_clicks"])),
+                verification.get(
+                    "allow_button_clicks",
+                    verification.get(
+                        "allowButtonClicks", default_verification["allow_button_clicks"]
+                    ),
+                ),
                 default_verification["allow_button_clicks"],
             ),
             "allow_text_answers": _bool_setting(
-                verification.get("allow_text_answers", verification.get("allowTextAnswers", default_verification["allow_text_answers"])),
+                verification.get(
+                    "allow_text_answers",
+                    verification.get(
+                        "allowTextAnswers", default_verification["allow_text_answers"]
+                    ),
+                ),
                 default_verification["allow_text_answers"],
             ),
             "answer_profile": str(
-                verification.get("answer_profile", verification.get("answerProfile", default_verification["answer_profile"]))
+                verification.get(
+                    "answer_profile",
+                    verification.get("answerProfile", default_verification["answer_profile"]),
+                )
                 or default_verification["answer_profile"]
             ).strip()[:500],
         },
         "group_capacity_cleanup": {
-            "enabled": _bool_setting(cleanup.get("enabled", default_cleanup["enabled"]), default_cleanup["enabled"]),
+            "enabled": _bool_setting(
+                cleanup.get("enabled", default_cleanup["enabled"]), default_cleanup["enabled"]
+            ),
             "no_conversion_days": _int_setting(
-                cleanup.get("no_conversion_days", cleanup.get("noConversionDays", default_cleanup["no_conversion_days"])),
+                cleanup.get(
+                    "no_conversion_days",
+                    cleanup.get("noConversionDays", default_cleanup["no_conversion_days"]),
+                ),
                 default_cleanup["no_conversion_days"],
                 min_value=1,
                 max_value=365,
             ),
             "min_join_age_days": _int_setting(
-                cleanup.get("min_join_age_days", cleanup.get("minJoinAgeDays", default_cleanup["min_join_age_days"])),
+                cleanup.get(
+                    "min_join_age_days",
+                    cleanup.get("minJoinAgeDays", default_cleanup["min_join_age_days"]),
+                ),
                 default_cleanup["min_join_age_days"],
                 min_value=1,
                 max_value=365,
             ),
             "max_cleanup_per_run": _int_setting(
-                cleanup.get("max_cleanup_per_run", cleanup.get("maxCleanupPerRun", default_cleanup["max_cleanup_per_run"])),
+                cleanup.get(
+                    "max_cleanup_per_run",
+                    cleanup.get("maxCleanupPerRun", default_cleanup["max_cleanup_per_run"]),
+                ),
                 default_cleanup["max_cleanup_per_run"],
                 min_value=1,
                 max_value=15,
             ),
             "interval_hours": _int_setting(
-                cleanup.get("interval_hours", cleanup.get("intervalHours", default_cleanup["interval_hours"])),
+                cleanup.get(
+                    "interval_hours",
+                    cleanup.get("intervalHours", default_cleanup["interval_hours"]),
+                ),
                 default_cleanup["interval_hours"],
                 min_value=1,
                 max_value=168,
@@ -361,10 +463,14 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
 
 
 async def get_auto_join_scheduler_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_auto_join_scheduler_settings(await _read_setting_payload(db, AUTO_JOIN_SCHEDULER_SETTING_KEY))
+    return normalize_auto_join_scheduler_settings(
+        await _read_setting_payload(db, AUTO_JOIN_SCHEDULER_SETTING_KEY)
+    )
 
 
-async def save_auto_join_scheduler_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_auto_join_scheduler_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_auto_join_scheduler_settings(payload)
     await _save_setting_payload(
         db,
@@ -388,7 +494,8 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         tone = defaults["tone"]
 
     system_prompt = str(
-        raw.get("systemPrompt", raw.get("system_prompt", defaults["systemPrompt"])) or defaults["systemPrompt"]
+        raw.get("systemPrompt", raw.get("system_prompt", defaults["systemPrompt"]))
+        or defaults["systemPrompt"]
     ).strip()
     if not system_prompt:
         system_prompt = defaults["systemPrompt"]
@@ -401,7 +508,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
     return {
         "enabled": enabled,
         "dailyTokenBudget": _int_setting(
-            raw.get("dailyTokenBudget", raw.get("daily_token_budget", defaults["dailyTokenBudget"])),
+            raw.get(
+                "dailyTokenBudget", raw.get("daily_token_budget", defaults["dailyTokenBudget"])
+            ),
             defaults["dailyTokenBudget"],
             min_value=0,
             max_value=10_000_000,
@@ -483,7 +592,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "semanticEvaluateEveryMessages": _int_setting(
             raw.get(
                 "semanticEvaluateEveryMessages",
-                raw.get("semantic_evaluate_every_messages", defaults["semanticEvaluateEveryMessages"]),
+                raw.get(
+                    "semantic_evaluate_every_messages", defaults["semanticEvaluateEveryMessages"]
+                ),
             ),
             defaults["semanticEvaluateEveryMessages"],
             min_value=1,
@@ -533,13 +644,18 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
             or defaults["semanticDecisionPrompt"]
         ).strip()[:2000],
         "allowProactiveWarmup": _bool_setting(
-            raw.get("allowProactiveWarmup", raw.get("allow_proactive_warmup", defaults["allowProactiveWarmup"])),
+            raw.get(
+                "allowProactiveWarmup",
+                raw.get("allow_proactive_warmup", defaults["allowProactiveWarmup"]),
+            ),
             defaults["allowProactiveWarmup"],
         ),
         "proactiveWarmupIntervalMinutes": _int_setting(
             raw.get(
                 "proactiveWarmupIntervalMinutes",
-                raw.get("proactive_warmup_interval_minutes", defaults["proactiveWarmupIntervalMinutes"]),
+                raw.get(
+                    "proactive_warmup_interval_minutes", defaults["proactiveWarmupIntervalMinutes"]
+                ),
             ),
             defaults["proactiveWarmupIntervalMinutes"],
             min_value=1,
@@ -548,7 +664,10 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupMaxGroupsPerRun": _int_setting(
             raw.get(
                 "proactiveWarmupMaxGroupsPerRun",
-                raw.get("proactive_warmup_max_groups_per_run", defaults["proactiveWarmupMaxGroupsPerRun"]),
+                raw.get(
+                    "proactive_warmup_max_groups_per_run",
+                    defaults["proactiveWarmupMaxGroupsPerRun"],
+                ),
             ),
             defaults["proactiveWarmupMaxGroupsPerRun"],
             min_value=1,
@@ -557,7 +676,10 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupMaxPerGroupPerDay": _int_setting(
             raw.get(
                 "proactiveWarmupMaxPerGroupPerDay",
-                raw.get("proactive_warmup_max_per_group_per_day", defaults["proactiveWarmupMaxPerGroupPerDay"]),
+                raw.get(
+                    "proactive_warmup_max_per_group_per_day",
+                    defaults["proactiveWarmupMaxPerGroupPerDay"],
+                ),
             ),
             defaults["proactiveWarmupMaxPerGroupPerDay"],
             min_value=0,
@@ -566,7 +688,10 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupMaxPerAccountPerDay": _int_setting(
             raw.get(
                 "proactiveWarmupMaxPerAccountPerDay",
-                raw.get("proactive_warmup_max_per_account_per_day", defaults["proactiveWarmupMaxPerAccountPerDay"]),
+                raw.get(
+                    "proactive_warmup_max_per_account_per_day",
+                    defaults["proactiveWarmupMaxPerAccountPerDay"],
+                ),
             ),
             defaults["proactiveWarmupMaxPerAccountPerDay"],
             min_value=0,
@@ -575,7 +700,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupCooldownSeconds": _int_setting(
             raw.get(
                 "proactiveWarmupCooldownSeconds",
-                raw.get("proactive_warmup_cooldown_seconds", defaults["proactiveWarmupCooldownSeconds"]),
+                raw.get(
+                    "proactive_warmup_cooldown_seconds", defaults["proactiveWarmupCooldownSeconds"]
+                ),
             ),
             defaults["proactiveWarmupCooldownSeconds"],
             min_value=60,
@@ -584,7 +711,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupWindowStartHour": _int_setting(
             raw.get(
                 "proactiveWarmupWindowStartHour",
-                raw.get("proactive_warmup_window_start_hour", defaults["proactiveWarmupWindowStartHour"]),
+                raw.get(
+                    "proactive_warmup_window_start_hour", defaults["proactiveWarmupWindowStartHour"]
+                ),
             ),
             defaults["proactiveWarmupWindowStartHour"],
             min_value=0,
@@ -593,7 +722,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupWindowEndHour": _int_setting(
             raw.get(
                 "proactiveWarmupWindowEndHour",
-                raw.get("proactive_warmup_window_end_hour", defaults["proactiveWarmupWindowEndHour"]),
+                raw.get(
+                    "proactive_warmup_window_end_hour", defaults["proactiveWarmupWindowEndHour"]
+                ),
             ),
             defaults["proactiveWarmupWindowEndHour"],
             min_value=0,
@@ -620,7 +751,9 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
         "proactiveWarmupGroupOverrides": _normalize_group_ai_overrides(
             raw.get(
                 "proactiveWarmupGroupOverrides",
-                raw.get("proactive_warmup_group_overrides", defaults["proactiveWarmupGroupOverrides"]),
+                raw.get(
+                    "proactive_warmup_group_overrides", defaults["proactiveWarmupGroupOverrides"]
+                ),
             ),
             defaults=defaults,
         ),
@@ -745,7 +878,9 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
             "proactiveEnabled": _bool_setting(
                 private_messaging.get(
                     "proactiveEnabled",
-                    private_messaging.get("proactive_enabled", DEFAULT_PRIVATE_MESSAGING_SETTINGS["proactive_enabled"]),
+                    private_messaging.get(
+                        "proactive_enabled", DEFAULT_PRIVATE_MESSAGING_SETTINGS["proactive_enabled"]
+                    ),
                 ),
                 DEFAULT_PRIVATE_MESSAGING_SETTINGS["proactive_enabled"],
             ),
@@ -760,7 +895,9 @@ async def get_app_runtime_settings(db: AsyncSession) -> dict[str, Any]:
 
 async def save_app_runtime_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_app_runtime_settings(payload)
-    await _save_setting_payload(db, APP_SETTINGS_SETTING_KEY, normalized, "Admin-managed runtime application settings")
+    await _save_setting_payload(
+        db, APP_SETTINGS_SETTING_KEY, normalized, "Admin-managed runtime application settings"
+    )
     return normalized
 
 
@@ -788,7 +925,9 @@ async def get_private_reply_template_settings(db: AsyncSession) -> dict[str, str
     return (await get_private_messaging_settings(db))["templates"]
 
 
-async def is_private_messaging_enabled(db: AsyncSession, *, initiated_by_user: bool = False) -> bool:
+async def is_private_messaging_enabled(
+    db: AsyncSession, *, initiated_by_user: bool = False
+) -> bool:
     settings = await get_private_messaging_settings(db)
     if initiated_by_user:
         return bool(settings["autoReplyEnabled"])
@@ -824,7 +963,10 @@ def normalize_ad_failure_policy(payload: dict[str, Any] | None) -> dict[str, Any
         "group_control_failure_limit": _int_setting(
             raw.get(
                 "group_control_failure_limit",
-                raw.get("groupControlFailureLimit", DEFAULT_AD_FAILURE_POLICY["group_control_failure_limit"]),
+                raw.get(
+                    "groupControlFailureLimit",
+                    DEFAULT_AD_FAILURE_POLICY["group_control_failure_limit"],
+                ),
             ),
             DEFAULT_AD_FAILURE_POLICY["group_control_failure_limit"],
             min_value=1,
@@ -849,7 +991,9 @@ def normalize_ad_failure_policy(payload: dict[str, Any] | None) -> dict[str, Any
 async def get_ad_failure_policy_settings(db: AsyncSession) -> dict[str, Any]:
     """Read advertisement failure policy from the database."""
     setting = (
-        await db.execute(select(SystemSetting).where(SystemSetting.key == AD_FAILURE_POLICY_SETTING_KEY))
+        await db.execute(
+            select(SystemSetting).where(SystemSetting.key == AD_FAILURE_POLICY_SETTING_KEY)
+        )
     ).scalar_one_or_none()
     if setting is None:
         return dict(DEFAULT_AD_FAILURE_POLICY)
@@ -860,11 +1004,15 @@ async def get_ad_failure_policy_settings(db: AsyncSession) -> dict[str, Any]:
     return normalize_ad_failure_policy(payload)
 
 
-async def save_ad_failure_policy_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_ad_failure_policy_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     """Persist advertisement failure policy to the database."""
     normalized = normalize_ad_failure_policy(payload)
     setting = (
-        await db.execute(select(SystemSetting).where(SystemSetting.key == AD_FAILURE_POLICY_SETTING_KEY))
+        await db.execute(
+            select(SystemSetting).where(SystemSetting.key == AD_FAILURE_POLICY_SETTING_KEY)
+        )
     ).scalar_one_or_none()
     if setting is None:
         setting = SystemSetting(
@@ -886,16 +1034,14 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
 
     actions: dict[str, dict[str, int]] = {}
     action_hard_limits = {
-        "join": 6,
+        "join": 10,
         "group_message": 4,
-        "ad_probe": 10,
         "ai_warmup": 1,
         "channel_create": 1,
     }
     action_min_cooldowns = {
         "join": 7200,
         "group_message": 7200,
-        "ad_probe": 3600,
         "ai_warmup": 21600,
         "channel_create": 86400,
     }
@@ -904,17 +1050,19 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         if not isinstance(item, dict):
             item = {}
         daily_limit = _int_setting(
-                item.get("daily_limit", item.get("dailyLimit", default_budget["daily_limit"])),
-                default_budget["daily_limit"],
-                min_value=1,
-                max_value=action_hard_limits.get(action, 100000),
-            )
+            item.get("daily_limit", item.get("dailyLimit", default_budget["daily_limit"])),
+            default_budget["daily_limit"],
+            min_value=1,
+            max_value=action_hard_limits.get(action, 100000),
+        )
         cooldown_seconds = _int_setting(
-                item.get("cooldown_seconds", item.get("cooldownSeconds", default_budget["cooldown_seconds"])),
-                default_budget["cooldown_seconds"],
-                min_value=0,
-                max_value=86400,
-            )
+            item.get(
+                "cooldown_seconds", item.get("cooldownSeconds", default_budget["cooldown_seconds"])
+            ),
+            default_budget["cooldown_seconds"],
+            min_value=0,
+            max_value=86400,
+        )
         actions[action] = {
             "daily_limit": daily_limit,
             "cooldown_seconds": max(action_min_cooldowns.get(action, 0), cooldown_seconds),
@@ -933,7 +1081,10 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
     thresholds["quarantined"] = max(thresholds["quarantined"], thresholds["frozen"])
 
     level_multipliers = _normalize_float_map(
-        raw.get("level_budget_multipliers", raw.get("levelBudgetMultipliers", defaults["level_budget_multipliers"])),
+        raw.get(
+            "level_budget_multipliers",
+            raw.get("levelBudgetMultipliers", defaults["level_budget_multipliers"]),
+        ),
         default=defaults["level_budget_multipliers"],
         min_value=0.0,
         max_value=2.0,
@@ -951,19 +1102,34 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
     lifecycle_defaults = defaults["lifecycle"]
     lifecycle = {
         "default_freeze_seconds": _int_setting(
-            lifecycle_raw.get("default_freeze_seconds", lifecycle_raw.get("defaultFreezeSeconds", lifecycle_defaults["default_freeze_seconds"])),
+            lifecycle_raw.get(
+                "default_freeze_seconds",
+                lifecycle_raw.get(
+                    "defaultFreezeSeconds", lifecycle_defaults["default_freeze_seconds"]
+                ),
+            ),
             lifecycle_defaults["default_freeze_seconds"],
             min_value=60,
             max_value=604800,
         ),
         "flood_wait_buffer_seconds": _int_setting(
-            lifecycle_raw.get("flood_wait_buffer_seconds", lifecycle_raw.get("floodWaitBufferSeconds", lifecycle_defaults["flood_wait_buffer_seconds"])),
+            lifecycle_raw.get(
+                "flood_wait_buffer_seconds",
+                lifecycle_raw.get(
+                    "floodWaitBufferSeconds", lifecycle_defaults["flood_wait_buffer_seconds"]
+                ),
+            ),
             lifecycle_defaults["flood_wait_buffer_seconds"],
             min_value=0,
             max_value=3600,
         ),
         "peer_flood_freeze_seconds": _int_setting(
-            lifecycle_raw.get("peer_flood_freeze_seconds", lifecycle_raw.get("peerFloodFreezeSeconds", lifecycle_defaults["peer_flood_freeze_seconds"])),
+            lifecycle_raw.get(
+                "peer_flood_freeze_seconds",
+                lifecycle_raw.get(
+                    "peerFloodFreezeSeconds", lifecycle_defaults["peer_flood_freeze_seconds"]
+                ),
+            ),
             lifecycle_defaults["peer_flood_freeze_seconds"],
             min_value=60,
             max_value=604800,
@@ -971,7 +1137,10 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "account_restricted_freeze_seconds": _int_setting(
             lifecycle_raw.get(
                 "account_restricted_freeze_seconds",
-                lifecycle_raw.get("accountRestrictedFreezeSeconds", lifecycle_defaults["account_restricted_freeze_seconds"]),
+                lifecycle_raw.get(
+                    "accountRestrictedFreezeSeconds",
+                    lifecycle_defaults["account_restricted_freeze_seconds"],
+                ),
             ),
             lifecycle_defaults["account_restricted_freeze_seconds"],
             min_value=60,
@@ -980,32 +1149,51 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "group_write_forbidden_freeze_seconds": _int_setting(
             lifecycle_raw.get(
                 "group_write_forbidden_freeze_seconds",
-                lifecycle_raw.get("groupWriteForbiddenFreezeSeconds", lifecycle_defaults["group_write_forbidden_freeze_seconds"]),
+                lifecycle_raw.get(
+                    "groupWriteForbiddenFreezeSeconds",
+                    lifecycle_defaults["group_write_forbidden_freeze_seconds"],
+                ),
             ),
             lifecycle_defaults["group_write_forbidden_freeze_seconds"],
             min_value=60,
             max_value=604800,
         ),
         "recovery_seconds": _int_setting(
-            lifecycle_raw.get("recovery_seconds", lifecycle_raw.get("recoverySeconds", lifecycle_defaults["recovery_seconds"])),
+            lifecycle_raw.get(
+                "recovery_seconds",
+                lifecycle_raw.get("recoverySeconds", lifecycle_defaults["recovery_seconds"]),
+            ),
             lifecycle_defaults["recovery_seconds"],
             min_value=60,
             max_value=604800,
         ),
         "post_freeze_score_cap": _float_setting(
-            lifecycle_raw.get("post_freeze_score_cap", lifecycle_raw.get("postFreezeScoreCap", lifecycle_defaults["post_freeze_score_cap"])),
+            lifecycle_raw.get(
+                "post_freeze_score_cap",
+                lifecycle_raw.get(
+                    "postFreezeScoreCap", lifecycle_defaults["post_freeze_score_cap"]
+                ),
+            ),
             float(lifecycle_defaults["post_freeze_score_cap"]),
             min_value=0.0,
             max_value=100.0,
         ),
         "manual_clear_score_cap": _float_setting(
-            lifecycle_raw.get("manual_clear_score_cap", lifecycle_raw.get("manualClearScoreCap", lifecycle_defaults["manual_clear_score_cap"])),
+            lifecycle_raw.get(
+                "manual_clear_score_cap",
+                lifecycle_raw.get(
+                    "manualClearScoreCap", lifecycle_defaults["manual_clear_score_cap"]
+                ),
+            ),
             float(lifecycle_defaults["manual_clear_score_cap"]),
             min_value=0.0,
             max_value=100.0,
         ),
         "decay_interval_hours": _int_setting(
-            lifecycle_raw.get("decay_interval_hours", lifecycle_raw.get("decayIntervalHours", lifecycle_defaults["decay_interval_hours"])),
+            lifecycle_raw.get(
+                "decay_interval_hours",
+                lifecycle_raw.get("decayIntervalHours", lifecycle_defaults["decay_interval_hours"]),
+            ),
             lifecycle_defaults["decay_interval_hours"],
             min_value=1,
             max_value=720,
@@ -1013,32 +1201,48 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "decay_points_per_interval": _float_setting(
             lifecycle_raw.get(
                 "decay_points_per_interval",
-                lifecycle_raw.get("decayPointsPerInterval", lifecycle_defaults["decay_points_per_interval"]),
+                lifecycle_raw.get(
+                    "decayPointsPerInterval", lifecycle_defaults["decay_points_per_interval"]
+                ),
             ),
             float(lifecycle_defaults["decay_points_per_interval"]),
             min_value=0.0,
             max_value=100.0,
         ),
         "new_account_days": _int_setting(
-            lifecycle_raw.get("new_account_days", lifecycle_raw.get("newAccountDays", lifecycle_defaults["new_account_days"])),
+            lifecycle_raw.get(
+                "new_account_days",
+                lifecycle_raw.get("newAccountDays", lifecycle_defaults["new_account_days"]),
+            ),
             lifecycle_defaults["new_account_days"],
             min_value=0,
             max_value=120,
         ),
         "new_account_multiplier": _float_setting(
-            lifecycle_raw.get("new_account_multiplier", lifecycle_raw.get("newAccountMultiplier", lifecycle_defaults["new_account_multiplier"])),
+            lifecycle_raw.get(
+                "new_account_multiplier",
+                lifecycle_raw.get(
+                    "newAccountMultiplier", lifecycle_defaults["new_account_multiplier"]
+                ),
+            ),
             float(lifecycle_defaults["new_account_multiplier"]),
             min_value=0.0,
             max_value=2.0,
         ),
         "recovery_multiplier": _float_setting(
-            lifecycle_raw.get("recovery_multiplier", lifecycle_raw.get("recoveryMultiplier", lifecycle_defaults["recovery_multiplier"])),
+            lifecycle_raw.get(
+                "recovery_multiplier",
+                lifecycle_raw.get("recoveryMultiplier", lifecycle_defaults["recovery_multiplier"]),
+            ),
             float(lifecycle_defaults["recovery_multiplier"]),
             min_value=0.0,
             max_value=2.0,
         ),
         "healthy_account_days": _int_setting(
-            lifecycle_raw.get("healthy_account_days", lifecycle_raw.get("healthyAccountDays", lifecycle_defaults["healthy_account_days"])),
+            lifecycle_raw.get(
+                "healthy_account_days",
+                lifecycle_raw.get("healthyAccountDays", lifecycle_defaults["healthy_account_days"]),
+            ),
             lifecycle_defaults["healthy_account_days"],
             min_value=0,
             max_value=365,
@@ -1046,21 +1250,30 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "healthy_account_multiplier": _float_setting(
             lifecycle_raw.get(
                 "healthy_account_multiplier",
-                lifecycle_raw.get("healthyAccountMultiplier", lifecycle_defaults["healthy_account_multiplier"]),
+                lifecycle_raw.get(
+                    "healthyAccountMultiplier", lifecycle_defaults["healthy_account_multiplier"]
+                ),
             ),
             float(lifecycle_defaults["healthy_account_multiplier"]),
             min_value=0.0,
             max_value=2.0,
         ),
         "max_budget_multiplier": _float_setting(
-            lifecycle_raw.get("max_budget_multiplier", lifecycle_raw.get("maxBudgetMultiplier", lifecycle_defaults["max_budget_multiplier"])),
+            lifecycle_raw.get(
+                "max_budget_multiplier",
+                lifecycle_raw.get(
+                    "maxBudgetMultiplier", lifecycle_defaults["max_budget_multiplier"]
+                ),
+            ),
             float(lifecycle_defaults["max_budget_multiplier"]),
             min_value=0.0,
             max_value=2.0,
         ),
     }
 
-    group_write_raw = raw.get("group_write_forbidden", raw.get("groupWriteForbidden", defaults["group_write_forbidden"]))
+    group_write_raw = raw.get(
+        "group_write_forbidden", raw.get("groupWriteForbidden", defaults["group_write_forbidden"])
+    )
     if not isinstance(group_write_raw, dict):
         group_write_raw = {}
     group_write_defaults = defaults["group_write_forbidden"]
@@ -1068,7 +1281,9 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "leave_after_failures": _int_setting(
             group_write_raw.get(
                 "leave_after_failures",
-                group_write_raw.get("leaveAfterFailures", group_write_defaults["leave_after_failures"]),
+                group_write_raw.get(
+                    "leaveAfterFailures", group_write_defaults["leave_after_failures"]
+                ),
             ),
             group_write_defaults["leave_after_failures"],
             min_value=1,
@@ -1084,13 +1299,23 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
             max_value=720,
         ),
         "freeze_window_hours": _int_setting(
-            group_write_raw.get("freeze_window_hours", group_write_raw.get("freezeWindowHours", group_write_defaults["freeze_window_hours"])),
+            group_write_raw.get(
+                "freeze_window_hours",
+                group_write_raw.get(
+                    "freezeWindowHours", group_write_defaults["freeze_window_hours"]
+                ),
+            ),
             group_write_defaults["freeze_window_hours"],
             min_value=1,
             max_value=168,
         ),
         "freeze_distinct_groups": _int_setting(
-            group_write_raw.get("freeze_distinct_groups", group_write_raw.get("freezeDistinctGroups", group_write_defaults["freeze_distinct_groups"])),
+            group_write_raw.get(
+                "freeze_distinct_groups",
+                group_write_raw.get(
+                    "freezeDistinctGroups", group_write_defaults["freeze_distinct_groups"]
+                ),
+            ),
             group_write_defaults["freeze_distinct_groups"],
             min_value=1,
             max_value=100,
@@ -1098,7 +1323,9 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "quarantine_window_hours": _int_setting(
             group_write_raw.get(
                 "quarantine_window_hours",
-                group_write_raw.get("quarantineWindowHours", group_write_defaults["quarantine_window_hours"]),
+                group_write_raw.get(
+                    "quarantineWindowHours", group_write_defaults["quarantine_window_hours"]
+                ),
             ),
             group_write_defaults["quarantine_window_hours"],
             min_value=1,
@@ -1107,7 +1334,9 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "quarantine_distinct_groups": _int_setting(
             group_write_raw.get(
                 "quarantine_distinct_groups",
-                group_write_raw.get("quarantineDistinctGroups", group_write_defaults["quarantine_distinct_groups"]),
+                group_write_raw.get(
+                    "quarantineDistinctGroups", group_write_defaults["quarantine_distinct_groups"]
+                ),
             ),
             group_write_defaults["quarantine_distinct_groups"],
             min_value=1,
@@ -1123,7 +1352,10 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "low_value_detail_retention_days": _int_setting(
             retention_raw.get(
                 "low_value_detail_retention_days",
-                retention_raw.get("lowValueDetailRetentionDays", retention_defaults["low_value_detail_retention_days"]),
+                retention_raw.get(
+                    "lowValueDetailRetentionDays",
+                    retention_defaults["low_value_detail_retention_days"],
+                ),
             ),
             retention_defaults["low_value_detail_retention_days"],
             min_value=1,
@@ -1132,14 +1364,22 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "high_value_detail_retention_days": _int_setting(
             retention_raw.get(
                 "high_value_detail_retention_days",
-                retention_raw.get("highValueDetailRetentionDays", retention_defaults["high_value_detail_retention_days"]),
+                retention_raw.get(
+                    "highValueDetailRetentionDays",
+                    retention_defaults["high_value_detail_retention_days"],
+                ),
             ),
             retention_defaults["high_value_detail_retention_days"],
             min_value=1,
             max_value=3650,
         ),
         "daily_stat_retention_days": _int_setting(
-            retention_raw.get("daily_stat_retention_days", retention_raw.get("dailyStatRetentionDays", retention_defaults["daily_stat_retention_days"])),
+            retention_raw.get(
+                "daily_stat_retention_days",
+                retention_raw.get(
+                    "dailyStatRetentionDays", retention_defaults["daily_stat_retention_days"]
+                ),
+            ),
             retention_defaults["daily_stat_retention_days"],
             min_value=1,
             max_value=3650,
@@ -1150,14 +1390,19 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "account_outbound_message_hard_cap_default": _int_setting(
             raw.get(
                 "account_outbound_message_hard_cap_default",
-                raw.get("accountOutboundMessageHardCapDefault", defaults["account_outbound_message_hard_cap_default"]),
+                raw.get(
+                    "accountOutboundMessageHardCapDefault",
+                    defaults["account_outbound_message_hard_cap_default"],
+                ),
             ),
             defaults["account_outbound_message_hard_cap_default"],
             min_value=1,
             max_value=100,
         ),
         "global_daily_limit": _int_setting(
-            raw.get("global_daily_limit", raw.get("globalDailyLimit", defaults["global_daily_limit"])),
+            raw.get(
+                "global_daily_limit", raw.get("globalDailyLimit", defaults["global_daily_limit"])
+            ),
             defaults["global_daily_limit"],
             min_value=1,
             max_value=30,
@@ -1183,10 +1428,14 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
 
 
 async def get_account_risk_guard_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_account_risk_guard_settings(await _read_setting_payload(db, ACCOUNT_RISK_GUARD_SETTING_KEY))
+    return normalize_account_risk_guard_settings(
+        await _read_setting_payload(db, ACCOUNT_RISK_GUARD_SETTING_KEY)
+    )
 
 
-async def save_account_risk_guard_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_account_risk_guard_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_account_risk_guard_settings(payload)
     await _save_setting_payload(
         db,
@@ -1210,31 +1459,42 @@ def normalize_account_asset_policy_settings(payload: dict[str, Any] | None) -> d
             item = {}
         normalized_tiers[tier] = {
             "join_multiplier": _float_setting(
-                item.get("join_multiplier", item.get("joinMultiplier", default_policy["join_multiplier"])),
+                item.get(
+                    "join_multiplier", item.get("joinMultiplier", default_policy["join_multiplier"])
+                ),
                 float(default_policy["join_multiplier"]),
                 min_value=0.0,
                 max_value=3.0,
             ),
             "ad_multiplier": _float_setting(
-                item.get("ad_multiplier", item.get("adMultiplier", default_policy["ad_multiplier"])),
+                item.get(
+                    "ad_multiplier", item.get("adMultiplier", default_policy["ad_multiplier"])
+                ),
                 float(default_policy["ad_multiplier"]),
                 min_value=0.0,
                 max_value=3.0,
             ),
             "run_multiplier": _float_setting(
-                item.get("run_multiplier", item.get("runMultiplier", default_policy["run_multiplier"])),
+                item.get(
+                    "run_multiplier", item.get("runMultiplier", default_policy["run_multiplier"])
+                ),
                 float(default_policy["run_multiplier"]),
                 min_value=0.0,
                 max_value=3.0,
             ),
             "probe_multiplier": _float_setting(
-                item.get("probe_multiplier", item.get("probeMultiplier", default_policy["probe_multiplier"])),
+                item.get(
+                    "probe_multiplier",
+                    item.get("probeMultiplier", default_policy["probe_multiplier"]),
+                ),
                 float(default_policy["probe_multiplier"]),
                 min_value=0.0,
                 max_value=3.0,
             ),
             "age_floor_days": _int_setting(
-                item.get("age_floor_days", item.get("ageFloorDays", default_policy["age_floor_days"])),
+                item.get(
+                    "age_floor_days", item.get("ageFloorDays", default_policy["age_floor_days"])
+                ),
                 int(default_policy["age_floor_days"]),
                 min_value=0,
                 max_value=3650,
@@ -1248,10 +1508,14 @@ def normalize_account_asset_policy_settings(payload: dict[str, Any] | None) -> d
 
 
 async def get_account_asset_policy_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_account_asset_policy_settings(await _read_setting_payload(db, ACCOUNT_ASSET_POLICY_SETTING_KEY))
+    return normalize_account_asset_policy_settings(
+        await _read_setting_payload(db, ACCOUNT_ASSET_POLICY_SETTING_KEY)
+    )
 
 
-async def save_account_asset_policy_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_account_asset_policy_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_account_asset_policy_settings(payload)
     await _save_setting_payload(
         db,
@@ -1290,13 +1554,18 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             item = {}
         normalized_stages[stage] = {
             "limit_multiplier": _float_setting(
-                item.get("limit_multiplier", item.get("limitMultiplier", default_stage["limit_multiplier"])),
+                item.get(
+                    "limit_multiplier",
+                    item.get("limitMultiplier", default_stage["limit_multiplier"]),
+                ),
                 float(default_stage["limit_multiplier"]),
                 min_value=0.0,
                 max_value=2.0,
             ),
             "join_multiplier": _float_setting(
-                item.get("join_multiplier", item.get("joinMultiplier", default_stage["join_multiplier"])),
+                item.get(
+                    "join_multiplier", item.get("joinMultiplier", default_stage["join_multiplier"])
+                ),
                 float(default_stage["join_multiplier"]),
                 min_value=0.0,
                 max_value=2.0,
@@ -1308,13 +1577,18 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
                 max_value=2.0,
             ),
             "run_multiplier": _float_setting(
-                item.get("run_multiplier", item.get("runMultiplier", default_stage["run_multiplier"])),
+                item.get(
+                    "run_multiplier", item.get("runMultiplier", default_stage["run_multiplier"])
+                ),
                 float(default_stage["run_multiplier"]),
                 min_value=0.0,
                 max_value=2.0,
             ),
             "probe_multiplier": _float_setting(
-                item.get("probe_multiplier", item.get("probeMultiplier", default_stage["probe_multiplier"])),
+                item.get(
+                    "probe_multiplier",
+                    item.get("probeMultiplier", default_stage["probe_multiplier"]),
+                ),
                 float(default_stage["probe_multiplier"]),
                 min_value=0.0,
                 max_value=2.0,
@@ -1322,7 +1596,9 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "private_message_multiplier": _float_setting(
                 item.get(
                     "private_message_multiplier",
-                    item.get("privateMessageMultiplier", default_stage["private_message_multiplier"]),
+                    item.get(
+                        "privateMessageMultiplier", default_stage["private_message_multiplier"]
+                    ),
                 ),
                 float(default_stage["private_message_multiplier"]),
                 min_value=0.0,
@@ -1349,20 +1625,27 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "allow_proactive_private_message": _bool_setting(
                 item.get(
                     "allow_proactive_private_message",
-                    item.get("allowProactivePrivateMessage", default_stage["allow_proactive_private_message"]),
+                    item.get(
+                        "allowProactivePrivateMessage",
+                        default_stage["allow_proactive_private_message"],
+                    ),
                 ),
                 bool(default_stage["allow_proactive_private_message"]),
             ),
         }
 
     minimum_days = _int_setting(
-        raw.get("minimum_warmup_days", raw.get("minimumWarmupDays", defaults["minimum_warmup_days"])),
+        raw.get(
+            "minimum_warmup_days", raw.get("minimumWarmupDays", defaults["minimum_warmup_days"])
+        ),
         int(defaults["minimum_warmup_days"]),
         min_value=7,
         max_value=120,
     )
     default_days = _int_setting(
-        raw.get("default_warmup_days", raw.get("defaultWarmupDays", defaults["default_warmup_days"])),
+        raw.get(
+            "default_warmup_days", raw.get("defaultWarmupDays", defaults["default_warmup_days"])
+        ),
         int(defaults["default_warmup_days"]),
         min_value=7,
         max_value=120,
@@ -1392,10 +1675,14 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
 
 
 async def get_account_warmup_policy_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_account_warmup_policy_settings(await _read_setting_payload(db, ACCOUNT_WARMUP_POLICY_SETTING_KEY))
+    return normalize_account_warmup_policy_settings(
+        await _read_setting_payload(db, ACCOUNT_WARMUP_POLICY_SETTING_KEY)
+    )
 
 
-async def save_account_warmup_policy_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_account_warmup_policy_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_account_warmup_policy_settings(payload)
     await _save_setting_payload(
         db,
@@ -1426,11 +1713,16 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
         "growth_max_interval_seconds": growth_max,
     }
 
+
 async def get_ad_delivery_throttle_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_ad_delivery_throttle_settings(await _read_setting_payload(db, AD_DELIVERY_THROTTLE_SETTING_KEY))
+    return normalize_ad_delivery_throttle_settings(
+        await _read_setting_payload(db, AD_DELIVERY_THROTTLE_SETTING_KEY)
+    )
 
 
-async def save_ad_delivery_throttle_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_ad_delivery_throttle_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_ad_delivery_throttle_settings(payload)
     await _save_setting_payload(
         db,
@@ -1445,25 +1737,64 @@ def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> 
     raw = payload if isinstance(payload, dict) else {}
     defaults = DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS
     cooldown_seconds = _int_setting(
-        raw.get("growth_group_global_cooldown_seconds", raw.get("growthGroupGlobalCooldownSeconds", defaults["growth_group_global_cooldown_seconds"])),
+        raw.get(
+            "growth_group_global_cooldown_seconds",
+            raw.get(
+                "growthGroupGlobalCooldownSeconds", defaults["growth_group_global_cooldown_seconds"]
+            ),
+        ),
         defaults["growth_group_global_cooldown_seconds"],
         min_value=3600,
         max_value=604800,
     )
     return {
         "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
-        "dispatcher_interval_seconds": _int_setting(raw.get("dispatcher_interval_seconds", raw.get("dispatcherIntervalSeconds", defaults["dispatcher_interval_seconds"])), defaults["dispatcher_interval_seconds"], min_value=10, max_value=3600),
-        "dispatcher_batch_size": _int_setting(raw.get("dispatcher_batch_size", raw.get("dispatcherBatchSize", defaults["dispatcher_batch_size"])), defaults["dispatcher_batch_size"], min_value=1, max_value=1000),
-        "max_parallel_accounts": _int_setting(raw.get("max_parallel_accounts", raw.get("maxParallelAccounts", defaults["max_parallel_accounts"])), defaults["max_parallel_accounts"], min_value=1, max_value=20),
-        "job_lease_seconds": _int_setting(raw.get("job_lease_seconds", raw.get("jobLeaseSeconds", defaults["job_lease_seconds"])), defaults["job_lease_seconds"], min_value=60, max_value=1800),
+        "dispatcher_interval_seconds": _int_setting(
+            raw.get(
+                "dispatcher_interval_seconds",
+                raw.get("dispatcherIntervalSeconds", defaults["dispatcher_interval_seconds"]),
+            ),
+            defaults["dispatcher_interval_seconds"],
+            min_value=10,
+            max_value=3600,
+        ),
+        "dispatcher_batch_size": _int_setting(
+            raw.get(
+                "dispatcher_batch_size",
+                raw.get("dispatcherBatchSize", defaults["dispatcher_batch_size"]),
+            ),
+            defaults["dispatcher_batch_size"],
+            min_value=1,
+            max_value=1000,
+        ),
+        "max_parallel_accounts": _int_setting(
+            raw.get(
+                "max_parallel_accounts",
+                raw.get("maxParallelAccounts", defaults["max_parallel_accounts"]),
+            ),
+            defaults["max_parallel_accounts"],
+            min_value=1,
+            max_value=20,
+        ),
+        "job_lease_seconds": _int_setting(
+            raw.get("job_lease_seconds", raw.get("jobLeaseSeconds", defaults["job_lease_seconds"])),
+            defaults["job_lease_seconds"],
+            min_value=60,
+            max_value=1800,
+        ),
         "growth_group_global_cooldown_seconds": cooldown_seconds,
     }
 
+
 async def get_ad_delivery_execution_settings(db: AsyncSession) -> dict[str, Any]:
-    return normalize_ad_delivery_execution_settings(await _read_setting_payload(db, AD_DELIVERY_EXECUTION_SETTING_KEY))
+    return normalize_ad_delivery_execution_settings(
+        await _read_setting_payload(db, AD_DELIVERY_EXECUTION_SETTING_KEY)
+    )
 
 
-async def save_ad_delivery_execution_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+async def save_ad_delivery_execution_settings(
+    db: AsyncSession, payload: dict[str, Any]
+) -> dict[str, Any]:
     normalized = normalize_ad_delivery_execution_settings(payload)
     await _save_setting_payload(
         db,
@@ -1479,13 +1810,15 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
     defaults = DEFAULT_AD_CAPACITY_SETTINGS
     configured_hour_defaults = defaults["hourly_weights"]
     hour_defaults = {
-        str(hour): int(configured_hour_defaults.get(str(hour), 1) or 1)
-        for hour in range(24)
+        str(hour): int(configured_hour_defaults.get(str(hour), 1) or 1) for hour in range(24)
     }
     normalized = {
         "enabled": _bool_setting(raw.get("enabled", defaults["enabled"]), defaults["enabled"]),
         "timezone_offset_hours": _int_setting(
-            raw.get("timezone_offset_hours", raw.get("timezoneOffsetHours", defaults["timezone_offset_hours"])),
+            raw.get(
+                "timezone_offset_hours",
+                raw.get("timezoneOffsetHours", defaults["timezone_offset_hours"]),
+            ),
             defaults["timezone_offset_hours"],
             min_value=-12,
             max_value=14,
@@ -1503,13 +1836,19 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             max_value=23,
         ),
         "survival_check_delay_seconds": _int_setting(
-            raw.get("survival_check_delay_seconds", raw.get("survivalCheckDelaySeconds", defaults["survival_check_delay_seconds"])),
+            raw.get(
+                "survival_check_delay_seconds",
+                raw.get("survivalCheckDelaySeconds", defaults["survival_check_delay_seconds"]),
+            ),
             defaults["survival_check_delay_seconds"],
             min_value=30,
             max_value=3600,
         ),
         "survival_one_hour_seconds": _int_setting(
-            raw.get("survival_one_hour_seconds", raw.get("survivalOneHourSeconds", defaults["survival_one_hour_seconds"])),
+            raw.get(
+                "survival_one_hour_seconds",
+                raw.get("survivalOneHourSeconds", defaults["survival_one_hour_seconds"]),
+            ),
             defaults["survival_one_hour_seconds"],
             min_value=300,
             max_value=7200,
@@ -1517,14 +1856,19 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
         "survival_twenty_four_hour_seconds": _int_setting(
             raw.get(
                 "survival_twenty_four_hour_seconds",
-                raw.get("survivalTwentyFourHourSeconds", defaults["survival_twenty_four_hour_seconds"]),
+                raw.get(
+                    "survivalTwentyFourHourSeconds", defaults["survival_twenty_four_hour_seconds"]
+                ),
             ),
             defaults["survival_twenty_four_hour_seconds"],
             min_value=3600,
             max_value=172800,
         ),
         "survival_check_batch_size": _int_setting(
-            raw.get("survival_check_batch_size", raw.get("survivalCheckBatchSize", defaults["survival_check_batch_size"])),
+            raw.get(
+                "survival_check_batch_size",
+                raw.get("survivalCheckBatchSize", defaults["survival_check_batch_size"]),
+            ),
             defaults["survival_check_batch_size"],
             min_value=1,
             max_value=500,
@@ -1548,31 +1892,47 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             max_value=3600,
         ),
         "max_groups_per_account": _int_setting(
-            raw.get("max_groups_per_account", raw.get("maxGroupsPerAccount", defaults["max_groups_per_account"])),
+            raw.get(
+                "max_groups_per_account",
+                raw.get("maxGroupsPerAccount", defaults["max_groups_per_account"]),
+            ),
             defaults["max_groups_per_account"],
             min_value=1,
             max_value=1000,
         ),
         "max_new_ad_groups_per_day": _int_setting(
-            raw.get("max_new_ad_groups_per_day", raw.get("maxNewAdGroupsPerDay", defaults["max_new_ad_groups_per_day"])),
+            raw.get(
+                "max_new_ad_groups_per_day",
+                raw.get("maxNewAdGroupsPerDay", defaults["max_new_ad_groups_per_day"]),
+            ),
             defaults["max_new_ad_groups_per_day"],
             min_value=0,
             max_value=2,
         ),
         "leave_on_deleted_ad": _bool_setting(
-            raw.get("leave_on_deleted_ad", raw.get("leaveOnDeletedAd", defaults["leave_on_deleted_ad"])),
+            raw.get(
+                "leave_on_deleted_ad", raw.get("leaveOnDeletedAd", defaults["leave_on_deleted_ad"])
+            ),
             defaults["leave_on_deleted_ad"],
         ),
         "block_group_on_probe_failure": _bool_setting(
-            raw.get("block_group_on_probe_failure", raw.get("blockGroupOnProbeFailure", defaults["block_group_on_probe_failure"])),
+            raw.get(
+                "block_group_on_probe_failure",
+                raw.get("blockGroupOnProbeFailure", defaults["block_group_on_probe_failure"]),
+            ),
             defaults["block_group_on_probe_failure"],
         ),
         "ad_policy_ai_enabled": _bool_setting(
-            raw.get("ad_policy_ai_enabled", raw.get("adPolicyAiEnabled", defaults["ad_policy_ai_enabled"])),
+            raw.get(
+                "ad_policy_ai_enabled",
+                raw.get("adPolicyAiEnabled", defaults["ad_policy_ai_enabled"]),
+            ),
             defaults["ad_policy_ai_enabled"],
         ),
         "ad_policy_ai_model": str(
-            raw.get("ad_policy_ai_model", raw.get("adPolicyAiModel", defaults["ad_policy_ai_model"]))
+            raw.get(
+                "ad_policy_ai_model", raw.get("adPolicyAiModel", defaults["ad_policy_ai_model"])
+            )
             or defaults["ad_policy_ai_model"]
         ).strip()[:100],
         "ad_policy_ai_timeout_seconds": _int_setting(
@@ -1596,7 +1956,9 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
         "ad_policy_ai_require_second_pass": _bool_setting(
             raw.get(
                 "ad_policy_ai_require_second_pass",
-                raw.get("adPolicyAiRequireSecondPass", defaults["ad_policy_ai_require_second_pass"]),
+                raw.get(
+                    "adPolicyAiRequireSecondPass", defaults["ad_policy_ai_require_second_pass"]
+                ),
             ),
             defaults["ad_policy_ai_require_second_pass"],
         ),
@@ -1607,24 +1969,12 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
             defaults["ad_policy_auto_probe_enabled"],
         ),
-        "ad_policy_auto_probe_daily_limit": _int_setting(
-            raw.get(
-                "ad_policy_auto_probe_daily_limit",
-                raw.get("adPolicyAutoProbeDailyLimit", defaults["ad_policy_auto_probe_daily_limit"]),
-            ),
-            defaults["ad_policy_auto_probe_daily_limit"],
-            min_value=0,
-            max_value=20,
-        ),
         "ad_policy_auto_probe_daily_limit_per_account": _int_setting(
             raw.get(
                 "ad_policy_auto_probe_daily_limit_per_account",
                 raw.get(
                     "adPolicyAutoProbeDailyLimitPerAccount",
-                    raw.get(
-                        "ad_policy_auto_probe_daily_limit",
-                        raw.get("adPolicyAutoProbeDailyLimit", defaults["ad_policy_auto_probe_daily_limit_per_account"]),
-                    ),
+                    defaults["ad_policy_auto_probe_daily_limit_per_account"],
                 ),
             ),
             defaults["ad_policy_auto_probe_daily_limit_per_account"],
@@ -1634,32 +1984,46 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
         "ad_policy_auto_probe_interval_hours": _int_setting(
             raw.get(
                 "ad_policy_auto_probe_interval_hours",
-                raw.get("adPolicyAutoProbeIntervalHours", defaults["ad_policy_auto_probe_interval_hours"]),
+                raw.get(
+                    "adPolicyAutoProbeIntervalHours",
+                    defaults["ad_policy_auto_probe_interval_hours"],
+                ),
             ),
             defaults["ad_policy_auto_probe_interval_hours"],
             min_value=1,
             max_value=168,
         ),
         "ad_policy_auto_ttl_days": _int_setting(
-            raw.get("ad_policy_auto_ttl_days", raw.get("adPolicyAutoTtlDays", defaults["ad_policy_auto_ttl_days"])),
+            raw.get(
+                "ad_policy_auto_ttl_days",
+                raw.get("adPolicyAutoTtlDays", defaults["ad_policy_auto_ttl_days"]),
+            ),
             defaults["ad_policy_auto_ttl_days"],
             min_value=1,
             max_value=90,
         ),
         "ad_policy_manual_ttl_days": _int_setting(
-            raw.get("ad_policy_manual_ttl_days", raw.get("adPolicyManualTtlDays", defaults["ad_policy_manual_ttl_days"])),
+            raw.get(
+                "ad_policy_manual_ttl_days",
+                raw.get("adPolicyManualTtlDays", defaults["ad_policy_manual_ttl_days"]),
+            ),
             defaults["ad_policy_manual_ttl_days"],
             min_value=1,
             max_value=365,
         ),
         "premium_min_samples": _int_setting(
-            raw.get("premium_min_samples", raw.get("premiumMinSamples", defaults["premium_min_samples"])),
+            raw.get(
+                "premium_min_samples", raw.get("premiumMinSamples", defaults["premium_min_samples"])
+            ),
             defaults["premium_min_samples"],
             min_value=1,
             max_value=1000,
         ),
         "premium_min_conversions": _int_setting(
-            raw.get("premium_min_conversions", raw.get("premiumMinConversions", defaults["premium_min_conversions"])),
+            raw.get(
+                "premium_min_conversions",
+                raw.get("premiumMinConversions", defaults["premium_min_conversions"]),
+            ),
             defaults["premium_min_conversions"],
             min_value=1,
             max_value=1000,
@@ -1674,7 +2038,10 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             max_value=100,
         ),
         "premium_growth_samples": _int_setting(
-            raw.get("premium_growth_samples", raw.get("premiumGrowthSamples", defaults["premium_growth_samples"])),
+            raw.get(
+                "premium_growth_samples",
+                raw.get("premiumGrowthSamples", defaults["premium_growth_samples"]),
+            ),
             defaults["premium_growth_samples"],
             min_value=20,
             max_value=1000,
@@ -1689,7 +2056,10 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             max_value=5000,
         ),
         "premium_clean_days_auto": _int_setting(
-            raw.get("premium_clean_days_auto", raw.get("premiumCleanDaysAuto", defaults["premium_clean_days_auto"])),
+            raw.get(
+                "premium_clean_days_auto",
+                raw.get("premiumCleanDaysAuto", defaults["premium_clean_days_auto"]),
+            ),
             defaults["premium_clean_days_auto"],
             min_value=3,
             max_value=30,
@@ -1704,7 +2074,10 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             max_value=30,
         ),
         "deleted_ad_pause_hours": _int_setting(
-            raw.get("deleted_ad_pause_hours", raw.get("deletedAdPauseHours", defaults["deleted_ad_pause_hours"])),
+            raw.get(
+                "deleted_ad_pause_hours",
+                raw.get("deletedAdPauseHours", defaults["deleted_ad_pause_hours"]),
+            ),
             defaults["deleted_ad_pause_hours"],
             min_value=1,
             max_value=720,

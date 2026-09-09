@@ -35,6 +35,11 @@ from app.core.account.models import (
     TelegramAccount,
     TelegramAPIConfig,
 )
+from app.core.account.operation_lease import (
+    AccountOperationLeaseHandle,
+    AccountOperationLeaseManager,
+    AccountOperationLeaseUnavailable,
+)
 from app.core.account.pool import get_account_pool, invalidate_account_in_all_pools
 from app.core.account.proxy_policy_events import publish_account_proxy_policy_changed
 from app.core.account.proxy_resolver import normalize_proxy_mode, resolve_auth_proxy
@@ -49,7 +54,9 @@ from app.core.security import require_admin
 
 router = APIRouter()
 auth_helper = TelegramAuthHelper()
-MAX_STATIC_PROXY_BINDINGS = 3
+# Keep static proxy capacity aligned with the proxy inventory API: one proxy
+# may be bound to up to ten accounts.
+MAX_STATIC_PROXY_BINDINGS = 10
 logger = structlog.get_logger()
 
 
@@ -138,7 +145,8 @@ async def _apply_onboarding_operation_mode(
             operation_mode=mode.value,
             auto_join_enabled=False,
             auto_ads_enabled=True,
-            keyword_auto_replenish_enabled=False,
+            keyword_auto_replenish_enabled=mode == AccountOperationMode.GROWTH,
+            keyword_replenish_requires_review=mode != AccountOperationMode.GROWTH,
         )
         db.add(config)
     elif config.operation_mode != mode.value:
@@ -543,6 +551,43 @@ async def _propagate_account_proxy_policy_change(account: TelegramAccount) -> No
                 "across all processes. Retry the operation."
             ),
         ) from exc
+
+
+AccountAuthLease = tuple[AccountOperationLeaseManager, AccountOperationLeaseHandle]
+
+
+async def _acquire_account_auth_lease(
+    account: TelegramAccount | None,
+    *,
+    purpose: str,
+) -> AccountAuthLease | None:
+    if account is None:
+        return None
+
+    manager = AccountOperationLeaseManager()
+    try:
+        handle = await manager.acquire(
+            account.id,
+            owner=f"account-auth:{purpose}",
+            ttl_seconds=600,
+        )
+    except AccountOperationLeaseUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="账号锁服务暂时不可用，请稍后重试",
+        ) from exc
+    if handle is None:
+        raise HTTPException(
+            status_code=409,
+            detail="账号正在执行其他 Telegram 任务，请稍后重试",
+        )
+    return manager, handle
+
+
+async def _release_account_auth_lease(lease: AccountAuthLease | None) -> None:
+    if lease is not None:
+        manager, handle = lease
+        await manager.release(handle)
 
 
 async def _sync_promoter_joined_groups(account: TelegramAccount, db: AsyncSession) -> None:
@@ -1637,7 +1682,17 @@ async def verify_verification_code(
     If successful, returns user info and session.
     If 2FA is enabled, returns requires_2fa=true.
     """
+    auth_lease: AccountAuthLease | None = None
     try:
+        phone = request.session_id.split("_")[0]
+        existing = await db.execute(
+            select(TelegramAccount).where(TelegramAccount.phone == phone)
+        )
+        account = existing.scalar_one_or_none()
+        auth_lease = await _acquire_account_auth_lease(
+            account,
+            purpose="verify-code",
+        )
         result = await auth_helper.verify_code(
             session_id=request.session_id,
             code=request.code,
@@ -1645,16 +1700,6 @@ async def verify_verification_code(
 
         # If login successful (no 2FA), create account in database
         if result.get("status") == "success":
-            # Extract session_id to get phone and api_config
-            # session_id format: "{phone}_{phone_code_hash}"
-            phone = request.session_id.split("_")[0]
-
-            # Check if account already exists
-            existing = await db.execute(
-                select(TelegramAccount).where(TelegramAccount.phone == phone)
-            )
-            account = existing.scalar_one_or_none()
-
             if account:
                 # Update existing account
                 account.session_string = encrypt_session_string(result["session_string"])
@@ -1673,6 +1718,7 @@ async def verify_verification_code(
                 await db.commit()
                 await db.refresh(account)
                 await AccountEnvironmentGuard(db).record_event(account, "login", details={"source": "verify_code"})
+                await _propagate_account_proxy_policy_change(account)
                 await _sync_promoter_joined_groups(account, db)
             else:
                 # Create new account (will be completed after getting more info from frontend)
@@ -1691,8 +1737,12 @@ async def verify_verification_code(
                 data=result,
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await _release_account_auth_lease(auth_lease)
 
 
 @router.post("/auth/verify-2fa", response_model=Verify2FAResponse)
@@ -1733,6 +1783,7 @@ async def complete_account_login(
     """
     manager = AccountManager(db)
     session_string = account_data.session_string
+    auth_lease: AccountAuthLease | None = None
 
     try:
         # Check if account already exists
@@ -1741,6 +1792,10 @@ async def complete_account_login(
         )
         account = existing.scalar_one_or_none()
         account_already_existed = account is not None
+        auth_lease = await _acquire_account_auth_lease(
+            account,
+            purpose="complete-login",
+        )
 
         if account:
             # Update existing account
@@ -1860,6 +1915,8 @@ async def complete_account_login(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        await _release_account_auth_lease(auth_lease)
 
 
 @router.post("/auth/import-session", response_model=ImportSessionResponse)
@@ -1899,6 +1956,7 @@ async def import_session_file(
     # Save uploaded file to temporary location
     temp_dir = Path(tempfile.mkdtemp())
     temp_session_path = temp_dir / session_file.filename
+    auth_lease: AccountAuthLease | None = None
 
     try:
         try:
@@ -1916,6 +1974,10 @@ async def import_session_file(
         existing = (
             await db.execute(select(TelegramAccount).where(TelegramAccount.phone == phone))
         ).scalar_one_or_none()
+        auth_lease = await _acquire_account_auth_lease(
+            existing,
+            purpose="import-session",
+        )
         if resolved_proxy_mode == ProxyMode.STATIC:
             await _ensure_static_proxy_capacity(
                 db,
@@ -2009,6 +2071,7 @@ async def import_session_file(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
+        await _release_account_auth_lease(auth_lease)
         # Cleanup temp file
         try:
             shutil.rmtree(temp_dir)

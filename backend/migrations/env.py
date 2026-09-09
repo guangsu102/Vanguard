@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from app.core.config import settings
 from app.core.database import Base
 
-
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
@@ -34,6 +33,8 @@ def _import_models() -> None:
         "app.modules.acquisition.models",
         "app.modules.private_chat.models",
         "app.integrations.xboard.models",
+        "app.modules.owned_group.models",
+        "app.modules.owned_group.models_extra",
     ):
         importlib.import_module(model_module)
 

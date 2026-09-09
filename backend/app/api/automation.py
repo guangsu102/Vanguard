@@ -53,6 +53,8 @@ from app.core.scheduler.tasks import (
 )
 from app.core.security import require_admin
 from app.modules.acquisition.automation import (
+    AD_ONLY_GROUP_CONTROL_BACKOFF_MINUTES,
+    AD_ONLY_GROUP_CONTROL_PAUSED_REASON_PREFIX,
     GROUP_STATUS_AD_BLOCKED,
     HTML_RESPONSE_RE,
     WEB_ERROR_RESPONSE_RE,
@@ -65,6 +67,8 @@ from app.modules.acquisition.models import (
     AdCreativeType,
     AdDeliveryLog,
     AdDeliveryPolicy,
+    AdDeliveryScheduleState,
+    AdScheduleStatus,
     AdSendMode,
     AutoJoinAttempt,
     GroupAdPolicyEvent,
@@ -76,6 +80,32 @@ from app.modules.acquisition.models import (
 )
 
 router = APIRouter()
+
+
+def _paused_ad_delivery_payload(state: AdDeliveryScheduleState) -> dict[str, Any]:
+    account = state.account
+    campaign = state.campaign
+    group = state.group
+    return {
+        "id": state.id,
+        "account_id": state.account_id,
+        "account_label": (
+            account.display_name or account.identifier or account.phone or account.session_name
+            if account
+            else None
+        ),
+        "campaign_id": state.campaign_id,
+        "campaign_name": campaign.name if campaign else None,
+        "group_id": state.group_id,
+        "telegram_group_id": state.telegram_group_id,
+        "group_title": group.title if group else None,
+        "group_username": group.username if group else None,
+        "status": state.status,
+        "backoff_count": len(AD_ONLY_GROUP_CONTROL_BACKOFF_MINUTES),
+        "last_reason": state.last_reason,
+        "last_attempt_at": state.last_attempt_at.isoformat() if state.last_attempt_at else None,
+        "paused_at": state.updated_at.isoformat() if state.updated_at else None,
+    }
 
 
 def _auto_join_verification_log_from_membership(
@@ -150,9 +180,12 @@ class AutoJoinSchedulerConfigUpdate(BaseModel):
 
 class AdFailurePolicyUpdate(BaseModel):
     enabled: bool = True
-    leave_on_group_control_failure: bool = True
-    group_control_failure_limit: int = Field(default=1, ge=1, le=20)
-    group_control_failure_window_hours: int = Field(default=720, ge=1, le=720)
+    leave_on_group_control_failure: bool = Field(
+        default=True,
+        description="同一账号在统计窗口内群控失败达到阈值后是否退群；与删除广告后退群规则独立",
+    )
+    group_control_failure_limit: int = Field(default=2, ge=1, le=20)
+    group_control_failure_window_hours: int = Field(default=48, ge=1, le=720)
     levels: list[str] = Field(default_factory=lambda: ["A", "B", "C", "UNRATED"])
 
 
@@ -175,6 +208,7 @@ class AccountRiskGuardUpdate(BaseModel):
     lifecycle: dict[str, Any] = Field(default_factory=dict)
     group_write_forbidden: dict[str, Any] = Field(default_factory=dict)
     retention: dict[str, Any] = Field(default_factory=dict)
+
 
 class AccountAssetTierPolicyUpdate(BaseModel):
     join_multiplier: float = Field(default=1.0, ge=0.0, le=3.0)
@@ -219,13 +253,15 @@ class AdDeliveryThrottleUpdate(BaseModel):
     growth_min_interval_seconds: int = Field(default=1800, ge=1800, le=86400)
     growth_max_interval_seconds: int = Field(default=10800, ge=3000, le=86400)
 
+
 class AdDeliveryExecutionUpdate(BaseModel):
     enabled: bool = True
     dispatcher_interval_seconds: int = Field(default=60, ge=10, le=3600)
     dispatcher_batch_size: int = Field(default=100, ge=1, le=1000)
-    max_parallel_accounts: int = Field(default=3, ge=1, le=20)
+    max_parallel_accounts: int = Field(default=10, ge=1, le=20)
     job_lease_seconds: int = Field(default=300, ge=60, le=1800)
     growth_group_global_cooldown_seconds: int = Field(default=86400, ge=3600, le=604800)
+
 
 class AdCapacityUpdate(BaseModel):
     enabled: bool = True
@@ -238,15 +274,23 @@ class AdCapacityUpdate(BaseModel):
     survival_check_batch_size: int = Field(default=50, ge=1, le=500)
     max_groups_per_account: int = Field(default=400, ge=1, le=1000)
     max_new_ad_groups_per_day: int = Field(default=2, ge=0, le=2)
-    leave_on_deleted_ad: bool = True
-    block_group_on_probe_failure: bool = True
+    leave_on_deleted_ad: bool = Field(
+        default=True,
+        description="删除广告达到触发条件时是否调用 Telegram 退群；关闭后仅暂停或记录",
+    )
+    block_group_on_probe_failure: bool = Field(
+        default=True,
+        description="写权限探针失败或探针广告被删除时是否封禁整个群的广告",
+    )
     ad_policy_ai_enabled: bool = True
     ad_policy_ai_model: str = Field(default="gpt-5.6-terra", min_length=1, max_length=100)
     ad_policy_ai_timeout_seconds: int = Field(default=45, ge=5, le=120)
     ad_policy_ai_min_confidence: int = Field(default=95, ge=90, le=100)
-    ad_policy_ai_require_second_pass: bool = True
-    ad_policy_auto_probe_enabled: bool = False
-    ad_policy_auto_probe_daily_limit: int = Field(default=1, ge=0, le=20)
+    ad_policy_ai_require_second_pass: bool = Field(
+        default=True,
+        description="可能产生投放的 AI 结论是否必须经过第二次对抗式 AI 复核；不涉及人工审核",
+    )
+    ad_policy_auto_probe_enabled: bool = True
     ad_policy_auto_probe_daily_limit_per_account: int = Field(default=10, ge=0, le=20)
     ad_policy_auto_probe_interval_hours: int = Field(default=24, ge=1, le=168)
     ad_policy_auto_ttl_days: int = Field(default=7, ge=1, le=90)
@@ -419,7 +463,9 @@ def _build_dynamic_health_diagnostic(
         )
     if health_gate_applies and warmup_action_multiplier <= 0:
         reasons.append(
-            _diagnostic_reason("warmup_multiplier_zero", "暖号阶段禁止 Growth 广告", severity="danger")
+            _diagnostic_reason(
+                "warmup_multiplier_zero", "暖号阶段禁止 Growth 广告", severity="danger"
+            )
         )
     if health_gate_applies and not health_gate_passed and not reasons:
         reasons.append(
@@ -467,7 +513,6 @@ def _build_dynamic_health_diagnostic(
         "health_gate_passed": health_gate_passed,
         "risk_score": round(float(health.get("risk_score", 0.0) or 0.0), 2),
         "warmup_action_multiplier": round(float(warmup_action_multiplier or 0.0), 3),
-
         "probe_factor": round(float(probe_budget.get("probe_factor", 0.0) or 0.0), 3),
         "writable_rate": round(float(join_metrics.get("writable_rate", 0.0) or 0.0), 3),
         "probe_success_rate_24h": round(
@@ -673,15 +718,9 @@ async def _build_ad_delivery_diagnostic(
             group_label = "专用账号未手动接管该群"
             severity = "danger"
             group_counts["blocked"] += 1
-        elif (
-            membership.ad_status == "blocked"
-            or (
-                not is_ad_only
-                and (
-                    membership.warmup_status == "blocked"
-                    or membership.probe_status == "failed"
-                )
-            )
+        elif membership.ad_status == "blocked" or (
+            not is_ad_only
+            and (membership.warmup_status == "blocked" or membership.probe_status == "failed")
         ):
             group_reason = "probe_or_ad_blocked"
             group_label = "探针或广告状态阻断"
@@ -727,7 +766,11 @@ async def _build_ad_delivery_diagnostic(
             group_label = "群广告暂停中"
             severity = "warning"
             group_counts["blocked"] += 1
-        elif not is_ad_only and membership.first_ad_allowed_at and now < membership.first_ad_allowed_at:
+        elif (
+            not is_ad_only
+            and membership.first_ad_allowed_at
+            and now < membership.first_ad_allowed_at
+        ):
             group_reason = "first_ad_warmup_wait"
             group_label = "首次广告暖群等待"
             severity = "warning"
@@ -884,9 +927,7 @@ async def _build_ad_delivery_diagnostic(
     probe_execution_allowed = not any(item["reason"] in probe_blocking_reasons for item in reasons)
     dynamic_health_allowed = is_ad_only or growth_health_allowed
     ad_delivery_allowed = (
-        probe_execution_allowed
-        and dynamic_health_allowed
-        and group_counts["ready"] > 0
+        probe_execution_allowed and dynamic_health_allowed and group_counts["ready"] > 0
     )
 
     hard_reason = next((item for item in reasons if item["severity"] == "danger"), None)
@@ -1055,7 +1096,9 @@ async def get_effective_limits(db: AsyncSession = Depends(get_db)) -> dict:
 
 
 def _group_ad_profile_payload(
-    profile: GroupAdProfile, metrics: Optional[dict[str, Any]] = None
+    profile: GroupAdProfile,
+    metrics: Optional[dict[str, Any]] = None,
+    readiness: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     group = profile.group
     return {
@@ -1081,7 +1124,147 @@ def _group_ad_profile_payload(
         "last_survived_at": _iso_datetime(profile.last_survived_at),
         "last_deleted_at": _iso_datetime(profile.last_deleted_at),
         "blocked_reason": profile.blocked_reason,
+        "unknown_reason": (readiness or {}).get("reason"),
+        "unknown_reason_label": (readiness or {}).get("label"),
+        "probe_ready": bool((readiness or {}).get("ready", False)),
         "metrics": metrics or {},
+    }
+
+
+def _unknown_group_ad_policy_readiness(
+    profile: GroupAdProfile,
+    memberships: list[
+        tuple[GroupAccountMembership, TelegramAccount, Optional[AccountOperationConfig]]
+    ],
+    now: datetime,
+    *,
+    active_binding_account_ids: set[int],
+    group_active: bool,
+    group_can_receive_ads: bool,
+    window_reason: Optional[str],
+) -> dict[str, Any]:
+    if profile.ad_policy_mode != GroupAdPolicyMode.UNKNOWN.value:
+        return {"reason": None, "label": None, "ready": False}
+    if profile.ad_policy_probe_status in {"sending", "sent"}:
+        return {
+            "reason": "probe_in_progress",
+            "label": "探测进行中",
+            "ready": False,
+        }
+    if (
+        profile.ad_policy_probe_status == "failed"
+        and profile.ad_policy_probe_at is not None
+        and now < profile.ad_policy_probe_at + timedelta(hours=24)
+    ):
+        return {
+            "reason": "waiting_probe_cooldown",
+            "label": "等待探测冷却",
+            "ready": False,
+        }
+    if not group_active:
+        return {
+            "reason": "group_unavailable",
+            "label": "群当前不可用",
+            "ready": False,
+        }
+    if not memberships:
+        return {
+            "reason": "no_joined_account",
+            "label": "没有已加入账号",
+            "ready": False,
+        }
+
+    reasons: set[str] = set()
+    for membership, account, operation_config in memberships:
+        operation_mode = operation_config.operation_mode if operation_config is not None else None
+        if operation_mode == AccountOperationMode.AD_ONLY.value:
+            reasons.add("no_growth_probe_account")
+            continue
+        account_status = str(getattr(account.status, "value", account.status) or "")
+        if not account.is_active or account_status in {
+            AccountStatus.ERROR.value,
+            AccountStatus.BANNED.value,
+        }:
+            reasons.add("account_unavailable")
+            continue
+        if membership.ad_status == "blocked":
+            reasons.add("membership_blocked")
+            continue
+        if membership.probe_status != "success":
+            reasons.add("waiting_write_probe")
+            continue
+        if membership.first_ad_allowed_at is None or membership.first_ad_allowed_at > now:
+            reasons.add("waiting_warmup")
+            continue
+        if membership.ad_eligible_after is None or membership.ad_eligible_after > now:
+            reasons.add("waiting_ad_eligible")
+            continue
+        if operation_config is not None and (
+            not getattr(operation_config, "enabled", True)
+            or not getattr(operation_config, "auto_ads_enabled", True)
+        ):
+            reasons.add("account_ads_disabled")
+            continue
+        account_risk_level = str(
+            getattr(
+                getattr(account, "risk_level", None),
+                "value",
+                getattr(account, "risk_level", None),
+            )
+            or ""
+        )
+        account_risk_pause_until = getattr(account, "risk_pause_until", None)
+        if account_risk_level == "quarantined" or (
+            account_risk_pause_until is not None and account_risk_pause_until > now
+        ):
+            reasons.add("account_risk_blocked")
+            continue
+        if membership.account_id not in active_binding_account_ids:
+            reasons.add("no_active_ad_binding")
+            continue
+        if not group_can_receive_ads:
+            reasons.add("group_level_disallows_ads")
+            continue
+        if window_reason:
+            reasons.add("waiting_delivery_window")
+            continue
+        return {
+            "reason": "ready_for_probe",
+            "label": "可探测",
+            "ready": True,
+        }
+
+    labels = {
+        "waiting_warmup": "等待养号",
+        "waiting_ad_eligible": "等待可投放时间",
+        "waiting_write_probe": "等待发言能力验证",
+        "account_unavailable": "账号不可用",
+        "account_ads_disabled": "账号广告已关闭",
+        "account_risk_blocked": "账号风控暂停",
+        "membership_blocked": "成员关系已阻止",
+        "no_active_ad_binding": "没有有效广告绑定",
+        "group_level_disallows_ads": "群等级不允许投放",
+        "waiting_delivery_window": "等待投放时间窗",
+        "no_growth_probe_account": "没有可用 Growth 探测账号",
+    }
+    precedence = (
+        "waiting_warmup",
+        "waiting_ad_eligible",
+        "waiting_write_probe",
+        "account_unavailable",
+        "account_ads_disabled",
+        "account_risk_blocked",
+        "membership_blocked",
+        "no_active_ad_binding",
+        "group_level_disallows_ads",
+        "waiting_delivery_window",
+        "no_growth_probe_account",
+    )
+    reason = next((item for item in precedence if item in reasons), "probe_prerequisite_missing")
+    return {
+        "reason": reason,
+        "label": labels.get(reason, "探测条件未满足"),
+        "ready": False,
     }
 
 
@@ -1089,7 +1272,7 @@ def _group_ad_profile_payload(
 async def list_group_ad_profiles(
     policy_mode: Optional[str] = Query(default=None),
     tier: Optional[str] = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=300),
+    limit: int = Query(default=300, ge=1, le=300),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     query = (
@@ -1102,9 +1285,72 @@ async def list_group_ad_profiles(
     if tier:
         query = query.where(GroupAdProfile.ad_tier == tier)
     profiles = list((await db.execute(query.limit(limit))).scalars().all())
+    memberships_by_group: dict[
+        int,
+        list[
+            tuple[
+                GroupAccountMembership,
+                TelegramAccount,
+                Optional[AccountOperationConfig],
+            ]
+        ],
+    ] = {}
+    if profiles:
+        membership_rows = await db.execute(
+            select(
+                GroupAccountMembership,
+                TelegramAccount,
+                AccountOperationConfig,
+            )
+            .join(
+                TelegramAccount,
+                TelegramAccount.id == GroupAccountMembership.account_id,
+            )
+            .outerjoin(
+                AccountOperationConfig,
+                AccountOperationConfig.account_id == TelegramAccount.id,
+            )
+            .where(
+                GroupAccountMembership.group_id.in_([profile.group_id for profile in profiles]),
+                GroupAccountMembership.status == "joined",
+            )
+        )
+        for membership, account, operation_config in membership_rows.all():
+            memberships_by_group.setdefault(membership.group_id, []).append(
+                (membership, account, operation_config)
+            )
     service = AcquisitionAutomationService(db)
     capacity = await get_ad_capacity_settings(db)
     now = datetime.utcnow()
+    membership_account_ids = {
+        membership.account_id
+        for memberships in memberships_by_group.values()
+        for membership, _account, _operation_config in memberships
+    }
+    active_binding_account_ids: set[int] = set()
+    if membership_account_ids:
+        binding_rows = await db.execute(
+            select(AccountAdBinding)
+            .options(selectinload(AccountAdBinding.campaign))
+            .where(
+                AccountAdBinding.enabled.is_(True),
+                AccountAdBinding.account_id.in_(membership_account_ids),
+            )
+        )
+        active_binding_account_ids = {
+            binding.account_id
+            for binding in binding_rows.scalars().all()
+            if binding.campaign is not None and service._campaign_is_active(binding.campaign)
+        }
+    group_can_receive_ads: dict[int, bool] = {}
+    for profile in profiles:
+        group = profile.group
+        group_can_receive_ads[profile.group_id] = bool(
+            group is not None
+            and group.status == "active"
+            and await service._group_can_receive_ads(group)
+        )
+    window_reason = service._ad_window_skip_reason(now, capacity)
     data = []
     for profile in profiles:
         metrics = (
@@ -1112,7 +1358,16 @@ async def list_group_ad_profiles(
             if profile.group
             else {}
         )
-        data.append(_group_ad_profile_payload(profile, metrics))
+        readiness = _unknown_group_ad_policy_readiness(
+            profile,
+            memberships_by_group.get(profile.group_id, []),
+            now,
+            active_binding_account_ids=active_binding_account_ids,
+            group_active=bool(profile.group and profile.group.status == "active"),
+            group_can_receive_ads=group_can_receive_ads.get(profile.group_id, False),
+            window_reason=window_reason,
+        )
+        data.append(_group_ad_profile_payload(profile, metrics, readiness))
     return {"code": 0, "message": "success", "data": data}
 
 
@@ -1409,9 +1664,7 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
             health_gate_passed=growth_health_allowed,
             now=now,
         )
-        ad_eligible_groups = int(
-            delivery_diagnostic["group_diagnostics"].get("ready", 0)
-        )
+        ad_eligible_groups = int(delivery_diagnostic["group_diagnostics"].get("ready", 0))
 
         data.append(
             {
@@ -1474,6 +1727,60 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
     return {"code": 0, "message": "success", "data": data}
 
 
+@router.get("/ads/paused-deliveries")
+async def list_paused_ad_deliveries(
+    account_id: Optional[int] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+    _current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    query = select(AdDeliveryScheduleState).where(
+        AdDeliveryScheduleState.status == AdScheduleStatus.PAUSED.value,
+        AdDeliveryScheduleState.last_reason.startswith(AD_ONLY_GROUP_CONTROL_PAUSED_REASON_PREFIX),
+    )
+    if account_id is not None:
+        query = query.where(AdDeliveryScheduleState.account_id == account_id)
+
+    total = (await db.execute(select(func.count()).select_from(query.subquery()))).scalar() or 0
+    rows = await db.execute(
+        query.order_by(AdDeliveryScheduleState.updated_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": [_paused_ad_delivery_payload(item) for item in rows.unique().scalars().all()],
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.post("/ads/paused-deliveries/{schedule_id:int}/resume")
+async def resume_paused_ad_delivery(
+    schedule_id: int,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    service = AcquisitionAutomationService(db)
+    try:
+        state = await service.resume_ad_only_group_control_schedule(
+            schedule_id,
+            resumed_by_user_id=current_user.get("id"),
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _paused_ad_delivery_payload(state),
+    }
+
+
 # =============================================================================
 # Advertisement Failure Policy
 # =============================================================================
@@ -1503,7 +1810,7 @@ class AccountOperationConfigUpdate(BaseModel):
     force_transition: bool = False
     auto_join_enabled: Optional[bool] = None
     auto_ads_enabled: Optional[bool] = None
-    max_groups_per_day: Optional[int] = Field(None, ge=0, le=1000)
+    max_groups_per_day: Optional[int] = Field(None, ge=0, le=10)
     max_groups_total: Optional[int] = Field(None, ge=0, le=10000)
     join_interval_min_seconds: Optional[int] = Field(None, ge=60)
     join_interval_max_seconds: Optional[int] = Field(None, ge=60)
@@ -1533,7 +1840,8 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
     return {
         "id": config.id,
         "account_id": config.account_id,
-        "operation_mode": getattr(config, "operation_mode", None) or AccountOperationMode.GROWTH.value,
+        "operation_mode": getattr(config, "operation_mode", None)
+        or AccountOperationMode.GROWTH.value,
         "auto_join_enabled": config.auto_join_enabled,
         "auto_ads_enabled": config.auto_ads_enabled,
         "max_groups_per_day": config.max_groups_per_day,
@@ -1607,16 +1915,27 @@ def _prepare_operation_config_update(
     return data
 
 
+def _operation_config_mode(config: AccountOperationConfig) -> str:
+    return getattr(config, "operation_mode", None) or AccountOperationMode.GROWTH.value
+
+
+def _operation_mode_mismatch_reason(
+    config: AccountOperationConfig,
+    requested_mode: str | None,
+) -> str | None:
+    current_mode = _operation_config_mode(config)
+    if not requested_mode or requested_mode == current_mode:
+        return None
+    return f"operation_mode_mismatch: expected {requested_mode}, found {current_mode}"
+
+
 async def _apply_operation_mode_transition_side_effects(
     config: AccountOperationConfig,
     payload: dict[str, Any],
     db: AsyncSession,
 ) -> None:
     target_mode = payload.get("operation_mode")
-    current_mode = (
-        getattr(config, "operation_mode", None)
-        or AccountOperationMode.GROWTH.value
-    )
+    current_mode = _operation_config_mode(config)
     if not target_mode or target_mode == current_mode:
         return
 
@@ -1634,9 +1953,7 @@ async def _apply_operation_mode_transition_side_effects(
 
     if target_mode == AccountOperationMode.GROWTH.value:
         owner_rows = await db.execute(
-            select(Group.id).where(
-                Group.ad_delivery_account_id == config.account_id
-            )
+            select(Group.id).where(Group.ad_delivery_account_id == config.account_id)
         )
         owned_group_ids = list(owner_rows.scalars().all())
         active_handover_rows = await db.execute(
@@ -1716,12 +2033,15 @@ async def update_account_operation_configs_batch(
 
     updated: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    requested_mode = data.get("operation_mode")
     for account_id in account_ids:
         try:
             config = await _get_or_create_operation_config(db, account_id)
-            await _apply_operation_mode_transition_side_effects(
-                config, data, db
-            )
+            mismatch_reason = _operation_mode_mismatch_reason(config, requested_mode)
+            if mismatch_reason:
+                skipped.append({"account_id": account_id, "reason": mismatch_reason})
+                continue
+            await _apply_operation_mode_transition_side_effects(config, data, db)
             prepared = _prepare_operation_config_update(config, data)
             _apply_operation_config_update(config, prepared)
             updated.append(_operation_config_to_dict(config))
@@ -2238,7 +2558,9 @@ class AdCampaignCreate(BaseModel):
     name: str = Field(..., max_length=120)
     enabled: bool = False
     status: str = Field(default="draft", max_length=30)
-    delivery_policy: str = Field(default=AdDeliveryPolicy.GROWTH.value, pattern="^(growth|ad_only)$")
+    delivery_policy: str = Field(
+        default=AdDeliveryPolicy.GROWTH.value, pattern="^(growth|ad_only)$"
+    )
     send_mode: str = Field(default=AdSendMode.AFTER_JOIN.value)
     target_group_levels: list[str] = Field(default_factory=lambda: ["A"])
     target_group_ids: list[int] = Field(default_factory=list)
@@ -2247,6 +2569,8 @@ class AdCampaignCreate(BaseModel):
     min_wait_after_join_minutes: int = Field(default=60, ge=0)
     interval_minutes: int = Field(default=1440, ge=1)
     scheduled_times: Optional[list[str]] = None
+    max_sends_per_group_per_day: int = Field(default=1, ge=1, le=1000)
+    max_sends_per_account_per_day: int = Field(default=10, ge=1, le=1000)
 
 
 class AdCampaignUpdate(BaseModel):
@@ -2262,6 +2586,8 @@ class AdCampaignUpdate(BaseModel):
     min_wait_after_join_minutes: Optional[int] = Field(None, ge=0)
     interval_minutes: Optional[int] = Field(None, ge=1)
     scheduled_times: Optional[list[str]] = None
+    max_sends_per_group_per_day: Optional[int] = Field(None, ge=1, le=1000)
+    max_sends_per_account_per_day: Optional[int] = Field(None, ge=1, le=1000)
 
 
 def _campaign_to_dict(item: AdCampaign) -> dict:
@@ -2279,6 +2605,8 @@ def _campaign_to_dict(item: AdCampaign) -> dict:
         "min_wait_after_join_minutes": item.min_wait_after_join_minutes,
         "interval_minutes": item.interval_minutes,
         "scheduled_times": item.get_scheduled_times(),
+        "max_sends_per_group_per_day": item.max_sends_per_group_per_day,
+        "max_sends_per_account_per_day": item.max_sends_per_account_per_day,
         "created_at": item.created_at.isoformat() if item.created_at else "",
         "updated_at": item.updated_at.isoformat() if item.updated_at else "",
     }
@@ -2340,10 +2668,7 @@ async def _validate_target_group_ids(group_ids: list[int], db: AsyncSession) -> 
     if unavailable_ids:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Target groups are not active or not currently joined: "
-                f"{unavailable_ids}"
-            ),
+            detail=(f"Target groups are not active or not currently joined: {unavailable_ids}"),
         )
 
 
@@ -2363,10 +2688,11 @@ def _validate_campaign_delivery_policy(
         raise HTTPException(status_code=400, detail="Invalid delivery_policy")
     if delivery_policy != AdDeliveryPolicy.AD_ONLY.value:
         return
-    if not target_group_ids:
-        raise HTTPException(status_code=400, detail="ad_only campaigns require explicit target groups")
     if send_mode not in {AdSendMode.INTERVAL.value, AdSendMode.SCHEDULED.value}:
-        raise HTTPException(status_code=400, detail="ad_only campaigns require interval or scheduled send mode")
+        raise HTTPException(
+            status_code=400, detail="ad_only campaigns require interval or scheduled send mode"
+        )
+
 
 def _campaign_payload(data: dict) -> dict:
     if "send_mode" in data and data["send_mode"] not in {item.value for item in AdSendMode}:
@@ -2410,7 +2736,9 @@ async def create_ad_campaign(request: AdCampaignCreate, db: AsyncSession = Depen
     data["scheduled_times"] = _normalize_scheduled_times(data.get("scheduled_times"))
     data["target_group_ids"] = _normalize_target_group_ids(data.get("target_group_ids"))
     _validate_campaign_schedule(data["send_mode"], data["scheduled_times"])
-    _validate_campaign_delivery_policy(data["delivery_policy"], data["send_mode"], data["target_group_ids"])
+    _validate_campaign_delivery_policy(
+        data["delivery_policy"], data["send_mode"], data["target_group_ids"]
+    )
     await _validate_target_group_ids(data["target_group_ids"], db)
     data = _campaign_payload(data)
     campaign = AdCampaign(**data)
@@ -2444,7 +2772,9 @@ async def update_ad_campaign(
     target_group_ids = data.get("target_group_ids", campaign.get_target_group_ids())
     _validate_campaign_delivery_policy(delivery_policy, send_mode, target_group_ids)
     if delivery_policy != campaign.delivery_policy and campaign.enabled:
-        raise HTTPException(status_code=409, detail="Disable campaign before changing delivery_policy")
+        raise HTTPException(
+            status_code=409, detail="Disable campaign before changing delivery_policy"
+        )
     data = _campaign_payload(data)
     for field, value in data.items():
         setattr(campaign, field, value)
@@ -2597,7 +2927,7 @@ async def _validate_ad_only_binding_scope(
 
     target_group_ids = campaign.get_target_group_ids()
     if not target_group_ids:
-        raise HTTPException(status_code=400, detail="Ad-only campaigns require explicit target groups")
+        return
 
     await db.execute(select(Group.id).where(Group.id.in_(target_group_ids)).with_for_update())
     membership_rows = await db.execute(
@@ -2641,7 +2971,9 @@ async def _validate_ad_only_binding_scope(
         if permission_by_group.get(group_id) not in confirmed_modes
     ]
     if unconfirmed:
-        raise HTTPException(status_code=409, detail=f"Ad permission is not confirmed for groups {unconfirmed}")
+        raise HTTPException(
+            status_code=409, detail=f"Ad permission is not confirmed for groups {unconfirmed}"
+        )
 
     other_rows = await db.execute(
         select(AdCampaign).where(
@@ -2679,6 +3011,7 @@ async def _validate_ad_only_binding_scope(
                 detail=f"Ad-only planned load {planned_daily}/day exceeds account {account_id} hard cap {hard_cap}",
             )
 
+
 @router.post("/ads/bindings", status_code=status.HTTP_201_CREATED)
 async def create_account_ad_binding(
     request: AccountAdBindingCreate, db: AsyncSession = Depends(get_db)
@@ -2709,13 +3042,12 @@ async def create_account_ad_bindings_batch(
         )
     )
     if not account_ids:
-        raise HTTPException(status_code=400, detail='account_id or account_ids is required')
+        raise HTTPException(status_code=400, detail="account_id or account_ids is required")
     if any(account_id <= 0 for account_id in account_ids):
-        raise HTTPException(status_code=400, detail='account_ids must contain positive integers')
+        raise HTTPException(status_code=400, detail="account_ids must contain positive integers")
 
     await _validate_ad_binding_accounts(account_ids, db)
     await _validate_ad_only_binding_scope(account_ids, request.ad_campaign_id, db)
-
 
     requested_creative_ids = list(dict.fromkeys(request.creative_ids))
     creatives = (

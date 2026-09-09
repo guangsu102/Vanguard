@@ -11,6 +11,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum as SQLEnum,
     ForeignKey,
@@ -231,6 +232,10 @@ class GroupAccountMembership(Base):
 
     __table_args__ = (
         UniqueConstraint("group_id", "account_id", name="uq_group_account_membership_group_account"),
+        CheckConstraint(
+            "status NOT IN ('left', 'banned', 'rejected') OR ad_status = 'blocked'",
+            name="ck_group_membership_inactive_ad_blocked",
+        ),
         Index("idx_group_membership_group", "group_id"),
         Index("idx_group_membership_account", "account_id"),
         Index("idx_group_membership_tg_group", "telegram_group_id"),

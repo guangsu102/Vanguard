@@ -4,7 +4,7 @@ Authentication API endpoints
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 import bcrypt
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,8 +35,10 @@ class UserInfo(BaseModel):
 
 
 class UpdatePasswordRequest(BaseModel):
-    old_password: str
-    new_password: str
+    model_config = ConfigDict(populate_by_name=True)
+
+    old_password: str = Field(alias="oldPassword", min_length=1)
+    new_password: str = Field(alias="newPassword", min_length=16)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:

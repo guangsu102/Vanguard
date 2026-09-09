@@ -28,7 +28,7 @@ const announcementChannelId = ref<number | undefined>()
 const groups = ref<ManagedGroupBinding[]>([])
 const bots = ref<GuardianBot[]>([])
 const promoterAccounts = ref<Account[]>([])
-const groupPagination = useClientPagination(groups, 20)
+const groupPagination = useClientPagination(groups)
 const selectedSyncBotId = ref<number | undefined>()
 
 const form = reactive({

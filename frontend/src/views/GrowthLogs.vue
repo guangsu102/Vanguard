@@ -8,7 +8,9 @@ import { accountsApi, type Account } from '@/api/accounts'
 import { automationApi, type AdCampaign, type AutoJoinVerificationLog } from '@/api/automation'
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import { useClientPagination } from '@/utils/clientPagination'
+import { DEFAULT_PAGE_SIZE, PAGE_SIZE_OPTIONS } from '@/utils/pagination'
 const route = useRoute()
+const CLIENT_LOG_FETCH_LIMIT = 200
 const queryNumber = (value: unknown) => {
   const item = Array.isArray(value) ? value[0] : value
   const parsed = Number(item)
@@ -22,7 +24,7 @@ const attempts = ref<any[]>([])
 const verificationLogs = ref<AutoJoinVerificationLog[]>([])
 const deliveryLogs = ref<any[]>([])
 const deliveryPage = ref(1)
-const deliveryPageSize = ref(20)
+const deliveryPageSize = ref(DEFAULT_PAGE_SIZE)
 const deliveryTotal = ref(0)
 
 const accounts = ref<Account[]>([])
@@ -38,13 +40,13 @@ const {
   pageSize: attemptPageSize,
   total: attemptTotal,
   rows: pagedAttempts,
-} = useClientPagination(attemptSource, 20)
+} = useClientPagination(attemptSource)
 const {
   page: verificationPage,
   pageSize: verificationPageSize,
   total: verificationTotal,
   rows: pagedVerificationLogs,
-} = useClientPagination(verificationSource, 20)
+} = useClientPagination(verificationSource)
 
 type TagType = 'success' | 'warning' | 'danger' | 'info'
 
@@ -86,8 +88,8 @@ function campaignLabel(campaignId?: number) {
 
 const loadJoinLogs = async () => {
   const [attemptResponse, verificationResponse] = await Promise.all([
-    automationApi.getAutoJoinAttempts({ limit: 500 }),
-    automationApi.getAutoJoinVerificationLogs({ limit: 500 }),
+    automationApi.getAutoJoinAttempts({ limit: CLIENT_LOG_FETCH_LIMIT }),
+    automationApi.getAutoJoinVerificationLogs({ limit: CLIENT_LOG_FETCH_LIMIT }),
   ])
   attempts.value = attemptResponse.data.data
   verificationLogs.value = verificationResponse.data.data
@@ -273,7 +275,7 @@ onMounted(loadAll)
           <el-pagination
             :current-page="deliveryPage"
             :page-size="deliveryPageSize"
-            :page-sizes="[10, 20, 50, 100]"
+            :page-sizes="PAGE_SIZE_OPTIONS"
             :total="deliveryTotal"
             background
             layout="total, sizes, prev, pager, next, jumper"

@@ -23,7 +23,7 @@ const sortedProfiles = computed(() =>
     (left, right) => Number(right.ad_policy_confidence || 0) - Number(left.ad_policy_confidence || 0),
   ),
 )
-const { page, pageSize, total, rows: pagedProfiles } = useClientPagination(sortedProfiles, 20)
+const { page, pageSize, total, rows: pagedProfiles } = useClientPagination(sortedProfiles)
 
 const pct = (value?: number) => `${Math.round(Number(value || 0) * 100)}%`
 
@@ -88,6 +88,21 @@ onMounted(loadProfiles)
           <el-select v-model="row.ad_policy_mode" size="small">
             <el-option v-for="item in adPolicyModeOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
+        </template>
+      </el-table-column>
+      <el-table-column label="当前状态" min-width="150">
+        <template #default="{ row }">
+          <el-tag
+            v-if="row.ad_policy_mode === 'unknown'"
+            :type="row.probe_ready ? 'success' : 'warning'"
+            effect="plain"
+          >
+            {{ row.unknown_reason_label || '待确认' }}
+          </el-tag>
+          <el-tag v-else-if="row.ad_policy_mode === 'forbidden'" type="danger" effect="plain">
+            禁止投放
+          </el-tag>
+          <el-tag v-else type="success" effect="plain">已确认</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="证据等级" width="110">

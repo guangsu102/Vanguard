@@ -20,7 +20,7 @@ import dayjs from 'dayjs'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
 import { moderationApi, type ModerationSuggestion, type ViolationRecord, type SuggestionStatus } from '@/api/moderation'
-import { normalizeListPayload } from '@/utils/pagination'
+import { DEFAULT_PAGE_SIZE, normalizeListPayload } from '@/utils/pagination'
 
 const loading = ref(false)
 const generating = ref(false)
@@ -30,11 +30,13 @@ const selectedSuggestionIds = ref<number[]>([])
 const suggestions = ref<ModerationSuggestion[]>([])
 const suggestionTotal = ref(0)
 const suggestionPage = ref(1)
-const suggestionPageSize = ref(20)
+const suggestionPageSize = ref(DEFAULT_PAGE_SIZE)
 const suggestionSearchParams = ref<Record<string, any>>({})
 
 const violations = ref<ViolationRecord[]>([])
 const violationTotal = ref(0)
+const violationPage = ref(1)
+const violationPageSize = ref(DEFAULT_PAGE_SIZE)
 const stats = ref({
   total: 0,
   pending: 0,
@@ -129,7 +131,10 @@ const loadSuggestions = async (params?: Record<string, any>) => {
 
 const loadViolations = async () => {
   try {
-    const response = await moderationApi.listViolations({ page: 1, page_size: 10 })
+    const response = await moderationApi.listViolations({
+      page: violationPage.value,
+      page_size: violationPageSize.value,
+    })
     const payload = normalizeListPayload<ViolationRecord>(response.data)
     violations.value = payload.list
     violationTotal.value = payload.total
@@ -161,6 +166,17 @@ const handlePageSizeChange = (pageSize: number) => {
   suggestionPageSize.value = pageSize
   suggestionPage.value = 1
   loadSuggestions()
+}
+
+const handleViolationPageChange = (page: number) => {
+  violationPage.value = page
+  loadViolations()
+}
+
+const handleViolationPageSizeChange = (pageSize: number) => {
+  violationPageSize.value = pageSize
+  violationPage.value = 1
+  loadViolations()
 }
 
 const handleSelectionChange = (rows: ModerationSuggestion[]) => {
@@ -372,9 +388,11 @@ onMounted(() => {
       :data="violations"
       :total="violationTotal"
       :loading="loading"
-      :page="1"
-      :page-size="10"
+      :page="violationPage"
+      :page-size="violationPageSize"
       row-key="id"
+      @page-change="handleViolationPageChange"
+      @page-size-change="handleViolationPageSizeChange"
     >
       <template #action_taken="{ row }">
         <el-tag :type="actionTagType(row.action_taken)" effect="plain">{{ row.action_taken }}</el-tag>

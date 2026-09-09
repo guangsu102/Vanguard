@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+import pytest
+
+from app.core.account.models import AccountStatus, AccountType, TelegramAccount
+from app.core.config import settings
+from app.core.p0_safety_gate import precheck_owned_group_resources
+from app.modules.owned_group.models_extra import OwnedBotProfile
+
+
+async def _account(
+    db,
+    identifier: str,
+    *,
+    account_type: AccountType = AccountType.PROMOTER,
+    status: AccountStatus = AccountStatus.ONLINE,
+    session_string: str | None = "session",
+    is_active: bool = True,
+    risk_level: str = "normal",
+    risk_pause_until: datetime | None = None,
+) -> TelegramAccount:
+    account = TelegramAccount(
+        identifier=identifier,
+        session_name=identifier,
+        account_type=account_type,
+        status=status,
+        session_string=session_string,
+        is_active=is_active,
+        risk_level=risk_level,
+        risk_pause_until=risk_pause_until,
+    )
+    db.add(account)
+    await db.flush()
+    return account
+
+
+@pytest.mark.asyncio
+async def test_precheck_rejects_runtime_unready_user(test_db):
+    owner = await _account(test_db, "p0-owner")
+    offline = await _account(
+        test_db,
+        "p0-offline",
+        status=AccountStatus.OFFLINE,
+        session_string=None,
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "user", "resource_id": offline.id},
+        ],
+        owner.id,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "resource_eligibility_failed"
+    assert any(
+        item["resource_id"] == offline.id and item["reason"] == "account_status_not_ready"
+        for item in decision.details["violations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_precheck_rejects_undecryptable_session_ciphertext(test_db):
+    owner = await _account(
+        test_db, "p0-invalid-ciphertext", session_string="vgs1:not-a-fernet-token"
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+    )
+
+    assert decision.allowed is False
+    assert decision.details["violations"][0]["reason"] == "account_session_missing"
+
+
+@pytest.mark.asyncio
+async def test_precheck_can_validate_references_before_runtime_check(test_db):
+    owner = await _account(test_db, "p0-owner-deferred")
+    offline = await _account(
+        test_db,
+        "p0-offline-deferred",
+        status=AccountStatus.OFFLINE,
+        session_string=None,
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "user", "resource_id": offline.id},
+        ],
+        owner.id,
+        require_runtime_ready=False,
+    )
+
+    assert decision.allowed is True
+    assert decision.details["selected_accounts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_precheck_enforces_staged_rollout_limit(test_db, monkeypatch):
+    accounts = [await _account(test_db, f"p0-rollout-{index}") for index in range(3)]
+    monkeypatch.setattr(settings, "OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS", 2)
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": account.id} for account in accounts],
+        accounts[0].id,
+        require_runtime_ready=False,
+    )
+
+    assert decision.allowed is False
+    assert any(
+        item["reason"] == "rollout_account_limit_exceeded"
+        for item in decision.details["violations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_precheck_requires_verified_owned_bot_profile(test_db):
+    owner = await _account(test_db, "p0-bot-owner")
+    bot_account = await _account(
+        test_db,
+        "p0-bot-account",
+        account_type=AccountType.GUARDIAN_BOT,
+    )
+    profile = OwnedBotProfile(
+        owner_account_id=owner.id,
+        account_id=bot_account.id,
+        token_ciphertext="encrypted-token",
+        status="pending_verification",
+        enabled=True,
+    )
+    test_db.add(profile)
+    await test_db.flush()
+
+    pending = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "bot", "resource_id": profile.id},
+        ],
+        owner.id,
+    )
+    assert pending.allowed is False
+    assert any(
+        item["reason"] == "bot_profile_not_verified" for item in pending.details["violations"]
+    )
+
+    profile.status = "verified"
+    await test_db.flush()
+    verified = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "bot", "resource_id": profile.id},
+        ],
+        owner.id,
+    )
+    assert verified.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_precheck_rejects_bot_profile_bound_to_promoter_account(test_db):
+    owner = await _account(test_db, "p0-bot-type-owner")
+    # A profile may be accidentally linked to a promoter row because the
+    # polymorphic foreign key cannot express account_type at the DB level.
+    # The safety gate must reject that before any Bot API adapter is invoked.
+    promoter_bot = await _account(test_db, "p0-promoter-as-bot")
+    profile = OwnedBotProfile(
+        owner_account_id=owner.id,
+        account_id=promoter_bot.id,
+        token_ciphertext="encrypted-token",
+        status="verified",
+        enabled=True,
+    )
+    test_db.add(profile)
+    await test_db.flush()
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "bot", "resource_id": profile.id},
+        ],
+        owner.id,
+    )
+
+    assert decision.allowed is False
+    assert any(
+        item["reason"] == "bot_account_type_invalid" for item in decision.details["violations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_precheck_blocks_risk_cooldown(test_db):
+    owner = await _account(
+        test_db,
+        "p0-risk-owner",
+        risk_pause_until=datetime.utcnow() + timedelta(minutes=5),
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+    )
+
+    assert decision.allowed is False
+    assert decision.details["violations"][0]["reason"] == "account_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_bot_precheck_keeps_risk_guard_without_user_session_requirement(test_db):
+    owner = await _account(test_db, "p0-bot-risk-owner")
+    bot_account = await _account(
+        test_db,
+        "p0-bot-risk-account",
+        account_type=AccountType.GUARDIAN_BOT,
+        status=AccountStatus.OFFLINE,
+        session_string=None,
+        risk_level="frozen",
+    )
+    profile = OwnedBotProfile(
+        owner_account_id=owner.id,
+        account_id=bot_account.id,
+        token_ciphertext="encrypted-token",
+        status="verified",
+        enabled=True,
+    )
+    test_db.add(profile)
+    await test_db.flush()
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "bot", "resource_id": profile.id},
+        ],
+        owner.id,
+        require_runtime_ready=False,
+    )
+
+    assert decision.allowed is False
+    assert any(
+        item["resource_id"] == profile.id and item["reason"] == "account_risk_blocked"
+        for item in decision.details["violations"]
+    )

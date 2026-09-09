@@ -109,6 +109,39 @@ async def test_evomi_builds_stable_account_sticky_proxy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_evomi_hard_session_has_no_timed_expiration(monkeypatch):
+    settings = SimpleNamespace(
+        EVOMI_API_KEY="key",
+        EVOMI_PRODUCT_CODE="rp",
+        EVOMI_PROTOCOL="http",
+        EVOMI_SESSION_TYPE="hard",
+        EVOMI_SESSION_LIFETIME_MINUTES=30,
+        EVOMI_SESSION_NAMESPACE="tests",
+        EVOMI_ADBLOCK=False,
+    )
+    monkeypatch.setattr("app.core.account.evomi.get_settings", lambda: settings)
+    client = EvomiClient()
+    client._proxy_data = {
+        "products": {
+            "rp": {
+                "username": "evomi_user",
+                "password": "evomi_pass",
+                "endpoint": "rp.evomi.com",
+                "ports": {"http": 1000},
+            }
+        }
+    }
+
+    first = await client.get_proxy_for_account("us", account_key="+15550000001")
+    second = await client.get_proxy_for_account("us", account_key="+15550000001")
+
+    assert first[0].session_id == second[0].session_id
+    assert "_hardsession-" in first[0].password
+    assert "_lifetime-" not in first[0].password
+    assert first[0].expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_evomi_static_gateway_does_not_require_api_key(monkeypatch):
     settings = SimpleNamespace(
         EVOMI_API_KEY=None,

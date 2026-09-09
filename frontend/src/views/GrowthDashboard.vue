@@ -60,7 +60,6 @@ const riskActionOptions = [
   { label: '加群', value: 'join' },
   { label: '私聊', value: 'private_message' },
   { label: '群消息', value: 'group_message' },
-  { label: '广告探针', value: 'ad_probe' },
   { label: 'AI暖群', value: 'ai_warmup' },
   { label: '审核', value: 'moderation' },
   { label: '资料', value: 'profile_update' },
@@ -363,7 +362,7 @@ const titleBlacklistText = computed({
 })
 
 const flowSteps = computed(() => [
-  {
+   {
     key: 'search',
     title: '搜群',
     enabled: schedulerForm.enabled,
@@ -405,14 +404,14 @@ const flowSteps = computed(() => [
     title: '广告',
     enabled: adExecutionForm.enabled,
     status: '账号内串行',
-    detail: `删帖检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
+    detail: `删除广告检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
   },
   {
     key: 'risk',
     title: '账号风控',
     enabled: riskGuardForm.enabled,
     status: `${riskGuardForm.account_outbound_message_hard_cap_default}/天`,
-    detail: adFailurePolicyForm.leave_on_group_control_failure ? '群控失败自动退群' : '群控失败仅记录',
+    detail: adFailurePolicyForm.leave_on_group_control_failure ? '群控失败达到阈值后退群' : '群控失败仅记录',
   },
 ])
 
@@ -913,7 +912,7 @@ onBeforeUnmount(() => {
                 <el-input-number v-model="schedulerForm.join_verification!.confidence_threshold" :min="0" :max="1" :step="0.01" />
               </el-form-item>
               <el-form-item label="消息采样">
-                <el-input-number v-model="schedulerForm.join_verification!.message_limit" :min="5" :max="50" />
+                <el-input-number v-model="schedulerForm.join_verification!.message_limit" :min="5" :max="100" />
               </el-form-item>
               <el-form-item label="未知验证">
                 <el-select v-model="schedulerForm.join_verification!.unknown_challenge_action">
@@ -1132,7 +1131,12 @@ onBeforeUnmount(() => {
               </el-table-column>
               <el-table-column label="单号日额度">
                 <template #default="{ row }">
-                  <el-input-number v-model="riskGuardForm.actions[row.value].daily_limit" :min="1" :max="100000" size="small" />
+                  <el-input-number
+                    v-model="riskGuardForm.actions[row.value].daily_limit"
+                    :min="1"
+                    :max="row.value === 'join' ? 10 : 100000"
+                    size="small"
+                  />
                 </template>
               </el-table-column>
               <el-table-column label="冷却秒">
@@ -1312,7 +1316,7 @@ onBeforeUnmount(() => {
               <el-form-item label="新广告群/天">
                 <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="2" />
               </el-form-item>
-              <el-form-item label="删帖检测延迟">
+              <el-form-item label="删除广告检测延迟">
                 <el-input-number v-model="adCapacityForm.survival_check_delay_seconds" :min="30" :max="3600" :step="10" />
               </el-form-item>
               <el-form-item label="1小时检测点">
@@ -1330,13 +1334,17 @@ onBeforeUnmount(() => {
               <el-form-item label="重试基础秒数">
                 <el-input-number v-model="adCapacityForm.survival_retry_base_seconds" :min="60" :max="3600" />
               </el-form-item>
-              <el-form-item label="删帖退群">
-                <el-switch v-model="adCapacityForm.leave_on_deleted_ad" />
+              <el-form-item label="删除广告后退群">
+                <span title="探针广告被删除且达到暂停/阻断条件时，是否调用 Telegram 退群；关闭后仅暂停或记录，不执行退群">
+                  <el-switch v-model="adCapacityForm.leave_on_deleted_ad" />
+                </span>
               </el-form-item>
-              <el-form-item label="探针失败封群">
-                <el-switch v-model="adCapacityForm.block_group_on_probe_failure" />
+              <el-form-item label="探针失败封禁全群广告">
+                <span title="写权限探针失败或探针广告被删除时，将整个群标记为禁止广告；关闭后保留群为未知并允许后续重新探测">
+                  <el-switch v-model="adCapacityForm.block_group_on_probe_failure" />
+                </span>
               </el-form-item>
-              <el-form-item label="AI许可复核">
+              <el-form-item label="AI许可判定">
                 <el-switch v-model="adCapacityForm.ad_policy_ai_enabled" />
               </el-form-item>
               <el-form-item label="许可识别模型">
@@ -1348,8 +1356,10 @@ onBeforeUnmount(() => {
               <el-form-item label="许可最低置信度">
                 <el-input-number v-model="adCapacityForm.ad_policy_ai_min_confidence" :min="90" :max="100" />
               </el-form-item>
-              <el-form-item label="双阶段复核">
-                <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
+              <el-form-item label="可投放结论二次AI复核">
+                <span title="只使用第二个对抗式 AI 复核，不进入人工审核；任何可能投放的结论必须两次 AI 一致">
+                  <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
+                </span>
               </el-form-item>
               <el-form-item label="未知群自动广告探针">
                 <el-switch v-model="adCapacityForm.ad_policy_auto_probe_enabled" />
@@ -1398,8 +1408,10 @@ onBeforeUnmount(() => {
               <el-form-item label="失败策略">
                 <el-switch v-model="adFailurePolicyForm.enabled" />
               </el-form-item>
-              <el-form-item label="群控失败退群">
-                <el-switch v-model="adFailurePolicyForm.leave_on_group_control_failure" />
+              <el-form-item label="群控失败达到阈值后退群">
+                <span title="同一账号在统计窗口内的群控失败次数达到阈值后是否退群；与“删除广告后退群”是两条独立规则">
+                  <el-switch v-model="adFailurePolicyForm.leave_on_group_control_failure" />
+                </span>
               </el-form-item>
               <el-form-item label="失败次数阈值">
                 <el-input-number v-model="adFailurePolicyForm.group_control_failure_limit" :min="1" :max="20" />

@@ -49,9 +49,9 @@ const riskSummary = ref<AccountRiskSummary | null>(null)
 const riskEvents = ref<AccountRiskEvent[]>([])
 const environmentEvents = ref<AccountEnvironmentEvent[]>([])
 const todayUsageRows = computed(() => riskSummary.value?.today_usage || [])
-const todayUsagePagination = useClientPagination(todayUsageRows, 10)
-const riskEventPagination = useClientPagination(riskEvents, 10)
-const environmentEventPagination = useClientPagination(environmentEvents, 10)
+const todayUsagePagination = useClientPagination(todayUsageRows)
+const riskEventPagination = useClientPagination(riskEvents)
+const environmentEventPagination = useClientPagination(environmentEvents)
 
 const resetSecurityPagination = () => {
   todayUsagePagination.reset()
@@ -645,52 +645,54 @@ onMounted(() => {
       </template>
 
       <template #actions="{ row }">
-        <el-button type="primary" link size="small" @click="openEditDrawer(row)">
-          <el-icon><Edit /></el-icon>
-          编辑
-        </el-button>
-        <el-button
-          v-if="row.is_active"
-          type="warning"
-          link
-          size="small"
-          @click="handleDisable(row)"
-        >
-          <el-icon><CircleClose /></el-icon>
-          断开
-        </el-button>
-        <el-button
-          v-else
-          type="success"
-          link
-          size="small"
-          @click="handleEnable(row)"
-        >
-          <el-icon><CircleCheck /></el-icon>
-          连接
-        </el-button>
-        <el-button type="info" link size="small" @click="openSecurityDrawer(row)">
-          <el-icon><View /></el-icon>
-          安全
-        </el-button>
-        <el-button type="primary" link size="small" @click="handleSyncProfileBio(row)">
-          <el-icon><RefreshLeft /></el-icon>
-          同步简介
-        </el-button>
-        <el-button
-          v-if="row.status !== 'banned'"
-          type="danger"
-          link
-          size="small"
-          @click="handleManualBan(row)"
-        >
-          <el-icon><CircleClose /></el-icon>
-          手动封禁
-        </el-button>
-        <el-button type="danger" link size="small" @click="handleDelete(row)">
-          <el-icon><Delete /></el-icon>
-          删除
-        </el-button>
+        <div class="account-action-buttons">
+          <el-button type="primary" link size="small" @click="openEditDrawer(row)">
+            <el-icon><Edit /></el-icon>
+            编辑
+          </el-button>
+          <el-button
+            v-if="row.is_active"
+            type="warning"
+            link
+            size="small"
+            @click="handleDisable(row)"
+          >
+            <el-icon><CircleClose /></el-icon>
+            断开
+          </el-button>
+          <el-button
+            v-else
+            type="success"
+            link
+            size="small"
+            @click="handleEnable(row)"
+          >
+            <el-icon><CircleCheck /></el-icon>
+            连接
+          </el-button>
+          <el-button type="info" link size="small" @click="openSecurityDrawer(row)">
+            <el-icon><View /></el-icon>
+            安全
+          </el-button>
+          <el-button type="primary" link size="small" @click="handleSyncProfileBio(row)">
+            <el-icon><RefreshLeft /></el-icon>
+            同步简介
+          </el-button>
+          <el-button
+            v-if="row.status !== 'banned'"
+            type="danger"
+            link
+            size="small"
+            @click="handleManualBan(row)"
+          >
+            <el-icon><CircleClose /></el-icon>
+            手动封禁
+          </el-button>
+          <el-button type="danger" link size="small" @click="handleDelete(row)">
+            <el-icon><Delete /></el-icon>
+            删除
+          </el-button>
+        </div>
       </template>
     </TableCard>
     </div>
@@ -706,6 +708,7 @@ onMounted(() => {
       v-model:visible="deliveryBlockDrawerVisible"
       :account="selectedDeliveryAccount"
       :status="selectedDeliveryStatus"
+      @recovered="loadOperationalStatuses"
     />
 
     <AccountLoginDialog
@@ -812,7 +815,6 @@ onMounted(() => {
           v-model:page="todayUsagePagination.page.value"
           v-model:page-size="todayUsagePagination.pageSize.value"
           :total="todayUsagePagination.total.value"
-          :page-sizes="[5, 10, 20]"
         />
 
         <h3 class="security-title">风险事件</h3>
@@ -835,7 +837,6 @@ onMounted(() => {
           v-model:page="riskEventPagination.page.value"
           v-model:page-size="riskEventPagination.pageSize.value"
           :total="riskEventPagination.total.value"
-          :page-sizes="[5, 10, 20, 30]"
         />
 
         <h3 class="security-title">环境事件</h3>
@@ -859,7 +860,6 @@ onMounted(() => {
           v-model:page="environmentEventPagination.page.value"
           v-model:page-size="environmentEventPagination.pageSize.value"
           :total="environmentEventPagination.total.value"
-          :page-sizes="[5, 10, 20, 30]"
         />
       </div>
     </el-drawer>
@@ -994,6 +994,19 @@ onMounted(() => {
   align-items: flex-start;
   flex-direction: column;
   gap: 4px;
+}
+
+.account-action-buttons {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 6px;
+  white-space: nowrap;
+
+  :deep(.el-button) {
+    flex: 0 0 auto;
+    margin-left: 0;
+  }
 }
 
 .identifier-cell,

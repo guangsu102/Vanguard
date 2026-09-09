@@ -7,7 +7,7 @@ def _summary(*, risk_enabled: bool = True):
             "enabled": risk_enabled,
             "account_outbound_message_hard_cap_default": 30,
             "actions": {
-                "join": {"daily_limit": 6},
+                "join": {"daily_limit": 10},
                 "group_message": {"daily_limit": 4},
             },
         },
@@ -34,7 +34,7 @@ def test_effective_limits_only_report_active_v2_limits():
     summary = _summary()
     items = _items(summary)
 
-    assert items["account_join_daily"]["value"] == 6
+    assert items["account_join_daily"]["value"] == 10
     assert items["account_group_message_daily"]["value"] == 4
     assert items["account_outbound_message_daily_hard_cap"]["value"] == 30
     assert items["growth_account_ad_min_interval"]["value"] == 9000

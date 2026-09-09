@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
 import { ElButton, ElIcon, ElMessage, ElTabs, ElTabPane, ElForm, ElFormItem, ElInput, ElSwitch, ElCard, ElTable, ElTag, ElDivider, ElAlert } from 'element-plus'
-import { Select, Download, Delete, FolderOpened } from '@element-plus/icons-vue'
+import { Select, Download, Delete, FolderOpened, Lock } from '@element-plus/icons-vue'
+import { authApi } from '@/api/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { settingsApi } from '@/api/settings'
 import { downloadBlob } from '@/utils/download'
@@ -12,6 +13,13 @@ const settingsStore = useSettingsStore()
 
 const loading = ref(false)
 const activeTab = ref('notification')
+
+const passwordForm = reactive({
+  oldPassword: '',
+  newPassword: '',
+  confirmPassword: '',
+})
+const passwordLoading = ref(false)
 
 const notificationForm = reactive({
   sub2apiAlertsEnabled: false,
@@ -218,6 +226,34 @@ const handleBackup = async () => {
     ElMessage.error('备份失败')
   } finally {
     loading.value = false
+  }
+}
+
+const handleChangePassword = async () => {
+  if (passwordForm.newPassword.length < 16) {
+    ElMessage.error('新密码至少需要 16 个字符')
+    return
+  }
+  if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+    ElMessage.error('两次输入的新密码不一致')
+    return
+  }
+
+  passwordLoading.value = true
+  try {
+    await authApi.updatePassword({
+      oldPassword: passwordForm.oldPassword,
+      newPassword: passwordForm.newPassword,
+    })
+    passwordForm.oldPassword = ''
+    passwordForm.newPassword = ''
+    passwordForm.confirmPassword = ''
+    ElMessage.success('密码修改成功，请使用新密码重新登录')
+  } catch (error) {
+    console.error('Failed to update password:', error)
+    ElMessage.error('密码修改失败，请检查原密码')
+  } finally {
+    passwordLoading.value = false
   }
 }
 
@@ -455,6 +491,33 @@ onMounted(() => {
               备份数据库
             </el-button>
           </div>
+        </el-card>
+      </el-tab-pane>
+
+      <el-tab-pane label="修改密码" name="password">
+        <el-card shadow="never" class="password-card">
+          <el-alert
+            title="为保护生产环境，请立即将初始密码修改为个人强密码。新密码至少 16 个字符。"
+            type="warning"
+            :closable="false"
+            show-icon
+          />
+          <el-form :model="passwordForm" label-width="140px" class="password-form" @submit.prevent="handleChangePassword">
+            <el-form-item label="原密码" required>
+              <el-input v-model="passwordForm.oldPassword" type="password" show-password autocomplete="current-password" />
+            </el-form-item>
+            <el-form-item label="新密码" required>
+              <el-input v-model="passwordForm.newPassword" type="password" show-password autocomplete="new-password" />
+            </el-form-item>
+            <el-form-item label="确认新密码" required>
+              <el-input v-model="passwordForm.confirmPassword" type="password" show-password autocomplete="new-password" />
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" :loading="passwordLoading" :icon="Lock" @click="handleChangePassword">
+                修改密码
+              </el-button>
+            </el-form-item>
+          </el-form>
         </el-card>
       </el-tab-pane>
     </el-tabs>

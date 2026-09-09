@@ -75,6 +75,8 @@ async def init_db(create_tables: bool = True) -> None:
         "app.modules.acquisition.models",
         "app.modules.private_chat.models",
         "app.modules.qq.models",
+        "app.modules.owned_group.models",
+        "app.modules.owned_group.models_extra",
         "app.integrations.xboard.models",
     ):
         importlib.import_module(model_module)

@@ -6,7 +6,13 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException
 
-from app.api.automation import _build_ad_delivery_diagnostic, _build_dynamic_health_diagnostic, _enqueue_automation_task, _prepare_operation_config_update
+from app.api.automation import (
+    _build_ad_delivery_diagnostic,
+    _build_dynamic_health_diagnostic,
+    _enqueue_automation_task,
+    _operation_mode_mismatch_reason,
+    _prepare_operation_config_update,
+)
 from app.core.account.models import AccountOperationConfig, AccountOperationMode, AccountStatus, AccountType, TelegramAccount
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 import app.modules.acquisition.automation as automation_module
@@ -285,6 +291,29 @@ def test_ad_only_mode_disables_growth_controls():
     assert payload["operation_mode"] == AccountOperationMode.AD_ONLY.value
     assert payload["auto_join_enabled"] is False
     assert payload["keyword_auto_replenish_enabled"] is False
+
+
+def test_batch_operation_config_only_accepts_same_mode_accounts():
+    growth_config = AccountOperationConfig(
+        operation_mode=AccountOperationMode.GROWTH.value
+    )
+    ad_only_config = AccountOperationConfig(
+        operation_mode=AccountOperationMode.AD_ONLY.value
+    )
+
+    assert (
+        _operation_mode_mismatch_reason(
+            ad_only_config, AccountOperationMode.AD_ONLY.value
+        )
+        is None
+    )
+    assert (
+        _operation_mode_mismatch_reason(
+            growth_config, AccountOperationMode.AD_ONLY.value
+        )
+        == "operation_mode_mismatch: expected ad_only, found growth"
+    )
+    assert _operation_mode_mismatch_reason(growth_config, None) is None
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,21 @@ class PrivateHandler:
             )
 
             try:
+                if not await is_private_messaging_enabled(
+                    self.db,
+                    initiated_by_user=True,
+                ):
+                    self.logger.info(
+                        "private_message_auto_reply_skipped",
+                        user_id=user_id,
+                        source=source,
+                        reason="auto_reply_disabled",
+                    )
+                    return PrivateMessageResult(
+                        success=True,
+                        action_taken="auto_reply_disabled",
+                    )
+
                 # 处理命令
                 if message_text.startswith("/"):
                     return await self._handle_command(user_id, message_text)
@@ -128,15 +143,26 @@ class PrivateHandler:
                         return PrivateMessageResult(
                             success=success,
                             reply=guide_reply,
+                            error=None if success else "private_message_not_sent",
                             action_taken="guide_flow",
                         )
 
                 # 处理普通对话
                 reply = await self._generate_reply(user_id, message_text, context)
                 if reply:
-                    await self.send_message(user_id, reply, initiated_by_user=True)
+                    success = await self.send_message(user_id, reply, initiated_by_user=True)
+                    return PrivateMessageResult(
+                        success=success,
+                        reply=reply,
+                        error=None if success else "private_message_not_sent",
+                        action_taken="auto_reply",
+                    )
 
-                return PrivateMessageResult(success=True, reply=reply)
+                return PrivateMessageResult(
+                    success=True,
+                    reply=reply,
+                    action_taken="no_reply_generated",
+                )
 
             except Exception as e:
                 self.logger.error("handle_message_error", user_id=user_id, error=str(e))
@@ -168,6 +194,7 @@ class PrivateHandler:
             return PrivateMessageResult(
                 success=success,
                 reply=reply,
+                error=None if success else "private_message_not_sent",
                 action_taken="unknown_command",
             )
 
@@ -197,6 +224,7 @@ class PrivateHandler:
         return PrivateMessageResult(
             success=success,
             reply=welcome,
+            error=None if success else "private_message_not_sent",
             action_taken="welcome",
         )
 
@@ -204,7 +232,12 @@ class PrivateHandler:
         """Handle /help command."""
         reply = await self._render_private_template("help", user_id)
         success = await self.send_message(user_id, reply, initiated_by_user=True)
-        return PrivateMessageResult(success=success, reply=reply, action_taken="help")
+        return PrivateMessageResult(
+            success=success,
+            reply=reply,
+            error=None if success else "private_message_not_sent",
+            action_taken="help",
+        )
 
     async def _handle_register(self, user_id: int) -> PrivateMessageResult:
         """Handle /register command."""
@@ -215,7 +248,12 @@ class PrivateHandler:
             register_link=tracking_link,
         )
         success = await self.send_message(user_id, reply, initiated_by_user=True)
-        return PrivateMessageResult(success=success, reply=reply, action_taken="register_link")
+        return PrivateMessageResult(
+            success=success,
+            reply=reply,
+            error=None if success else "private_message_not_sent",
+            action_taken="register_link",
+        )
 
     async def _handle_status(self, user_id: int) -> PrivateMessageResult:
         """Handle /status command."""
@@ -225,7 +263,12 @@ class PrivateHandler:
         else:
             reply = await self._render_private_template("statusPending", user_id, status="")
         success = await self.send_message(user_id, reply, initiated_by_user=True)
-        return PrivateMessageResult(success=success, reply=reply, action_taken="status_check")
+        return PrivateMessageResult(
+            success=success,
+            reply=reply,
+            error=None if success else "private_message_not_sent",
+            action_taken="status_check",
+        )
 
     async def _generate_reply(
         self,

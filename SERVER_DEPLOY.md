@@ -1,76 +1,38 @@
-# Vanguard 服务器部署指南
+# Vanguard 生产部署指南（oracle4c24g）
 
-## 📦 部署包信息
+当前生产目标：`oracle4c24g`（`168.110.23.229:22`），公网入口为
+`https://vanguard.pipenai.xyz`。主机 Nginx 转发到 loopback 后端
+`127.0.0.1:18080`、前端 `127.0.0.1:13000`；同机的 `/opt/sub2api-dr`
+服务由另一套 Compose 管理，禁止在 Vanguard 发布中停止或重配。
 
-- **文件名**: vanguard_20260524_174907.tar.gz
-- **大小**: 64M
-- **位置**: /d/tanxuan/project/Vanguard/
-
-## 🚀 部署步骤
-
-### 1. 上传部署包到服务器
+## 发布
 
 ```bash
-# 在本地执行
-scp vanguard_20260524_174907.tar.gz xd:/root/
+# 在仓库根目录执行；首次目标机部署才加 --bootstrap
+PYTHONIOENCODING=utf-8 python backend/../scripts/codex_deploy_automation.py --bootstrap
+
+# 后续发布
+PYTHONIOENCODING=utf-8 python backend/../scripts/codex_deploy_automation.py
 ```
 
-### 2. 登录服务器并解压
+脚本会把旧 `/opt/vanguard` 移到 `/opt/vanguard.file-backups/`，保留
+`.env.production`、数据库/Redis 数据和会话目录；首次 bootstrap 执行基础
+建表、增量迁移 026–044，并从环境变量创建管理员。管理员密码不写入仓库。
+
+## 验证
 
 ```bash
-# 登录服务器
-ssh xd
-
-# 解压文件
-cd /root
-tar -xzf vanguard_20260524_174907.tar.gz
-cd Vanguard
+ssh oracle4c24g 'cd /opt/vanguard && docker compose -f docker-compose.production.yml ps'
+curl -fsS https://vanguard.pipenai.xyz/health
+curl -fsS -o /dev/null -w '%{http_code}\n' https://vanguard.pipenai.xyz/
 ```
 
-### 3. 配置环境变量
+生产环境初始阶段 `OWNED_GROUP_EXECUTION_ENABLED=false`，Telegram 凭据未配置；
+启用真实群操作前必须另行完成凭据、代理、两账号以内灰度和回滚演练。
 
-编辑 .env.production 文件，确保所有配置正确。
+## Nginx 回滚
 
-### 4. 停止旧服务
-
-```bash
-docker stop vanguard-backend vanguard-bot vanguard-frontend 2>/dev/null || true
-docker rm vanguard-backend vanguard-bot vanguard-frontend 2>/dev/null || true
-```
-
-### 5. 启动服务
-
-```bash
-# 启动后端和 Bot
-docker-compose -f docker-compose.production.yml up -d backend bot
-
-# 检查状态
-docker ps | grep vanguard
-
-# 测试后端
-curl https://api.rensw.xyz/health
-
-# 启动前端
-docker-compose -f docker-compose.production.yml up -d frontend
-```
-
-### 6. 验证部署
-
-```bash
-# 查看所有容器
-docker ps | grep vanguard
-
-# 测试 API
-curl https://api.rensw.xyz/health
-
-# 测试前端
-curl -I https://www.rensw.xyz
-```
-
-## 🔐 系统访问说明
-
-**重要**: 当前项目没有传统的用户登录系统。前端直接连接到后端 API。
-
-## 📅 部署时间
-
-2026-05-24
+新增配置模板位于 `deploy/oracle4c24g-nginx.conf`，主机安装位置为
+`/etc/nginx/conf.d/vanguard.conf`。每次变更前先备份该文件和
+`sub2api.conf`，通过 `nginx -t` 后再 `systemctl reload nginx`；回滚时恢复最近的
+`/root/vanguard-nginx-backups/<timestamp>/vanguard.conf`，然后再次测试并 reload。

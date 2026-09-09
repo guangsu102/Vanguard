@@ -151,8 +151,9 @@ class ProxyPool:
         return len(proxy_rows)
 
     async def health_check_all(self) -> dict:
-        """Run health check for all known proxies and return summary."""
-        await self.sync_from_db()
+        """Run health checks for active proxies and return an operational summary."""
+        active_proxies = await self.list_proxies(active_only=True)
+        await self.sync_from_db(active_proxies)
         results = await self.health_check()
         healthy = sum(1 for item in results.values() if item.get("success"))
         unhealthy = len(results) - healthy
@@ -593,11 +594,20 @@ class ProxyPool:
         result = await self.db.execute(
             select(
                 func.count(Proxy.id).label("total"),
-                func.avg(Proxy.success_rate).label("avg_success_rate"),
-                func.avg(Proxy.avg_latency).label("avg_latency"),
             )
         )
         row = result.one()
+
+        operational_result = await self.db.execute(
+            select(
+                func.avg(Proxy.success_rate).label("avg_success_rate"),
+                func.avg(Proxy.avg_latency).label("avg_latency"),
+            ).where(
+                Proxy.is_active.is_(True),
+                Proxy.consecutive_failures < 3,
+            )
+        )
+        operational_row = operational_result.one()
 
         type_counts = {}
         for ptype in ProxyType:
@@ -608,8 +618,8 @@ class ProxyPool:
 
         return {
             "total_proxies": row.total or 0,
-            "average_success_rate": float(row.avg_success_rate or 0),
-            "average_latency": int(row.avg_latency or 0),
+            "average_success_rate": float(operational_row.avg_success_rate or 0),
+            "average_latency": int(operational_row.avg_latency or 0),
             "by_type": type_counts,
             "account_bindings": len(self._account_bindings),
         }

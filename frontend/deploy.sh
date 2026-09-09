@@ -2,5 +2,5 @@
 set -e
 
 echo "This deployment target is deprecated for Vanguard."
-echo "Use ssh alias test001 and docker-compose.test001.yml instead."
+echo "Use oracle4c24g and scripts/codex_deploy_automation.py from the repository root instead."
 exit 1

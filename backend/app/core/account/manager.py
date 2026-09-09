@@ -240,7 +240,8 @@ class AccountManager:
                 operation_mode=operation_mode.value,
                 auto_join_enabled=False,
                 auto_ads_enabled=True,
-                keyword_auto_replenish_enabled=False,
+                keyword_auto_replenish_enabled=operation_mode == AccountOperationMode.GROWTH,
+                keyword_replenish_requires_review=operation_mode != AccountOperationMode.GROWTH,
             )
         
         config.account_count += 1

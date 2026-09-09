@@ -9,7 +9,7 @@ import { useClientPagination } from '@/utils/clientPagination'
 const loading = ref(false)
 const workers = ref<TelegramWorkerStatus[]>([])
 const role = ref('')
-const workerPagination = useClientPagination(workers, 20)
+const workerPagination = useClientPagination(workers)
 
 const fetchWorkers = async () => {
   loading.value = true

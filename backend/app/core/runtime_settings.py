@@ -58,7 +58,7 @@ DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS: dict[str, Any] = {
         "post_action_wait_seconds": 8,
         "post_action_recheck_attempts": 3,
         "post_action_extra_wait_seconds": 12,
-        "message_limit": 20,
+        "message_limit": 100,
         "ai_timeout_seconds": 45,
         "action_timeout_seconds": 5,
         "pending_sync_min_age_seconds": 120,
@@ -157,13 +157,11 @@ DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
     "redis_fail_closed": True,
     "actions": {
         "search": {"daily_limit": 100, "cooldown_seconds": 30},
-        "join": {"daily_limit": 6, "cooldown_seconds": 7200},
+        "join": {"daily_limit": 10, "cooldown_seconds": 7200},
         "private_message": {"daily_limit": 20, "cooldown_seconds": 300},
         "group_message": {"daily_limit": 4, "cooldown_seconds": 7200},
-        "ad_probe": {"daily_limit": 10, "cooldown_seconds": 3600},
         "ai_warmup": {"daily_limit": 1, "cooldown_seconds": 21600},
         "moderation": {"daily_limit": 60, "cooldown_seconds": 15},
-        "ad_delivery": {"daily_limit": 100000, "cooldown_seconds": 0},
         "profile_update": {"daily_limit": 5, "cooldown_seconds": 3600},
         "reaction": {"daily_limit": 120, "cooldown_seconds": 10},
         "forward": {"daily_limit": 25, "cooldown_seconds": 120},
@@ -365,7 +363,7 @@ DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "dispatcher_interval_seconds": 60,
     "dispatcher_batch_size": 100,
-    "max_parallel_accounts": 3,
+    "max_parallel_accounts": 10,
     "job_lease_seconds": 300,
     "growth_group_global_cooldown_seconds": 86400,
 }
@@ -394,9 +392,6 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "survival_check_batch_size": 50,
     "survival_retry_max_attempts": 3,
     "survival_retry_base_seconds": 300,
-
-
-
     "max_groups_per_account": 400,
     "max_new_ad_groups_per_day": 2,
     "leave_on_deleted_ad": True,
@@ -406,8 +401,7 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "ad_policy_ai_timeout_seconds": 45,
     "ad_policy_ai_min_confidence": 95,
     "ad_policy_ai_require_second_pass": True,
-    "ad_policy_auto_probe_enabled": False,
-    "ad_policy_auto_probe_daily_limit": 1,
+    "ad_policy_auto_probe_enabled": True,
     "ad_policy_auto_probe_daily_limit_per_account": 10,
     "ad_policy_auto_probe_interval_hours": 24,
     "ad_policy_auto_ttl_days": 7,
@@ -416,9 +410,6 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "premium_min_conversions": 1,
     "premium_growth_samples": 100,
     "premium_full_capacity_samples": 1000,
-
-
-
     "premium_survival_rate_percent": 95,
     "premium_clean_days_auto": 5,
     "premium_clean_days_verified": 3,
@@ -515,7 +506,6 @@ def _normalize_string_list(value: Any, *, default: list[str], max_items: int = 2
         if len(result) >= max_items:
             break
     return result
-
 
 
 def render_runtime_template(template: str, variables: Mapping[str, Any]) -> str:

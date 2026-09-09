@@ -11,6 +11,7 @@ import {
 } from '@/api/qq'
 import wsClient from '@/utils/websocket'
 import ClientListPagination from '@/components/ClientListPagination.vue'
+import { DEFAULT_PAGE_SIZE } from '@/utils/pagination'
 
 const loading = ref(false)
 const connection = ref<QQConnectionStatus>({
@@ -22,7 +23,7 @@ const connection = ref<QQConnectionStatus>({
 const groups = ref<QQManagedGroup[]>([])
 const total = ref(0)
 const groupPage = ref(1)
-const groupPageSize = ref(20)
+const groupPageSize = ref(DEFAULT_PAGE_SIZE)
 
 const registerVisible = ref(false)
 const registerLoading = ref(false)
@@ -39,7 +40,7 @@ const currentGroup = ref<QQManagedGroup | null>(null)
 const messages = ref<QQGroupMessage[]>([])
 const messageTotal = ref(0)
 const messagePage = ref(1)
-const messagePageSize = ref(20)
+const messagePageSize = ref(DEFAULT_PAGE_SIZE)
 const messageFilters = reactive({ keyword: '', member_qq: '' })
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null

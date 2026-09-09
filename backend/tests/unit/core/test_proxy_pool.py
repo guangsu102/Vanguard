@@ -9,6 +9,8 @@ Tests cover:
 - Statistics
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 import pytest_asyncio
 
@@ -144,6 +146,35 @@ class TestProxyHealthCheck:
         assert proxy.is_active is False
         assert proxy.consecutive_failures == 1
         assert proxy.success_rate == pytest.approx(0.8)
+
+    @pytest.mark.asyncio
+    async def test_health_check_all_excludes_inactive_proxies(self, test_db):
+        pool = ProxyPool(test_db)
+        active = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "1.1.1.1",
+            8080,
+            "US",
+        )
+        inactive = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "2.2.2.2",
+            8080,
+            "US",
+        )
+        inactive.is_active = False
+        inactive.consecutive_failures = 1328
+        await test_db.commit()
+        pool.health_check = AsyncMock(
+            return_value={active.id: {"success": True, "latency": 10}}
+        )
+
+        result = await pool.health_check_all()
+
+        assert result["checked"] == 1
+        assert result["healthy"] == 1
+        assert result["unhealthy"] == 0
+        assert set(pool._proxies) == {active.id}
 
 
 class TestProxyPoolAddRemove:

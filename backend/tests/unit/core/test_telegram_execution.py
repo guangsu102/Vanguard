@@ -68,11 +68,41 @@ async def test_auto_join_blocked_by_risk_guard_does_not_touch_telegram_client():
         record_success=AsyncMock(),
     )
     service = TelegramExecutionService(risk_guard)
+    attempted = []
 
     with pytest.raises(RuntimeError, match="risk_guard_blocked:join_frozen"):
-        await service.join_group(account, SimpleNamespace(username="demo_group", group_id=1001))
+        await service.join_group(
+            account,
+            SimpleNamespace(username="demo_group", group_id=1001),
+            on_join_request_attempted=lambda: attempted.append(True),
+        )
 
     assert client.get_entity_called is False
+    assert attempted == []
+
+
+@pytest.mark.asyncio
+async def test_auto_join_marks_real_telegram_join_request():
+    client = FakeClient()
+    account = SimpleNamespace(account_id=11, client=client)
+    risk_guard = SimpleNamespace(
+        check_and_reserve=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, reason="reserved")
+        ),
+        record_failure=AsyncMock(),
+        record_success=AsyncMock(),
+    )
+    service = TelegramExecutionService(risk_guard)
+    attempted = []
+
+    await service.join_group(
+        account,
+        SimpleNamespace(username="demo_group", group_id=1001),
+        on_join_request_attempted=lambda: attempted.append(True),
+    )
+
+    assert attempted == [True]
+    assert len(client.request_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -87,11 +117,46 @@ async def test_ad_delivery_blocked_by_risk_guard_does_not_send_message():
         record_success=AsyncMock(),
     )
     service = TelegramExecutionService(risk_guard)
+    attempted = []
 
     with pytest.raises(RuntimeError, match="risk_guard_blocked:ad_delivery_daily_budget"):
-        await service.send_ad(account, 123, "hello", source="test")
+        await service.send_ad(
+            account,
+            123,
+            "hello",
+            source="test",
+            on_send_attempted=lambda: attempted.append(True),
+        )
     assert client.send_message_calls == []
     assert client.send_file_calls == []
+    assert attempted == []
+
+
+@pytest.mark.asyncio
+async def test_ad_delivery_marks_attempt_at_telegram_call_boundary():
+    client = FakeClient()
+    account = SimpleNamespace(account_id=12, client=client)
+    risk_guard = SimpleNamespace(
+        check_and_reserve=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, reason="reserved")
+        ),
+        record_failure=AsyncMock(),
+        record_success=AsyncMock(),
+    )
+    service = TelegramExecutionService(risk_guard)
+    attempted = []
+
+    message_id = await service.send_ad(
+        account,
+        123,
+        "hello",
+        source="test",
+        on_send_attempted=lambda: attempted.append(True),
+    )
+
+    assert message_id == 321
+    assert attempted == [True]
+    assert client.send_message_calls == [((123, "hello"), {})]
 
 
 @pytest.mark.asyncio

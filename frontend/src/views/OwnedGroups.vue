@@ -1,0 +1,1505 @@
+<script setup lang="ts">
+import {
+  computed,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { accountsApi, type Account } from "@/api/accounts";
+import { getApiErrorMessage } from "@/api/client";
+import { useAuthStore } from "@/stores/auth";
+import { useOwnedGroupStore } from "@/stores/ownedGroup";
+import {
+  redactOwnedGroupError,
+  type OwnedBotProfile,
+  type OwnedGroupAsset,
+  type OwnedGroupInviteLink,
+  type OwnedGroupOperationStatus,
+  type OwnedGroupPrecheckResult,
+  type OwnedGroupResourceSelection,
+  type OwnedGroupResourceType,
+} from "@/api/ownedGroups";
+
+const store = useOwnedGroupStore();
+const authStore = useAuthStore();
+const accounts = ref<Account[]>([]);
+const botAccounts = ref<Account[]>([]);
+const errorMessage = ref("");
+const actionMessage = ref("");
+const botProfileError = ref("");
+const selectedId = ref<number | null>(null);
+const selectedResources = ref<string[]>([]);
+type ResourceAdminConfig = {
+  admin_required: boolean;
+  admin_title: string;
+  admin_permissions: Record<string, boolean>;
+};
+
+const resourceConfigs = reactive<Record<string, ResourceAdminConfig>>({});
+const inviteLinksLoadedFor = ref<number | null>(null);
+const inviteLinkAction = ref<string | null>(null);
+const inviteLinksError = ref("");
+const precheckResult = ref<OwnedGroupPrecheckResult | null>(null);
+const creating = ref(false);
+const prechecking = ref(false);
+const submitting = ref(false);
+const controlling = ref(false);
+const reconcilingAsset = ref(false);
+const reconcileChatId = ref("");
+const reconcileUsername = ref("");
+const botRegistrationVisible = ref(false);
+const registeringBot = ref(false);
+const verifyingBotId = ref<number | null>(null);
+const botForm = reactive({
+  owner_account_id: undefined as number | undefined,
+  account_id: undefined as number | undefined,
+  bot_token: "",
+});
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+const ADMIN_PERMISSION_OPTIONS = [
+  { key: "invite_users", label: "邀请成员" },
+  { key: "change_info", label: "修改群信息" },
+  { key: "post_messages", label: "发布消息" },
+  { key: "edit_messages", label: "编辑消息" },
+  { key: "delete_messages", label: "删除消息" },
+  { key: "ban_users", label: "封禁成员" },
+  { key: "pin_messages", label: "置顶消息" },
+  { key: "add_admins", label: "添加管理员" },
+  { key: "manage_topics", label: "管理话题" },
+  { key: "manage_call", label: "管理语音/视频" },
+  { key: "anonymous", label: "匿名管理员" },
+] as const;
+
+const draft = reactive({
+  internal_name: "",
+  title: "",
+  about: "",
+  visibility: "public" as "public" | "private",
+  telegram_username: "",
+  owner_account_id: undefined as number | undefined,
+  invite_mode: "direct_invite" as const,
+});
+
+const ownerOptions = computed(() =>
+  accounts.value.filter(
+    (account) => account.account_type === "promoter" && account.is_active,
+  ),
+);
+const resourceOptions = computed(() => ownerOptions.value);
+const botProfiles = computed(() => store.botProfiles);
+const botProfileOptions = computed(() =>
+  botProfiles.value.filter((profile) => profile.enabled),
+);
+const selectedAsset = computed(
+  () =>
+    store.list.find((asset) => asset.id === selectedId.value) || store.current,
+);
+const isAdmin = computed(() => authStore.userInfo?.role === "admin");
+const inviteLinks = computed(() => store.inviteLinks);
+const inviteLinksLoading = computed(() => store.inviteLinksLoading);
+const selectedResourceEntries = computed(() =>
+  selectedResources.value.map((key) => {
+    const [resourceType, rawId] = key.split(":");
+    const resourceId = Number(rawId);
+    const account =
+      resourceType === "user"
+        ? resourceOptions.value.find((item) => item.id === resourceId)
+        : undefined;
+    const profile =
+      resourceType === "bot"
+        ? botProfileOptions.value.find((item) => item.id === resourceId)
+        : undefined;
+    return {
+      key,
+      resource_type: resourceType as OwnedGroupResourceType,
+      resource_id: resourceId,
+      config: ensureResourceConfig(key),
+      is_owner:
+        resourceType === "user" &&
+        resourceId === selectedAsset.value?.owner_account_id,
+      label:
+        resourceType === "bot"
+          ? profile
+            ? botProfileLabel(profile)
+            : `Bot #${resourceId}`
+          : account
+            ? `${account.display_name || account.identifier} · ${account.status}`
+            : `用户 #${resourceId}`,
+    };
+  }),
+);
+const operation = computed(() => store.operation);
+const operationActive = computed(() =>
+  ["queued", "running", "stopping"].includes(operation.value?.status || ""),
+);
+const assetActive = computed(() =>
+  ["prechecking", "creating"].includes(selectedAsset.value?.status || ""),
+);
+const operationCanPause = computed(() =>
+  ["queued", "running"].includes(operation.value?.status || ""),
+);
+const operationCanResume = computed(() => operation.value?.status === "paused");
+const operationCanStop = computed(() =>
+  ["queued", "running", "paused", "unknown"].includes(
+    operation.value?.status || "",
+  ),
+);
+const operationCanRetry = computed(() =>
+  ["stopped", "partial_completed", "failed"].includes(
+    operation.value?.status || "",
+  ),
+);
+const operationNeedsReconcile = computed(() =>
+  ["unknown", "stopping"].includes(operation.value?.status || ""),
+);
+const assetNeedsReconcile = computed(() =>
+  ["needs_attention", "create_failed"].includes(
+    selectedAsset.value?.status || "",
+  ),
+);
+const precheckViolations = computed(() => {
+  const violations = precheckResult.value?.details?.violations;
+  return Array.isArray(violations)
+    ? (violations as Array<Record<string, unknown>>)
+    : [];
+});
+
+const resourceKey = (
+  resourceType: OwnedGroupResourceType,
+  resourceId: number,
+) => `${resourceType}:${resourceId}`;
+
+const createDefaultResourceConfig = (): ResourceAdminConfig => ({
+  admin_required: false,
+  admin_title: "",
+  admin_permissions: Object.fromEntries(
+    ADMIN_PERMISSION_OPTIONS.map(({ key }) => [key, false]),
+  ),
+});
+
+const ensureResourceConfig = (key: string): ResourceAdminConfig => {
+  if (!resourceConfigs[key])
+    resourceConfigs[key] = createDefaultResourceConfig();
+  return resourceConfigs[key];
+};
+
+const setAdminRequired = (key: string, value: boolean) => {
+  const config = ensureResourceConfig(key);
+  config.admin_required = Boolean(value);
+  if (
+    config.admin_required &&
+    !Object.values(config.admin_permissions).some(Boolean)
+  ) {
+    // A Telegram admin assignment without any right is rejected server-side;
+    // choose the least surprising minimal right when the switch is enabled.
+    config.admin_permissions.invite_users = true;
+  }
+  if (!config.admin_required) {
+    Object.keys(config.admin_permissions).forEach((permission) => {
+      config.admin_permissions[permission] = false;
+    });
+    config.admin_title = "";
+  }
+};
+
+const setAdminPermission = (
+  key: string,
+  permission: string,
+  value: boolean,
+) => {
+  const config = ensureResourceConfig(key);
+  if (!config.admin_required) return;
+  config.admin_permissions[permission] = Boolean(value);
+};
+
+const buildResourceSelections = (): OwnedGroupResourceSelection[] =>
+  selectedResources.value.flatMap((key) => {
+    const [resourceType, rawId] = key.split(":");
+    const resourceId = Number(rawId);
+    if (
+      (resourceType !== "user" && resourceType !== "bot") ||
+      !Number.isInteger(resourceId) ||
+      resourceId <= 0
+    )
+      return [];
+    const config = ensureResourceConfig(key);
+    const isOwner =
+      resourceType === "user" &&
+      resourceId === selectedAsset.value?.owner_account_id;
+    const adminRequired = config.admin_required && !isOwner;
+    const adminPermissions = adminRequired
+      ? Object.fromEntries(
+          Object.entries(config.admin_permissions).filter(
+            ([, enabled]) => enabled,
+          ),
+        )
+      : {};
+    return [
+      {
+        resource_type: resourceType as OwnedGroupResourceType,
+        resource_id: resourceId,
+        admin_required: adminRequired,
+        admin_permissions: adminPermissions,
+        admin_title: adminRequired
+          ? config.admin_title.trim() || undefined
+          : undefined,
+      },
+    ];
+  });
+
+const validateResourceAdminConfigs = (): boolean => {
+  for (const entry of selectedResourceEntries.value) {
+    if (entry.is_owner) continue;
+    const config = ensureResourceConfig(entry.key);
+    if (!config.admin_required) continue;
+    if (!Object.values(config.admin_permissions).some(Boolean)) {
+      ElMessage.warning(`${entry.label} 至少需要选择一项管理员权限`);
+      return false;
+    }
+    if (config.admin_title.trim().length > 16) {
+      ElMessage.warning(`${entry.label} 的群内管理员头衔不能超过 16 个字符`);
+      return false;
+    }
+  }
+  return true;
+};
+
+const botProfileLabel = (profile: OwnedBotProfile) => {
+  const name =
+    profile.display_name || profile.bot_username || `Bot #${profile.id}`;
+  return `${name} · ${profile.status}`;
+};
+
+const violationLabel = (violation: Record<string, unknown>) => {
+  const resourceType =
+    typeof violation.resource_type === "string"
+      ? violation.resource_type
+      : "resource";
+  const resourceId =
+    typeof violation.resource_id === "number"
+      ? `#${violation.resource_id}`
+      : "";
+  const reason =
+    typeof violation.reason === "string" ? violation.reason : "ineligible";
+  return `${resourceType} ${resourceId}: ${reason}`.trim();
+};
+
+const showError = (error: unknown, fallback: string) => {
+  const responseData = (error as any)?.response?.data;
+  let message = "";
+  if (responseData?.detail && typeof responseData.detail === "object") {
+    const reason = responseData.detail.reason;
+    const details = responseData.detail.details;
+    message = [reason, typeof details === "string" ? details : ""]
+      .filter(Boolean)
+      .join(": ");
+  } else {
+    message = getApiErrorMessage(responseData);
+  }
+  errorMessage.value = redactOwnedGroupError(message, fallback);
+};
+
+const showBotProfileError = (error: unknown, fallback: string) => {
+  const status = (error as any)?.response?.status;
+  if (status === 404) {
+    botProfileError.value =
+      "后端尚未启用自建 Bot profile 接口，暂不能把 Guardian Bot 账号用于自建群；请先完成服务端登记接口。";
+    return;
+  }
+  const responseData = (error as any)?.response?.data;
+  botProfileError.value = redactOwnedGroupError(
+    getApiErrorMessage(responseData),
+    fallback,
+  );
+};
+
+const showInviteLinkError = (error: unknown, fallback: string) => {
+  const responseData = (error as any)?.response?.data;
+  const detail = responseData?.detail;
+  const message =
+    detail && typeof detail === "object" && typeof detail.reason === "string"
+      ? detail.reason
+      : getApiErrorMessage(responseData);
+  inviteLinksError.value = redactOwnedGroupError(message, fallback);
+};
+
+const loadInviteLinks = async (assetId = selectedAsset.value?.id) => {
+  if (!assetId || selectedAsset.value?.status !== "ready") {
+    store.clearInviteLinks();
+    inviteLinksLoadedFor.value = null;
+    return;
+  }
+  inviteLinksError.value = "";
+  try {
+    await store.fetchInviteLinks(assetId);
+    if (selectedId.value === assetId) inviteLinksLoadedFor.value = assetId;
+  } catch (error) {
+    if (selectedId.value === assetId) {
+      store.clearInviteLinks();
+      inviteLinksLoadedFor.value = null;
+      showInviteLinkError(error, "邀请链接加载失败");
+    }
+  }
+};
+
+const copyInviteLink = async (row: OwnedGroupInviteLink) => {
+  if (
+    !row.available ||
+    !row.link ||
+    row.group_asset_id !== selectedAsset.value?.id
+  ) {
+    ElMessage.warning("当前邀请链接不可复制");
+    return;
+  }
+  try {
+    if (!navigator.clipboard?.writeText)
+      throw new Error("clipboard_unavailable");
+    await navigator.clipboard.writeText(row.link);
+    ElMessage.success("邀请链接已复制，请按敏感凭据妥善保管");
+  } catch {
+    ElMessage.warning("浏览器未允许访问剪贴板，请手动选择复制");
+  }
+};
+
+const revokeInviteLink = async (row: OwnedGroupInviteLink) => {
+  if (!isAdmin.value || !selectedAsset.value || row.id === null) return;
+  try {
+    await ElMessageBox.confirm(
+      "撤销后所有持有旧链接的人都将无法继续使用，确认撤销？",
+      "撤销邀请链接",
+      { type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  inviteLinkAction.value = `revoke:${row.id}`;
+  inviteLinksError.value = "";
+  try {
+    await store.revokeInviteLink(selectedAsset.value.id, row.id);
+    inviteLinksLoadedFor.value = selectedAsset.value.id;
+    ElMessage.success("邀请链接已撤销");
+  } catch (error) {
+    showInviteLinkError(error, "邀请链接撤销失败");
+  } finally {
+    inviteLinkAction.value = null;
+  }
+};
+
+const regenerateInviteLink = async () => {
+  if (!isAdmin.value || !selectedAsset.value) return;
+  try {
+    await ElMessageBox.confirm(
+      "重新生成会先撤销当前有效链接。新链接生成后，请更新所有分发位置。",
+      "重新生成邀请链接",
+      { type: "warning" },
+    );
+  } catch {
+    return;
+  }
+  const assetId = selectedAsset.value.id;
+  inviteLinkAction.value = "regenerate";
+  inviteLinksError.value = "";
+  try {
+    await store.regenerateInviteLink(
+      assetId,
+      selectedAsset.value.invite_mode === "manual_approval",
+    );
+    if (selectedId.value === assetId) inviteLinksLoadedFor.value = assetId;
+    ElMessage.success("新的邀请链接已生成");
+  } catch (error) {
+    showInviteLinkError(error, "邀请链接重新生成失败");
+  } finally {
+    inviteLinkAction.value = null;
+  }
+};
+
+const stopPolling = () => {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = undefined;
+};
+
+const poll = async () => {
+  try {
+    if (operation.value) await store.refreshOperation();
+    if (selectedId.value && assetActive.value)
+      await store.fetchAsset(selectedId.value);
+    if (
+      selectedId.value &&
+      selectedAsset.value?.status === "ready" &&
+      inviteLinksLoadedFor.value !== selectedId.value
+    )
+      await loadInviteLinks(selectedId.value);
+    if (!operationActive.value && !assetActive.value) stopPolling();
+  } catch (error) {
+    showError(error, "刷新操作状态失败");
+  }
+};
+
+const startPolling = () => {
+  stopPolling();
+  pollTimer = setInterval(() => void poll(), 3000);
+};
+
+const load = async () => {
+  errorMessage.value = "";
+  try {
+    await Promise.all([
+      store.fetchList(),
+      accountsApi
+        .list({ limit: 200, account_type: "promoter" })
+        .then((response) => {
+          accounts.value = response.list;
+        }),
+      accountsApi
+        .list({ limit: 200, account_type: "guardian_bot" })
+        .then((response) => {
+          botAccounts.value = response.list;
+        }),
+    ]);
+    botProfileError.value = "";
+    try {
+      await store.fetchBotProfiles();
+    } catch (error) {
+      showBotProfileError(error, "自建 Bot profile 列表加载失败");
+    }
+    if (selectedId.value && !selectedAsset.value) selectedId.value = null;
+  } catch (error) {
+    showError(error, "自建群资产加载失败");
+  }
+};
+
+const openBotRegistration = () => {
+  if (!isAdmin.value) {
+    ElMessage.warning("只有管理员可以登记 Bot profile");
+    return;
+  }
+  botForm.owner_account_id =
+    draft.owner_account_id || ownerOptions.value[0]?.id;
+  botForm.account_id = undefined;
+  botForm.bot_token = "";
+  botProfileError.value = "";
+  botRegistrationVisible.value = true;
+};
+
+const registerBotProfile = async () => {
+  if (!isAdmin.value) {
+    ElMessage.warning("只有管理员可以登记 Bot profile");
+    return;
+  }
+  if (!botForm.owner_account_id || !botForm.account_id) {
+    ElMessage.warning("请选择归属用户和 Bot 账号");
+    return;
+  }
+  registeringBot.value = true;
+  botProfileError.value = "";
+  try {
+    const profile = await store.registerBotProfile({
+      owner_account_id: botForm.owner_account_id,
+      account_id: botForm.account_id,
+      bot_token: botForm.bot_token.trim(),
+    });
+    actionMessage.value = `Bot profile #${profile.id} 已登记，当前状态：${profile.status}`;
+    botRegistrationVisible.value = false;
+    ElMessage.success("Bot profile 已登记；请等待验证通过后再选择");
+  } catch (error) {
+    showBotProfileError(error, "Bot profile 登记失败");
+  } finally {
+    // Never retain a Bot token in component state after the request settles.
+    botForm.bot_token = "";
+    registeringBot.value = false;
+  }
+};
+
+const verifyBotProfile = async (profile: OwnedBotProfile) => {
+  if (!isAdmin.value) {
+    ElMessage.warning("只有管理员可以验证 Bot profile");
+    return;
+  }
+  verifyingBotId.value = profile.id;
+  botProfileError.value = "";
+  try {
+    const result = await store.verifyBotProfile(profile.id);
+    actionMessage.value = `Bot profile #${result.id} 验证结果：${result.status}`;
+    ElMessage.success(
+      result.status === "verified" || result.status === "active"
+        ? "Bot Token 验证通过"
+        : "验证请求已提交",
+    );
+  } catch (error) {
+    showBotProfileError(error, "Bot profile 验证失败");
+  } finally {
+    verifyingBotId.value = null;
+  }
+};
+
+const toggleBotProfile = async (profile: OwnedBotProfile, enabled: boolean) => {
+  if (!isAdmin.value) {
+    ElMessage.warning("只有管理员可以修改 Bot profile");
+    return;
+  }
+  botProfileError.value = "";
+  try {
+    await store.setBotProfileEnabled(profile.id, enabled);
+  } catch (error) {
+    showBotProfileError(error, "Bot profile 状态更新失败");
+  }
+};
+
+const createDraft = async () => {
+  if (
+    !draft.internal_name.trim() ||
+    !draft.title.trim() ||
+    !draft.owner_account_id
+  )
+    return ElMessage.warning("请填写内部名称、群标题并选择群主账号");
+  if (
+    draft.visibility === "public" &&
+    !/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(draft.telegram_username.trim())
+  )
+    return ElMessage.warning(
+      "公开群用户名需为 5-32 位字母、数字或下划线，并以字母开头",
+    );
+  creating.value = true;
+  errorMessage.value = "";
+  try {
+    const asset = await store.createDraft({
+      ...draft,
+      owner_account_id: draft.owner_account_id,
+      telegram_username:
+        draft.visibility === "public"
+          ? draft.telegram_username.trim()
+          : undefined,
+    });
+    selectedId.value = asset.id;
+    store.select(asset);
+    selectedResources.value = [];
+    Object.keys(resourceConfigs).forEach((key) => delete resourceConfigs[key]);
+    reconcileChatId.value = "";
+    reconcileUsername.value = "";
+    precheckResult.value = null;
+    actionMessage.value =
+      "草稿 #" + asset.id + " 已创建，当前状态：" + asset.status;
+    ElMessage.success("自建群草稿已创建");
+  } catch (error) {
+    showError(error, "创建草稿失败");
+  } finally {
+    creating.value = false;
+  }
+};
+
+const reconcileAsset = async () => {
+  if (!selectedAsset.value || !assetNeedsReconcile.value) return;
+  if (!isAdmin.value) {
+    ElMessage.warning("只有管理员可以绑定并对账 Telegram 群");
+    return;
+  }
+  const rawChatId = reconcileChatId.value.trim();
+  const rawUsername = reconcileUsername.value.trim();
+  let telegramChatId: number | undefined;
+  if (rawChatId) {
+    if (!/^-?\d+$/.test(rawChatId)) {
+      ElMessage.warning("Telegram chat ID 必须是整数");
+      return;
+    }
+    telegramChatId = Number(rawChatId);
+    if (!Number.isSafeInteger(telegramChatId) || telegramChatId === 0) {
+      ElMessage.warning("Telegram chat ID 无效");
+      return;
+    }
+  }
+  let telegramUsername: string | undefined;
+  if (rawUsername) {
+    telegramUsername = rawUsername.startsWith("@")
+      ? rawUsername.slice(1)
+      : rawUsername;
+    if (!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(telegramUsername)) {
+      ElMessage.warning(
+        "公开群用户名需为 5-32 位字母、数字或下划线，并以字母开头",
+      );
+      return;
+    }
+  }
+  try {
+    await ElMessageBox.confirm(
+      telegramChatId === undefined && telegramUsername === undefined
+        ? "将使用系统已保存的 chat ID 核验群主权限、超级群类型和访问配置；此操作不会创建新群。"
+        : `将把已有群${telegramChatId === undefined ? "" : `（chat ID ${telegramChatId}）`}按候选用户名${telegramUsername ? ` @${telegramUsername}` : ""}进行核验；此操作不会创建新群。`,
+      "恢复并对账已有群",
+      { type: "warning", confirmButtonText: "确认对账" },
+    );
+  } catch {
+    return;
+  }
+  const assetId = selectedAsset.value.id;
+  reconcilingAsset.value = true;
+  errorMessage.value = "";
+  try {
+    const result = await store.reconcileAsset(
+      assetId,
+      telegramChatId,
+      telegramUsername,
+    );
+    if (result.status === "ready") {
+      reconcileChatId.value = "";
+      reconcileUsername.value = "";
+      actionMessage.value = "已有 Telegram 群验证通过，资产已恢复为 ready";
+      await loadInviteLinks(assetId);
+      ElMessage.success("资产对账完成");
+    } else {
+      actionMessage.value = `资产仍需处理：${result.reason_code || result.status}`;
+      ElMessage.warning("未能确认已有群，系统不会自动重试建群");
+    }
+  } catch (error) {
+    showError(error, "资产对账失败");
+  } finally {
+    reconcilingAsset.value = false;
+  }
+};
+
+const precheck = async () => {
+  if (!selectedAsset.value) return ElMessage.warning("请先选择一个资产");
+  const resources = buildResourceSelections();
+  if (!resources.length)
+    return ElMessage.warning(
+      "请先选择至少一个用户或已验证 Bot，再执行资源预检查",
+    );
+  if (!validateResourceAdminConfigs()) return;
+  prechecking.value = true;
+  errorMessage.value = "";
+  try {
+    const dryRun = await store.precheckOperation(selectedAsset.value.id, {
+      resources,
+    });
+    precheckResult.value = dryRun;
+    if (!dryRun.allowed) {
+      actionMessage.value = `资源预检查未通过：${dryRun.reason}`;
+      ElMessage.warning("资源预检查未通过，请修正后重试");
+      return;
+    }
+    if (selectedAsset.value.status === "ready") {
+      actionMessage.value =
+        "资源预检查通过；群资产已经 READY，可直接提交成员操作";
+    } else {
+      await store.precheck(selectedAsset.value.id);
+      actionMessage.value = "资源预检查通过，群创建预检查已排队";
+      startPolling();
+    }
+  } catch (error) {
+    showError(error, "预检查失败");
+  } finally {
+    prechecking.value = false;
+  }
+};
+
+const submit = async () => {
+  if (!selectedAsset.value) return ElMessage.warning("请先选择一个资产");
+  const resources = buildResourceSelections();
+  if (!resources.length) return ElMessage.warning("请选择至少一个计划成员");
+  if (!validateResourceAdminConfigs()) return;
+  if (!precheckResult.value?.allowed)
+    return ElMessage.warning("请先完成所选资源的严格预检查");
+  submitting.value = true;
+  errorMessage.value = "";
+  try {
+    const result = await store.submitOperation(selectedAsset.value.id, {
+      resources,
+    });
+    if (result) {
+      actionMessage.value =
+        "操作 #" + result.id + " 已提交，状态：" + result.status;
+      startPolling();
+    }
+    ElMessage.success("操作已提交");
+  } catch (error) {
+    showError(error, "提交失败：资产尚未 READY 或资源未通过预检查");
+  } finally {
+    submitting.value = false;
+  }
+};
+
+const control = async (
+  action: "pause" | "resume" | "stop" | "retry" | "reconcile",
+) => {
+  if (!operation.value) return;
+  if (action === "stop") {
+    try {
+      await ElMessageBox.confirm(
+        "停止后未执行项目将不会继续处理，确认停止？",
+        "确认停止",
+        { type: "warning" },
+      );
+    } catch {
+      return;
+    }
+  }
+  controlling.value = true;
+  errorMessage.value = "";
+  try {
+    await store.controlOperation(action);
+    actionMessage.value = "操作控制已提交";
+    startPolling();
+  } catch (error) {
+    showError(error, "操作控制失败");
+  } finally {
+    controlling.value = false;
+  }
+};
+
+const selectAsset = (asset: OwnedGroupAsset) => {
+  selectedId.value = asset.id;
+  store.select(asset);
+  selectedResources.value = [];
+  Object.keys(resourceConfigs).forEach((key) => delete resourceConfigs[key]);
+  inviteLinksLoadedFor.value = null;
+  inviteLinksError.value = "";
+  precheckResult.value = null;
+  actionMessage.value = "";
+  reconcileChatId.value = "";
+  reconcileUsername.value = "";
+  stopPolling();
+  if (asset.status === "ready") void loadInviteLinks(asset.id);
+};
+
+const statusType = (status: OwnedGroupOperationStatus | string) => {
+  if (["completed", "member_verified", "admin_verified"].includes(status))
+    return "success";
+  if (["failed", "unknown", "create_failed"].includes(status)) return "danger";
+  if (["paused", "stopping", "needs_attention"].includes(status))
+    return "warning";
+  return "info";
+};
+
+// A dry-run is tied to the exact selection snapshot.  Changing the selected
+// resources invalidates the previous result and forces a fresh server check.
+watch(
+  selectedResources,
+  (keys) => {
+    const selected = new Set(keys);
+    keys.forEach((key) => ensureResourceConfig(key));
+    Object.keys(resourceConfigs).forEach((key) => {
+      if (!selected.has(key)) delete resourceConfigs[key];
+    });
+    precheckResult.value = null;
+  },
+  { deep: true },
+);
+
+watch(
+  resourceConfigs,
+  () => {
+    precheckResult.value = null;
+  },
+  { deep: true },
+);
+
+onMounted(load);
+onBeforeUnmount(() => {
+  stopPolling();
+  store.clearInviteLinks();
+});
+</script>
+
+<template>
+  <div class="page-shell">
+    <div class="page-header">
+      <div>
+        <h2 class="page-title">自建群编排</h2>
+        <p class="page-desc">
+          创建自有 Telegram 群草稿，预检查并提交成员编排操作。
+        </p>
+      </div>
+      <el-button @click="load">刷新</el-button>
+    </div>
+    <el-alert
+      v-if="errorMessage"
+      type="error"
+      show-icon
+      :closable="false"
+      :title="errorMessage"
+    />
+    <el-alert
+      v-if="actionMessage"
+      type="info"
+      show-icon
+      :closable="false"
+      :title="actionMessage"
+    />
+    <div class="grid">
+      <el-card class="draft-card">
+        <template #header>创建草稿</template>
+        <el-form label-width="100px">
+          <el-form-item label="内部名称"
+            ><el-input
+              v-model="draft.internal_name"
+              placeholder="例如 ops-group-2026-01"
+          /></el-form-item>
+          <el-form-item label="群标题"
+            ><el-input v-model="draft.title"
+          /></el-form-item>
+          <el-form-item label="群简介"
+            ><el-input v-model="draft.about" type="textarea" :rows="3"
+          /></el-form-item>
+          <el-form-item label="群主账号">
+            <el-select
+              v-model="draft.owner_account_id"
+              filterable
+              placeholder="选择已授权用户账号"
+              style="width: 100%"
+            >
+              <el-option
+                v-for="account in ownerOptions"
+                :key="account.id"
+                :label="
+                  (account.display_name || account.identifier) +
+                  ' · ' +
+                  account.status
+                "
+                :value="account.id"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="可见性"
+            ><el-radio-group v-model="draft.visibility"
+              ><el-radio-button label="public">公开</el-radio-button
+              ><el-radio-button label="private"
+                >私有</el-radio-button
+              ></el-radio-group
+            ></el-form-item
+          >
+          <el-form-item v-if="draft.visibility === 'public'" label="公开用户名"
+            ><el-input v-model="draft.telegram_username" placeholder="不含 @"
+          /></el-form-item>
+          <el-button type="primary" :loading="creating" @click="createDraft"
+            >创建草稿</el-button
+          >
+        </el-form>
+      </el-card>
+      <el-card class="asset-card">
+        <template #header>资产状态与操作</template>
+        <el-empty v-if="!store.list.length" description="暂无自建群资产" />
+        <el-table
+          v-else
+          :data="store.list"
+          size="small"
+          highlight-current-row
+          @row-click="selectAsset"
+        >
+          <el-table-column prop="id" label="ID" width="65" /><el-table-column
+            prop="title"
+            label="群标题"
+            min-width="130"
+          /><el-table-column label="状态" width="130"
+            ><template #default="{ row }"
+              ><el-tag :type="statusType(row.status)">{{
+                row.status
+              }}</el-tag></template
+            ></el-table-column
+          ><el-table-column prop="visibility" label="可见性" width="80" />
+        </el-table>
+        <div v-if="selectedAsset" class="operation-panel">
+          <p>
+            <strong>当前：</strong>{{ selectedAsset.title }}（#{{
+              selectedAsset.id
+            }}）
+          </p>
+          <div v-if="assetNeedsReconcile" class="asset-reconcile-panel">
+            <el-alert
+              type="warning"
+              :closable="false"
+              show-icon
+              title="上一次建群结果无法确认。普通预检查不会盲目重建；请先核验 Telegram 中已存在的群。"
+            />
+            <template v-if="isAdmin">
+              <el-input
+                v-model="reconcileChatId"
+                clearable
+                placeholder="候选 Telegram chat ID；系统已保存时可留空"
+              >
+                <template #append>
+                  <el-button :loading="reconcilingAsset" @click="reconcileAsset"
+                    >恢复并对账</el-button
+                  >
+                </template>
+              </el-input>
+              <el-input
+                v-if="selectedAsset.visibility === 'public'"
+                v-model="reconcileUsername"
+                clearable
+                class="reconcile-username-input"
+                placeholder="可选：替换失败的公开群用户名，如 owned_group_2"
+              />
+              <small class="poll-hint"
+                >只验证已有群及群主权限，并补齐用户名/邀请链接；不会调用新建群接口。</small
+              >
+            </template>
+            <small v-else class="poll-hint"
+              >绑定候选 chat ID 需要管理员权限。</small
+            >
+          </div>
+          <el-button
+            :loading="prechecking"
+            :disabled="selectedAsset.status === 'archived'"
+            @click="precheck"
+            >资源预检查并排队</el-button
+          >
+          <el-form-item label="计划成员">
+            <el-select
+              v-model="selectedResources"
+              multiple
+              filterable
+              collapse-tags
+              placeholder="选择用户账号或已验证 Bot"
+              style="width: 100%"
+            >
+              <el-option-group label="用户账号">
+                <el-option
+                  v-for="account in resourceOptions"
+                  :key="resourceKey('user', account.id)"
+                  :label="
+                    (account.display_name || account.identifier) +
+                    ' · ' +
+                    account.status
+                  "
+                  :value="resourceKey('user', account.id)"
+                />
+              </el-option-group>
+              <el-option-group
+                v-if="botProfileOptions.length"
+                label="已登记 Bot profile"
+              >
+                <el-option
+                  v-for="profile in botProfileOptions"
+                  :key="resourceKey('bot', profile.id)"
+                  :label="botProfileLabel(profile)"
+                  :value="resourceKey('bot', profile.id)"
+                  :disabled="
+                    profile.status !== 'verified' && profile.status !== 'active'
+                  "
+                />
+              </el-option-group>
+            </el-select>
+          </el-form-item>
+          <div
+            v-if="selectedResourceEntries.length"
+            class="resource-admin-list"
+          >
+            <div
+              v-for="entry in selectedResourceEntries"
+              :key="entry.key"
+              class="resource-admin-item"
+            >
+              <div class="resource-admin-header">
+                <span>{{ entry.label }}</span>
+                <el-tag v-if="entry.is_owner" type="info" size="small"
+                  >群主已自动计入</el-tag
+                >
+                <el-switch
+                  v-else
+                  :model-value="entry.config.admin_required"
+                  active-text="设为管理员"
+                  @change="setAdminRequired(entry.key, Boolean($event))"
+                />
+              </div>
+              <template v-if="!entry.is_owner && entry.config.admin_required">
+                <el-input
+                  v-model="entry.config.admin_title"
+                  maxlength="16"
+                  show-word-limit
+                  clearable
+                  placeholder="可选：群内管理员头衔（最多 16 字符）"
+                />
+                <div class="permission-grid">
+                  <el-checkbox
+                    v-for="permission in ADMIN_PERMISSION_OPTIONS"
+                    :key="permission.key"
+                    :model-value="
+                      Boolean(entry.config.admin_permissions[permission.key])
+                    "
+                    @change="
+                      setAdminPermission(
+                        entry.key,
+                        permission.key,
+                        Boolean($event),
+                      )
+                    "
+                    >{{ permission.label }}</el-checkbox
+                  >
+                </div>
+              </template>
+            </div>
+          </div>
+          <el-alert
+            v-if="!botProfileOptions.length"
+            type="info"
+            :closable="false"
+            title="暂无可用的已登记 Bot；如需使用 Bot，请先在下方登记并完成验证。"
+          />
+          <el-alert
+            v-if="precheckResult"
+            :type="precheckResult.allowed ? 'success' : 'error'"
+            :closable="false"
+            show-icon
+            :title="
+              precheckResult.allowed
+                ? '资源预检查通过'
+                : `资源预检查未通过：${precheckResult.reason}`
+            "
+          >
+            <template v-if="precheckViolations.length" #default>
+              <div class="violation-list">
+                <span
+                  v-for="(violation, index) in precheckViolations"
+                  :key="index"
+                  class="violation-item"
+                  >{{ violationLabel(violation) }}</span
+                >
+              </div>
+            </template>
+          </el-alert>
+          <el-button
+            type="primary"
+            :loading="submitting"
+            :disabled="selectedAsset.status !== 'ready'"
+            @click="submit"
+            >提交成员操作</el-button
+          >
+          <el-alert
+            v-if="selectedAsset.status !== 'ready'"
+            type="warning"
+            :closable="false"
+            title="资产必须先通过预检查并达到 ready，才能提交成员操作。"
+          />
+          <div v-if="operation" class="operation-status">
+            <div class="status-header">
+              <strong>操作 #{{ operation.id }}</strong
+              ><el-tag :type="statusType(operation.status)">{{
+                operation.status
+              }}</el-tag
+              ><el-button text :loading="store.loading" @click="poll"
+                >刷新</el-button
+              >
+            </div>
+            <el-progress
+              :percentage="
+                operation.planned_count
+                  ? Math.min(
+                      100,
+                      Math.round(
+                        ((operation.completed_count +
+                          operation.skipped_count +
+                          operation.failed_count) /
+                          operation.planned_count) *
+                          100,
+                      ),
+                    )
+                  : 0
+              "
+            />
+            <p class="counts">
+              已完成 {{ operation.completed_count }} · 跳过
+              {{ operation.skipped_count }} · 失败
+              {{ operation.failed_count }} / {{ operation.planned_count }}
+            </p>
+            <p v-if="operation.last_error" class="last-error">
+              {{ operation.last_error }}
+            </p>
+            <el-button-group>
+              <el-button
+                v-if="operationCanPause"
+                :loading="controlling"
+                @click="control('pause')"
+                >暂停</el-button
+              >
+              <el-button
+                v-if="operationCanResume"
+                :loading="controlling"
+                @click="control('resume')"
+                >恢复</el-button
+              >
+              <el-button
+                v-if="operationCanStop"
+                :loading="controlling"
+                type="danger"
+                plain
+                @click="control('stop')"
+                >停止</el-button
+              >
+              <el-button
+                v-if="operationCanRetry"
+                :loading="controlling"
+                @click="control('retry')"
+                >重试</el-button
+              >
+              <el-button
+                v-if="operationNeedsReconcile"
+                :loading="controlling"
+                @click="control('reconcile')"
+                >执行对账</el-button
+              >
+            </el-button-group>
+            <small v-if="operationActive" class="poll-hint"
+              >执行中，页面每 3 秒自动刷新；可随时暂停或停止。</small
+            >
+          </div>
+          <div v-if="selectedAsset.status === 'ready'" class="invite-panel">
+            <div class="invite-header">
+              <strong>邀请链接</strong>
+              <div>
+                <el-button
+                  text
+                  :loading="inviteLinksLoading"
+                  @click="loadInviteLinks(selectedAsset.id)"
+                  >刷新</el-button
+                >
+                <el-button
+                  v-if="isAdmin && selectedAsset.visibility === 'private'"
+                  type="warning"
+                  plain
+                  size="small"
+                  :loading="inviteLinkAction === 'regenerate'"
+                  @click="regenerateInviteLink"
+                  >重新生成</el-button
+                >
+              </div>
+            </div>
+            <el-alert
+              type="warning"
+              :closable="false"
+              show-icon
+              title="私有邀请链接属于 bearer 凭据；仅复制给授权对象，页面切换后会清除明文。撤销和重新生成仅管理员可执行。"
+            />
+            <el-alert
+              v-if="inviteLinksError"
+              type="error"
+              :closable="false"
+              :title="inviteLinksError"
+            />
+            <el-empty
+              v-if="
+                inviteLinksLoadedFor === selectedAsset.id &&
+                !inviteLinksLoading &&
+                !inviteLinks.length
+              "
+              description="暂无可用邀请链接"
+            />
+            <div
+              v-for="link in inviteLinks"
+              :key="`${link.link_type}:${link.id ?? 'public'}`"
+              class="invite-row"
+            >
+              <div class="invite-row-meta">
+                <el-tag size="small">{{ link.link_type }}</el-tag>
+                <span>{{ link.status }}</span>
+              </div>
+              <el-input :model-value="link.link || '链接当前不可用'" readonly>
+                <template #append>
+                  <el-button
+                    :disabled="!link.available || !link.link"
+                    @click="copyInviteLink(link as OwnedGroupInviteLink)"
+                    >复制</el-button
+                  >
+                </template>
+              </el-input>
+              <el-button
+                v-if="isAdmin && link.id !== null && link.is_active"
+                type="danger"
+                plain
+                size="small"
+                :loading="inviteLinkAction === `revoke:${link.id}`"
+                @click="revokeInviteLink(link as OwnedGroupInviteLink)"
+                >撤销</el-button
+              >
+            </div>
+          </div>
+        </div>
+      </el-card>
+    </div>
+    <el-card class="bot-card">
+      <template #header>
+        <div class="card-header">
+          <span>自建 Bot profile</span>
+          <el-button
+            v-if="isAdmin"
+            type="primary"
+            size="small"
+            @click="openBotRegistration"
+            >登记 Bot</el-button
+          >
+        </div>
+      </template>
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="Bot Token 只会通过 HTTPS 发送一次；页面、列表和审计响应均不会回显 Token。不能用 Guardian Bot profile ID 替代自建 Bot profile。"
+      />
+      <el-alert
+        v-if="botProfileError"
+        class="bot-error"
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="botProfileError"
+      />
+      <el-empty
+        v-if="!botProfiles.length && !store.botProfilesLoading"
+        description="暂无自建 Bot profile"
+      />
+      <el-table
+        v-else
+        v-loading="store.botProfilesLoading"
+        :data="botProfiles"
+        size="small"
+        border
+      >
+        <el-table-column prop="id" label="ID" width="70" />
+        <el-table-column label="Bot" min-width="180"
+          ><template #default="{ row }">{{
+            row.display_name || row.bot_username || `Bot #${row.id}`
+          }}</template></el-table-column
+        >
+        <el-table-column prop="bot_username" label="用户名" min-width="150" />
+        <el-table-column prop="account_id" label="账号 ID" width="90" />
+        <el-table-column label="状态" width="150"
+          ><template #default="{ row }"
+            ><el-tag :type="statusType(row.status)">{{
+              row.status
+            }}</el-tag></template
+          ></el-table-column
+        >
+        <el-table-column label="启用" width="90"
+          ><template #default="{ row }"
+            ><el-switch
+              :model-value="row.enabled"
+              :disabled="!isAdmin"
+              @change="
+                toggleBotProfile(row as OwnedBotProfile, Boolean($event))
+              " /></template
+        ></el-table-column>
+        <el-table-column label="操作" width="100"
+          ><template #default="{ row }"
+            ><el-button
+              v-if="
+                isAdmin && row.status !== 'verified' && row.status !== 'active'
+              "
+              text
+              size="small"
+              :loading="verifyingBotId === row.id"
+              @click="verifyBotProfile(row as OwnedBotProfile)"
+              >验证</el-button
+            ></template
+          ></el-table-column
+        >
+      </el-table>
+    </el-card>
+
+    <el-dialog
+      v-model="botRegistrationVisible"
+      title="登记自建 Bot profile"
+      width="520px"
+      :close-on-click-modal="false"
+      @closed="botForm.bot_token = ''"
+    >
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="请先在 BotFather 创建 Bot。Token 仅用于本次登记和服务端加密托管，提交后无法再次查看。"
+      />
+      <el-form label-width="110px" class="bot-form">
+        <el-form-item label="归属用户" required>
+          <el-select
+            v-model="botForm.owner_account_id"
+            filterable
+            placeholder="选择推广用户账号"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="account in ownerOptions"
+              :key="account.id"
+              :label="
+                (account.display_name || account.identifier) +
+                ' · ' +
+                account.status
+              "
+              :value="account.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="Bot 账号" required>
+          <el-select
+            v-model="botForm.account_id"
+            filterable
+            placeholder="选择已登记的 guardian_bot 账号"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="account in botAccounts.filter((item) => item.is_active)"
+              :key="account.id"
+              :label="
+                (account.display_name || account.identifier) +
+                ' · ' +
+                account.status
+              "
+              :value="account.id"
+            />
+          </el-select>
+          <small v-if="!botAccounts.length" class="form-hint"
+            >暂无可用 Bot 账号，请先在“Bot账号”页面创建账号。</small
+          >
+        </el-form-item>
+        <el-form-item label="BotFather Token">
+          <el-input
+            v-model="botForm.bot_token"
+            type="password"
+            autocomplete="new-password"
+            placeholder="可留空：若该账号已有服务端托管 Token 将自动复用"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="botRegistrationVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="registeringBot"
+          :disabled="!botAccounts.length"
+          @click="registerBotProfile"
+          >安全登记</el-button
+        >
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<style scoped lang="scss">
+.page-shell {
+  display: grid;
+  gap: 16px;
+}
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+.page-title {
+  margin: 0;
+  font-size: 20px;
+}
+.page-desc {
+  margin: 6px 0 0;
+  color: #606266;
+}
+.grid {
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) minmax(440px, 1.4fr);
+  gap: 16px;
+}
+.operation-panel {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+.operation-status {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+.asset-reconcile-panel,
+.resource-admin-list,
+.invite-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+}
+.reconcile-username-input {
+  margin-top: 2px;
+}
+.resource-admin-item {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  background: var(--el-fill-color-lighter);
+  border-radius: 6px;
+}
+.resource-admin-header,
+.invite-header,
+.invite-row-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 12px;
+}
+.invite-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: end;
+}
+.invite-row-meta {
+  grid-column: 1 / -1;
+  justify-content: flex-start;
+  color: var(--el-text-color-secondary);
+}
+.status-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.status-header .el-button {
+  margin-left: auto;
+}
+.counts,
+.poll-hint,
+.form-hint {
+  color: var(--el-text-color-secondary);
+  margin: 0;
+}
+.last-error {
+  color: var(--el-color-danger);
+  margin: 0;
+  white-space: pre-wrap;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.bot-card {
+  overflow: hidden;
+}
+.bot-error {
+  margin-top: 10px;
+}
+.bot-form {
+  margin-top: 16px;
+}
+.violation-list {
+  display: grid;
+  gap: 4px;
+}
+.violation-item {
+  color: var(--el-color-danger);
+}
+@media (max-width: 900px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  .permission-grid,
+  .invite-row {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

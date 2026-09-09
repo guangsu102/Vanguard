@@ -15,6 +15,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.acquisition.models import ConversationContext as DBConversationContext
+from app.modules.acquisition.context_store import upsert_conversation_context
 
 logger = structlog.get_logger()
 
@@ -281,15 +282,6 @@ class DialogManager:
 
     async def _save_to_db(self, context: ConversationData) -> None:
         """Save context to database."""
-        from sqlalchemy import select
-
-        result = await self.db.execute(
-            select(DBConversationContext).where(
-                DBConversationContext.user_id == context.user_id
-            )
-        )
-        db_context = result.scalar_one_or_none()
-
         context_data = {
             "state": context.state.value,
             "current_step": context.current_step,
@@ -299,19 +291,10 @@ class DialogManager:
             "tracking_code": context.tracking_code,
             "steps_completed": context.steps_completed,
         }
-
-        if db_context:
-            db_context.context_data = json.dumps(context_data, ensure_ascii=False)
-            db_context.message_history = json.dumps(context.message_history, ensure_ascii=False)
-            db_context.expires_at = datetime.utcnow() + timedelta(minutes=self.expire_minutes)
-            db_context.updated_at = datetime.utcnow()
-        else:
-            db_context = DBConversationContext(
-                user_id=context.user_id,
-                context_data=json.dumps(context_data, ensure_ascii=False),
-                message_history=json.dumps(context.message_history, ensure_ascii=False),
-                expires_at=datetime.utcnow() + timedelta(minutes=self.expire_minutes),
-            )
-            self.db.add(db_context)
-
-        await self.db.commit()
+        await upsert_conversation_context(
+            self.db,
+            user_id=context.user_id,
+            context_data=json.dumps(context_data, ensure_ascii=False),
+            message_history=json.dumps(context.message_history, ensure_ascii=False),
+            expires_at=datetime.utcnow() + timedelta(minutes=self.expire_minutes),
+        )

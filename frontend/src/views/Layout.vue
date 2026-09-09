@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { ElContainer, ElAside, ElMenu, ElMenuItem, ElSubMenu, ElIcon, ElScrollbar, ElDropdown, ElDropdownMenu, ElDropdownItem, ElAvatar, ElBadge, ElMessage } from 'element-plus'
 import {
   Odometer, User, ChatDotRound,
   Key, UserFilled, Present, SetUp, DataLine, Setting,
-  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor, Connection, ChatLineSquare, Document
+  Fold, Expand, Bell, SwitchButton, User as UserIcon, Operation, Promotion, Monitor, Connection, ChatLineSquare, Document, Search as SearchIcon, OfficeBuilding
 } from '@element-plus/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
@@ -25,10 +25,12 @@ const menuItems = [
       { path: '/growth-dashboard', title: '增长驾驶舱', icon: Promotion },
       { path: '/growth-settings', title: '配置中心', icon: Setting },
       { path: '/growth-logs', title: '增长日志', icon: Document },
+      { path: '/resource-search', title: '资源搜索', icon: SearchIcon, adminOnly: true },
       { path: '/accounts', title: '推广账号', icon: User },
       { path: '/private-chats', title: '私聊工作台', icon: ChatLineSquare },
       { path: '/proxies', title: '静态代理IP', icon: Connection },
       { path: '/groups', title: '群池管理', icon: ChatDotRound },
+      { path: '/owned-groups', title: '自建群编排', icon: OfficeBuilding },
       { path: '/keywords', title: '关键词管理', icon: Key },
       { path: '/campaigns', title: '活动管理', icon: Present },
       { path: '/automation', title: '自动化管理', icon: Promotion },
@@ -52,6 +54,18 @@ const menuItems = [
   { path: '/stats', title: '数据统计', icon: DataLine },
   { path: '/settings', title: '系统设置', icon: Setting },
 ]
+
+const visibleMenuItems = computed(() =>
+  menuItems
+    .filter((item) => !('adminOnly' in item) || !item.adminOnly || authStore.userInfo?.role === 'admin')
+    .map((item) => ({
+      ...item,
+      children: item.children?.filter(
+        (child) =>
+          !('adminOnly' in child) || !child.adminOnly || authStore.userInfo?.role === 'admin',
+      ),
+    })),
+)
 
 const handleMenuSelect = (index: string) => {
   router.push(index)
@@ -82,7 +96,7 @@ const toggleCollapse = () => {
           router
           class="sidebar-menu"
         >
-          <template v-for="item in menuItems" :key="item.path">
+          <template v-for="item in visibleMenuItems" :key="item.path">
             <el-sub-menu v-if="item.children" :index="item.path">
               <template #title>
                 <el-icon><component :is="item.icon" /></el-icon>

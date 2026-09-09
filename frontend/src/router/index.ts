@@ -55,6 +55,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '增长日志', icon: 'Document' },
       },
       {
+        path: 'resource-search',
+        name: 'ResourceSearch',
+        component: () => import('@/views/ResourceSearch.vue'),
+        meta: { title: '资源搜索', icon: 'Search', requiresAdmin: true },
+      },
+      {
         path: 'proxies',
         name: 'Proxies',
         component: () => import('@/views/Proxies.vue'),
@@ -65,6 +71,12 @@ const routes: RouteRecordRaw[] = [
         name: 'Groups',
         component: () => import('@/views/Groups.vue'),
         meta: { title: '群池管理', icon: 'ChatDotRound' },
+      },
+      {
+        path: 'owned-groups',
+        name: 'OwnedGroups',
+        component: () => import('@/views/OwnedGroups.vue'),
+        meta: { title: '自建群编排', icon: 'OfficeBuilding' },
       },
       {
         path: 'keywords',
@@ -177,6 +189,16 @@ router.beforeEach(async (to, _from, next) => {
       next('/login')
     }
     return
+  }
+
+  if (to.matched.some((record) => record.meta.requiresAdmin === true)) {
+    if (!authStore.userInfo) {
+      await authStore.fetchUserInfo()
+    }
+    if (authStore.userInfo?.role !== 'admin') {
+      next('/dashboard')
+      return
+    }
   }
 
   // Redirect to dashboard if already logged in and trying to access login

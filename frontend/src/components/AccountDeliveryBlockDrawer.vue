@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { VideoPlay } from '@element-plus/icons-vue'
 
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import type { Account } from '@/api/accounts'
-import type { AdDynamicStatus } from '@/api/automation'
+import { automationApi, type AdDynamicStatus, type PausedAdDelivery } from '@/api/automation'
 import { useClientPagination } from '@/utils/clientPagination'
 
 type TagType = 'success' | 'warning' | 'danger' | 'info'
@@ -16,6 +18,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'update:visible', value: boolean): void
+  (event: 'recovered'): void
 }>()
 
 const title = computed(() => {
@@ -26,8 +29,61 @@ const title = computed(() => {
 const diagnostic = computed(() => props.status?.delivery_diagnostic)
 const blockedGroupSamples = computed(() => diagnostic.value?.blocked_group_samples || [])
 const recentErrors = computed(() => props.status?.recent_errors || [])
-const blockedGroupPagination = useClientPagination(blockedGroupSamples, 5)
-const recentErrorPagination = useClientPagination(recentErrors, 5)
+const blockedGroupPagination = useClientPagination(blockedGroupSamples)
+const recentErrorPagination = useClientPagination(recentErrors)
+const pausedDeliveries = ref<PausedAdDelivery[]>([])
+const pausedDeliveriesLoading = ref(false)
+const recoveringScheduleId = ref<number | null>(null)
+
+async function loadPausedDeliveries() {
+  if (!props.visible || !props.account?.id) {
+    pausedDeliveries.value = []
+    return
+  }
+  pausedDeliveriesLoading.value = true
+  try {
+    const response = await automationApi.getPausedAdDeliveries({
+      account_id: props.account.id,
+      page_size: 200,
+    })
+    pausedDeliveries.value = response.data.data
+  } catch {
+    pausedDeliveries.value = []
+    ElMessage.error('禁言停投群加载失败')
+  } finally {
+    pausedDeliveriesLoading.value = false
+  }
+}
+
+async function resumePausedDelivery(scheduleId: number, groupLabel: string | number) {
+  try {
+    await ElMessageBox.confirm(
+      `确认恢复「${groupLabel}」的广告投放？`,
+      '恢复投放',
+      {
+        type: 'warning',
+        confirmButtonText: '恢复投放',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+
+  recoveringScheduleId.value = scheduleId
+  try {
+    await automationApi.resumePausedAdDelivery(scheduleId)
+    ElMessage.success('已恢复投放；再次禁言时将从 40 分钟退避开始')
+    await loadPausedDeliveries()
+    emit('recovered')
+  } finally {
+    recoveringScheduleId.value = null
+  }
+}
+
+function formatTime(value?: string) {
+  return value ? value.slice(0, 16).replace('T', ' ') : '-'
+}
 
 watch(
   () => props.account?.id,
@@ -35,6 +91,18 @@ watch(
     blockedGroupPagination.reset()
     recentErrorPagination.reset()
   },
+)
+
+watch(
+  [() => props.visible, () => props.account?.id],
+  ([visible, accountId]) => {
+    if (!visible || !accountId) {
+      pausedDeliveries.value = []
+      return
+    }
+    void loadPausedDeliveries()
+  },
+  { immediate: true },
 )
 
 function severityTagType(severity?: string): TagType {
@@ -131,6 +199,41 @@ function pct(value?: number) {
       </el-descriptions>
 
       <section class="detail-section">
+        <h4>禁言停投群</h4>
+        <el-table
+          v-loading="pausedDeliveriesLoading"
+          :data="pausedDeliveries"
+          border
+          size="small"
+          empty-text="暂无因连续禁言而停投的群"
+        >
+          <el-table-column label="群" min-width="180" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.group_title || row.telegram_group_id }}</template>
+          </el-table-column>
+          <el-table-column prop="campaign_name" label="广告计划" min-width="150" show-overflow-tooltip />
+          <el-table-column label="退避次数" width="100">
+            <template #default="{ row }">{{ row.backoff_count }} 次</template>
+          </el-table-column>
+          <el-table-column label="停投时间" width="150">
+            <template #default="{ row }">{{ formatTime(row.paused_at) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" width="125" fixed="right">
+            <template #default="{ row }">
+              <el-button
+                type="primary"
+                link
+                :icon="VideoPlay"
+                :loading="recoveringScheduleId === row.id"
+                @click="resumePausedDelivery(row.id, row.group_title || row.telegram_group_id)"
+              >
+                恢复投放
+              </el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+      </section>
+
+      <section class="detail-section">
         <h4>阻塞原因</h4>
         <div v-if="diagnostic?.block_reasons?.length" class="diagnostic-tags">
           <el-tag
@@ -186,7 +289,6 @@ function pct(value?: number) {
           v-model:page="blockedGroupPagination.page.value"
           v-model:page-size="blockedGroupPagination.pageSize.value"
           :total="blockedGroupPagination.total.value"
-          :page-sizes="[5, 10, 20]"
         />
       </section>
 
@@ -200,7 +302,6 @@ function pct(value?: number) {
           v-model:page="recentErrorPagination.page.value"
           v-model:page-size="recentErrorPagination.pageSize.value"
           :total="recentErrorPagination.total.value"
-          :page-sizes="[5, 10, 20]"
         />
       </section>
     </div>

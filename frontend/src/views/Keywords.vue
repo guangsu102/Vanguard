@@ -35,7 +35,7 @@ import {
 } from '@/api/acquisition'
 import { groupSearchKeywordsApi, type GenerateGroupSearchKeywordsResult, type GroupSearchKeyword } from '@/api/groupSearchKeywords'
 import { GROUP_SEARCH_KEYWORD_TYPE_OPTIONS } from '@/api/keywords'
-import { normalizeListPayload } from '@/utils/pagination'
+import { DEFAULT_PAGE_SIZE, normalizeListPayload } from '@/utils/pagination'
 
 type KeywordScene = 'group' | 'reply'
 type ReplyTarget = 'private' | 'group'
@@ -65,14 +65,14 @@ const editingTemplateId = ref<number | null>(null)
 const searchKeywords = ref<GroupSearchKeyword[]>([])
 const searchKeywordTotal = ref(0)
 const searchKeywordPage = ref(1)
-const searchKeywordPageSize = ref(20)
+const searchKeywordPageSize = ref(DEFAULT_PAGE_SIZE)
 const groupSearchParams = ref<Record<string, any>>({})
 const selectedGroupKeywords = ref<GroupSearchKeyword[]>([])
 
 const replyTriggers = ref<KeywordTrigger[]>([])
 const replyTotal = ref(0)
 const replyPage = ref(1)
-const replyPageSize = ref(20)
+const replyPageSize = ref(DEFAULT_PAGE_SIZE)
 const replySearchParams = ref<Record<string, any>>({})
 const selectedReplyTriggers = ref<KeywordTrigger[]>([])
 const replyTemplates = ref<MessageTemplate[]>([])

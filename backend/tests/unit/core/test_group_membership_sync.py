@@ -142,6 +142,7 @@ async def test_upsert_synced_group_membership_refreshes_existing_left_membership
         member_count=0,
     )
     first.status = "left"
+    first.ad_status = "blocked"
     await db_session.commit()
 
     refreshed = await _upsert_synced_group_membership(

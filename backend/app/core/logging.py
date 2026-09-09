@@ -15,6 +15,24 @@ import structlog
 from app.core.config import settings
 
 
+class TelegramAccountLogContextFilter(logging.Filter):
+    """Add the owning account id to otherwise context-free Telethon logs."""
+
+    logger_prefix = "vanguard.telethon.account."
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not record.name.startswith(self.logger_prefix):
+            return True
+        if getattr(record, "telegram_account_context_added", False):
+            return True
+
+        account_id = record.name[len(self.logger_prefix) :].split(".", 1)[0]
+        record.msg = f"[telegram account_id={account_id}] {record.getMessage()}"
+        record.args = ()
+        record.telegram_account_context_added = True
+        return True
+
+
 def setup_logging() -> None:
     """Configure structured logging."""
 
@@ -28,6 +46,7 @@ def setup_logging() -> None:
     handlers: list[logging.Handler] = []
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(stdout_level)
+    stdout_handler.addFilter(TelegramAccountLogContextFilter())
     handlers.append(stdout_handler)
 
     if settings.LOG_FILE:
@@ -43,6 +62,7 @@ def setup_logging() -> None:
             utc=True,
         )
         file_handler.setLevel(log_level)
+        file_handler.addFilter(TelegramAccountLogContextFilter())
         handlers.append(file_handler)
 
     root_level = min(handler.level for handler in handlers)

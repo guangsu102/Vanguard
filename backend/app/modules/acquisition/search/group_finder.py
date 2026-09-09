@@ -10,6 +10,7 @@ from typing import Optional
 
 import structlog
 
+from app.core.account.operation_lease import AccountOperationLeaseHandle
 from app.core.account.pool import AccountPool
 from app.core.network.proxy_pool import ProxyPool
 from app.integrations.telegram.client import TelegramAPIError
@@ -156,6 +157,8 @@ class GroupFinder:
         keyword: str,
         limit: int = 20,
         account_id: Optional[int] = None,
+        raise_errors: bool = False,
+        operation_lease: AccountOperationLeaseHandle | None = None,
     ) -> list[DiscoveredGroup]:
         """
         Search groups by keyword.
@@ -171,17 +174,34 @@ class GroupFinder:
 
         # 获取可用账号
         if account_id is not None and hasattr(self.account_pool, "acquire_by_id"):
-            account = await self.account_pool.acquire_by_id(account_id, purpose="search")
+            if operation_lease is not None:
+                account = await self.account_pool.acquire_by_id(
+                    account_id,
+                    purpose="resource_search",
+                    operation_lease=operation_lease,
+                )
+            else:
+                account = await self.account_pool.acquire_by_id(
+                    account_id,
+                    purpose="search",
+                )
         else:
             account = await self.account_pool.acquire(purpose="search")
 
         if account is None:
             self.logger.warning("search_no_account", keyword=keyword, account_id=account_id)
+            if raise_errors:
+                raise RuntimeError(f"Account {account_id or 'pool'} is unavailable for search")
             return []
 
         try:
             # 使用 Telegram API 搜索
-            results = await self._search_via_api(account, keyword, limit)
+            results = await self._search_via_api(
+                account,
+                keyword,
+                limit,
+                raise_errors=raise_errors,
+            )
 
             discovered = []
             for result in results:
@@ -298,6 +318,7 @@ class GroupFinder:
         account,
         keyword: str,
         limit: int,
+        raise_errors: bool = False,
     ) -> list[dict]:
         """
         Perform search via Telegram API.
@@ -318,6 +339,8 @@ class GroupFinder:
             except Exception as exc:
                 raise_if_flood_wait(exc, operation="search_connect")
                 self.logger.warning("search_via_api_connect_failed", keyword=keyword, error=str(exc))
+                if raise_errors:
+                    raise
                 return []
 
         if client is None:
@@ -346,9 +369,13 @@ class GroupFinder:
             except Exception as exc:
                 raise_if_flood_wait(exc, operation="public_search")
                 self.logger.debug("telethon_public_search_failed", keyword=keyword, error=str(exc))
+                if raise_errors:
+                    raise
 
         if search_call is None:
             self.logger.warning("search_via_api_no_support", keyword=keyword)
+            if raise_errors:
+                raise RuntimeError("Telegram client does not support public group search")
             return []
 
         try:
@@ -359,10 +386,14 @@ class GroupFinder:
         except TelegramAPIError as exc:
             raise_if_flood_wait(exc, operation="search")
             self.logger.warning("search_via_api_failed", keyword=keyword, error=str(exc))
+            if raise_errors:
+                raise
             return []
         except Exception as exc:
             raise_if_flood_wait(exc, operation="search")
             self.logger.warning("search_via_api_error", keyword=keyword, error=str(exc))
+            if raise_errors:
+                raise
             return []
 
         if isinstance(result, list):

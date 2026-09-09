@@ -114,5 +114,17 @@ describe('Rules view', () => {
     expect(moderationMocks.getStats).toHaveBeenCalledTimes(1)
     expect(moderationMocks.listSuggestions).toHaveBeenCalledTimes(1)
     expect(moderationMocks.listViolations).toHaveBeenCalledTimes(1)
+    expect(moderationMocks.listViolations).toHaveBeenCalledWith({ page: 1, page_size: 20 })
+  })
+
+  it('applies the selected page size to violation requests', async () => {
+    const wrapper = mount(Rules, {
+      global: { stubs },
+    })
+    await flushPromises()
+
+    await (wrapper.vm as any).handleViolationPageSizeChange(100)
+
+    expect(moderationMocks.listViolations).toHaveBeenLastCalledWith({ page: 1, page_size: 100 })
   })
 })

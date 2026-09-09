@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urlparse
 
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
@@ -292,6 +292,7 @@ class TelegramExecutionService:
         media_url: Optional[str] = None,
         source: str = "acquisition_ad",
         delivery_policy: str = "growth",
+        on_send_attempted: Optional[Callable[[], None]] = None,
     ) -> Optional[int]:
         client = self._get_client(account)
         if client is None:
@@ -309,6 +310,8 @@ class TelegramExecutionService:
                 "delivery_policy": delivery_policy,
             },
         ):
+            if on_send_attempted is not None:
+                on_send_attempted()
             if media_url:
                 result = await client.send_file(target, media_url, caption=content)
             else:
@@ -722,6 +725,7 @@ class TelegramExecutionService:
         group: Any,
         *,
         source: str = "auto_join",
+        on_join_request_attempted: Optional[Callable[[], None]] = None,
     ) -> None:
         client = self._get_client(account)
         if client is None:
@@ -747,6 +751,8 @@ class TelegramExecutionService:
 
             from telethon.tl.functions.channels import JoinChannelRequest
 
+            if on_join_request_attempted is not None:
+                on_join_request_attempted()
             await client(JoinChannelRequest(entity))
 
     async def join_group_by_link(

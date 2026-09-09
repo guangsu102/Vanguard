@@ -11,10 +11,9 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import structlog
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.acquisition.models import ConversationContext as DBConversationContext
+from app.modules.acquisition.context_store import upsert_conversation_context
 
 logger = structlog.get_logger()
 
@@ -184,28 +183,14 @@ class ContextManager:
             return
 
         try:
-            # 获取或创建数据库记录
-            result = await self.db.execute(
-                select(DBConversationContext).where(
-                    DBConversationContext.user_id == user_id
-                )
-            )
-            db_ctx = result.scalar_one_or_none()
-
             context_data = json.dumps(ctx.metadata)
-
-            if db_ctx:
-                db_ctx.context_data = context_data
-                db_ctx.expires_at = datetime.utcnow() + timedelta(minutes=60)
-            else:
-                db_ctx = DBConversationContext(
-                    user_id=user_id,
-                    context_data=context_data,
-                    expires_at=datetime.utcnow() + timedelta(minutes=60),
-                )
-                self.db.add(db_ctx)
-
-            await self.db.commit()
+            await upsert_conversation_context(
+                self.db,
+                user_id=user_id,
+                context_data=context_data,
+                expires_at=datetime.utcnow() + timedelta(minutes=60),
+                preserve_message_history=True,
+            )
             self.logger.debug("context_persisted", user_id=user_id)
 
         except Exception as e:

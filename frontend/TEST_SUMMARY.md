@@ -4,7 +4,7 @@
 
 ### 开发环境测试
 - **开发服务器**: ✅ 成功启动 (http://localhost:3000)
-- **API 连接**: ✅ 配置正确（生产同源 `/api`，域名为 https://www.dh113.xyz 或 https://dh113.xyz）
+- **API 连接**: ✅ 配置正确（生产同源 `/api`，域名为 https://vanguard.pipenai.xyz）
 - **热重载**: ✅ 正常工作
 
 ### 生产构建测试

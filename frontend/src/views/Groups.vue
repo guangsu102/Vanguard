@@ -62,7 +62,7 @@ const {
   total: memberTotal,
   rows: pagedMembers,
   reset: resetMemberPage,
-} = useClientPagination(memberSource, 10)
+} = useClientPagination(memberSource)
 
 const levelTagType = (level: string) => {
   if (level === 'A') return 'success'

@@ -176,6 +176,8 @@ export interface AdCampaign {
   min_wait_after_join_minutes: number
   interval_minutes: number
   scheduled_times: string[]
+  max_sends_per_group_per_day: number
+  max_sends_per_account_per_day: number
   created_at?: string
   updated_at?: string
 }
@@ -193,6 +195,8 @@ export interface AdCampaignCreatePayload {
   min_wait_after_join_minutes?: number
   interval_minutes?: number
   scheduled_times?: string[]
+  max_sends_per_group_per_day?: number
+  max_sends_per_account_per_day?: number
 }
 
 export interface AdFailurePolicy {
@@ -295,7 +299,6 @@ export interface AdCapacitySettings {
   ad_policy_ai_min_confidence: number
   ad_policy_ai_require_second_pass: boolean
   ad_policy_auto_probe_enabled: boolean
-  ad_policy_auto_probe_daily_limit: number
   ad_policy_auto_probe_daily_limit_per_account: number
   ad_policy_auto_probe_interval_hours: number
   ad_policy_auto_ttl_days: number
@@ -339,6 +342,9 @@ export interface GroupAdProfile {
   last_survived_at?: string
   last_deleted_at?: string
   blocked_reason?: string
+  unknown_reason?: string
+  unknown_reason_label?: string
+  probe_ready: boolean
   metrics: {
     completed_samples?: number
     survived_24h?: number
@@ -490,6 +496,23 @@ export interface AdDynamicStatus {
   }
 }
 
+export interface PausedAdDelivery {
+  id: number
+  account_id: number
+  account_label?: string
+  campaign_id: number
+  campaign_name?: string
+  group_id: number
+  telegram_group_id: number
+  group_title?: string
+  group_username?: string
+  status: 'paused' | 'idle'
+  backoff_count: number
+  last_reason?: string
+  last_attempt_at?: string
+  paused_at?: string
+}
+
 export interface EffectiveLimitSource {
   key: string
   value: number
@@ -613,6 +636,12 @@ export interface AdOnlyHandover {
   creative_id: number
   creative_name?: string
   campaign_id?: number
+  campaign_name?: string
+  batch_id?: string
+  queue_position: number
+  join_interval_min_minutes: number
+  join_interval_max_minutes: number
+  next_attempt_at?: string
   send_mode: 'interval' | 'scheduled'
   interval_minutes: number
   scheduled_times: string[]
@@ -654,6 +683,18 @@ export interface AdOnlyDirectAssignmentRequest {
   permission_expires_at: string
 }
 
+export interface AdOnlyDirectAssignmentBatchRequest {
+  campaign_id: number
+  target_account_id: number
+  creative_id: number
+  invite_links: string[]
+  join_interval_min_minutes: number
+  join_interval_max_minutes: number
+  permission_mode: 'soft_ad_allowed' | 'high_volume_ad_allowed'
+  permission_note: string
+  permission_expires_at: string
+}
+
 export interface AdOnlyHandoverOptions {
   accounts: Array<{
     id: number
@@ -663,6 +704,16 @@ export interface AdOnlyHandoverOptions {
     max_messages_per_day: number | null
   }>
   creatives: Array<{ id: number; name: string }>
+  campaigns: Array<{
+    id: number
+    name: string
+    enabled: boolean
+    status: string
+    send_mode: 'interval' | 'scheduled'
+    interval_minutes: number
+    scheduled_times: string[]
+    target_group_count: number
+  }>
 }
 
 export const automationApi = {
@@ -734,8 +785,14 @@ export const automationApi = {
     return apiClient.put<{ data: AdCapacitySettings }>('/automation/ads/capacity', data)
   },
 
-  getGroupAdProfiles: () => {
-    return apiClient.get<{ data: GroupAdProfile[] }>('/automation/ads/group-profiles')
+  getGroupAdProfiles: (params?: {
+    policy_mode?: string
+    tier?: string
+    limit?: number
+  }) => {
+    return apiClient.get<{ data: GroupAdProfile[] }>('/automation/ads/group-profiles', {
+      params: { limit: 300, ...params },
+    })
   },
 
   updateGroupAdPolicy: (
@@ -759,6 +816,21 @@ export const automationApi = {
 
   getAdDynamicStatus: () => {
     return apiClient.get<{ data: AdDynamicStatus[] }>('/automation/ads/dynamic-status')
+  },
+
+  getPausedAdDeliveries: (params?: { account_id?: number; page?: number; page_size?: number }) => {
+    return apiClient.get<{
+      data: PausedAdDelivery[]
+      total: number
+      page: number
+      page_size: number
+    }>('/automation/ads/paused-deliveries', { params })
+  },
+
+  resumePausedAdDelivery: (scheduleId: number) => {
+    return apiClient.post<{ data: PausedAdDelivery }>(
+      `/automation/ads/paused-deliveries/${scheduleId}/resume`,
+    )
   },
 
   getAccountOperationConfig: (accountId: number) => {
@@ -973,13 +1045,43 @@ export const automationApi = {
     }>('/automation/ad-only/direct-assignments', data)
   },
 
+  preflightAdOnlyDirectAssignmentBatch: (
+    data: AdOnlyDirectAssignmentBatchRequest,
+  ) => {
+    return apiClient.post<{ data: Record<string, any> }>(
+      '/automation/ad-only/direct-assignments/batch/preflight',
+      data,
+    )
+  },
+
+  createAdOnlyDirectAssignmentBatch: (
+    data: AdOnlyDirectAssignmentBatchRequest & { idempotency_key: string },
+  ) => {
+    return apiClient.post<{
+      data: {
+        created: boolean
+        batch_id: string
+        invite_count: number
+        estimated_queue_minutes: number
+        capacity_warning: boolean
+        handovers: AdOnlyHandover[]
+      }
+    }>('/automation/ad-only/direct-assignments/batch', data)
+  },
+
   getAdOnlyHandovers: (params?: { group_id?: number; status?: string; limit?: number }) => {
     return apiClient.get<{ data: AdOnlyHandover[] }>('/automation/ad-only/handovers', { params })
   },
 
   retryAdOnlyHandover: (handoverId: number) => {
-    return apiClient.post<{ data: { task_id: string; handover: AdOnlyHandover } }>(
+    return apiClient.post<{ data: { task_id?: string; handover: AdOnlyHandover } }>(
       `/automation/ad-only/handovers/${handoverId}/retry`,
+    )
+  },
+
+  cancelAdOnlyHandover: (handoverId: number) => {
+    return apiClient.post<{ data: { handover: AdOnlyHandover } }>(
+      `/automation/ad-only/handovers/${handoverId}/cancel`,
     )
   },
 

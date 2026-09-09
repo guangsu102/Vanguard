@@ -39,8 +39,15 @@ from app.api import (
     qq,
     private_chats,
     sub2api_alerts,
+    resource_search,
+    owned_groups,
+    owned_group_controls,
+    owned_group_audit,
+    owned_group_bots,
+    owned_group_invites,
 )
 from app.api.settings import router as settings_router
+from app.api.safety_gate import router as safety_gate_router
 from app.api.websocket import start_redis_bridge, stop_redis_bridge
 from app.core.config import settings
 from app.core.security import get_current_user
@@ -111,8 +118,6 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
         status_code=500,
         content={"code": 5000, "message": "Internal server error", "data": None}
     )
-
-
 # Health check endpoint
 @app.get("/health")
 async def health_check() -> dict:
@@ -149,6 +154,13 @@ app.include_router(workers, prefix="/api/workers", tags=["Execution Workers"])
 app.include_router(qq, prefix="/api/qq", tags=["NapCat OneBot"], dependencies=[Depends(get_current_user)])
 app.include_router(private_chats, prefix="/api/private-chats", tags=["Telegram Private Chats"], dependencies=[Depends(get_current_user)])
 app.include_router(sub2api_alerts, prefix="/api/integrations/sub2api", tags=["Sub2API Alerts"])
+app.include_router(safety_gate_router, prefix="/api/safety-gate", tags=["P0 Safety Gate"], dependencies=[Depends(get_current_user)])
+app.include_router(resource_search, prefix="/api/resource-search", tags=["Resource Search"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_groups, prefix="/api/owned-groups", tags=["Owned Groups"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_controls, prefix="/api/owned-groups", tags=["Owned Group Controls"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_audit, prefix="/api/owned-groups", tags=["Owned Group Audit"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_bots, prefix="/api/owned-groups", tags=["Owned Group Bot Profiles"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_invites, prefix="/api/owned-groups", tags=["Owned Group Invite Links"], dependencies=[Depends(get_current_user)])
 
 
 if __name__ == "__main__":
@@ -160,3 +172,5 @@ if __name__ == "__main__":
         reload=settings.DEBUG,
         workers=1 if settings.DEBUG else 4,
     )
+
+

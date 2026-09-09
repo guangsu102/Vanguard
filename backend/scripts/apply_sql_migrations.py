@@ -22,6 +22,15 @@ DEFAULT_MIGRATIONS = [
     "035_add_telegram_private_inbox.sql",
     "036_add_ad_only_recommendations.sql",
     "037_add_direct_ad_only_assignments.sql",
+    "038_add_ad_only_join_queue.sql",
+    "039_repair_runtime_health_consistency.sql",
+    "040_add_resource_search.sql",
+    "041_harden_resource_search.sql",
+    "042_fix_growth_daily_quotas.sql",
+    "043_normalize_join_and_ad_cooldowns.sql",
+    "044_add_owned_group_orchestration.sql",
+    "045_remove_ad_delivery_risk_budget.sql",
+    "046_remove_redundant_probe_configuration.sql",
 ]
 
 
@@ -140,7 +149,13 @@ async def _apply(files: list[str]) -> None:
 
     async with db_module.get_db_session() as session:
         await session.execute(text(history_table_sql))
-
+        # Migration files are trusted raw PostgreSQL, not parameterized ORM
+        # statements.  ``sqlalchemy.text()`` scans colon-prefixed tokens even
+        # inside SQL string literals (for example JSON values such as
+        # ``{"daily_limit":10}``) and turns them into bind parameters.  That
+        # corrupts otherwise valid migrations.  Execute the file statements
+        # through the driver while retaining the surrounding session
+        # transaction and the checksum/history bookkeeping below.
         for filename in files:
             path = MIGRATIONS_DIR / filename
             if not path.exists():
@@ -161,7 +176,11 @@ async def _apply(files: list[str]) -> None:
 
             print(f"apply {filename}")
             for statement in _split_sql_statements(content):
-                await session.execute(text(statement))
+                # ``session.commit()`` below may release the underlying
+                # connection. Reacquire it for each statement/file rather than
+                # retaining a stale AsyncConnection across migration commits.
+                driver_connection = await session.connection()
+                await driver_connection.exec_driver_sql(statement)
 
             await session.execute(
                 text(

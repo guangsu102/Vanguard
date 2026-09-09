@@ -6,6 +6,7 @@ import {
   type SystemInfo,
   type OperationLog,
 } from '@/api/settings'
+import { DEFAULT_PAGE_SIZE, normalizePageSize } from '@/utils/pagination'
 
 export interface AllSettings extends SettingsFormData {
   system?: SystemInfo
@@ -19,7 +20,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const loading = ref(false)
 
   const page = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(DEFAULT_PAGE_SIZE)
 
   const fetchSettings = async () => {
     loading.value = true
@@ -93,7 +94,7 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   const setPageSize = (newPageSize: number) => {
-    pageSize.value = newPageSize
+    pageSize.value = normalizePageSize(newPageSize)
     page.value = 1
   }
 

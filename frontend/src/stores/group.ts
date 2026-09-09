@@ -1,7 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import { groupsApi, type Group, type GroupListParams, type GroupFormData, type GroupMember } from '@/api/groups'
-import { normalizeListPayload } from '@/utils/pagination'
+import { DEFAULT_PAGE_SIZE, normalizeListPayload, normalizePageSize } from '@/utils/pagination'
 
 export const useGroupStore = defineStore('group', () => {
   const list = ref<Group[]>([])
@@ -12,7 +12,7 @@ export const useGroupStore = defineStore('group', () => {
   const memberTotal = ref(0)
 
   const page = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(DEFAULT_PAGE_SIZE)
   const params = ref<GroupListParams>({})
 
   const fetchList = async (newParams?: GroupListParams) => {
@@ -104,7 +104,7 @@ export const useGroupStore = defineStore('group', () => {
   }
 
   const setPageSize = (newPageSize: number) => {
-    pageSize.value = newPageSize
+    pageSize.value = normalizePageSize(newPageSize)
     page.value = 1
   }
 

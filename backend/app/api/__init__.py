@@ -29,6 +29,12 @@ from app.api.workers import router as workers
 from app.api.qq import router as qq
 from app.api.private_chats import router as private_chats
 from app.api.sub2api_alerts import router as sub2api_alerts
+from app.api.resource_search import router as resource_search
+from app.api.owned_groups import router as owned_groups
+from app.api.owned_group_controls import router as owned_group_controls
+from app.api.owned_group_audit import router as owned_group_audit
+from app.api.owned_group_bots import router as owned_group_bots
+from app.api.owned_group_invites import router as owned_group_invites
 
 __all__ = [
     "auth",
@@ -58,4 +64,10 @@ __all__ = [
     "qq",
     "private_chats",
     "sub2api_alerts",
+    "resource_search",
+    "owned_groups",
+    "owned_group_controls",
+    "owned_group_audit",
+    "owned_group_bots",
+    "owned_group_invites",
 ]

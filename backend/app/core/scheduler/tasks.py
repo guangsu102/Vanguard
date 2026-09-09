@@ -11,11 +11,11 @@ import json
 import time
 from collections import Counter
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery import celery_app
@@ -48,17 +48,21 @@ async def _run_with_worker_cleanup(awaitable: Awaitable[Any]) -> Any:
     """Run a Celery coroutine and dispose loop-bound resources before loop close."""
     from app.core import database as db_module
     from app.core import redis as redis_module
+    from app.core.account.pool import close_account_pool
 
     await redis_module.init_redis()
     try:
         return await awaitable
     finally:
         try:
-            if redis_module.redis_client is not None:
-                await redis_module.close_redis()
+            await close_account_pool()
         finally:
-            if db_module.engine is not None:
-                await db_module.close_db()
+            try:
+                if redis_module.redis_client is not None:
+                    await redis_module.close_redis()
+            finally:
+                if db_module.engine is not None:
+                    await db_module.close_db()
 
 
 def _run_async(awaitable: Awaitable[Any]) -> Any:
@@ -108,10 +112,7 @@ def _scheduler_interval_is_due(
 ) -> bool:
     if last_run_at is None:
         return True
-    return (
-        now + SCHEDULER_INTERVAL_EARLY_TOLERANCE_SECONDS
-        >= last_run_at + interval_seconds
-    )
+    return now + SCHEDULER_INTERVAL_EARLY_TOLERANCE_SECONDS >= last_run_at + interval_seconds
 
 
 def _auto_join_lock_stale_seconds(config: dict[str, Any]) -> int:
@@ -576,6 +577,42 @@ async def _health_check_proxies_async() -> dict[str, Any]:
     return await _run_with_db(handler)
 
 
+async def _reconcile_stale_worker_statuses_async(
+    stale_after_seconds: int = 90,
+) -> dict[str, Any]:
+    from app.core.worker_status import TelegramWorkerStatus, TelegramWorkerStatusValue
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        now = datetime.utcnow()
+        normalized_stale_after = max(30, int(stale_after_seconds))
+        cutoff = now - timedelta(seconds=normalized_stale_after)
+        result = await db.execute(
+            update(TelegramWorkerStatus)
+            .where(
+                TelegramWorkerStatus.status.in_(
+                    {
+                        TelegramWorkerStatusValue.STARTING.value,
+                        TelegramWorkerStatusValue.ONLINE.value,
+                        TelegramWorkerStatusValue.DEGRADED.value,
+                    }
+                ),
+                TelegramWorkerStatus.last_heartbeat_at.is_not(None),
+                TelegramWorkerStatus.last_heartbeat_at < cutoff,
+            )
+            .values(
+                status=TelegramWorkerStatusValue.OFFLINE.value,
+                updated_at=now,
+            )
+        )
+        await db.commit()
+        return {
+            "reconciled": int(result.rowcount or 0),
+            "stale_after_seconds": normalized_stale_after,
+        }
+
+    return await _run_with_db(handler)
+
+
 async def _group_snapshot_async(task_name: str) -> dict[str, Any]:
     from app.core.group.manager import GroupManager
 
@@ -601,8 +638,43 @@ async def _cleanup_expired_tokens_async() -> dict[str, Any]:
     return _skipped_result("cleanup_expired_tokens", "persistent_auth_token_store_not_implemented")
 
 
-async def _cleanup_old_messages_async() -> dict[str, Any]:
-    return _skipped_result("cleanup_old_messages", "message_retention_cleanup_not_implemented")
+async def _cleanup_old_messages_async(
+    batch_size: int = 1000,
+    max_batches: int = 5,
+) -> dict[str, Any]:
+    from app.modules.acquisition.models import ConversationContext
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        normalized_batch_size = max(100, min(int(batch_size), 5000))
+        normalized_max_batches = max(1, min(int(max_batches), 20))
+        deleted = 0
+        batches = 0
+        now = datetime.utcnow()
+        while batches < normalized_max_batches:
+            expired_ids = (
+                select(ConversationContext.id)
+                .where(ConversationContext.expires_at <= now)
+                .order_by(ConversationContext.expires_at.asc())
+                .limit(normalized_batch_size)
+            )
+            result = await db.execute(
+                delete(ConversationContext).where(ConversationContext.id.in_(expired_ids))
+            )
+            batch_deleted = int(result.rowcount or 0)
+            await db.commit()
+            deleted += batch_deleted
+            batches += 1
+            if batch_deleted < normalized_batch_size:
+                break
+        return {
+            "deleted": deleted,
+            "batches": batches,
+            "batch_size": normalized_batch_size,
+            "has_more": batches == normalized_max_batches
+            and deleted == normalized_batch_size * normalized_max_batches,
+        }
+
+    return await _run_with_db(handler)
 
 
 async def _maintain_account_risk_async() -> dict[str, Any]:
@@ -1057,6 +1129,20 @@ def health_check_proxies(self):
 
 
 @celery_app.task
+def reconcile_stale_worker_statuses(stale_after_seconds: int = 90):
+    logger.info(
+        "reconcile_stale_worker_statuses",
+        task="reconcile_stale_worker_statuses",
+        stale_after_seconds=stale_after_seconds,
+    )
+    try:
+        return _run_async(_reconcile_stale_worker_statuses_async(stale_after_seconds))
+    except Exception as exc:
+        logger.error("reconcile_stale_worker_statuses_failed", error=str(exc))
+        return {"error": str(exc)}
+
+
+@celery_app.task
 def sync_group_metrics():
     logger.info("sync_group_metrics", task="sync_group_metrics")
     try:
@@ -1092,10 +1178,20 @@ def cleanup_expired_tokens():
 
 
 @celery_app.task
-def cleanup_old_messages():
-    logger.info("cleanup_old_messages", task="cleanup_old_messages")
+def cleanup_old_messages(batch_size: int = 1000, max_batches: int = 5):
+    logger.info(
+        "cleanup_old_messages",
+        task="cleanup_old_messages",
+        batch_size=batch_size,
+        max_batches=max_batches,
+    )
     try:
-        return _run_async(_cleanup_old_messages_async())
+        return _run_async(
+            _cleanup_old_messages_async(
+                batch_size=batch_size,
+                max_batches=max_batches,
+            )
+        )
     except Exception as exc:
         logger.error("cleanup_old_messages_failed", error=str(exc))
         return {"error": str(exc)}
@@ -1415,7 +1511,7 @@ def check_ad_survival_task(limit: Optional[int] = None):
 
 
 @celery_app.task
-def audit_group_ad_policies_task(limit: int = 5, dry_run: bool = False):
+def audit_group_ad_policies_task(limit: int = 20, dry_run: bool = False):
     logger.info("audit_group_ad_policies_task", task="audit_group_ad_policies_task", limit=limit)
     try:
         from app.modules.acquisition.automation import run_group_ad_policy_audit_with_db
@@ -1449,20 +1545,21 @@ def auto_probe_unknown_group_ad_policies_task(
     try:
         from app.modules.acquisition.automation import run_auto_group_ad_policy_probe_with_db
 
-        result = _run_async(
-            run_auto_group_ad_policy_probe_with_db(limit=limit, dry_run=dry_run)
-        )
+        result = _run_async(run_auto_group_ad_policy_probe_with_db(limit=limit, dry_run=dry_run))
         logger.info(
             "auto_probe_unknown_group_ad_policies_completed",
             processed=result.get("processed", 0),
             succeeded=result.get("succeeded", 0),
             skipped=result.get("skipped", 0),
             failed=result.get("failed", 0),
+            warmup_bypass_processed=(result.get("warmup_bypass") or {}).get("processed", 0),
+            warmup_bypass_succeeded=(result.get("warmup_bypass") or {}).get("succeeded", 0),
+            warmup_bypass_updated=(result.get("warmup_bypass") or {}).get("updated", 0),
         )
         return result
     except Exception as exc:
-        logger.error("auto_probe_unknown_group_ad_policies_failed", error=str(exc))
-        return {"error": str(exc)}
+        logger.exception("auto_probe_unknown_group_ad_policies_failed", error=str(exc))
+        raise
 
 
 @celery_app.task
@@ -1481,9 +1578,7 @@ def evaluate_ad_only_candidates_task(
             evaluate_ad_only_candidates_with_db,
         )
 
-        result = _run_async(
-            evaluate_ad_only_candidates_with_db(limit=limit, force=force)
-        )
+        result = _run_async(evaluate_ad_only_candidates_with_db(limit=limit, force=force))
         logger.info(
             "evaluate_ad_only_candidates_completed",
             status=result.get("status"),
@@ -1495,6 +1590,37 @@ def evaluate_ad_only_candidates_task(
     except Exception as exc:
         logger.error("evaluate_ad_only_candidates_failed", error=str(exc))
         return {"error": str(exc)}
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def dispatch_ad_only_join_queue_task(self, limit: int = 10):
+    logger.info(
+        "dispatch_ad_only_join_queue_task",
+        task="dispatch_ad_only_join_queue_task",
+        limit=limit,
+    )
+    try:
+        from app.modules.acquisition.ad_only_recommendation import (
+            claim_due_ad_only_join_queue_with_db,
+        )
+
+        handover_ids = _run_async(claim_due_ad_only_join_queue_with_db(limit=limit))
+        task_ids: list[str] = []
+        for handover_id in handover_ids:
+            result = execute_ad_only_handover_task.apply_async(
+                kwargs={"handover_id": handover_id},
+                queue="automation",
+            )
+            task_ids.append(result.id)
+        return {
+            "status": "dispatched",
+            "count": len(handover_ids),
+            "handover_ids": handover_ids,
+            "task_ids": task_ids,
+        }
+    except Exception as exc:
+        logger.error("dispatch_ad_only_join_queue_failed", error=str(exc))
+        raise self.retry(exc=exc)
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
@@ -1670,6 +1796,74 @@ def send_trial_reminder(user_id: int, hours_before_expiry: int):
     except Exception as exc:
         logger.error("send_trial_reminder_failed", user_id=user_id, error=str(exc))
         return {"sent": False, "error": str(exc)}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.core.scheduler.tasks.resource_search_task",
+    time_limit=21600,
+    soft_time_limit=20700,
+)
+def resource_search_task(self, run_id: int):
+    """Execute one manual resource-search batch on its isolated worker."""
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.modules.acquisition.resource_search import ResourceSearchService
+
+        return await ResourceSearchService(db).run(
+            run_id,
+            task_id=str(self.request.id or ""),
+        )
+
+    logger.info("resource_search_task_started", run_id=run_id)
+    result = _run_async(_run_with_db(handler))
+    logger.info("resource_search_task_completed", run_id=run_id, result=result)
+    return result
+
+
+@celery_app.task(name="app.core.scheduler.tasks.reconcile_resource_searches_task")
+def reconcile_resource_searches_task(stale_after_seconds: int = 1800):
+    """Requeue searches abandoned by worker loss without starting a real search here."""
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.modules.acquisition.resource_search import (
+            reconcile_stale_resource_search_runs,
+        )
+
+        return await reconcile_stale_resource_search_runs(
+            db,
+            stale_after_seconds=stale_after_seconds,
+        )
+
+    result = _run_async(_run_with_db(handler))
+    for item in result.get("requeued", []):
+        old_task_id = item.get("old_task_id")
+        if old_task_id:
+            celery_app.control.revoke(old_task_id, terminate=False)
+        resource_search_task.apply_async(
+            args=[item["run_id"]],
+            queue="resource_search",
+            task_id=item["task_id"],
+        )
+    return {
+        "requeued": len(result.get("requeued", [])),
+        "cancelled": result.get("cancelled", 0),
+    }
+
+
+@celery_app.task(name="app.core.scheduler.tasks.cleanup_resource_search_history_task")
+def cleanup_resource_search_history_task(retention_days: int = 90):
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.modules.acquisition.resource_search import (
+            cleanup_resource_search_history,
+        )
+
+        return await cleanup_resource_search_history(
+            db,
+            retention_days=retention_days,
+        )
+
+    return _run_async(_run_with_db(handler))
 
 
 # =============================================================================

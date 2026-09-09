@@ -4,6 +4,14 @@ import { describe, expect, it } from 'vitest'
 import { useClientPagination } from './clientPagination'
 
 describe('useClientPagination', () => {
+  it('uses 20 rows per page by default', () => {
+    const source = ref(Array.from({ length: 25 }, (_, index) => index + 1))
+    const pagination = useClientPagination(source)
+
+    expect(pagination.pageSize.value).toBe(20)
+    expect(pagination.rows.value).toEqual(Array.from({ length: 20 }, (_, index) => index + 1))
+  })
+
   it('returns only the rows for the current page', () => {
     const source = ref(Array.from({ length: 25 }, (_, index) => index + 1))
     const pagination = useClientPagination(source, 10)
@@ -35,5 +43,15 @@ describe('useClientPagination', () => {
 
     expect(pagination.page.value).toBe(1)
     expect(pagination.rows.value).toEqual([1, 2])
+  })
+
+  it('caps configured page sizes at 100', async () => {
+    const source = ref(Array.from({ length: 150 }, (_, index) => index + 1))
+    const pagination = useClientPagination(source, 200)
+
+    expect(pagination.pageSize.value).toBe(100)
+    pagination.pageSize.value = 500
+    await nextTick()
+    expect(pagination.pageSize.value).toBe(100)
   })
 })

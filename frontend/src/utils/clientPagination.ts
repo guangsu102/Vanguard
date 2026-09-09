@@ -1,11 +1,12 @@
 import { computed, ref, watch, type Ref } from 'vue'
+import { DEFAULT_PAGE_SIZE, normalizePageSize } from './pagination'
 
 export function useClientPagination<T>(
   source: Readonly<Ref<readonly T[]>>,
-  initialPageSize = 10,
+  initialPageSize = DEFAULT_PAGE_SIZE,
 ) {
   const page = ref(1)
-  const pageSize = ref(initialPageSize)
+  const pageSize = ref(normalizePageSize(initialPageSize))
   const total = computed(() => source.value.length)
   const rows = computed(() => {
     const start = (page.value - 1) * pageSize.value
@@ -18,7 +19,9 @@ export function useClientPagination<T>(
   }
 
   watch(total, clampPage)
-  watch(pageSize, () => {
+  watch(pageSize, (value) => {
+    const normalized = normalizePageSize(value)
+    if (value !== normalized) pageSize.value = normalized
     page.value = 1
   })
 

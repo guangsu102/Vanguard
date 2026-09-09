@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { campaignsApi, type Campaign, type CampaignFormData, type CampaignListParams, type CampaignStats } from '@/api/campaigns'
+import { DEFAULT_PAGE_SIZE, normalizePageSize } from '@/utils/pagination'
 
 export const useCampaignStore = defineStore('campaign', () => {
   const list = ref<Campaign[]>([])
@@ -11,7 +12,7 @@ export const useCampaignStore = defineStore('campaign', () => {
   const nextCursor = ref<string | null>(null)
 
   const page = ref(1)
-  const pageSize = ref(20)
+  const pageSize = ref(DEFAULT_PAGE_SIZE)
   const params = ref<CampaignListParams>({})
 
   const hasMore = computed(() => Boolean(nextCursor.value))
@@ -114,7 +115,7 @@ export const useCampaignStore = defineStore('campaign', () => {
   }
 
   const setPageSize = (newPageSize: number) => {
-    pageSize.value = newPageSize
+    pageSize.value = normalizePageSize(newPageSize)
     page.value = 1
   }
 

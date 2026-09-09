@@ -47,6 +47,56 @@ class FakeEvomiProvider:
 
 
 @pytest.mark.asyncio
+async def test_health_check_status_counts_are_mutually_exclusive():
+    pool = AccountPool()
+    offline = await pool.add_account(
+        account_id=101,
+        phone="+10000000101",
+        session_name="health_offline",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+    )
+    online = await pool.add_account(
+        account_id=102,
+        phone="+10000000102",
+        session_name="health_online",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+    )
+    failed = await pool.add_account(
+        account_id=103,
+        phone="+10000000103",
+        session_name="health_error",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+    )
+    offline.status = AccountStatus.OFFLINE
+    online.status = AccountStatus.ONLINE
+    online.client = FakeClient()
+    failed.status = AccountStatus.ERROR
+
+    stats = await pool.health_check()
+
+    assert stats["total"] == 3
+    assert stats["offline"] == 1
+    assert stats["online"] == 1
+    assert stats["error"] == 1
+    assert stats["healthy"] == 2
+    assert stats["schedulable"] == 1
+    assert stats["connected"] == 1
+    assert sum(
+        stats[key]
+        for key in ("online", "offline", "error", "banned", "working", "idle")
+    ) == stats["total"]
+
+
+@pytest.mark.asyncio
 async def test_release_keeps_persistent_listener_client_connected():
     pool = AccountPool()
     account = await pool.add_account(
@@ -190,6 +240,12 @@ async def test_acquire_fails_closed_when_published_policy_is_newer(monkeypatch):
     )
     client = FakeClient()
     account.client = client
+
+    async def claim_test_lease(_account, _purpose, *, raise_on_failure=False):
+        assert raise_on_failure is False
+        return True
+
+    monkeypatch.setattr(pool, "_claim_operation_lease", claim_test_lease)
 
     with pytest.raises(RuntimeError, match="Proxy policy changed"):
         await pool.acquire_by_id(13, purpose="stale_policy_test")
@@ -500,6 +556,11 @@ async def test_create_client_uses_stable_telegram_device_profile(monkeypatch, tm
     assert captured["system_version"] == account.system_version
     assert captured["app_version"] == account.app_version
     assert captured["lang_code"] == captured["system_lang_code"]
+    assert captured["auto_reconnect"] is True
+    assert captured["connection_retries"] == 10
+    assert captured["retry_delay"] == 2
+    assert captured["timeout"] == 20
+    assert captured["base_logger"] == "vanguard.telethon.account.11"
 
     first_profile = {
         "device_model": account.device_model,

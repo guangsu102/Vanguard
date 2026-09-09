@@ -1,76 +1,27 @@
 # Vanguard 认证系统说明
 
-## 🔐 登录信息
+生产站点：`https://vanguard.pipenai.xyz`。
 
-### 默认管理员账号
+## 接口
 
-- **用户名**: `admin`
-- **密码**: `admin123`
-- **角色**: 管理员 (admin)
+- `POST /api/auth/login`：提交 `username`、`password`，返回 JWT。
+- `GET /api/auth/user`：使用 `Authorization: Bearer <token>`。
+- `POST /api/auth/logout`：注销客户端会话。
+- `PUT /api/auth/password`：修改当前管理员密码。
 
-⚠️ **重要**: 首次登录后请立即修改密码！
+## 首次管理员
 
-## 📋 认证功能
+首次部署通过 `scripts/codex_deploy_automation.py --bootstrap` 调用
+`backend/scripts/init_admin.py` 创建管理员。用户名默认为 `admin`，密码由部署时
+随机生成并只保存在目标机 `/opt/vanguard/.env.production`（0600）；仓库不包含
+默认密码。登录后请立即轮换密码，并按组织的密钥保管流程保存新凭据。
 
-### 1. 用户登录
-- **接口**: `POST /api/auth/login`
-- **请求**: username + password
-- **响应**: token + user info
-
-### 2. 获取用户信息
-- **接口**: `GET /api/auth/user`
-- **请求头**: `Authorization: Bearer <token>`
-
-### 3. 用户登出
-- **接口**: `POST /api/auth/logout`
-
-### 4. 修改密码
-- **接口**: `PUT /api/auth/password`
-
-## 🔧 部署后初始化
-
-### 方法 1: 使用数据库迁移脚本（推荐）
+## 部署后检查
 
 ```bash
-cd /root/Vanguard
-mysql -u vanguard -p vanguard < backend/migrations/009_admin_user.sql
+curl -fsS https://vanguard.pipenai.xyz/health
+ssh oracle4c24g 'cd /opt/vanguard && docker compose -f docker-compose.production.yml ps'
 ```
 
-### 方法 2: 使用 Python 脚本
-
-```bash
-docker exec -it vanguard-backend python /app/scripts/create_admin.py
-```
-
-## 🛡️ 安全说明
-
-### JWT Token
-- **有效期**: 7 天
-- **算法**: HS256
-- **密钥**: 配置在 .env.production 的 JWT_SECRET
-
-### 密码加密
-- **算法**: bcrypt
-- **强度**: 12 rounds
-
-### 角色权限
-- **admin**: 管理员，拥有所有权限
-- **operator**: 操作员，可以管理日常操作
-- **viewer**: 查看者，只读权限
-
-## 📝 使用流程
-
-1. 用户访问 https://www.rensw.xyz
-2. 自动跳转到登录页面
-3. 输入用户名和密码
-4. 登录成功后获得 JWT token
-5. Token 存储在 localStorage
-6. 后续请求自动携带 token
-
-## 🔄 修改默认密码
-
-登录后进入"系统设置" → "修改密码"
-
-## 📅 更新时间
-
-2026-05-24
+JWT 密钥至少 64 字符，生产环境不允许使用开发占位符。Telegram 群真实执行仍由
+`OWNED_GROUP_EXECUTION_ENABLED=false` 阻断，需完成单独的安全审批后才可开启。

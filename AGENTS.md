@@ -236,7 +236,7 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `VANGUARD_CALLBACK_SIGNING_SECRET` - Shared HMAC secret for XBoard callbacks
 
 **Frontend (.env.development, .env.production)**:
-- `VITE_API_BASE_URL` - Backend API base URL. Production should use same-origin `/api` so both `https://www.dh113.xyz` and `https://dh113.xyz` work.
+- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path on `https://vanguard.pipenai.xyz`.
 
 ### Configuration Files
 - `backend/alembic.ini` - Database migration configuration
@@ -299,23 +299,23 @@ If Telegram accounts fail to connect:
 ## Deployment
 
 ### Production Server
-- **Server**: 107.149.161.99 (SSH alias: `test001`; SSH port `28278`)
-- **Important**: Vanguard production deploys must target `ssh test001`. Do not deploy Vanguard to `xd`; `xd` is reserved for `new-api` and `sub2api` services.
-- **Public domains**: https://www.dh113.xyz and https://dh113.xyz
-- **Important**: `api.dh113.xyz` is deprecated and must not be used for Vanguard API checks, frontend configuration, or deployment verification.
-- **Backend**: served behind the same public domains under `/api` and `/health` (container port 8000)
-- **Frontend**: served by the Docker gateway in the `test001` deployment
-- **Database**: PostgreSQL service from `docker-compose.test001.yml`
-- **Cache**: Redis service from `docker-compose.test001.yml`
+- **Server**: `168.110.23.229` (SSH alias: `oracle4c24g`; SSH port `22`)
+- **SSH**: `ssh oracle4c24g` via the local SOCKS5 `connect.exe` proxy on `127.0.0.1:7897`, using `E:/sshkey/sshkey/id_rsa`.
+- **Important**: Vanguard production deploys must target `ssh oracle4c24g`. The co-located Sub2API stack under `/opt/sub2api-dr` is a separate service and must not be stopped or reconfigured by Vanguard deployment.
+- **Public domain**: https://vanguard.pipenai.xyz
+- **Backend**: host Nginx proxies `/api`, `/api/ws`, and `/health` to the loopback backend port `127.0.0.1:18080`.
+- **Frontend**: host Nginx proxies the public site to the loopback frontend port `127.0.0.1:13000`.
+- **Database**: isolated `vanguard-postgres` service and `./data/postgres` volume from `docker-compose.production.yml`.
+- **Cache**: isolated `vanguard-redis` service and `./data/redis` volume from `docker-compose.production.yml`.
+- **TLS/Nginx**: host configuration is `/etc/nginx/conf.d/vanguard.conf`; use the existing Cloudflare Origin wildcard certificate for `*.pipenai.xyz` only after verifying its dates and key permissions on the target host.
 
 ### Deployment Process
 
 **Backend**:
 ```bash
 # On server
-cd /root/Vanguard
-git pull
-docker-compose -f docker-compose.test001.yml up -d --build
+cd /opt/vanguard
+docker compose -f docker-compose.production.yml up -d --build
 ```
 
 **Frontend**:
@@ -325,16 +325,16 @@ cd frontend
 npm run build
 tar -czf dist.tar.gz -C dist .
 
-# Deploy to server
-scp dist.tar.gz test001:/tmp/
-ssh test001
-cd /root/Vanguard
-docker-compose -f docker-compose.test001.yml up -d --build frontend gateway
+# Deploy to server (the frontend image is built as part of the production stack)
+scp dist.tar.gz oracle4c24g:/tmp/
+ssh oracle4c24g
+cd /opt/vanguard
+docker compose -f docker-compose.production.yml up -d --build frontend
 ```
 
 ### Health Checks
-- Backend: `curl https://www.dh113.xyz/health` or `curl https://dh113.xyz/health`
-- API Docs: `https://www.dh113.xyz/docs` or `https://dh113.xyz/docs` (only in DEBUG mode)
+- Backend: `curl https://vanguard.pipenai.xyz/health`
+- API Docs: `https://vanguard.pipenai.xyz/docs` (only in DEBUG mode)
 - Logs: `docker logs -f vanguard-backend`
 
 ## Code Style

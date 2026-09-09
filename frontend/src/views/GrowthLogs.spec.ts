@@ -102,6 +102,8 @@ describe('GrowthLogs view', () => {
         page_size: 20,
       }),
     )
+    expect(getAutoJoinAttempts).toHaveBeenCalledWith({ limit: 200 })
+    expect(getAutoJoinVerificationLogs).toHaveBeenCalledWith({ limit: 200 })
     expect(wrapper.text()).toContain('增长日志')
     expect(vm.accountLabel(7)).toBe('专用广告号')
   })

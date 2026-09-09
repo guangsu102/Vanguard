@@ -13,17 +13,27 @@ from pathlib import Path
 import paramiko
 import socks
 
+# Remote Docker/build logs can contain UTF-8 symbols (for example BuildKit's
+# check marks).  The Windows desktop shell may still expose a GBK stdout
+# codec; replace only unrepresentable log characters so deployment verification
+# cannot abort after a successful remote command.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="replace")
+
 ROOT = Path(__file__).resolve().parents[1]
-REMOTE_ROOT = "/root/Vanguard"
-SSH_HOST = "107.149.161.99"
-SSH_PORT = 28278
+REMOTE_ROOT = "/opt/vanguard"
+REMOTE_BACKUP_ROOT = "/opt/vanguard.file-backups"
+REMOTE_ARCHIVE_ROOT = "/tmp"
+SSH_HOST = "168.110.23.229"
+SSH_PORT = 22
 SSH_USER = "root"
 SSH_KEY_CANDIDATES = [
-    Path(os.environ["TEMP"]) / "codex-ssh-vanguard" / "id_rsa",
-    Path("D:/tanxuan/proxy-app/sshkey/id_rsa"),
+    Path("E:/sshkey/sshkey/id_rsa"),
 ]
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7897
+HEALTH_URL = "http://127.0.0.1:18080/health"
 
 ARCHIVE_PATH = ROOT / ".codex-vanguard-full-deploy.tar.gz"
 
@@ -65,6 +75,7 @@ SKIP_SUFFIXES = {
     ".sqlite",
     ".tar.gz",
     ".zip",
+    ".patch",
 }
 
 APP_CONTAINERS = [
@@ -72,6 +83,7 @@ APP_CONTAINERS = [
     "vanguard-frontend",
     "vanguard-celery-worker",
     "vanguard-celery-beat",
+    "vanguard-resource-search-worker",
     "vanguard-telegram-growth-worker",
     "vanguard-telegram-guardian-worker",
     "vanguard-bot",
@@ -81,13 +93,10 @@ MAINLINE_SERVICES = [
     "backend",
     "frontend",
     "celery-worker",
+    "resource-search-worker",
     "celery-beat",
     "telegram-growth-worker",
     "telegram-guardian-worker",
-]
-
-EXTERNAL_NETWORKS = [
-    "xboard_xboard_internal",
 ]
 
 
@@ -163,9 +172,9 @@ def connect() -> paramiko.SSHClient:
     return client
 
 
-def assert_test001_target() -> None:
-    if SSH_HOST != "107.149.161.99" or SSH_PORT != 28278:
-        raise RuntimeError("Vanguard deployment must target ssh test001 only")
+def assert_oracle4c24g_target() -> None:
+    if SSH_HOST != "168.110.23.229" or SSH_PORT != 22:
+        raise RuntimeError("Vanguard deployment must target ssh oracle4c24g only")
 
 
 def run(client: paramiko.SSHClient, command: str, timeout: int = 900, allow_fail: bool = False) -> str:
@@ -189,17 +198,17 @@ def wait_for_health(client: paramiko.SSHClient) -> None:
         client,
         (
             "for i in $(seq 1 30); do "
-            "curl -fsS http://127.0.0.1:8000/health && exit 0; "
+            f"curl -fsS {HEALTH_URL} && exit 0; "
             "sleep 2; "
             "done; "
-            "curl -v --max-time 10 http://127.0.0.1:8000/health"
+            f"curl -v --max-time 10 {HEALTH_URL}"
         ),
         timeout=180,
     )
 
 
 def upload_archive(client: paramiko.SSHClient, archive_path: Path, timestamp: str) -> tuple[paramiko.SSHClient, str]:
-    remote_archive = f"/root/.codex-vanguard-full-deploy-{timestamp}.tar.gz"
+    remote_archive = f"{REMOTE_ARCHIVE_ROOT}/.codex-vanguard-full-deploy-{timestamp}.tar.gz"
     for attempt in range(1, 4):
         try:
             with client.open_sftp() as sftp:
@@ -242,11 +251,16 @@ def upload_single_file(client: paramiko.SSHClient, rel_path: str) -> str:
 def remote_prepare_command(remote_archive: str, timestamp: str) -> str:
     containers = " ".join(shlex.quote(item) for item in APP_CONTAINERS)
     remote_root = shlex.quote(REMOTE_ROOT)
-    backup_root = shlex.quote(f"/root/Vanguard.backups/Vanguard.{timestamp}")
+    backup_parent = shlex.quote(REMOTE_BACKUP_ROOT)
+    backup_root = shlex.quote(f"{REMOTE_BACKUP_ROOT}/Vanguard.{timestamp}")
     archive = shlex.quote(remote_archive)
     return (
         "set -e; "
-        f"mkdir -p /root/Vanguard.backups; "
+        f"mkdir -p {backup_parent}; "
+        # Stop only the Vanguard Compose project before moving its bind-mount
+        # directory. This leaves the independent Sub2API containers untouched.
+        f"if [ -f {remote_root}/docker-compose.production.yml ]; then "
+        f"cd {remote_root} && docker compose -f docker-compose.production.yml down --remove-orphans || true; fi; "
         f"docker rm -f {containers} >/dev/null 2>&1 || true; "
         f"if [ -d {remote_root} ]; then mv {remote_root} {backup_root}; fi; "
         f"mkdir -p {remote_root}; "
@@ -254,39 +268,39 @@ def remote_prepare_command(remote_archive: str, timestamp: str) -> str:
         f"if [ -f {backup_root}/.env.production ]; then cp {backup_root}/.env.production {remote_root}/.env.production; fi; "
         f"if [ -d {backup_root}/data ]; then mv {backup_root}/data {remote_root}/data; fi; "
         f"if [ -d {backup_root}/sessions ]; then mv {backup_root}/sessions {remote_root}/sessions; fi; "
+        # Keep database bind-mount ownership intact across releases; only the
+        # application-owned log/upload/session directories are writable by
+        # UID 1000.
         f"mkdir -p {remote_root}/data/logs {remote_root}/data/uploads {remote_root}/sessions; "
-        f"chown -R 1000:1000 {remote_root}/data {remote_root}/sessions || true; "
+        f"chown -R 1000:1000 {remote_root}/data/logs {remote_root}/data/uploads {remote_root}/sessions || true; "
         f"cd {remote_root}; "
         "docker compose -f docker-compose.production.yml config --services"
     )
 
 
-def ensure_external_networks_command() -> str:
-    parts = []
-    for network in EXTERNAL_NETWORKS:
-        quoted = shlex.quote(network)
-        parts.append(
-            f"docker network inspect {quoted} >/dev/null 2>&1 || docker network create {quoted}"
-        )
-    return "set -e; " + "; ".join(parts)
-
-
 def apply_migrations_command() -> str:
+    # Keep the deployment path on the same curated chain used by the runner.
+    # Older 010-020 names are Alembic-only in this checkout and must not be
+    # passed as raw SQL files (the previous command failed before 044 ran).
     return (
         "docker exec -i vanguard-backend "
-        "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py "
-        "--files "
-        "010_add_telegram_account_session_string.sql "
-        "011_acquisition_message_type_varchar.sql "
-        "012_group_pool_memberships.sql "
-        "013_acquisition_automation_ads.sql "
-        "014_account_keyword_replenish_policy.sql "
-        "015_growth_guardian_refactor.sql "
-        "016_xboard_acquisition_tracking_worker.sql "
-        "017_campaign_execution.sql "
-        "018_group_search_keyword_usage.sql "
-        "019_group_search_keyword_normalized.sql "
-        "020_keyword_trigger_review.sql"
+        "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py"
+    )
+
+
+def apply_migrations_compose_command() -> str:
+    """Run the same curated migration chain from a one-off backend container.
+
+    Specialized deploy modes do not start the long-lived backend before their
+    migration step, so they cannot use ``docker exec``.  Keeping this command
+    on the runner's default list prevents references to old Alembic-only/raw SQL
+    filenames that are not present in the release archive.
+    """
+
+    return (
+        f"cd {shlex.quote(REMOTE_ROOT)} && "
+        "docker compose -f docker-compose.production.yml run --rm backend "
+        "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py"
     )
 
 
@@ -893,9 +907,14 @@ def pause_keyword_private_reply(client: paramiko.SSHClient) -> None:
 
 
 def main() -> int:
-    assert_test001_target()
-    parser = argparse.ArgumentParser(description="Deploy Vanguard to xd.")
+    assert_oracle4c24g_target()
+    parser = argparse.ArgumentParser(description="Deploy Vanguard to oracle4c24g.")
     parser.add_argument("--check", action="store_true", help="Only inspect the remote deployment state.")
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Initialize the production schema and administrator on a fresh target (explicit opt-in).",
+    )
     parser.add_argument(
         "--tune-search-keywords",
         action="store_true",
@@ -931,6 +950,11 @@ def main() -> int:
         action="store_true",
         help="Deploy account-concurrency runtime files and restart backend/worker services.",
     )
+    parser.add_argument(
+        "--deploy-ad-policy-controls",
+        action="store_true",
+        help="Deploy ad policy switch wiring, retired-budget cleanup, and UI labels.",
+    )
     args = parser.parse_args()
 
     if args.check:
@@ -941,10 +965,10 @@ def main() -> int:
             run(client, "docker logs --tail 120 vanguard-celery-worker", timeout=180, allow_fail=True)
             run(client, "docker logs --tail 120 vanguard-telegram-growth-worker", timeout=180, allow_fail=True)
             run(client, "docker logs --tail 120 vanguard-telegram-guardian-worker", timeout=180, allow_fail=True)
-            run(client, "curl -v --max-time 10 http://127.0.0.1:8000/health", timeout=120, allow_fail=True)
+            run(client, f"curl -v --max-time 10 {HEALTH_URL}", timeout=120, allow_fail=True)
             run(client, env_check_command(), timeout=180, allow_fail=True)
-            run(client, "cd /root/Vanguard && docker compose -f docker-compose.production.yml ps", timeout=120, allow_fail=True)
-            run(client, "rm -f /root/.codex-vanguard-full-deploy-*.tar.gz", timeout=120, allow_fail=True)
+            run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml ps", timeout=120, allow_fail=True)
+            run(client, f"rm -f {shlex.quote(REMOTE_ARCHIVE_ROOT)}/.codex-vanguard-full-deploy-*.tar.gz", timeout=120, allow_fail=True)
             return 0
         finally:
             with suppress(Exception):
@@ -994,7 +1018,7 @@ def main() -> int:
             "frontend/src/api/settings.ts",
             "frontend/src/views/Settings.vue",
         ]
-        backup_dir = f"/root/Vanguard.file-backups/keyword-private-reply-pause-{timestamp}"
+        backup_dir = f"{REMOTE_BACKUP_ROOT}/keyword-private-reply-pause-{timestamp}"
         build_log = f"/tmp/codex-keyword-private-reply-build-{timestamp}.log"
         services = "backend frontend telegram-growth-worker"
         client = connect()
@@ -1013,7 +1037,7 @@ def main() -> int:
             run(
                 client,
                 (
-                    "docker run --rm -v /root/Vanguard/backend:/code python:3.12-slim "
+                    f"docker run --rm -v {REMOTE_ROOT}/backend:/code python:3.12-slim "
                     "python -m py_compile "
                     "/code/app/core/runtime_settings.py "
                     "/code/app/modules/acquisition/keyword_trigger/handler.py "
@@ -1104,7 +1128,7 @@ def main() -> int:
             "frontend/src/api/automation.ts",
             "frontend/src/views/Automation.vue",
         ]
-        backup_dir = f"/root/Vanguard.file-backups/concurrency-runtime-{timestamp}"
+        backup_dir = f"{REMOTE_BACKUP_ROOT}/concurrency-runtime-{timestamp}"
         services = "backend frontend celery-worker celery-beat telegram-growth-worker telegram-guardian-worker"
         client = connect()
         try:
@@ -1122,7 +1146,7 @@ def main() -> int:
             run(
                 client,
                 (
-                    "docker run --rm -v /root/Vanguard/backend:/code python:3.12-slim "
+                    f"docker run --rm -v {REMOTE_ROOT}/backend:/code python:3.12-slim "
                     "python -m py_compile "
                     "/code/app/modules/acquisition/automation.py "
                     "/code/app/core/scheduler/tasks.py "
@@ -1160,6 +1184,216 @@ def main() -> int:
             with suppress(Exception):
                 client.close()
 
+    if args.deploy_ad_policy_controls:
+        started = time.time()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        rel_paths = [
+            "backend/app/modules/acquisition/automation.py",
+            "backend/app/core/automation_settings.py",
+            "backend/app/core/runtime_settings.py",
+            "backend/app/core/account/risk_guard.py",
+            "backend/app/api/automation.py",
+            "backend/scripts/apply_sql_migrations.py",
+            "backend/migrations/045_remove_ad_delivery_risk_budget.sql",
+            "backend/migrations/046_remove_redundant_probe_configuration.sql",
+            "frontend/src/views/GrowthDashboard.vue",
+            "frontend/src/views/Automation.vue",
+            "frontend/src/api/automation.ts",
+            "frontend/src/config/automationDefaults.ts",
+        ]
+        backup_dir = f"{REMOTE_BACKUP_ROOT}/Vanguard.ad-policy-controls-{timestamp}"
+        build_log = f"/tmp/codex-ad-policy-controls-build-{timestamp}.log"
+        services = (
+            "backend frontend celery-worker resource-search-worker celery-beat "
+            "telegram-growth-worker telegram-guardian-worker"
+        )
+        client = connect()
+        try:
+            settings_sql = (
+                "select key, value from system_setting "
+                "where key in ('automation.account_risk_guard','automation.ad_capacity') "
+                "order by key"
+            )
+            migration_sql = (
+                "select filename from schema_migration_history "
+                "where filename = '046_remove_redundant_probe_configuration.sql'"
+            )
+            settings_psql = (
+                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atc "
+                f"{shlex.quote(settings_sql)}"
+            )
+            migration_psql = (
+                "psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -Atc "
+                f"{shlex.quote(migration_sql)}"
+            )
+            settings_check = """
+import asyncio
+from app.core.automation_settings import get_account_risk_guard_settings, get_ad_capacity_settings
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.database import close_db, get_db_session, init_db
+
+async def main():
+    await init_db(create_tables=False)
+    try:
+        async with get_db_session() as db:
+            risk = await get_account_risk_guard_settings(db)
+            capacity = await get_ad_capacity_settings(db)
+            probe_budget = AccountRiskGuard._budget_for_action(AccountRiskAction.AD_PROBE, risk)
+            print("risk_actions=", sorted(risk.get("actions", {})))
+            print("has_ad_delivery_action=", "ad_delivery" in risk.get("actions", {}))
+            print("has_editable_ad_probe_action=", "ad_probe" in risk.get("actions", {}))
+            print("internal_ad_probe_budget=", {"daily_limit": probe_budget.daily_limit, "cooldown_seconds": probe_budget.cooldown_seconds})
+            print("has_retired_global_probe_limit=", "ad_policy_auto_probe_daily_limit" in capacity)
+            print("probe_limit_per_account=", capacity.get("ad_policy_auto_probe_daily_limit_per_account"))
+            print("switches=", {key: capacity.get(key) for key in (
+                "leave_on_deleted_ad", "block_group_on_probe_failure",
+                "ad_policy_ai_require_second_pass",
+            )})
+    finally:
+        await close_db()
+
+asyncio.run(main())
+"""
+            run(
+                client,
+                "docker ps --format '{{.Names}} {{.Status}}' | grep vanguard",
+                timeout=120,
+            )
+            run(client, f"mkdir -p {shlex.quote(backup_dir)}", timeout=120)
+            run(
+                client,
+                "docker ps --format '{{.Names}} {{.ID}} {{.Status}}' | "
+                f"grep -E '^(vanguard|sub2api-dr)' > {shlex.quote(backup_dir + '/containers.before')}",
+                timeout=120,
+                allow_fail=True,
+            )
+            run(
+                client,
+                "docker inspect --format '{{.Id}} {{.State.Status}}' "
+                "sub2api-dr-app-candidate-622ee4881 sub2api-dr-postgres sub2api-dr-redis "
+                f"> {shlex.quote(backup_dir + '/sub2api.before')}",
+                timeout=120,
+                allow_fail=True,
+            )
+            for rel_path in rel_paths:
+                remote_path = f"{REMOTE_ROOT}/{rel_path}"
+                backup_path = f"{backup_dir}/{rel_path.replace('/', '__')}"
+                run(
+                    client,
+                    f"if [ -f {shlex.quote(remote_path)} ]; then cp -p "
+                    f"{shlex.quote(remote_path)} {shlex.quote(backup_path)}; fi",
+                    timeout=120,
+                )
+                upload_single_file(client, rel_path)
+
+            # Save the pre-migration settings rows without printing their
+            # contents. They are the precise rollback artifacts for the
+            # retired/duplicate probe configuration.
+            run(
+                client,
+                (
+                    f"cd {shlex.quote(REMOTE_ROOT)} && "
+                    "docker compose -f docker-compose.production.yml exec -T postgres "
+                    f"sh -lc {shlex.quote(settings_psql)} "
+                    f"> {shlex.quote(backup_dir + '/probe-settings.before')}; "
+                    f"sha256sum {shlex.quote(backup_dir + '/probe-settings.before')}"
+                ),
+                timeout=180,
+                allow_fail=True,
+            )
+            run(
+                client,
+                (
+                    f"docker run --rm -v {REMOTE_ROOT}/backend:/code python:3.12-slim "
+                    "python -m py_compile "
+                    "/code/app/modules/acquisition/automation.py "
+                    "/code/app/core/automation_settings.py "
+                    "/code/app/core/runtime_settings.py "
+                    "/code/app/core/account/risk_guard.py "
+                    "/code/app/api/automation.py "
+                    "/code/scripts/apply_sql_migrations.py"
+                ),
+                timeout=180,
+            )
+            run(
+                client,
+                (
+                    f"cd {shlex.quote(REMOTE_ROOT)} && "
+                    f"(docker compose -f docker-compose.production.yml build {services} "
+                    f"> {shlex.quote(build_log)} 2>&1; code=$?; "
+                    f"tail -n 240 {shlex.quote(build_log)}; exit $code)"
+                ),
+                timeout=3000,
+            )
+            run(client, apply_migrations_compose_command(), timeout=1200)
+            run(
+                client,
+                (
+                    f"cd {shlex.quote(REMOTE_ROOT)} && "
+                    f"docker compose -f docker-compose.production.yml up -d --force-recreate {services}"
+                ),
+                timeout=1200,
+            )
+            wait_for_health(client)
+            run(
+                client,
+                "docker ps --format '{{.Names}} {{.ID}} {{.Status}}' | "
+                f"grep -E '^(vanguard|sub2api-dr)' > {shlex.quote(backup_dir + '/containers.after')}",
+                timeout=120,
+            )
+            run(
+                client,
+                "docker inspect --format '{{.Id}} {{.State.Status}}' "
+                "sub2api-dr-app-candidate-622ee4881 sub2api-dr-postgres sub2api-dr-redis "
+                f"> {shlex.quote(backup_dir + '/sub2api.after')}; "
+                f"diff -u {shlex.quote(backup_dir + '/sub2api.before')} "
+                f"{shlex.quote(backup_dir + '/sub2api.after')} || true",
+                timeout=120,
+                allow_fail=True,
+            )
+            run(
+                client,
+                (
+                    f"cd {shlex.quote(REMOTE_ROOT)} && "
+                    "docker compose -f docker-compose.production.yml exec -T postgres "
+                    f"sh -lc {shlex.quote(migration_psql)}"
+                ),
+                timeout=180,
+            )
+            run(
+                client,
+                (
+                    "docker exec -i vanguard-backend python -c "
+                    + shlex.quote(f"exec({settings_check!r})")
+                ),
+                timeout=180,
+            )
+            run(
+                client,
+                "docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "
+                "vanguard-backend | grep -E '^(OWNED_GROUP_EXECUTION_ENABLED|P0_SAFETY_GATE_ENABLED|P0_SAFETY_GATE_FAIL_CLOSED|OWNED_GROUP_KILL_SWITCH_ENABLED)=' | sort",
+                timeout=120,
+            )
+            run(client, f"curl -fsS https://vanguard.pipenai.xyz/health", timeout=120)
+            run(
+                client,
+                "grep -nE 'server_name|proxy_pass' /etc/nginx/conf.d/vanguard.conf",
+                timeout=120,
+                allow_fail=True,
+            )
+            run(client, "docker logs --since 5m --tail 160 vanguard-backend", timeout=180, allow_fail=True)
+            run(client, "docker logs --since 5m --tail 100 vanguard-telegram-growth-worker", timeout=180, allow_fail=True)
+            run(client, f"rm -f {shlex.quote(build_log)}", timeout=120, allow_fail=True)
+            print(
+                f"\nad policy controls deploy completed in {time.time() - started:.1f}s; "
+                f"backup={backup_dir}",
+                flush=True,
+            )
+            return 0
+        finally:
+            with suppress(Exception):
+                client.close()
+
     if args.deploy_acquisition_automation:
         started = time.time()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1180,8 +1414,6 @@ def main() -> int:
             "backend/app/core/ai/keyword_generator.py",
             "backend/app/core/ai/llm_client.py",
             "backend/scripts/apply_sql_migrations.py",
-            "backend/migrations/019_group_search_keyword_normalized.sql",
-            "backend/migrations/020_keyword_trigger_review.sql",
             "frontend/src/api/acquisition.ts",
             "frontend/src/api/automation.ts",
             "frontend/src/api/groups.ts",
@@ -1190,7 +1422,7 @@ def main() -> int:
             "frontend/src/views/Groups.vue",
             "frontend/src/views/Keywords.vue",
         ]
-        backup_dir = f"/root/Vanguard.file-backups/acquisition-automation-{timestamp}"
+        backup_dir = f"{REMOTE_BACKUP_ROOT}/acquisition-automation-{timestamp}"
         services = "backend frontend celery-worker celery-beat telegram-growth-worker"
         client = connect()
         try:
@@ -1208,7 +1440,7 @@ def main() -> int:
             run(
                 client,
                 (
-                    "docker run --rm -v /root/Vanguard/backend:/code python:3.12-slim "
+                    f"docker run --rm -v {REMOTE_ROOT}/backend:/code python:3.12-slim "
                     "python -m py_compile "
                     "/code/app/modules/acquisition/automation.py "
                     "/code/app/modules/acquisition/config.py "
@@ -1237,16 +1469,7 @@ def main() -> int:
                 ),
                 timeout=2400,
             )
-            run(
-                client,
-                (
-                    f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    "docker compose -f docker-compose.production.yml run --rm backend "
-                    "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py "
-                    "--files 019_group_search_keyword_normalized.sql 020_keyword_trigger_review.sql"
-                ),
-                timeout=600,
-            )
+            run(client, apply_migrations_compose_command(), timeout=900)
             run(
                 client,
                 (
@@ -1271,7 +1494,7 @@ def main() -> int:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         rel_path = "backend/app/core/scheduler/tasks.py"
         remote_path = f"{REMOTE_ROOT}/{rel_path}"
-        backup_dir = f"/root/Vanguard.file-backups/scheduler-tasks-{timestamp}"
+        backup_dir = f"{REMOTE_BACKUP_ROOT}/scheduler-tasks-{timestamp}"
         client = connect()
         try:
             run(client, "docker ps --format '{{.Names}} {{.Status}}' | grep vanguard", timeout=120)
@@ -1288,7 +1511,7 @@ def main() -> int:
             run(
                 client,
                 (
-                    "docker run --rm -v /root/Vanguard/backend:/code python:3.12-slim "
+                    f"docker run --rm -v {REMOTE_ROOT}/backend:/code python:3.12-slim "
                     "python -m py_compile /code/app/core/scheduler/tasks.py"
                 ),
                 timeout=180,
@@ -1330,11 +1553,33 @@ def main() -> int:
         client, remote_archive = upload_archive(client, archive_path, timestamp)
 
         run(client, remote_prepare_command(remote_archive, timestamp), timeout=900)
-        run(client, ensure_external_networks_command(), timeout=120, allow_fail=False)
         services = " ".join(MAINLINE_SERVICES)
-        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml build {services}", timeout=3600)
+        compose_root = shlex.quote(REMOTE_ROOT)
+        build_services = f"{services} db-init admin-init" if args.bootstrap else services
+        run(
+            client,
+            f"cd {compose_root} && docker compose -f docker-compose.production.yml build {build_services}",
+            timeout=3600,
+        )
+        run(
+            client,
+            f"cd {compose_root} && docker compose -f docker-compose.production.yml up -d postgres redis",
+            timeout=600,
+        )
+        if args.bootstrap:
+            run(
+                client,
+                f"cd {compose_root} && docker compose -f docker-compose.production.yml --profile bootstrap run --rm db-init",
+                timeout=1200,
+            )
+            run(
+                client,
+                f"cd {compose_root} && docker compose -f docker-compose.production.yml --profile bootstrap run --rm --no-deps admin-init",
+                timeout=600,
+            )
         run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --force-recreate backend", timeout=1200)
-        run(client, apply_migrations_command(), timeout=600)
+        if not args.bootstrap:
+            run(client, apply_migrations_command(), timeout=600)
         run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --force-recreate {services}", timeout=1200)
 
         wait_for_health(client)

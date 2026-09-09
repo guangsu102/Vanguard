@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from contextlib import suppress
 
-from codex_deploy_automation import connect, run
+from codex_deploy_automation import HEALTH_URL, connect, run
 
 
 COMMANDS = [
-    "curl -fsS http://127.0.0.1:8000/health",
+    f"curl -fsS {HEALTH_URL}",
     "docker ps --format '{{.Names}} {{.Status}} {{.Networks}}' | grep vanguard",
     (
         "docker exec -i vanguard-backend python - <<'PY'\n"
@@ -14,11 +14,11 @@ COMMANDS = [
         "import redis\n"
         "from app.core.config import settings\n"
         "for name in ('REDIS_URL', 'CELERY_BROKER_URL', 'CELERY_RESULT_BACKEND'):\n"
-        "    parsed = urlparse(getattr(settings, name))\n"
-        "    print(f'{name}: host={parsed.hostname} db={parsed.path.lstrip(\"/\")}')\n"
-        "for db in (1, 2):\n"
-        "    client = redis.Redis.from_url(f'redis://redis:6379/{db}', socket_connect_timeout=2, socket_timeout=2)\n"
-        "    print(f'redis_db_{db}_ping=' + str(client.ping()))\n"
+        "    value = getattr(settings, name)\n"
+        "    parsed = urlparse(value)\n"
+        "    print(f'{name}: host={parsed.hostname} db={parsed.path.lstrip(\"/\")} password_set={bool(parsed.password)}')\n"
+        "    client = redis.Redis.from_url(value, socket_connect_timeout=2, socket_timeout=2)\n"
+        "    print(f'{name}_ping=' + str(client.ping()))\n"
         "PY"
     ),
     (

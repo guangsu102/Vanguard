@@ -236,7 +236,7 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `VANGUARD_CALLBACK_SIGNING_SECRET` - Shared HMAC secret for XBoard callbacks
 
 **Frontend (.env.development, .env.production)**:
-- `VITE_API_BASE_URL` - Backend API base URL (e.g., `https://api.rensw.xyz/api`)
+- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path at `https://vanguard.pipenai.xyz`.
 
 ### Configuration Files
 - `backend/alembic.ini` - Database migration configuration
@@ -299,20 +299,20 @@ If Telegram accounts fail to connect:
 ## Deployment
 
 ### Production Server
-- **Server**: 137.175.65.47 (SSH alias: `xd`)
-- **Backend**: https://api.rensw.xyz (port 8000)
-- **Frontend**: /var/www/vanguard/frontend (served by nginx)
-- **Database**: PostgreSQL 15 (system service)
-- **Cache**: Redis 7 (system service)
+- **Server**: `168.110.23.229` (SSH alias: `oracle4c24g`, port `22`)
+- **SSH**: local SOCKS5 `connect.exe -S 127.0.0.1:7897`, key `E:/sshkey/sshkey/id_rsa`
+- **Public domain**: https://vanguard.pipenai.xyz
+- **Backend/frontend**: isolated Docker Compose stack in `/opt/vanguard`; host nginx forwards `/api`, `/api/ws`, `/health` to `127.0.0.1:18080` and `/` to `127.0.0.1:13000`.
+- **Database/cache**: Vanguard-owned PostgreSQL and Redis volumes under `/opt/vanguard/data`; do not stop the co-located `/opt/sub2api-dr` stack.
+- **Host Nginx**: `/etc/nginx/conf.d/vanguard.conf`, using the verified Cloudflare Origin wildcard certificate for `*.pipenai.xyz`.
 
 ### Deployment Process
 
 **Backend**:
 ```bash
 # On server
-cd /root/Vanguard
-git pull
-docker-compose -f docker-compose.production.yml up -d --build backend bot
+cd /opt/vanguard
+docker compose -f docker-compose.production.yml up -d --build
 ```
 
 **Frontend**:
@@ -322,19 +322,14 @@ cd frontend
 npm run build
 tar -czf dist.tar.gz -C dist .
 
-# Deploy to server
-scp dist.tar.gz root@xd:/tmp/
-ssh root@xd
-cd /var/www/vanguard/frontend
-tar -xzf /tmp/dist.tar.gz
-chown -R www-data:www-data .
-systemctl reload nginx
+# The frontend image is built as part of the isolated production stack.
+ssh oracle4c24g 'cd /opt/vanguard && docker compose -f docker-compose.production.yml up -d --build frontend'
 ```
 
 ### Health Checks
-- Backend: `curl https://api.rensw.xyz/health`
-- API Docs: `https://api.rensw.xyz/docs` (only in DEBUG mode)
-- Logs: `docker logs -f vanguard-backend`
+- Backend: `curl https://vanguard.pipenai.xyz/health`
+- API Docs: `https://vanguard.pipenai.xyz/docs` (only in DEBUG mode)
+- Logs: `ssh oracle4c24g 'docker logs -f vanguard-backend'`
 
 ## Code Style
 

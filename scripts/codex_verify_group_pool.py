@@ -9,12 +9,13 @@ import paramiko
 import socks
 
 
-SSH_HOST = "137.175.65.47"
-SSH_PORT = 58243
+SSH_HOST = "168.110.23.229"
+SSH_PORT = 22
 SSH_USER = "root"
-SSH_KEY = Path(r"D:\tanxuan\proxy-app\sshkey\id_rsa")
+SSH_KEY = Path("E:/sshkey/sshkey/id_rsa")
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 7897
+API_BASE_URL = "http://127.0.0.1:18080"
 TEST_GROUP_ID = -1009876543210123
 
 
@@ -59,7 +60,7 @@ def run(client: paramiko.SSHClient, command: str, timeout: int = 180) -> str:
 def main() -> int:
     client = connect()
     try:
-        run(client, "curl -fsS http://127.0.0.1:8000/health")
+        run(client, f"curl -fsS {API_BASE_URL}/health")
         account_info = run(
             client,
             "docker exec -i vanguard-backend python - <<'PY'\n"
@@ -104,7 +105,7 @@ def main() -> int:
         payload_json = json.dumps(create_payload, ensure_ascii=False)
         create_response = run(
             client,
-            "curl -fsS -X POST http://127.0.0.1:8000/api/groups "
+            f"curl -fsS -X POST {API_BASE_URL}/api/groups "
             "-H 'Content-Type: application/json' "
             f"--data-binary {json.dumps(payload_json)}",
         )
@@ -124,7 +125,7 @@ def main() -> int:
             duplicate_code = run(
                 client,
                 "curl -sS -o /tmp/codex_group_dup.json -w '%{http_code}' "
-                f"-X POST http://127.0.0.1:8000/api/groups/{group_id}/memberships "
+                f"-X POST {API_BASE_URL}/api/groups/{group_id}/memberships "
                 "-H 'Content-Type: application/json' "
                 f"--data-binary {json.dumps(dup_payload)}",
             ).strip()
@@ -137,14 +138,14 @@ def main() -> int:
 
         list_response = run(
             client,
-            "curl -fsS 'http://127.0.0.1:8000/api/groups?page=1&page_size=5&keyword=Codex'",
+            f"curl -fsS '{API_BASE_URL}/api/groups?page=1&page_size=5&keyword=Codex'",
         )
         listed = json.loads(list_response)
         if not listed.get("data"):
             raise RuntimeError("created group was not returned by keyword list")
         print("list_after_create_ok=true", flush=True)
 
-        run(client, f"curl -fsS -X DELETE http://127.0.0.1:8000/api/groups/{group_id}")
+        run(client, f"curl -fsS -X DELETE {API_BASE_URL}/api/groups/{group_id}")
         print("cleanup_deleted=true", flush=True)
         return 0
     finally:
