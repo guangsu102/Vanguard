@@ -25,6 +25,8 @@ def test_owned_group_execution_defaults_off_and_kill_switch_is_available():
     configured = Settings(_env_file=None)
 
     assert configured.OWNED_GROUP_EXECUTION_ENABLED is False
+    assert configured.OWNED_GROUP_GOVERNANCE_ENABLED is False
+    assert configured.OWNED_GROUP_MESSAGING_ENABLED is False
     assert configured.P0_SAFETY_GATE_ENABLED is True
     assert configured.P0_SAFETY_GATE_FAIL_CLOSED is False
     assert configured.OWNED_GROUP_KILL_SWITCH_ENABLED is False

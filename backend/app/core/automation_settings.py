@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -20,6 +22,8 @@ from app.core.runtime_settings import (
     DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS,
     DEFAULT_GROUP_AI_INTERACTION_SETTINGS,
     DEFAULT_KEYWORD_PRIVATE_REPLY_SETTINGS,
+    DEFAULT_OWNED_GROUP_AI_PERSONA_SETTINGS,
+    DEFAULT_OWNED_GROUP_MESSAGING_SETTINGS,
     DEFAULT_PRIVATE_MESSAGING_SETTINGS,
     DEFAULT_PRIVATE_REPLY_TEMPLATES,
 )
@@ -35,6 +39,31 @@ AD_DELIVERY_EXECUTION_SETTING_KEY = "automation.ad_delivery_execution"
 AD_CAPACITY_SETTING_KEY = "automation.ad_capacity"
 AD_ONLY_RECOMMENDATION_SETTING_KEY = "automation.ad_only_recommendation"
 APP_SETTINGS_SETTING_KEY = "app.runtime_settings"
+
+
+class OwnedGroupAiPersonaFeatureError(RuntimeError):
+    """Stable domain error for the revisioned Persona feature switch."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        http_status: int,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+        self.details = details or {}
+
+
+@dataclass(frozen=True, slots=True)
+class OwnedGroupAiPersonaFeatureMutation:
+    value: dict[str, Any]
+    before: dict[str, Any]
+    changed: bool
 DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
     "sub2apiAlertsEnabled": False,
     "sub2apiNotifyResolved": True,
@@ -192,7 +221,11 @@ def _normalize_float_map(
 
 async def _read_setting_payload(db: AsyncSession, key: str) -> dict[str, Any]:
     setting = (
-        await db.execute(select(SystemSetting).where(SystemSetting.key == key))
+        await db.execute(
+            select(SystemSetting)
+            .where(SystemSetting.key == key)
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one_or_none()
     if setting is None:
         return {}
@@ -761,6 +794,97 @@ def normalize_group_ai_interaction_settings(payload: dict[str, Any] | None) -> d
     }
 
 
+def normalize_owned_group_messaging_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    defaults = DEFAULT_OWNED_GROUP_MESSAGING_SETTINGS
+    return {
+        "enabled": _bool_setting(raw.get("enabled"), defaults["enabled"]),
+        "dryRun": _bool_setting(
+            raw.get("dryRun", raw.get("dry_run")), defaults["dryRun"]
+        ),
+        "globalMaxPerGroupPerDay": _int_setting(
+            raw.get(
+                "globalMaxPerGroupPerDay",
+                raw.get("global_max_per_group_per_day"),
+            ),
+            defaults["globalMaxPerGroupPerDay"],
+            min_value=0,
+            max_value=1000,
+        ),
+        "globalMaxPerAccountPerDay": _int_setting(
+            raw.get(
+                "globalMaxPerAccountPerDay",
+                raw.get("global_max_per_account_per_day"),
+            ),
+            defaults["globalMaxPerAccountPerDay"],
+            min_value=0,
+            max_value=1000,
+        ),
+        "minGroupCooldownSeconds": _int_setting(
+            raw.get(
+                "minGroupCooldownSeconds",
+                raw.get("min_group_cooldown_seconds"),
+            ),
+            defaults["minGroupCooldownSeconds"],
+            min_value=60,
+            max_value=86400,
+        ),
+        "contentDedupeWindowSeconds": _int_setting(
+            raw.get(
+                "contentDedupeWindowSeconds",
+                raw.get("content_dedupe_window_seconds"),
+            ),
+            defaults["contentDedupeWindowSeconds"],
+            min_value=600,
+            max_value=86400,
+        ),
+        "reviewTtlHours": _int_setting(
+            raw.get("reviewTtlHours", raw.get("review_ttl_hours")),
+            defaults["reviewTtlHours"],
+            min_value=1,
+            max_value=168,
+        ),
+        "maxSendAttempts": _int_setting(
+            raw.get("maxSendAttempts", raw.get("max_send_attempts")),
+            defaults["maxSendAttempts"],
+            min_value=1,
+            max_value=3,
+        ),
+    }
+
+
+def normalize_owned_group_ai_persona_settings(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Normalize only the persisted, revisioned Persona switch fields."""
+
+    raw = payload if isinstance(payload, dict) else {}
+    defaults = DEFAULT_OWNED_GROUP_AI_PERSONA_SETTINGS
+    updated_at = raw.get("updatedAt", raw.get("updated_at"))
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        updated_at = None
+    else:
+        updated_at = updated_at.strip()[:64]
+    updated_by_raw = raw.get("updatedBy", raw.get("updated_by"))
+    try:
+        updated_by = int(updated_by_raw) if updated_by_raw is not None else None
+    except (TypeError, ValueError):
+        updated_by = None
+    if updated_by is not None and updated_by <= 0:
+        updated_by = None
+    return {
+        "enabled": _bool_setting(raw.get("enabled"), defaults["enabled"]),
+        "revision": _int_setting(
+            raw.get("revision"),
+            defaults["revision"],
+            min_value=0,
+            max_value=2_147_483_647,
+        ),
+        "updatedAt": updated_at,
+        "updatedBy": updated_by,
+    }
+
+
 def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     raw = payload if isinstance(payload, dict) else {}
     notification = raw.get("notification", {})
@@ -772,6 +896,12 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
     group_ai = raw.get("groupAiInteraction", {})
     if not isinstance(group_ai, dict):
         group_ai = {}
+    owned_group_messaging = raw.get("ownedGroupMessaging", {})
+    if not isinstance(owned_group_messaging, dict):
+        owned_group_messaging = {}
+    owned_group_ai_persona = raw.get("ownedGroupAiPersona", {})
+    if not isinstance(owned_group_ai_persona, dict):
+        owned_group_ai_persona = {}
     keyword_private = raw.get("keywordPrivateReply", {})
     if not isinstance(keyword_private, dict):
         keyword_private = {}
@@ -865,6 +995,12 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
         },
         "groupAiInteraction": normalize_group_ai_interaction_settings(group_ai),
+        "ownedGroupMessaging": normalize_owned_group_messaging_settings(
+            owned_group_messaging
+        ),
+        "ownedGroupAiPersona": normalize_owned_group_ai_persona_settings(
+            owned_group_ai_persona
+        ),
         "keywordPrivateReply": {
             "enabled": _bool_setting(
                 keyword_private.get("enabled", DEFAULT_KEYWORD_PRIVATE_REPLY_SETTINGS["enabled"]),
@@ -893,12 +1029,174 @@ async def get_app_runtime_settings(db: AsyncSession) -> dict[str, Any]:
     return normalize_app_runtime_settings(await _read_setting_payload(db, APP_SETTINGS_SETTING_KEY))
 
 
-async def save_app_runtime_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = normalize_app_runtime_settings(payload)
-    await _save_setting_payload(
-        db, APP_SETTINGS_SETTING_KEY, normalized, "Admin-managed runtime application settings"
+def with_owned_group_ai_persona_effective_state(
+    persisted: dict[str, Any] | None,
+) -> dict[str, Any]:
+    value = normalize_owned_group_ai_persona_settings(persisted)
+    static_enabled = bool(settings.OWNED_GROUP_AI_PERSONA_ENABLED)
+    return {
+        **value,
+        "staticEnabled": static_enabled,
+        "effectiveEnabled": static_enabled and bool(value["enabled"]),
+    }
+
+
+async def get_owned_group_ai_persona_settings(db: AsyncSession) -> dict[str, Any]:
+    app_settings = await get_app_runtime_settings(db)
+    return with_owned_group_ai_persona_effective_state(
+        app_settings.get("ownedGroupAiPersona")
     )
+
+
+def _deep_merge_runtime_settings(
+    base: dict[str, Any],
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_runtime_settings(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _setting_payload(setting: SystemSetting | None) -> dict[str, Any]:
+    if setting is None:
+        return {}
+    try:
+        payload = json.loads(setting.value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _lock_app_runtime_setting(db: AsyncSession) -> SystemSetting | None:
+    """Serialize app settings changes, including the first-row insert on PostgreSQL."""
+
+    bind = getattr(db, "bind", None)
+    dialect_name = str(getattr(getattr(bind, "dialect", None), "name", ""))
+    if dialect_name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:setting_key, 0))"),
+            {"setting_key": APP_SETTINGS_SETTING_KEY},
+        )
+    return (
+        await db.execute(
+            select(SystemSetting)
+            .where(SystemSetting.key == APP_SETTINGS_SETTING_KEY)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def _commit_app_runtime_setting(
+    db: AsyncSession,
+    setting: SystemSetting | None,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = normalize_app_runtime_settings(payload)
+    if setting is None:
+        setting = SystemSetting(
+            key=APP_SETTINGS_SETTING_KEY,
+            description="Admin-managed runtime application settings",
+        )
+        db.add(setting)
+    setting.value = json.dumps(normalized, ensure_ascii=False)
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     return normalized
+
+
+async def save_app_runtime_settings(db: AsyncSession, payload: dict[str, Any]) -> dict[str, Any]:
+    setting = await _lock_app_runtime_setting(db)
+    current_persona = normalize_owned_group_ai_persona_settings(
+        _setting_payload(setting).get("ownedGroupAiPersona")
+    )
+    safe_payload = dict(payload) if isinstance(payload, dict) else {}
+    safe_payload.pop("ownedGroupAiPersona", None)
+    safe_payload["ownedGroupAiPersona"] = current_persona
+    return await _commit_app_runtime_setting(db, setting, safe_payload)
+
+
+async def patch_app_runtime_settings(
+    db: AsyncSession,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Atomically merge a partial update into the latest committed settings row."""
+
+    setting = await _lock_app_runtime_setting(db)
+    current = normalize_app_runtime_settings(_setting_payload(setting))
+    safe_patch = dict(patch) if isinstance(patch, dict) else {}
+    safe_patch.pop("ownedGroupAiPersona", None)
+    merged = _deep_merge_runtime_settings(current, safe_patch)
+    return await _commit_app_runtime_setting(
+        db,
+        setting,
+        merged,
+    )
+
+
+async def mutate_owned_group_ai_persona_feature(
+    db: AsyncSession,
+    *,
+    expected_revision: int,
+    enabled: bool,
+    actor_id: int | None,
+) -> OwnedGroupAiPersonaFeatureMutation:
+    """Lock and update only the Persona switch; caller owns commit and audit."""
+
+    setting = await _lock_app_runtime_setting(db)
+    if setting is None:
+        raise OwnedGroupAiPersonaFeatureError(
+            "PERSONA_FEATURE_SETTING_NOT_INITIALIZED",
+            "Persona 运行时设置尚未初始化",
+            http_status=503,
+        )
+    payload = _setting_payload(setting)
+    before = normalize_owned_group_ai_persona_settings(
+        payload.get("ownedGroupAiPersona")
+    )
+    target_enabled = bool(enabled)
+    if bool(before["enabled"]) == target_enabled:
+        return OwnedGroupAiPersonaFeatureMutation(
+            value=with_owned_group_ai_persona_effective_state(before),
+            before=before,
+            changed=False,
+        )
+    if int(before["revision"]) != int(expected_revision):
+        raise OwnedGroupAiPersonaFeatureError(
+            "PERSONA_FEATURE_REVISION_CONFLICT",
+            "Persona 运行时设置已被其他管理员修改",
+            http_status=409,
+            details={
+                "currentRevision": int(before["revision"]),
+                "enabled": bool(before["enabled"]),
+            },
+        )
+    now = (
+        datetime.now(UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    updated = {
+        "enabled": target_enabled,
+        "revision": int(before["revision"]) + 1,
+        "updatedAt": now,
+        "updatedBy": int(actor_id) if actor_id is not None else None,
+    }
+    payload["ownedGroupAiPersona"] = updated
+    setting.value = json.dumps(payload, ensure_ascii=False)
+    await db.flush()
+    return OwnedGroupAiPersonaFeatureMutation(
+        value=with_owned_group_ai_persona_effective_state(updated),
+        before=before,
+        changed=True,
+    )
 
 
 async def is_ai_reply_enabled(db: AsyncSession) -> bool:
@@ -907,6 +1205,10 @@ async def is_ai_reply_enabled(db: AsyncSession) -> bool:
 
 async def get_group_ai_interaction_settings(db: AsyncSession) -> dict[str, Any]:
     return (await get_app_runtime_settings(db))["groupAiInteraction"]
+
+
+async def get_owned_group_messaging_settings(db: AsyncSession) -> dict[str, Any]:
+    return (await get_app_runtime_settings(db))["ownedGroupMessaging"]
 
 
 async def is_group_ai_interaction_enabled(db: AsyncSession) -> bool:

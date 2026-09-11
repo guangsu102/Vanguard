@@ -1,5 +1,6 @@
 import asyncio
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -83,6 +84,37 @@ async def test_account_pool_can_surface_busy_lease_to_opted_in_caller():
         )
 
     assert account.operation_lease is None
+
+
+@pytest.mark.asyncio
+async def test_account_pool_redacts_composite_secrets_from_acquire_log():
+    handle = AccountOperationLeaseHandle(
+        account_id=45,
+        key="account:45",
+        token="token",
+        owner="account-pool:test",
+        ttl_seconds=30,
+    )
+    pool = AccountPool(operation_lease_manager=FakeLeaseManager(handle=handle))
+    account = await add_test_account(pool, 45)
+    pool._assert_proxy_policy_current = AsyncMock(
+        side_effect=RuntimeError(
+            "proxy_password=ProxyPlain TELEGRAM_API_HASH=HashPlain jwt_secret=JwtPlain"
+        )
+    )
+    pool.logger = SimpleNamespace(warning=MagicMock(), debug=MagicMock())
+
+    with pytest.raises(RuntimeError):
+        await pool.acquire_by_id(
+            account.account_id,
+            purpose="owned_group_message",
+            operation_lease=handle,
+        )
+
+    logged_error = pool.logger.warning.call_args.kwargs["error"]
+    assert "ProxyPlain" not in logged_error
+    assert "HashPlain" not in logged_error
+    assert "JwtPlain" not in logged_error
 
 
 @pytest.mark.asyncio

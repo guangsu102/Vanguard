@@ -41,6 +41,7 @@ from app.modules.acquisition.models import (
     GroupAdProfile,
     GroupAdTier,
 )
+from app.modules.owned_group.models import OwnedGroupAsset
 
 
 @pytest.mark.asyncio
@@ -197,6 +198,132 @@ async def test_create_campaign_rejects_unknown_target_group(test_db):
 
     assert exc_info.value.status_code == 400
     assert "Target groups not found" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_create_campaign_rejects_non_archived_owned_group(test_db):
+    account = TelegramAccount(
+        identifier="owned-domain-owner",
+        session_name="owned-domain-owner",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=-100900004,
+        title="Owned domain target",
+        level=GroupLevel.A,
+        status="active",
+    )
+    test_db.add_all([account, group])
+    await test_db.flush()
+    test_db.add_all(
+        [
+            GroupAccountMembership(
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                account_id=account.id,
+                status="joined",
+            ),
+            OwnedGroupAsset(
+                internal_name="owned-domain-target",
+                title=group.title,
+                telegram_chat_id=group.group_id,
+                owner_account_id=account.id,
+                # The Telegram chat is claimed before the governance bridge
+                # necessarily persists core_group_id; the API must still fail closed.
+                core_group_id=None,
+                status="ready",
+            ),
+        ]
+    )
+    await test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_ad_campaign(
+            AdCampaignCreate(
+                name="must not target owned group",
+                target_group_ids=[group.id],
+            ),
+            db=test_db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "OWNED_GROUP_AD_DOMAIN_EXCLUDED"
+    assert exc_info.value.detail["details"]["group_ids"] == [group.id]
+
+
+@pytest.mark.asyncio
+async def test_binding_rejects_legacy_campaign_targeting_owned_group(test_db):
+    account = TelegramAccount(
+        identifier="owned-domain-binding-account",
+        session_name="owned-domain-binding-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=-100900005,
+        title="Owned binding target",
+        level=GroupLevel.A,
+        status="active",
+    )
+    campaign = AdCampaign(
+        name="legacy owned target campaign",
+        target_group_ids=json.dumps([1]),
+    )
+    creative = AdCreative(
+        name="legacy owned creative",
+        content="legacy content",
+        enabled=True,
+    )
+    test_db.add_all([account, group, campaign, creative])
+    await test_db.flush()
+    campaign.target_group_ids = json.dumps([group.id])
+    test_db.add(
+        OwnedGroupAsset(
+            internal_name="owned-domain-binding-target",
+            title=group.title,
+            telegram_chat_id=group.group_id,
+            owner_account_id=account.id,
+            core_group_id=group.id,
+            status="ready",
+        )
+    )
+    await test_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await create_account_ad_binding(
+            AccountAdBindingCreate(
+                account_id=account.id,
+                ad_campaign_id=campaign.id,
+                creative_id=creative.id,
+            ),
+            db=test_db,
+        )
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "OWNED_GROUP_AD_DOMAIN_EXCLUDED"
+
+    legacy_binding = AccountAdBinding(
+        account_id=account.id,
+        ad_campaign_id=campaign.id,
+        creative_id=creative.id,
+        enabled=True,
+        priority=0,
+    )
+    test_db.add(legacy_binding)
+    await test_db.commit()
+
+    with pytest.raises(HTTPException) as update_exc:
+        await update_account_ad_binding(
+            legacy_binding.id,
+            AccountAdBindingUpdate(priority=10),
+            db=test_db,
+        )
+
+    assert update_exc.value.status_code == 409
+    assert update_exc.value.detail["code"] == "OWNED_GROUP_AD_DOMAIN_EXCLUDED"
 
 
 @pytest.mark.asyncio

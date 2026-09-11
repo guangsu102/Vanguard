@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 DEFAULT_AUTO_JOIN_TITLE_BLACKLIST = [
     "机场",
@@ -142,6 +143,22 @@ DEFAULT_GROUP_AI_INTERACTION_SETTINGS: dict[str, Any] = {
     ],
     "proactiveWarmupGroupOverrides": {},
     "systemPrompt": "你是一个中文Telegram社群客服助手，回复要简洁、自然、友好，不要提及你是AI。",
+}
+DEFAULT_OWNED_GROUP_MESSAGING_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "dryRun": True,
+    "globalMaxPerGroupPerDay": 20,
+    "globalMaxPerAccountPerDay": 30,
+    "minGroupCooldownSeconds": 300,
+    "contentDedupeWindowSeconds": 21600,
+    "reviewTtlHours": 24,
+    "maxSendAttempts": 3,
+}
+DEFAULT_OWNED_GROUP_AI_PERSONA_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "revision": 0,
+    "updatedAt": None,
+    "updatedBy": None,
 }
 DEFAULT_PRIVATE_MESSAGING_SETTINGS: dict[str, Any] = {
     "auto_reply_enabled": False,

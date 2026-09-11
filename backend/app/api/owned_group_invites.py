@@ -26,6 +26,7 @@ from app.core.p0_safety_gate import (
 )
 from app.core.security import get_current_user
 from app.modules.owned_group.contracts import AssetStatus
+from app.modules.owned_group.lock_queries import owned_group_asset_for_update_query
 from app.modules.owned_group.models import OwnedGroupAsset
 from app.modules.owned_group.models_extra import OwnedGroupAuditEvent, OwnedGroupInviteLink
 from app.modules.owned_group.security import redact_sensitive_text
@@ -330,9 +331,8 @@ async def revoke_owned_group_invite_link(
     # Serialize all invite mutations for one asset.  Without this row lock two
     # administrators could revoke the same link and publish two replacements.
     asset = await db.scalar(
-        select(OwnedGroupAsset)
+        owned_group_asset_for_update_query()
         .where(OwnedGroupAsset.id == asset_id)
-        .with_for_update()
     )
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Owned group asset not found")
@@ -398,9 +398,8 @@ async def regenerate_owned_group_invite_link(
     # The asset row is the per-group invite-rotation mutex.  PostgreSQL keeps
     # the lock until the request transaction commits after this response.
     asset = await db.scalar(
-        select(OwnedGroupAsset)
+        owned_group_asset_for_update_query()
         .where(OwnedGroupAsset.id == asset_id)
-        .with_for_update()
     )
     if asset is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Owned group asset not found")

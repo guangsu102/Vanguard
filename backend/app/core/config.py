@@ -54,6 +54,18 @@ class Settings(BaseSettings):
         default=False,
         description="Allow the owned-group worker to perform Telegram side effects",
     )
+    OWNED_GROUP_GOVERNANCE_ENABLED: bool = Field(
+        default=False,
+        description="Enable explicit Guardian governance binding and owned-group event handling",
+    )
+    OWNED_GROUP_MESSAGING_ENABLED: bool = Field(
+        default=False,
+        description="Enable self-owned group AI/template message orchestration and Telegram sends",
+    )
+    OWNED_GROUP_AI_PERSONA_ENABLED: bool = Field(
+        default=False,
+        description="Enable account-level Persona for new self-owned-group AI executions",
+    )
     OWNED_GROUP_KILL_SWITCH_ENABLED: bool = Field(
         default=False,
         description="Static emergency stop for all owned-group execution",

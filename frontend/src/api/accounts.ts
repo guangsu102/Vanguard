@@ -1,4 +1,5 @@
 import apiClient from './client'
+import type { AccountPersonaSummary } from './accountPersonas'
 
 export type AccountStatus = 'offline' | 'online' | 'working' | 'idle' | 'error' | 'banned'
 export type AccountType = 'promoter' | 'guardian_bot'
@@ -7,6 +8,8 @@ export type AccountWarmupStage = 'observe' | 'seed' | 'soft' | 'ramp' | 'normal'
 export type ProxyMode = 'dynamic' | 'static' | 'none'
 export type AccountRiskLevel = 'normal' | 'watch' | 'limited' | 'frozen' | 'quarantined'
 export type AccountOperationMode = 'growth' | 'ad_only'
+export type AccountListPersonaSummary = Omit<AccountPersonaSummary, 'effective_enabled'> &
+  Partial<Pick<AccountPersonaSummary, 'effective_enabled'>>
 
 export interface Account {
   id: number
@@ -42,6 +45,7 @@ export interface Account {
   last_connected_at?: string
   created_at: string
   updated_at: string
+  persona?: AccountListPersonaSummary
 }
 
 export interface AccountListParams {
@@ -180,41 +184,79 @@ export interface AccountListPayload {
   hasMore: boolean
 }
 
-const normalizeAccount = (item: any): Account => ({
-  id: Number(item.id),
-  phone: item.phone || undefined,
-  identifier: item.identifier || item.phone || `account-${item.id}`,
-  display_name: item.display_name || undefined,
-  profile_bio: item.profile_bio || undefined,
-  profile_bio_synced_at: item.profile_bio_synced_at || undefined,
-  account_type: item.account_type || 'promoter',
-  operation_mode: item.operation_mode || 'growth',
-  asset_tier: item.asset_tier || 'unknown',
-  registered_at: item.registered_at || undefined,
-  asset_verified_at: item.asset_verified_at || undefined,
-  asset_note: item.asset_note || undefined,
-  managed_started_at: item.managed_started_at || undefined,
-  warmup_stage: item.warmup_stage || 'observe',
-  warmup_stage_updated_at: item.warmup_stage_updated_at || undefined,
-  warmup_hold_until: item.warmup_hold_until || undefined,
-  warmup_note: item.warmup_note || undefined,
-  status: item.status || 'offline',
-  country_code: item.country_code || 'US',
-  country_name: item.country_name || undefined,
-  api_config_name: item.api_config_name || 'default',
-  fingerprint_id: item.fingerprint_id || undefined,
-  session_name: item.session_name || '',
-  proxy_mode: item.proxy_mode || 'dynamic',
-  static_proxy_id: item.static_proxy_id ? Number(item.static_proxy_id) : undefined,
-  static_proxy_address: item.static_proxy_address || undefined,
-  is_active: Boolean(item.is_active),
-  connection_count: Number(item.connection_count ?? 0),
-  error_count: Number(item.error_count ?? 0),
-  last_active_at: item.last_active_at || undefined,
-  last_connected_at: item.last_connected_at || undefined,
-  created_at: item.created_at || '',
-  updated_at: item.updated_at || '',
-})
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+
+const optionalString = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.length > 0 ? value : undefined
+
+const normalizePersonaSummary = (
+  value: Record<string, unknown>,
+  accountId: number,
+): AccountListPersonaSummary | undefined => {
+  const flatFields = [
+    'persona_configured',
+    'persona_name',
+    'persona_revision',
+    'persona_applicable',
+  ] as const
+  if (!flatFields.some((field) => Object.prototype.hasOwnProperty.call(value, field))) {
+    return undefined
+  }
+  return {
+    account_id: accountId,
+    configured: value.persona_configured === true,
+    name: typeof value.persona_name === 'string' ? value.persona_name : null,
+    revision: Number(value.persona_revision ?? 0),
+    applicable: value.persona_applicable === true,
+  }
+}
+
+const normalizeAccount = (item: unknown): Account => {
+  const value = isRecord(item) ? item : {}
+  const id = Number(value.id ?? 0)
+  const phone = optionalString(value.phone)
+  return {
+    id,
+    phone,
+    identifier: optionalString(value.identifier) ?? phone ?? `account-${id}`,
+    display_name: optionalString(value.display_name),
+    profile_bio: optionalString(value.profile_bio),
+    profile_bio_synced_at: optionalString(value.profile_bio_synced_at),
+    account_type: value.account_type === 'guardian_bot' ? 'guardian_bot' : 'promoter',
+    operation_mode: value.operation_mode === 'ad_only' ? 'ad_only' : 'growth',
+    asset_tier: typeof value.asset_tier === 'string'
+      ? value.asset_tier as AccountAssetTier
+      : 'unknown',
+    registered_at: optionalString(value.registered_at),
+    asset_verified_at: optionalString(value.asset_verified_at),
+    asset_note: optionalString(value.asset_note),
+    managed_started_at: optionalString(value.managed_started_at),
+    warmup_stage: typeof value.warmup_stage === 'string'
+      ? value.warmup_stage as AccountWarmupStage
+      : 'observe',
+    warmup_stage_updated_at: optionalString(value.warmup_stage_updated_at),
+    warmup_hold_until: optionalString(value.warmup_hold_until),
+    warmup_note: optionalString(value.warmup_note),
+    status: typeof value.status === 'string' ? value.status as AccountStatus : 'offline',
+    country_code: optionalString(value.country_code) ?? 'US',
+    country_name: optionalString(value.country_name),
+    api_config_name: optionalString(value.api_config_name) ?? 'default',
+    fingerprint_id: optionalString(value.fingerprint_id),
+    session_name: optionalString(value.session_name) ?? '',
+    proxy_mode: typeof value.proxy_mode === 'string' ? value.proxy_mode as ProxyMode : 'dynamic',
+    static_proxy_id: value.static_proxy_id ? Number(value.static_proxy_id) : undefined,
+    static_proxy_address: optionalString(value.static_proxy_address),
+    is_active: Boolean(value.is_active),
+    connection_count: Number(value.connection_count ?? 0),
+    error_count: Number(value.error_count ?? 0),
+    last_active_at: optionalString(value.last_active_at),
+    last_connected_at: optionalString(value.last_connected_at),
+    created_at: optionalString(value.created_at) ?? '',
+    updated_at: optionalString(value.updated_at) ?? '',
+    persona: normalizePersonaSummary(value, id),
+  }
+}
 
 export const accountsApi = {
   list: async (params?: AccountListParams): Promise<AccountListPayload> => {
@@ -232,8 +274,10 @@ export const accountsApi = {
     return normalizeAccount(response.data)
   },
 
-  getById: async (id: number): Promise<Account> => {
-    const response = await apiClient.get(`/accounts/${id}`)
+  getById: async (id: number, signal?: AbortSignal): Promise<Account> => {
+    const response = signal
+      ? await apiClient.get(`/accounts/${id}`, { signal })
+      : await apiClient.get(`/accounts/${id}`)
     return normalizeAccount(response.data)
   },
 

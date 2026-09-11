@@ -32,6 +32,8 @@ celery_app = Celery(
         "app.core.scheduler.tasks",
         "app.modules.qq.tasks",
         "app.modules.owned_group.tasks",
+        "app.modules.owned_group.messaging_tasks",
+        "app.modules.owned_group.messaging_retention_tasks",
     ],
 )
 
@@ -234,6 +236,21 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"limit": 10, "stale_after_seconds": 900},
         "options": {"queue": "owned_group"},
     },
+    "owned-group-message-dispatch-every-minute": {
+        "task": "app.modules.owned_group.messaging_tasks.dispatch_owned_group_messages",
+        "schedule": 60.0,
+        "kwargs": {"limit": 50},
+        "options": {"queue": "owned_group"},
+    },
+    "owned-group-persona-retention-daily": {
+        "task": (
+            "app.modules.owned_group.messaging_retention_tasks."
+            "cleanup_owned_group_persona_retention"
+        ),
+        "schedule": crontab(hour=3, minute=45),
+        "kwargs": {"batch_size": 500, "dry_run": False},
+        "options": {"queue": "owned_group"},
+    },
 }
 
 # =============================================================================
@@ -265,6 +282,12 @@ celery_app.conf.task_routes = {
     "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},
     "app.modules.qq.tasks.cleanup_qq_messages": {"queue": "qq_commands"},
     "app.modules.owned_group.tasks.owned_group_worker_tick": {"queue": "owned_group"},
+    "app.modules.owned_group.messaging_tasks.dispatch_owned_group_messages": {
+        "queue": "owned_group"
+    },
+    "app.modules.owned_group.messaging_retention_tasks.cleanup_owned_group_persona_retention": {
+        "queue": "owned_group"
+    },
 }
 
 # =============================================================================

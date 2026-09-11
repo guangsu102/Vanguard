@@ -8,6 +8,7 @@ import {
   type AccountType,
   type AccountUpdateData,
 } from '@/api/accounts'
+import type { AccountPersonaDetail } from '@/api/accountPersonas'
 import { DEFAULT_PAGE_SIZE, normalizePageSize } from '@/utils/pagination'
 
 export const useAccountStore = defineStore('account', () => {
@@ -132,6 +133,24 @@ export const useAccountStore = defineStore('account', () => {
     return result
   }
 
+  const updatePersonaSummary = (detail: AccountPersonaDetail) => {
+    const summary = {
+      account_id: detail.account_id,
+      configured: detail.configured,
+      name: detail.persona?.name ?? null,
+      revision: detail.revision,
+      applicable: detail.persona_applicable,
+      effective_enabled: detail.feature.effective_enabled,
+    }
+    const index = list.value.findIndex((item) => item.id === detail.account_id)
+    if (index !== -1) {
+      list.value[index] = { ...list.value[index], persona: summary }
+    }
+    if (currentAccount.value?.id === detail.account_id) {
+      currentAccount.value = { ...currentAccount.value, persona: summary }
+    }
+  }
+
   const setPage = (newPage: number) => {
     page.value = newPage
   }
@@ -166,6 +185,7 @@ export const useAccountStore = defineStore('account', () => {
     disable,
     syncProfileBio,
     updateProxyPolicy,
+    updatePersonaSummary,
     setPage,
     setPageSize,
     setAccountTypeFilter,

@@ -48,6 +48,10 @@ export const createDefaultRiskGuard = (): AccountRiskGuardSettings => ({
     join: { daily_limit: 10, cooldown_seconds: 7200 },
     private_message: { daily_limit: 20, cooldown_seconds: 300 },
     group_message: { daily_limit: 4, cooldown_seconds: 7200 },
+    // Owned-group messaging has its own policy/cooldown domain.  This action
+    // only participates in the account-wide outbound hard cap and is not
+    // exposed as an editable growth budget.
+    owned_group_message: { daily_limit: 0, cooldown_seconds: 0 },
     ai_warmup: { daily_limit: 1, cooldown_seconds: 21600 },
     moderation: { daily_limit: 60, cooldown_seconds: 15 },
     profile_update: { daily_limit: 5, cooldown_seconds: 3600 },

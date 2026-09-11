@@ -1056,10 +1056,12 @@ class TestAutoJoinStateHandling:
         service.account_pool.acquire_by_id = AsyncMock(return_value=account)
         service.account_pool.release = AsyncMock()
         service._ad_send_target = AsyncMock(return_value=-100123)
+        service._is_owned_group_ad_domain_excluded = AsyncMock(return_value=False)
         service.telegram_execution.send_group_message = AsyncMock(
             side_effect=RuntimeError("risk_guard_blocked:ad_probe_cooldown")
         )
         membership = SimpleNamespace(
+            group_id=1,
             group=SimpleNamespace(id=1),
             telegram_group_id=-100123,
             note=None,

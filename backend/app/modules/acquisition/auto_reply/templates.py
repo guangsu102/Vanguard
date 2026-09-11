@@ -35,17 +35,41 @@ class TemplateEngine:
     Manages templates with variable substitution and caching.
     """
 
-    def __init__(self, db: Optional[AsyncSession] = None):
+    def __init__(
+        self,
+        db: Optional[AsyncSession] = None,
+        *,
+        scope: str = "acquisition",
+        owned_group_asset_id: int | None = None,
+    ):
         """
         Initialize TemplateEngine.
 
         Args:
             db: Optional database session for persistent templates
         """
+        if scope not in {"acquisition", "owned_group"}:
+            raise ValueError("template scope must be acquisition or owned_group")
+        if scope == "acquisition" and owned_group_asset_id is not None:
+            raise ValueError("acquisition templates cannot have an owned-group asset")
+        if scope == "owned_group" and owned_group_asset_id is None:
+            raise ValueError("owned_group template scope requires owned_group_asset_id")
         self.db = db
-        self._cache: dict[int, MessageTemplate] = {}
+        self.scope = scope
+        self.owned_group_asset_id = owned_group_asset_id
+        self._cache: dict[tuple[str, int | None, int], MessageTemplate] = {}
         self._lock = asyncio.Lock()
         self.logger = logger.bind(module="template_engine")
+
+    def _scope_conditions(self) -> tuple:
+        return (
+            MessageTemplate.scope == self.scope,
+            MessageTemplate.owned_group_asset_id
+            == (self.owned_group_asset_id if self.scope == "owned_group" else None),
+        )
+
+    def _cache_key(self, template_id: int) -> tuple[str, int | None, int]:
+        return (self.scope, self.owned_group_asset_id, int(template_id))
 
     async def load_templates(self) -> int:
         """
@@ -59,13 +83,16 @@ class TemplateEngine:
 
         async with self._lock:
             result = await self.db.execute(
-                select(MessageTemplate).where(MessageTemplate.enabled == True)
+                select(MessageTemplate).where(
+                    *self._scope_conditions(),
+                    MessageTemplate.enabled.is_(True),
+                )
             )
             templates = list(result.scalars().all())
 
             self._cache.clear()
             for tmpl in templates:
-                self._cache[tmpl.id] = tmpl
+                self._cache[self._cache_key(tmpl.id)] = tmpl
 
             self.logger.debug("templates_loaded", count=len(self._cache))
             return len(self._cache)
@@ -80,14 +107,21 @@ class TemplateEngine:
         Returns:
             MessageTemplate or None
         """
-        if template_id in self._cache:
-            return self._cache[template_id]
+        cache_key = self._cache_key(template_id)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
         if self.db:
             result = await self.db.execute(
-                select(MessageTemplate).where(MessageTemplate.id == template_id)
+                select(MessageTemplate).where(
+                    MessageTemplate.id == template_id,
+                    *self._scope_conditions(),
+                )
             )
-            return result.scalar_one_or_none()
+            template = result.scalar_one_or_none()
+            if template is not None:
+                self._cache[cache_key] = template
+            return template
 
         return None
 
@@ -108,7 +142,10 @@ class TemplateEngine:
             result = await self.db.execute(
                 select(MessageTemplate)
                 .join_from(MessageTemplate, MessageTemplate)
-                .where(MessageTemplate.id == keyword_id)  # 简化：假设 keyword_id 对应 template_id
+                .where(
+                    MessageTemplate.id == keyword_id,
+                    *self._scope_conditions(),
+                )  # 简化：假设 keyword_id 对应 template_id
             )
             return result.scalar_one_or_none()
         return None
@@ -128,14 +165,15 @@ class TemplateEngine:
         """
         type_templates = [
             tmpl for tmpl in self._cache.values()
-            if tmpl.message_type == message_type
+            if tmpl.message_type == message_type and tmpl.enabled
         ]
 
         if not type_templates and self.db:
             result = await self.db.execute(
                 select(MessageTemplate).where(
+                    *self._scope_conditions(),
                     MessageTemplate.message_type == message_type,
-                    MessageTemplate.enabled == True,
+                    MessageTemplate.enabled.is_(True),
                 )
             )
             type_templates = list(result.scalars().all())
@@ -162,14 +200,25 @@ class TemplateEngine:
         """
         content = template.content
 
-        # 支持的变量：{{user_name}}, {{group_name}}, {{bot_name}}, {{register_link}}, {{keyword}}
-        replacements = {
-            "user_name": kwargs.get("user_name", "朋友"),
-            "group_name": kwargs.get("group_name", ""),
-            "bot_name": kwargs.get("bot_name", "XBoard"),
-            "register_link": kwargs.get("register_link", ""),
-            "keyword": kwargs.get("keyword", ""),
-        }
+        if self.scope == "owned_group":
+            replacements = {
+                "user_name": kwargs.get("user_name", "朋友"),
+                "group_name": kwargs.get("group_name", ""),
+                "account_name": kwargs.get("account_name", ""),
+                "current_date": kwargs.get("current_date", ""),
+                "current_time": kwargs.get("current_time", ""),
+                "promotion_url": kwargs.get("promotion_url", ""),
+                "promotion_cta": kwargs.get("promotion_cta", ""),
+            }
+        else:
+            # Growth templates retain their historical variable contract.
+            replacements = {
+                "user_name": kwargs.get("user_name", "朋友"),
+                "group_name": kwargs.get("group_name", ""),
+                "bot_name": kwargs.get("bot_name", "XBoard"),
+                "register_link": kwargs.get("register_link", ""),
+                "keyword": kwargs.get("keyword", ""),
+            }
 
         for var, value in replacements.items():
             placeholder = f"{{{{{var}}}}}"
@@ -192,12 +241,23 @@ class TemplateEngine:
         Returns:
             Rendered content
         """
-        replacements = {
-            "user_name": kwargs.get("user_name", "朋友"),
-            "group_name": kwargs.get("group_name", ""),
-            "bot_name": kwargs.get("bot_name", "XBoard"),
-            "register_link": kwargs.get("register_link", ""),
-        }
+        if self.scope == "owned_group":
+            replacements = {
+                "user_name": kwargs.get("user_name", "朋友"),
+                "group_name": kwargs.get("group_name", ""),
+                "account_name": kwargs.get("account_name", ""),
+                "current_date": kwargs.get("current_date", ""),
+                "current_time": kwargs.get("current_time", ""),
+                "promotion_url": kwargs.get("promotion_url", ""),
+                "promotion_cta": kwargs.get("promotion_cta", ""),
+            }
+        else:
+            replacements = {
+                "user_name": kwargs.get("user_name", "朋友"),
+                "group_name": kwargs.get("group_name", ""),
+                "bot_name": kwargs.get("bot_name", "XBoard"),
+                "register_link": kwargs.get("register_link", ""),
+            }
 
         for var, value in replacements.items():
             placeholder = f"{{{{{var}}}}}"

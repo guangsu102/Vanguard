@@ -61,6 +61,9 @@ services:
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
       OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_GOVERNANCE_ENABLED: ${OWNED_GROUP_GOVERNANCE_ENABLED:-false}
+      OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
+      OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
       OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
       OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     restart: unless-stopped
@@ -101,6 +104,8 @@ services:
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
       OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
+      OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
       OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
       OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     restart: on-failure:3
@@ -155,6 +160,8 @@ services:
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
       OWNED_GROUP_EXECUTION_ENABLED: ${OWNED_GROUP_EXECUTION_ENABLED:-false}
+      OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
+      OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
       OWNED_GROUP_KILL_SWITCH_ENABLED: ${OWNED_GROUP_KILL_SWITCH_ENABLED:-false}
       OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: ${OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS:-2}
     restart: unless-stopped
@@ -178,6 +185,9 @@ services:
     container_name: vanguard-telegram-growth-worker
     env_file:
       - .env.production
+    environment:
+      OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
+      OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
     restart: unless-stopped
     command:
       ["python", "-m", "app.workers.telegram_worker", "--role", "growth_user_worker", "--worker-id", "growth_user_worker:oracle4c24g"]
@@ -200,6 +210,8 @@ services:
     container_name: vanguard-telegram-guardian-worker
     env_file:
       - .env.production
+    environment:
+      OWNED_GROUP_GOVERNANCE_ENABLED: ${OWNED_GROUP_GOVERNANCE_ENABLED:-false}
     restart: unless-stopped
     command:
       ["python", "-m", "app.workers.telegram_worker", "--role", "guardian_bot_worker", "--worker-id", "guardian_bot_worker:oracle4c24g"]

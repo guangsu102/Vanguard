@@ -108,7 +108,8 @@ class GuardianBot:
         chat_id: int,
         user_id: int,
         username: Optional[str],
-        text: str
+        text: str,
+        core_group_id: Optional[int] = None,
     ) -> bool:
         """
         Handle an incoming group message.
@@ -135,16 +136,31 @@ class GuardianBot:
                     text=text,
                 )
             
-            is_verified = await self._context.verification_manager.is_user_verified(user_id, chat_id)
-            
-            config = await self._context.verification_manager.get_verification_config(chat_id)
+            if core_group_id is None:
+                self.logger.warning(
+                    "guardian_core_group_id_missing",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+                return False
+            policy_group_id = core_group_id
+
+            is_verified = await self._context.verification_manager.is_user_verified(
+                user_id, policy_group_id
+            )
+
+            config = await self._context.verification_manager.get_verification_config(
+                policy_group_id
+            )
             needs_verification = config and config.enable_verification
             
             if needs_verification and not is_verified:
                 self.logger.debug("user_not_verified", user_id=user_id, chat_id=chat_id)
                 return False
             
-            spam_results = await self._context.spam_detector.check_all(user_id, chat_id, text)
+            spam_results = await self._context.spam_detector.check_all(
+                user_id, policy_group_id, text
+            )
             
             if spam_results:
                 self.logger.warning(
@@ -157,7 +173,7 @@ class GuardianBot:
             evaluation = await self._context.rule_engine.evaluate_message(
                 text=text,
                 user_id=user_id,
-                group_id=chat_id,
+                group_id=policy_group_id,
                 sender_username=username
             )
             
@@ -168,7 +184,8 @@ class GuardianBot:
                     chat_id=chat_id,
                     user_id=user_id,
                     username=username,
-                    text=text
+                    text=text,
+                    core_group_id=policy_group_id,
                 )
                 return True
             
@@ -218,7 +235,8 @@ class GuardianBot:
         chat_id: int,
         user_id: int,
         username: Optional[str],
-        text: str
+        text: str,
+        core_group_id: Optional[int] = None,
     ) -> None:
         """Handle a detected violation."""
         matched_rule = evaluation.matched_rules[0] if evaluation.matched_rules else None
@@ -226,9 +244,11 @@ class GuardianBot:
         rule_type = matched_rule.rule_type.value if matched_rule else "unknown"
         action = evaluation.recommended_action
         
+        policy_group_id = core_group_id if core_group_id is not None else chat_id
+
         punishment = await self._context.punishment_manager.calculate_punishment(
             user_id=user_id,
-            group_id=chat_id,
+            group_id=policy_group_id,
             level=evaluation.severity,
             is_repeat=len(evaluation.matched_rules) > 1
         )
@@ -240,7 +260,7 @@ class GuardianBot:
         
         await self._context.punishment_manager.record_violation(
             user_id=user_id,
-            group_id=chat_id,
+            group_id=policy_group_id,
             rule_id=matched_rule.rule_id if matched_rule else None,
             rule_type=rule_type,
             content=text[:500] if text else None,
@@ -248,7 +268,9 @@ class GuardianBot:
             duration=duration
         )
         
-        warning_count = await self._context.punishment_manager.get_warning_count(user_id, chat_id)
+        warning_count = await self._context.punishment_manager.get_warning_count(
+            user_id, policy_group_id
+        )
         
         await self._context.action_executor.execute(
             action=action,
@@ -279,7 +301,8 @@ class GuardianBot:
         self,
         chat_id: int,
         user_id: int,
-        username: Optional[str]
+        username: Optional[str],
+        core_group_id: Optional[int] = None,
     ) -> Optional[str]:
         """
         Handle a new member joining a group.
@@ -293,9 +316,17 @@ class GuardianBot:
             Message to send or None
         """
         try:
+            if core_group_id is None:
+                self.logger.warning(
+                    "guardian_core_group_id_missing",
+                    chat_id=chat_id,
+                    user_id=user_id,
+                )
+                return None
+            policy_group_id = core_group_id
             result = await self._context.verification_manager.handle_new_member(
                 user_id=user_id,
-                chat_id=chat_id,
+                chat_id=policy_group_id,
                 username=username
             )
 
@@ -382,7 +413,8 @@ class GuardianBot:
     async def handle_member_leave(
         self,
         chat_id: int,
-        user_id: int
+        user_id: int,
+        core_group_id: Optional[int] = None,
     ) -> None:
         """
         Handle a member leaving the group.
@@ -391,7 +423,12 @@ class GuardianBot:
             chat_id: Chat/Group ID
             user_id: User ID
         """
-        self.logger.info("member_left", user_id=user_id, chat_id=chat_id)
+        self.logger.info(
+            "member_left",
+            user_id=user_id,
+            chat_id=chat_id,
+            core_group_id=core_group_id,
+        )
     
     async def broadcast_node_status(
         self,

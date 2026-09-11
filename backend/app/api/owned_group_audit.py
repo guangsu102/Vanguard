@@ -33,7 +33,11 @@ async def require_owned_group_audit_reader(
     if current_user.get("role") not in _AUDIT_READER_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Owned group audit access required",
+            detail={
+                "reason": "owned_group_role_forbidden",
+                "message": "Owned group audit access required",
+                "retryable": False,
+            },
         )
     return current_user
 
@@ -119,7 +123,7 @@ async def _query_audit_events(
     if result:
         filters.append(OwnedGroupAuditEvent.result == result.strip()[:32])
     if resource_type:
-        filters.append(OwnedGroupAuditEvent.resource_type == resource_type.strip()[:16])
+        filters.append(OwnedGroupAuditEvent.resource_type == resource_type.strip()[:32])
     if created_after is not None:
         filters.append(OwnedGroupAuditEvent.created_at >= created_after)
     if created_before is not None:
@@ -179,7 +183,7 @@ async def list_owned_group_audit_events(
     operation_item_id: int | None = Query(default=None, gt=0),
     event_type: str | None = Query(default=None, max_length=64),
     result: str | None = Query(default=None, max_length=32),
-    resource_type: str | None = Query(default=None, max_length=16),
+    resource_type: str | None = Query(default=None, max_length=32),
     created_after: datetime | None = None,
     created_before: datetime | None = None,
     limit: int = Query(default=100, ge=1, le=500),
@@ -209,7 +213,7 @@ async def export_owned_group_audit_events(
     operation_item_id: int | None = Query(default=None, gt=0),
     event_type: str | None = Query(default=None, max_length=64),
     result: str | None = Query(default=None, max_length=32),
-    resource_type: str | None = Query(default=None, max_length=16),
+    resource_type: str | None = Query(default=None, max_length=32),
     created_after: datetime | None = None,
     created_before: datetime | None = None,
     limit: int = Query(default=1000, ge=1, le=5000),

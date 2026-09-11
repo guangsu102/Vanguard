@@ -6,12 +6,18 @@ import pytest
 from sqlalchemy import select
 
 from app.core.account.models import AccountType, TelegramAccount
+from app.core.group.models import Group
+from app.modules.guardian.models import (
+    ManagedGroupBinding,
+    ManagedGroupBindingStatus,
+    ManagedGroupBotRole,
+)
 from app.modules.owned_group.models import (
     OwnedGroupAsset,
     OwnedGroupOperation,
     OwnedGroupOperationItem,
 )
-from app.modules.owned_group.models_extra import OwnedGroupAuditEvent
+from app.modules.owned_group.models_extra import OwnedGroupAuditEvent, OwnedGroupMembership
 from app.modules.owned_group.worker import (
     GroupCreateResult,
     ItemExecutionResult,
@@ -32,6 +38,7 @@ class ReadyAdapter:
         return GroupCreateResult(
             success=True,
             telegram_chat_id=-100123,
+            telegram_user_id=2001,
             telegram_username="owned_worker_test",
         )
 
@@ -55,6 +62,7 @@ class ExistingGroupAdapter(ReadyAdapter):
         return GroupCreateResult(
             success=self.success,
             telegram_chat_id=asset.telegram_chat_id,
+            telegram_user_id=2001 if self.success else None,
             reason_code="already_created" if self.success else "owner_not_group_admin",
         )
 
@@ -69,6 +77,7 @@ class PublicUsernameRecoveryAdapter(ReadyAdapter):
         return GroupCreateResult(
             success=self.success,
             telegram_chat_id=asset.telegram_chat_id,
+            telegram_user_id=2001 if self.success else None,
             telegram_username=asset.telegram_username if self.success else None,
             public_link=(f"https://t.me/{asset.telegram_username}" if self.success else None),
             reason_code="already_created" if self.success else "username_unavailable",
@@ -132,6 +141,66 @@ async def test_precheck_ready_adapter_persists_chat_and_link(test_db):
     assert asset.status == "ready"
     assert asset.telegram_chat_id == -100123
     assert asset.public_link == "https://t.me/owned_worker_test"
+    owner_membership = await test_db.scalar(
+        select(OwnedGroupMembership).where(
+            OwnedGroupMembership.group_asset_id == asset.id,
+            OwnedGroupMembership.resource_type == "user",
+            OwnedGroupMembership.resource_id == owner.id,
+        )
+    )
+    assert owner_membership is not None
+    assert owner_membership.telegram_user_id == 2001
+
+
+@pytest.mark.asyncio
+async def test_owned_chat_claim_quarantines_racing_legacy_active_binding(test_db):
+    owner = TelegramAccount(
+        identifier="owned-worker-race-owner",
+        session_name="owned-worker-race-owner",
+        account_type=AccountType.PROMOTER,
+        is_active=True,
+    )
+    bot = TelegramAccount(
+        identifier="owned-worker-race-bot",
+        session_name="owned-worker-race-bot",
+        account_type=AccountType.GUARDIAN_BOT,
+        is_active=True,
+    )
+    group = Group(group_id=-100123, title="Racing Legacy Group")
+    test_db.add_all([owner, bot, group])
+    await test_db.flush()
+    binding = ManagedGroupBinding(
+        group_id=group.id,
+        telegram_group_id=-100123,
+        bot_account_id=bot.id,
+        binding_status=ManagedGroupBindingStatus.ACTIVE,
+        bot_role=ManagedGroupBotRole.ADMIN,
+    )
+    asset = OwnedGroupAsset(
+        internal_name="owned-worker-race",
+        title="Owned Worker Race",
+        visibility="private",
+        owner_account_id=owner.id,
+        invite_mode="direct_invite",
+        status="draft",
+    )
+    test_db.add_all([binding, asset])
+    await test_db.flush()
+
+    result = await execute_asset_precheck(test_db, asset.id, adapter=ReadyAdapter())
+
+    assert result["status"] == "ready"
+    assert asset.telegram_chat_id == -100123
+    assert binding.binding_status == ManagedGroupBindingStatus.INACTIVE
+    audit = await test_db.scalar(
+        select(OwnedGroupAuditEvent).where(
+            OwnedGroupAuditEvent.group_asset_id == asset.id,
+            OwnedGroupAuditEvent.event_type
+            == "owned_group_legacy_binding_quarantined",
+        )
+    )
+    assert audit is not None
+    assert audit.reason_code == "owned_group_requires_explicit_governance"
 
 
 @pytest.mark.asyncio

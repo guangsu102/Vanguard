@@ -189,6 +189,7 @@ async def test_create_uses_supergroup_request_and_public_username():
 
     assert result.success is True
     assert result.telegram_chat_id == 12345
+    assert result.telegram_user_id == 2001
     assert asset.telegram_chat_id == 12345
     assert [request.__class__.__name__ for request in client.requests] == [
         "CreateChannelRequest",
@@ -213,6 +214,7 @@ async def test_private_direct_invite_group_still_persists_recovery_link():
     result = await adapter.create_group(asset, owner)
 
     assert result.success is True
+    assert result.telegram_user_id == 2001
     request_names = [request.__class__.__name__ for request in client.requests]
     assert request_names == ["CreateChannelRequest", "ExportChatInviteRequest"]
     assert any(isinstance(value, OwnedGroupInviteLink) for value in db.added)

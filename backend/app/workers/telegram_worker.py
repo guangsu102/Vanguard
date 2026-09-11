@@ -10,15 +10,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import socket
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from telethon import events as telethon_events
 
@@ -46,10 +48,21 @@ from app.core.database import close_db, get_db_session, init_db
 from app.core.keyword.models import Keyword, KeywordStatus
 from app.core.logging import setup_logging
 from app.core.redis import close_redis, init_redis
-from app.core.worker_status import TelegramWorkerRole, TelegramWorkerStatus, TelegramWorkerStatusValue
+from app.core.telegram_chat_lock import acquire_telegram_chat_transaction_lock
+from app.core.worker_status import (
+    TelegramWorkerRole,
+    TelegramWorkerStatus,
+    TelegramWorkerStatusValue,
+)
 from app.integrations.telegram.client import TelegramClient, TelegramConfig
 from app.modules.acquisition.handler import AcquisitionEventHandler, MemberJoinEvent, MessageEvent
-from app.modules.acquisition.models import AdCampaign, GroupSearchKeyword, KeywordTrigger, MessageTemplate, SearchKeywordStatus
+from app.modules.acquisition.models import (
+    AdCampaign,
+    GroupSearchKeyword,
+    KeywordTrigger,
+    MessageTemplate,
+    SearchKeywordStatus,
+)
 from app.modules.guardian.main import create_guardian_bot
 from app.modules.guardian.models import (
     ManagedGroupBinding,
@@ -63,6 +76,22 @@ from app.modules.guardian.sync import (
     guardian_role_and_status_from_member,
     sync_managed_group_binding,
 )
+from app.modules.owned_group.governance_worker import (
+    add_owned_governance_audit,
+    evaluate_guardian_member,
+    owned_governance_audit_state,
+    owned_group_governance_gate_reason,
+    resolve_governance_worker_target,
+)
+from app.modules.owned_group.member_observation import (
+    project_owned_group_member_observations,
+)
+from app.modules.owned_group.messaging_event_router import (
+    OwnedGroupMessagingEventRouter,
+)
+from app.modules.owned_group.models import OwnedGroupAsset
+from app.modules.owned_group.models_extra import OwnedBotProfile
+from app.modules.owned_group.security import safe_exception_message
 from app.modules.private_chat.service import (
     IncomingPrivateMessage,
     claim_pending_outbound_message,
@@ -124,7 +153,13 @@ class TelegramWorker:
             await self._heartbeat(TelegramWorkerStatusValue.OFFLINE.value, {"phase": "cancelled"})
             raise
         except Exception as exc:
-            logger.exception("telegram_worker_failed", worker_id=self.worker_id, role=self.role.value, error=str(exc))
+            logger.error(
+                "telegram_worker_failed",
+                worker_id=self.worker_id,
+                role=self.role.value,
+                error_type=type(exc).__name__,
+                error=safe_exception_message(exc, max_length=500),
+            )
             await self._heartbeat(TelegramWorkerStatusValue.ERROR.value, {"phase": "error"}, last_error=str(exc))
             raise
         finally:
@@ -633,8 +668,77 @@ class TelegramWorker:
                     error=str(exc),
                 )
                 return
-        elif not text:
-            return
+        else:
+            telegram_sender = getattr(event, "sender", None)
+            reply_to_message_id = getattr(
+                telegram_message,
+                "reply_to_msg_id",
+                None,
+            )
+            mentioned_usernames = tuple(
+                match.casefold()
+                for match in re.findall(
+                    r"@([A-Za-z0-9_]{3,64})",
+                    str(text or ""),
+                )
+            )
+
+            async def resolve_mentioned_user_id(username: str) -> Optional[int]:
+                client = getattr(event, "client", None)
+                if client is None:
+                    return None
+                entity = await client.get_entity(f"@{username}")
+                entity_id = getattr(entity, "id", None)
+                return int(entity_id) if entity_id is not None else None
+
+            try:
+                async with get_db_session() as db:
+                    route = await OwnedGroupMessagingEventRouter(
+                        db
+                    ).route_incoming(
+                        telegram_chat_id=int(chat_id),
+                        source_message_id=int(message_id or 0),
+                        sender_id=int(sender_id),
+                        sender_name=sender_name,
+                        text=str(text or ""),
+                        occurred_at=occurred_at,
+                        listener_account_id=int(account_id),
+                        reply_to_message_id=(
+                            int(reply_to_message_id)
+                            if reply_to_message_id is not None
+                            else None
+                        ),
+                        mentioned_usernames=mentioned_usernames,
+                        mention_resolver=resolve_mentioned_user_id,
+                        sender_is_bot=bool(
+                            getattr(telegram_sender, "bot", False)
+                        ),
+                        outgoing=bool(getattr(event, "out", False)),
+                    )
+                if route.owned_group_event:
+                    logger.debug(
+                        "owned_group_message_event_consumed",
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        asset_id=route.asset_id,
+                        execution_id=route.execution_id,
+                        ignored_reason=route.ignored_reason,
+                    )
+                    return
+            except Exception as exc:
+                # A DB/router outage must fail closed. Falling through here can
+                # make legacy keyword/semantic handlers duplicate owned sends.
+                logger.warning(
+                    "owned_group_message_route_failed_closed",
+                    account_id=account_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    error=safe_exception_message(exc, max_length=500),
+                )
+                return
+            if not text:
+                return
 
         async def resolve_sender_name() -> str:
             return await self._resolve_sender_name_from_event(event, int(sender_id))
@@ -676,10 +780,11 @@ class TelegramWorker:
                 raise
             except Exception as exc:
                 processed = False
-                logger.exception(
+                logger.error(
                     "private_outbox_loop_failed",
                     worker_id=self.worker_id,
-                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    error=safe_exception_message(exc, max_length=500),
                 )
             if not processed:
                 await asyncio.sleep(0.5)
@@ -849,12 +954,27 @@ class TelegramWorker:
         synced_groups = 0
         group_sync_errors = 0
         errors: list[dict[str, Any]] = []
+        owned_governance = await self._guardian_owned_asset_counts()
+        owned_governance.update(
+            {
+                "processed_updates": 0,
+                "skipped_unbound_updates": 0,
+                "skipped_mismatched_bot_updates": 0,
+                "skipped_inactive_updates": 0,
+                "skipped_gate_updates": 0,
+                "skipped_not_managed_updates": 0,
+                "permission_degraded": 0,
+            }
+        )
 
         for profile in profiles:
             client = TelegramClient(TelegramConfig(bot_token=profile.bot_token, timeout=min(self.heartbeat_interval, 30)))
             try:
                 profile_group_sync_errors = 0
                 bot_user = await client.get_me()
+                await self._assert_guardian_runtime_identity(
+                    profile, int(bot_user.user_id)
+                )
                 offset = self._guardian_update_offsets.get(profile.id)
                 updates = await client.get_updates(offset=offset, limit=50, timeout=0)
                 if updates:
@@ -863,19 +983,36 @@ class TelegramWorker:
                     discovered_groups += len(chat_payloads)
                     for chat_payload in chat_payloads:
                         try:
-                            if await self._sync_guardian_group_from_chat(profile, client, bot_user.user_id, chat_payload):
+                            if await self._sync_guardian_group_from_chat(
+                                profile,
+                                client,
+                                bot_user.user_id,
+                                chat_payload,
+                                governance_metrics=owned_governance,
+                            ):
                                 synced_groups += 1
-                        except Exception as exc:
+                        except Exception:
                             group_sync_errors += 1
                             profile_group_sync_errors += 1
-                            errors.append({"bot_profile_id": profile.id, "chat_id": chat_payload.get("id"), "error": str(exc)})
+                            errors.append(
+                                {
+                                    "bot_account_id": profile.account_id,
+                                    "telegram_chat_id": chat_payload.get("id"),
+                                    "reason_code": "guardian_group_sync_failed",
+                                }
+                            )
                             logger.warning(
                                 "guardian_group_sync_failed",
-                                bot_profile_id=profile.id,
-                                chat_id=chat_payload.get("id"),
-                                error=str(exc),
+                                bot_account_id=profile.account_id,
+                                telegram_chat_id=chat_payload.get("id"),
+                                reason_code="guardian_group_sync_failed",
                             )
-                    processed_updates += await self._dispatch_guardian_updates(profile.id, client, updates)
+                    processed_updates += await self._dispatch_guardian_updates(
+                        profile.account_id,
+                        client,
+                        updates,
+                        governance_metrics=owned_governance,
+                    )
                 active_bindings = await self._guardian_active_binding_count(profile.account_id)
                 await self._mark_guardian_profile(
                     profile.id,
@@ -885,13 +1022,26 @@ class TelegramWorker:
                     bot_username=bot_user.username,
                     bot_user_id=bot_user.user_id,
                 )
-            except Exception as exc:
+            except Exception:
                 failed_bots += 1
-                errors.append({"bot_profile_id": profile.id, "error": str(exc)})
+                errors.append(
+                    {
+                        "bot_account_id": profile.account_id,
+                        "reason_code": "guardian_bot_cycle_failed",
+                    }
+                )
                 await self._mark_guardian_profile(profile.id, GuardianBotHealthStatus.DEGRADED, sync_status="failed")
-                logger.warning("guardian_bot_cycle_failed", bot_profile_id=profile.id, error=str(exc))
+                logger.warning(
+                    "guardian_bot_cycle_failed",
+                    bot_account_id=profile.account_id,
+                    reason_code="guardian_bot_cycle_failed",
+                )
             finally:
                 await client.close()
+
+        # Permission loss may have changed asset states during this cycle, so
+        # report final counts rather than the pre-poll snapshot.
+        owned_governance.update(await self._guardian_owned_asset_counts())
 
         return {
             "runtime": {
@@ -902,7 +1052,57 @@ class TelegramWorker:
                 "synced_groups": synced_groups,
                 "group_sync_errors": group_sync_errors,
                 "errors": errors[:5],
-            }
+            },
+            "owned_group_governance": owned_governance,
+        }
+
+    async def _assert_guardian_runtime_identity(
+        self, profile: GuardianBotProfile, runtime_bot_user_id: int
+    ) -> None:
+        """Reject a token whose getMe identity conflicts with either profile."""
+
+        async with get_db_session() as db:
+            current_profile = await db.get(GuardianBotProfile, profile.id)
+            account = await db.get(TelegramAccount, profile.account_id)
+            owned_profiles = (
+                await db.scalars(
+                    select(OwnedBotProfile).where(
+                        OwnedBotProfile.account_id == profile.account_id,
+                        OwnedBotProfile.enabled == True,
+                        OwnedBotProfile.status == "verified",
+                    )
+                )
+            ).all()
+            if (
+                current_profile is None
+                or not bool(current_profile.enabled)
+                or account is None
+                or not bool(account.is_active)
+            ):
+                raise RuntimeError("guardian_bot_profile_invalid")
+            if len(owned_profiles) > 1:
+                raise RuntimeError("owned_bot_profile_ambiguous")
+            expected_ids = [current_profile.bot_user_id]
+            if owned_profiles:
+                expected_ids.append(owned_profiles[0].bot_user_id)
+            if any(
+                expected_id is not None
+                and int(expected_id) != int(runtime_bot_user_id)
+                for expected_id in expected_ids
+            ):
+                raise RuntimeError("guardian_bot_identity_mismatch")
+
+    async def _guardian_owned_asset_counts(self) -> dict[str, int]:
+        async with get_db_session() as db:
+            rows = await db.execute(
+                select(OwnedGroupAsset.governance_status, func.count(OwnedGroupAsset.id))
+                .where(OwnedGroupAsset.governance_status.in_(["managed", "degraded"]))
+                .group_by(OwnedGroupAsset.governance_status)
+            )
+        counts = {str(status): int(count) for status, count in rows.all()}
+        return {
+            "managed_assets": counts.get("managed", 0),
+            "degraded_assets": counts.get("degraded", 0),
         }
 
     @staticmethod
@@ -936,6 +1136,8 @@ class TelegramWorker:
         client: TelegramClient,
         bot_user_id: int,
         chat_payload: dict[str, Any],
+        *,
+        governance_metrics: dict[str, int] | None = None,
     ) -> bool:
         chat_id = int(chat_payload["id"])
         chat_title = chat_payload.get("title")
@@ -943,52 +1145,216 @@ class TelegramWorker:
         chat_type = chat_payload.get("type")
         member_count: Optional[int] = None
 
+        # A self-owned chat is never auto-bound. It must already satisfy every
+        # explicit asset/binding invariant before this worker calls Telegram.
+        async with get_db_session() as db:
+            preliminary_target = await resolve_governance_worker_target(
+                db,
+                telegram_chat_id=chat_id,
+                bot_account_id=profile.account_id,
+            )
+            if preliminary_target.is_owned_group:
+                gate_reason = await owned_group_governance_gate_reason()
+                preliminary_target = await resolve_governance_worker_target(
+                    db,
+                    telegram_chat_id=chat_id,
+                    bot_account_id=profile.account_id,
+                    owned_gate_reason=gate_reason,
+                )
+            if preliminary_target.is_owned_group and not preliminary_target.allowed:
+                add_owned_governance_audit(
+                    db,
+                    preliminary_target,
+                    event_type="owned_group_governance_update_skipped",
+                    result="skipped",
+                    reason_code=preliminary_target.reason_code,
+                    correlation_id=(
+                        f"guardian-sync:{profile.account_id}:{chat_id}"
+                    ),
+                )
+        if preliminary_target.is_owned_group and not preliminary_target.allowed:
+            logger.info(
+                "guardian_owned_group_sync_skipped",
+                asset_id=preliminary_target.owned_group_asset_id,
+                core_group_id=preliminary_target.core_group_id,
+                telegram_chat_id=chat_id,
+                managed_binding_id=preliminary_target.managed_binding_id,
+                bot_account_id=profile.account_id,
+                reason_code=preliminary_target.reason_code,
+            )
+            return False
+
         try:
             chat_info = await client.get_chat(chat_id)
             chat_title = chat_info.title or chat_title
             chat_username = chat_info.username if chat_info.username is not None else chat_username
             chat_type = chat_info.type or chat_type
             member_count = chat_info.member_count
-        except Exception as exc:
-            logger.debug("guardian_get_chat_failed", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+        except Exception:
+            logger.debug(
+                "guardian_get_chat_failed",
+                asset_id=preliminary_target.owned_group_asset_id,
+                core_group_id=preliminary_target.core_group_id,
+                telegram_chat_id=chat_id,
+                managed_binding_id=preliminary_target.managed_binding_id,
+                bot_account_id=profile.account_id,
+                reason_code="guardian_get_chat_failed",
+            )
 
         if member_count is None:
             try:
                 member_count = await client.get_chat_member_count(chat_id)
-            except Exception as exc:
-                logger.debug("guardian_get_chat_member_count_failed", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+            except Exception:
+                logger.debug(
+                    "guardian_get_chat_member_count_failed",
+                    asset_id=preliminary_target.owned_group_asset_id,
+                    core_group_id=preliminary_target.core_group_id,
+                    telegram_chat_id=chat_id,
+                    managed_binding_id=preliminary_target.managed_binding_id,
+                    bot_account_id=profile.account_id,
+                    reason_code="guardian_get_chat_member_count_failed",
+                )
 
         member: dict[str, Any]
+        member_probe_failed = False
         try:
             member = await client.get_chat_member(chat_id, bot_user_id)
-        except Exception as exc:
-            member = {"status": "unknown", "sync_error": str(exc)}
+        except Exception:
+            member = {"status": "unknown"}
+            member_probe_failed = True
 
-        bot_role, binding_status = self._guardian_role_and_status(member)
-        permissions_snapshot = {
-            "chat_type": chat_type,
-            "bot_member": member,
-            "source": "guardian_worker_updates",
-            "synced_at": datetime.utcnow().isoformat(),
-        }
-
+        member_evaluation = evaluate_guardian_member(
+            member,
+            chat_type=chat_type,
+            bot_user_id=bot_user_id,
+            probe_failed=member_probe_failed,
+        )
         try:
             async with get_db_session() as db:
+                await acquire_telegram_chat_transaction_lock(db, chat_id)
+                current_target = await resolve_governance_worker_target(
+                    db,
+                    telegram_chat_id=chat_id,
+                    bot_account_id=profile.account_id,
+                )
+                if current_target.is_owned_group:
+                    # The Telegram permission probe can take long enough for an
+                    # operator to engage the runtime stop. Sample again inside
+                    # the final chat-locked transaction before any DB sync.
+                    gate_reason = await owned_group_governance_gate_reason()
+                    current_target = await resolve_governance_worker_target(
+                        db,
+                        telegram_chat_id=chat_id,
+                        bot_account_id=profile.account_id,
+                        owned_gate_reason=gate_reason,
+                    )
+                if current_target.is_owned_group and not current_target.allowed:
+                    add_owned_governance_audit(
+                        db,
+                        current_target,
+                        event_type="owned_group_governance_update_skipped",
+                        result="skipped",
+                        reason_code=current_target.reason_code,
+                        correlation_id=(
+                            f"guardian-sync:{profile.account_id}:{chat_id}"
+                        ),
+                    )
+                    logger.info(
+                        "guardian_owned_group_sync_skipped_after_probe",
+                        asset_id=current_target.owned_group_asset_id,
+                        core_group_id=current_target.core_group_id,
+                        telegram_chat_id=chat_id,
+                        managed_binding_id=current_target.managed_binding_id,
+                        bot_account_id=profile.account_id,
+                        reason_code=current_target.reason_code,
+                    )
+                    return False
+
+                if current_target.is_owned_group:
+                    bot_role = member_evaluation.bot_role
+                    binding_status = member_evaluation.binding_status
+                else:
+                    # Legacy managed groups keep their current role-based
+                    # activation semantics. Only the persisted snapshot is
+                    # narrowed to safe fields.
+                    bot_role, binding_status = self._guardian_role_and_status(member)
+
                 await sync_managed_group_binding(
                     db,
                     bot_account_id=profile.account_id,
                     telegram_group_id=chat_id,
+                    group_id=(
+                        current_target.core_group_id
+                        if current_target.allowed
+                        else None
+                    ),
                     title=chat_title,
                     username=chat_username,
                     member_count=member_count,
                     binding_status=binding_status,
                     bot_role=bot_role,
-                    permissions_snapshot=permissions_snapshot,
+                    permissions_snapshot=member_evaluation.snapshot,
+                    replace_permissions_snapshot=current_target.is_owned_group,
                     discovery_source="guardian_auto_sync",
                     allow_existing=True,
+                    reject_owned_group_auto_bind=(
+                        not current_target.is_owned_group
+                    ),
                 )
-        except ManagedGroupSyncConflict as exc:
-            logger.info("guardian_group_sync_conflict", bot_profile_id=profile.id, chat_id=chat_id, error=str(exc))
+                if current_target.is_owned_group:
+                    asset = await db.get(
+                        OwnedGroupAsset, current_target.owned_group_asset_id
+                    )
+                    if asset is not None:
+                        asset.governance_last_checked_at = datetime.utcnow()
+                        if not member_evaluation.passed:
+                            before_state = owned_governance_audit_state(
+                                current_target,
+                                permission_snapshot=member_evaluation.snapshot,
+                            )
+                            asset.governance_status = "degraded"
+                            asset.governance_last_error_code = (
+                                member_evaluation.reason_code
+                            )
+                            asset.governance_last_error_message = (
+                                "Guardian Bot permissions or membership changed"
+                            )
+                            if governance_metrics is not None:
+                                governance_metrics["permission_degraded"] += 1
+                            add_owned_governance_audit(
+                                db,
+                                current_target,
+                                event_type="owned_group_governance_degraded",
+                                result="failed",
+                                reason_code=(
+                                    member_evaluation.reason_code
+                                    or "guardian_permissions_missing"
+                                ),
+                                correlation_id=(
+                                    f"guardian-permission:{profile.account_id}:{chat_id}"
+                                ),
+                                before_state=before_state,
+                                permission_snapshot=member_evaluation.snapshot,
+                            )
+                            logger.warning(
+                                "guardian_owned_group_permission_degraded",
+                                asset_id=asset.id,
+                                core_group_id=asset.core_group_id,
+                                telegram_chat_id=chat_id,
+                                managed_binding_id=asset.managed_binding_id,
+                                bot_account_id=profile.account_id,
+                                reason_code=member_evaluation.reason_code,
+                            )
+        except ManagedGroupSyncConflict:
+            logger.info(
+                "guardian_group_sync_conflict",
+                asset_id=preliminary_target.owned_group_asset_id,
+                core_group_id=preliminary_target.core_group_id,
+                telegram_chat_id=chat_id,
+                managed_binding_id=preliminary_target.managed_binding_id,
+                bot_account_id=profile.account_id,
+                reason_code="managed_group_sync_conflict",
+            )
             return False
         return True
 
@@ -1005,31 +1371,163 @@ class TelegramWorker:
 
     async def _dispatch_guardian_updates(
         self,
-        bot_profile_id: int,
+        bot_account_id: int,
         telegram_client: TelegramClient,
         updates: list[dict[str, Any]],
+        *,
+        governance_metrics: dict[str, int] | None = None,
     ) -> int:
         processed = 0
         async with get_db_session() as db:
             telegram_client.risk_guard = AccountRiskGuard(db)
-            telegram_client.risk_account = bot_risk_identity(f"guardian_worker:{bot_profile_id}")
+            telegram_client.risk_account = bot_risk_identity(
+                f"guardian_worker:{bot_account_id}"
+            )
             bot = await create_guardian_bot(db, telegram_client=telegram_client)
             for update in updates:
-                message = update.get("message") or update.get("edited_message")
+                update_kind: Literal["message", "edited_message"]
+                message = update.get("message")
+                if isinstance(message, dict):
+                    update_kind = "message"
+                else:
+                    message = update.get("edited_message")
+                    if not isinstance(message, dict):
+                        continue
+                    update_kind = "edited_message"
                 if not message:
                     continue
-                processed += await self._dispatch_guardian_message(bot, telegram_client, message)
+                processed += await self._dispatch_guardian_message(
+                    bot,
+                    telegram_client,
+                    message,
+                    db=db,
+                    bot_account_id=bot_account_id,
+                    update_id=update.get("update_id"),
+                    update_kind=update_kind,
+                    governance_metrics=governance_metrics,
+                )
             await bot.cleanup()
-        logger.info("guardian_updates_dispatched", bot_profile_id=bot_profile_id, processed=processed)
+        logger.info(
+            "guardian_updates_dispatched",
+            bot_account_id=bot_account_id,
+            processed=processed,
+        )
         return processed
 
-    async def _dispatch_guardian_message(self, bot: Any, telegram_client: TelegramClient, message: dict[str, Any]) -> int:
+    async def _dispatch_guardian_message(
+        self,
+        bot: Any,
+        telegram_client: TelegramClient,
+        message: dict[str, Any],
+        *,
+        db: AsyncSession,
+        bot_account_id: int,
+        update_id: int,
+        update_kind: Literal["message", "edited_message"],
+        governance_metrics: dict[str, int] | None = None,
+    ) -> int:
         chat = message.get("chat") or {}
         sender = message.get("from") or {}
         chat_id = chat.get("id")
         user_id = sender.get("id")
         if chat_id is None:
             return 0
+
+        is_private = chat.get("type") == "private" or (
+            user_id is not None and int(chat_id) == int(user_id)
+        )
+        core_group_id: int | None = None
+        target = None
+        if not is_private:
+            target = await resolve_governance_worker_target(
+                db,
+                telegram_chat_id=int(chat_id),
+                bot_account_id=bot_account_id,
+            )
+            if target.is_owned_group:
+                # Polling-cycle snapshots are deliberately insufficient here:
+                # every owned update samples the stop immediately before its
+                # moderation handlers are allowed to run.
+                gate_reason = await owned_group_governance_gate_reason()
+                target = await resolve_governance_worker_target(
+                    db,
+                    telegram_chat_id=int(chat_id),
+                    bot_account_id=bot_account_id,
+                    owned_gate_reason=gate_reason,
+                )
+            if not target.allowed:
+                if governance_metrics is not None and target.is_owned_group:
+                    if target.reason_code in {
+                        "owned_group_binding_missing",
+                        "managed_binding_missing",
+                    }:
+                        governance_metrics["skipped_unbound_updates"] += 1
+                    elif target.reason_code == "mismatched_guardian_bot":
+                        governance_metrics["skipped_mismatched_bot_updates"] += 1
+                    elif target.reason_code == "managed_binding_not_active":
+                        governance_metrics["skipped_inactive_updates"] += 1
+                    elif target.reason_code in {
+                        "governance_feature_disabled",
+                        "governance_stop_enabled",
+                        "governance_gate_backend_unavailable",
+                    }:
+                        governance_metrics["skipped_gate_updates"] += 1
+                    else:
+                        governance_metrics["skipped_not_managed_updates"] += 1
+                if target.is_owned_group:
+                    add_owned_governance_audit(
+                        db,
+                        target,
+                        event_type="owned_group_governance_update_skipped",
+                        result="skipped",
+                        reason_code=target.reason_code,
+                        correlation_id=(
+                            f"guardian-update:{bot_account_id}:{chat_id}:"
+                            f"{update_id}"
+                        ),
+                    )
+                logger.info(
+                    "guardian_group_update_skipped",
+                    asset_id=target.owned_group_asset_id,
+                    core_group_id=target.core_group_id,
+                    telegram_chat_id=target.telegram_chat_id,
+                    managed_binding_id=target.managed_binding_id,
+                    bot_account_id=bot_account_id,
+                    reason_code=target.reason_code,
+                )
+                return 0
+            core_group_id = target.core_group_id
+            if governance_metrics is not None and target.is_owned_group:
+                governance_metrics["processed_updates"] += 1
+
+            if target.is_owned_group and target.owned_group_asset_id is not None:
+                try:
+                    # The projector opens and commits its own short session. It
+                    # must finish before Guardian handlers run so their later
+                    # failures cannot roll back an accepted member fact.
+                    await project_owned_group_member_observations(
+                        message,
+                        group_asset_id=target.owned_group_asset_id,
+                        core_group_id=target.core_group_id,
+                        source_bot_account_id=bot_account_id,
+                        update_id=update_id,
+                        update_kind=update_kind,
+                    )
+                except Exception:
+                    # The projector is itself fail-open; this final boundary
+                    # also protects Guardian when a test double or future
+                    # telemetry adapter violates that contract.
+                    logger.warning(
+                        "owned_group_member_observation_failed",
+                        asset_id=target.owned_group_asset_id,
+                        core_group_id=target.core_group_id,
+                        bot_account_id=bot_account_id,
+                        update_id=(update_id if type(update_id) is int else None),
+                        event_type="unknown",
+                        result="failed",
+                        reason_code="projector_unhandled_error",
+                        candidate_count=0,
+                    )
 
         processed = 0
         for member in message.get("new_chat_members") or []:
@@ -1040,6 +1538,7 @@ class TelegramWorker:
                 chat_id=chat_id,
                 user_id=member_id,
                 username=member.get("username"),
+                core_group_id=core_group_id,
             )
             if response:
                 await telegram_client.send_message(chat_id, response)
@@ -1047,7 +1546,11 @@ class TelegramWorker:
 
         left_member = message.get("left_chat_member")
         if left_member and left_member.get("id") is not None:
-            await bot.handle_member_leave(chat_id=chat_id, user_id=left_member["id"])
+            await bot.handle_member_leave(
+                chat_id=chat_id,
+                user_id=left_member["id"],
+                core_group_id=core_group_id,
+            )
             processed += 1
 
         text = message.get("text") or message.get("caption") or ""
@@ -1058,6 +1561,7 @@ class TelegramWorker:
                 user_id=user_id,
                 username=sender.get("username"),
                 text=text,
+                core_group_id=core_group_id,
             )
             processed += 1
 

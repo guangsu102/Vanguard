@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElCheckbox, ElDialog, ElFormItem, ElIcon, ElInput, ElInputNumber, ElMessage, ElMessageBox, ElOption, ElSelect, ElTabPane, ElTabs, ElTag } from 'element-plus'
 import { Edit, Plus, Refresh, Delete, VideoPlay } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
@@ -22,6 +22,7 @@ import type {
   Sub2APICouponType,
 } from '@/api/campaigns'
 import { guardianApi, type GuardianBot, type ManagedGroupBinding } from '@/api/guardian'
+import { parseSafePositiveId, parseSafeTelegramId } from '@/utils/groupOpsAccess'
 
 type TabName = string | number
 type DrawerField = {
@@ -34,7 +35,9 @@ type DrawerField = {
 }
 
 const route = useRoute()
+const router = useRouter()
 const campaignStore = useCampaignStore()
+const returnAssetId = computed(() => parseSafePositiveId(route.query.assetId))
 
 const loading = ref(false)
 const activeTab = ref<CampaignScope>('global')
@@ -393,8 +396,8 @@ const applyRouteContext = () => {
     activeTab.value = scope as CampaignScope
   }
 
-  const groupId = Number(route.query.groupId)
-  const botId = Number(route.query.botId)
+  const groupId = parseSafeTelegramId(route.query.groupId)
+  const botId = parseSafePositiveId(route.query.botId)
   const triggerEvent = route.query.triggerEvent
 
   if (activeTab.value === 'managed_group' && editingId.value === null) {
@@ -402,10 +405,10 @@ const applyRouteContext = () => {
       formData.trigger_event = triggerEvent as ManagedGroupTriggerEvent
       normalizeManagedGroupFormByEvent(formData.trigger_event)
     }
-    if (Number.isFinite(groupId) && groupId > 0) {
+    if (groupId !== null) {
       formData.target_group_ids = [groupId]
     }
-    if (Number.isFinite(botId) && botId > 0) {
+    if (botId !== null) {
       formData.bot_account_id = botId
     }
   }
@@ -736,10 +739,15 @@ const handleViewDetail = async (row: Campaign) => {
 const formatDate = (date?: string) => (date ? dayjs(date).format('YYYY-MM-DD HH:mm') : '-')
 
 onMounted(() => {
-  loadManagedGroupContext()
+  // Apply the route before the first list request so direct links are scoped
+  // immediately. Re-apply once the group/Bot options arrive because their
+  // watchers may normalize an option that was not loaded yet.
   applyRouteContext()
   fetchData()
-  normalizeManagedGroupFormByEvent()
+  void loadManagedGroupContext().then(() => {
+    applyRouteContext()
+    normalizeManagedGroupFormByEvent()
+  })
 })
 
 watch(
@@ -803,6 +811,7 @@ watch(
         <p v-if="selectedManagedGroupTitle" class="page-subtitle">当前管理群：{{ selectedManagedGroupTitle }}</p>
       </div>
       <div class="header-actions">
+        <el-button v-if="returnAssetId" @click="router.push(`/owned-groups/${returnAssetId}/operations?tab=overview`)">返回群运营中心</el-button>
         <el-button @click="fetchData()">
           <el-icon><Refresh /></el-icon>
           刷新

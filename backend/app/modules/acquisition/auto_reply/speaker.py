@@ -7,39 +7,79 @@ Automatic message sending scheduler and executor for group messaging.
 import asyncio
 import random
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Optional
 
 import structlog
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
+from app.core.account.models import TelegramAccount
 from app.core.account.pool import AccountPool
-from app.core.account.risk_guard import AccountRiskGuard
-from app.core.account.telegram_execution import TelegramExecutionService
+from app.core.account.risk_guard import (
+    DEFAULT_FREEZE_SECONDS,
+    FLOOD_WAIT_BUFFER_SECONDS,
+    AccountRiskGuard,
+)
+from app.core.account.telegram_execution import (
+    TelegramExecutionService,
+    TelegramSendReservationReleasePendingError,
+    TelegramSendOutcomeUnknownError,
+    TelegramSendPreflightError,
+)
 from app.core.ai.llm_client import LLMClient, LLMProvider
 from app.core.automation_settings import get_group_ai_interaction_settings
 from app.core.config import settings
 from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupLevel
 from app.modules.acquisition.auto_reply.safety import sanitize_natural_group_reply
-from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.auto_reply.scheduler import SpeakScheduler
+from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.config import AcquisitionConfig
-from app.modules.acquisition.models import AcquisitionMessage, MessageType
 from app.modules.acquisition.exceptions import MessageSendError
+from app.modules.acquisition.models import AcquisitionMessage, MessageType
 from app.modules.acquisition.rate_limit import AcquisitionRateLimitService
+from app.modules.owned_group.messaging_target import (
+    TELEGRAM_NON_MEMBER_STATUSES,
+    TELEGRAM_VERIFIED_MEMBER_STATUSES,
+    normalize_telegram_member_status,
+)
+from app.modules.owned_group.models_extra import OwnedGroupMembership
+from app.modules.owned_group.security import safe_exception_message
+
+if TYPE_CHECKING:
+    from app.modules.owned_group.messaging_target import OwnedGroupMessageTarget
 
 logger = structlog.get_logger()
+
+
+class OwnedGroupMembershipProbeError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "ACCOUNT_MEMBERSHIP_PROBE_FAILED",
+        retryable: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
 
 
 @dataclass
 class SpeakResult:
     """Result of a speak operation."""
+
     success: bool
     message_id: Optional[int] = None
     group_id: Optional[int] = None
     account_id: Optional[int] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    retryable: bool = False
+    outcome_unknown: bool = False
+    retry_after_seconds: Optional[int] = None
     sent_at: datetime = field(default_factory=datetime.utcnow)
 
 
@@ -91,6 +131,366 @@ class Speaker:
         settings = await self._group_ai_settings()
         return bool(settings.get("enabled") and settings.get("allowProactiveWarmup"))
 
+    async def send_owned_group_message(
+        self,
+        *,
+        target: "OwnedGroupMessageTarget",
+        account_id: int,
+        content: str,
+        purpose: Literal["community_ai", "template"],
+        content_category: Literal["community", "promotion"],
+        execution_id: int,
+        send_attempt_id: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        before_telegram_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> SpeakResult:
+        """Send a stage-2 message with exactly the account selected by policy.
+
+        Business gates, content generation, durable deduplication, and the
+        compatibility message row belong to the owned-group execution service.
+        This bridge owns only one exact AccountPool lease and the Telegram
+        execution call; it never falls back to another account.
+        """
+
+        telegram_chat_id = int(target.telegram_chat_id)
+        account = None
+        try:
+            get_pooled = getattr(self.account_pool, "get_account_by_id", None)
+            if callable(get_pooled) and await get_pooled(int(account_id)) is None:
+                db_account = await self.db.scalar(
+                    select(TelegramAccount)
+                    .options(selectinload(TelegramAccount.static_proxy))
+                    .where(TelegramAccount.id == int(account_id))
+                )
+                if db_account is not None:
+                    await self.account_pool.sync_from_db([db_account])
+            account = await self.account_pool.acquire_by_id(
+                int(account_id),
+                purpose="owned_group_message",
+            )
+        except Exception as exc:
+            safe_error = safe_exception_message(exc, max_length=500)
+            self.logger.warning(
+                "owned_group_account_unavailable",
+                execution_id=execution_id,
+                account_id=account_id,
+                telegram_chat_id=telegram_chat_id,
+                error=safe_error,
+            )
+            return SpeakResult(
+                success=False,
+                error="Specific account unavailable",
+                error_code="ACCOUNT_UNAVAILABLE",
+                retryable=True,
+                group_id=telegram_chat_id,
+                account_id=account_id,
+            )
+
+        if account is None:
+            return SpeakResult(
+                success=False,
+                error="Specific account unavailable",
+                error_code="ACCOUNT_UNAVAILABLE",
+                retryable=True,
+                group_id=telegram_chat_id,
+                account_id=account_id,
+            )
+
+        try:
+            await self._ensure_owned_group_membership_fresh(
+                account,
+                target=target,
+                account_id=int(account_id),
+            )
+            message_id = await self.telegram_execution.send_owned_group_message(
+                account,
+                telegram_chat_id,
+                content,
+                reply_to=reply_to_message_id,
+                execution_id=execution_id,
+                send_attempt_id=send_attempt_id,
+                before_telegram_write=before_telegram_write,
+            )
+            if message_id is None:
+                raise TelegramSendOutcomeUnknownError(
+                    "Telegram send returned without a message id"
+                )
+            self.logger.info(
+                "owned_group_message_sent",
+                execution_id=execution_id,
+                account_id=account_id,
+                telegram_chat_id=telegram_chat_id,
+                purpose=purpose,
+                content_category=content_category,
+                telegram_message_id=message_id,
+            )
+            return SpeakResult(
+                success=True,
+                message_id=message_id,
+                group_id=telegram_chat_id,
+                account_id=account_id,
+            )
+        except Exception as exc:
+            outcome_unknown = isinstance(
+                exc,
+                (
+                    asyncio.TimeoutError,
+                    TimeoutError,
+                    TelegramSendOutcomeUnknownError,
+                ),
+            )
+            wait_seconds = getattr(exc, "seconds", None)
+            risk_reason = AccountRiskGuard.classify_error(
+                exc,
+                action="owned_group_message",
+                target_type="group",
+            )
+            if wait_seconds is None and risk_reason == "flood_wait":
+                wait_seconds = AccountRiskGuard.extract_wait_seconds(exc)
+            error_text = str(exc).casefold()
+            if isinstance(exc, OwnedGroupMembershipProbeError):
+                error_code = exc.code
+                retryable = exc.retryable
+            elif isinstance(exc, TelegramSendReservationReleasePendingError):
+                error_code = "RISK_RESERVATION_RELEASE_PENDING"
+                retryable = False
+            elif isinstance(exc, TelegramSendPreflightError):
+                error_code = "TELEGRAM_SEND_FAILED"
+                retryable = True
+            elif outcome_unknown:
+                error_code = "TELEGRAM_SEND_OUTCOME_UNKNOWN"
+                retryable = False
+            elif risk_reason == "flood_wait":
+                error_code = "FLOOD_WAIT"
+                retryable = wait_seconds is None or int(wait_seconds) < 15 * 60
+            elif risk_reason == "peer_flood":
+                error_code = "PEER_FLOOD"
+                retryable = False
+            elif risk_reason == "account_banned":
+                error_code = "ACCOUNT_BANNED"
+                retryable = False
+            elif risk_reason == "account_restricted":
+                error_code = "ACCOUNT_RESTRICTED"
+                retryable = False
+            elif "risk_guard_blocked:" in error_text:
+                error_code = "ACCOUNT_RISK_BLOCKED"
+                retryable = False
+            elif risk_reason == "group_write_forbidden" or any(
+                marker in error_text
+                for marker in (
+                    "not a participant",
+                    "usernotparticipant",
+                    "chatwriteforbidden",
+                    "chat write forbidden",
+                    "forbidden from sending",
+                )
+            ):
+                error_code = "GROUP_WRITE_FORBIDDEN"
+                retryable = False
+            else:
+                # Once the Telegram write boundary is entered, an unclassified
+                # exception cannot prove that the request was never submitted.
+                # Default to fail-closed/no-retry to avoid duplicate messages.
+                error_code = "TELEGRAM_SEND_OUTCOME_UNKNOWN"
+                retryable = False
+                outcome_unknown = True
+            retry_after_seconds = int(wait_seconds) if wait_seconds is not None else None
+            if error_code == "FLOOD_WAIT" and retryable:
+                retry_after_seconds = await self._flood_wait_retry_after(
+                    account_id=int(account_id),
+                    wait_seconds=wait_seconds,
+                )
+            safe_error = safe_exception_message(exc, max_length=500)
+            self.logger.warning(
+                "owned_group_message_failed",
+                execution_id=execution_id,
+                account_id=account_id,
+                telegram_chat_id=telegram_chat_id,
+                error=safe_error,
+            )
+            return SpeakResult(
+                success=False,
+                error=safe_error,
+                error_code=error_code,
+                retryable=retryable,
+                outcome_unknown=outcome_unknown,
+                retry_after_seconds=retry_after_seconds,
+                group_id=telegram_chat_id,
+                account_id=account_id,
+            )
+        finally:
+            await self.account_pool.release(account)
+
+    async def _flood_wait_retry_after(
+        self,
+        *,
+        account_id: int,
+        wait_seconds: Optional[int],
+    ) -> int:
+        """Never retry before RiskGuard's persisted FloodWait pause expires."""
+
+        fallback = int(wait_seconds or DEFAULT_FREEZE_SECONDS) + int(FLOOD_WAIT_BUFFER_SECONDS)
+        try:
+            db_account = await self.db.get(
+                TelegramAccount,
+                int(account_id),
+                populate_existing=True,
+            )
+            pause_until = getattr(db_account, "risk_pause_until", None)
+            if isinstance(pause_until, datetime):
+                remaining = max(
+                    1,
+                    int((pause_until - datetime.utcnow()).total_seconds()) + 1,
+                )
+                return max(fallback, remaining)
+        except Exception:
+            pass
+        return max(1, fallback)
+
+    async def _ensure_owned_group_membership_fresh(
+        self,
+        account,
+        *,
+        target: "OwnedGroupMessageTarget",
+        account_id: int,
+    ) -> None:
+        """Verify the exact leased session, probing membership only when stale."""
+
+        leased_account_id = getattr(account, "account_id", None)
+        if leased_account_id is None:
+            leased_account_id = getattr(account, "id", None)
+        try:
+            exact_account = int(leased_account_id) == int(account_id)
+        except (TypeError, ValueError):
+            exact_account = False
+        if not exact_account:
+            raise OwnedGroupMembershipProbeError(
+                "Leased Telegram account does not match the policy account",
+                code="ACCOUNT_NOT_ELIGIBLE",
+                retryable=False,
+            )
+
+        membership = await self.db.scalar(
+            select(OwnedGroupMembership).where(
+                OwnedGroupMembership.group_asset_id == int(target.owned_group_asset_id),
+                OwnedGroupMembership.resource_type == "user",
+                OwnedGroupMembership.resource_id == int(account_id),
+            )
+        )
+        allowed_statuses = {
+            "member_verified",
+            "admin_verified",
+            "skipped_already_member",
+        }
+        if membership is None or str(membership.status) not in allowed_statuses:
+            raise OwnedGroupMembershipProbeError(
+                "Owned-group membership is not verified",
+                code="ACCOUNT_NOT_ELIGIBLE",
+                retryable=False,
+            )
+        client = getattr(account, "client", None)
+        if client is None and hasattr(account, "get_client"):
+            client = account.get_client()
+        if client is None:
+            raise OwnedGroupMembershipProbeError("Telegram client unavailable")
+        try:
+            me = await client.get_me()
+            telegram_user_id = int(getattr(me, "id", None) or getattr(me, "user_id", None) or 0)
+            if not telegram_user_id:
+                raise OwnedGroupMembershipProbeError("Telegram account identity unavailable")
+            if membership.telegram_user_id is None:
+                membership.status = "unknown_needs_reconcile"
+                await self.db.commit()
+                raise OwnedGroupMembershipProbeError(
+                    "Owned-group membership has no trusted Telegram identity binding",
+                    code="ACCOUNT_NOT_ELIGIBLE",
+                    retryable=False,
+                )
+            if (
+                int(membership.telegram_user_id) != telegram_user_id
+            ):
+                membership.status = "unknown_needs_reconcile"
+                await self.db.commit()
+                raise OwnedGroupMembershipProbeError(
+                    "Telegram session identity does not match the bound group membership",
+                    code="ACCOUNT_NOT_ELIGIBLE",
+                    retryable=False,
+                )
+            now = datetime.utcnow()
+            if (
+                membership.last_verified_at is not None
+                and membership.last_verified_at >= now - timedelta(hours=24)
+            ):
+                return
+            if hasattr(client, "get_chat_member"):
+                participant = await client.get_chat_member(
+                    int(target.telegram_chat_id),
+                    telegram_user_id,
+                )
+                raw_status = (
+                    participant.get("status", "")
+                    if isinstance(participant, dict)
+                    else getattr(participant, "status", "")
+                )
+                status = normalize_telegram_member_status(raw_status)
+                if status in TELEGRAM_NON_MEMBER_STATUSES:
+                    membership.status = "unknown_needs_reconcile"
+                    await self.db.commit()
+                    raise OwnedGroupMembershipProbeError(
+                        "Specified account is no longer a group member",
+                        code="ACCOUNT_NOT_ELIGIBLE",
+                        retryable=False,
+                    )
+                if participant is None or status not in TELEGRAM_VERIFIED_MEMBER_STATUSES:
+                    raise OwnedGroupMembershipProbeError(
+                        "Telegram membership probe returned an unknown status"
+                    )
+            else:
+                from telethon import functions
+
+                from app.core.account.telegram_membership import (
+                    classify_telethon_membership_response,
+                )
+
+                entity = await client.get_entity(int(target.telegram_chat_id))
+                response = await client(
+                    functions.channels.GetParticipantRequest(
+                        channel=entity,
+                        participant=me,
+                    )
+                )
+                membership_state = classify_telethon_membership_response(response)
+                if membership_state == "not_member":
+                    membership.status = "unknown_needs_reconcile"
+                    await self.db.commit()
+                    raise OwnedGroupMembershipProbeError(
+                        "Specified account is no longer a group member",
+                        code="ACCOUNT_NOT_ELIGIBLE",
+                        retryable=False,
+                    )
+                if membership_state != "verified":
+                    raise OwnedGroupMembershipProbeError(
+                        "Telegram membership probe returned an unknown participant type"
+                    )
+            membership.telegram_user_id = telegram_user_id
+            membership.last_verified_at = now
+            await self.db.commit()
+        except OwnedGroupMembershipProbeError:
+            raise
+        except Exception as exc:
+            name = exc.__class__.__name__.casefold()
+            if "notparticipant" in name or "usernotparticipant" in name:
+                membership.status = "unknown_needs_reconcile"
+                await self.db.commit()
+                raise OwnedGroupMembershipProbeError(
+                    "Specified account is no longer a group member",
+                    code="ACCOUNT_NOT_ELIGIBLE",
+                    retryable=False,
+                ) from exc
+            raise OwnedGroupMembershipProbeError(
+                "Read-only Telegram membership probe failed"
+            ) from exc
+
     async def speak_in_group(
         self,
         group_id: int,
@@ -113,10 +513,14 @@ class Speaker:
         if not message:
             if not await self._proactive_warmup_enabled():
                 self.logger.info("proactive_group_warmup_paused", group_id=group_id)
-                return SpeakResult(success=False, error="Proactive group warmup disabled", group_id=group_id)
+                return SpeakResult(
+                    success=False, error="Proactive group warmup disabled", group_id=group_id
+                )
             message = await self._generate_proactive_warmup_message(group_id)
             if not message:
-                return SpeakResult(success=False, error="Proactive group warmup skipped", group_id=group_id)
+                return SpeakResult(
+                    success=False, error="Proactive group warmup skipped", group_id=group_id
+                )
             message_type = MessageType.AI_WARMUP
         else:
             message_type = None
@@ -125,9 +529,13 @@ class Speaker:
         account = None
         if account_id:
             try:
-                account = await self.account_pool.acquire_by_id(account_id, purpose="proactive_group_warmup")
+                account = await self.account_pool.acquire_by_id(
+                    account_id, purpose="proactive_group_warmup"
+                )
             except Exception as exc:
-                self.logger.warning("specific_account_unavailable", account_id=account_id, error=str(exc))
+                self.logger.warning(
+                    "specific_account_unavailable", account_id=account_id, error=str(exc)
+                )
                 account = None
             if account is None:
                 return SpeakResult(
@@ -164,7 +572,9 @@ class Speaker:
             msg_id = await self._send_message(account, group_id, message)
 
             # 记录消息
-            await self._record_message(account.account_id, group_id, message, msg_id, message_type=message_type)
+            await self._record_message(
+                account.account_id, group_id, message, msg_id, message_type=message_type
+            )
 
             # 随机延迟（模拟人类行为）
             await self._random_delay()
@@ -178,7 +588,9 @@ class Speaker:
 
         except Exception as e:
             self.logger.error("speak_failed", group_id=group_id, error=str(e))
-            return SpeakResult(success=False, error=str(e), group_id=group_id, account_id=account.account_id)
+            return SpeakResult(
+                success=False, error=str(e), group_id=group_id, account_id=account.account_id
+            )
 
         finally:
             if account:
@@ -199,7 +611,9 @@ class Speaker:
         """
         self.logger.info("execute_schedule", schedule_name=schedule.name)
         if not await self._proactive_warmup_enabled():
-            self.logger.info("execute_schedule_paused_by_group_ai_config", schedule_name=schedule.name)
+            self.logger.info(
+                "execute_schedule_paused_by_group_ai_config", schedule_name=schedule.name
+            )
             return []
 
         results = []
@@ -255,7 +669,9 @@ class Speaker:
             if message:
                 content = message
             else:
-                content = await self._generate_message_content(message_type or MessageType.INTERACTION)
+                content = await self._generate_message_content(
+                    message_type or MessageType.INTERACTION
+                )
 
             result = await self.speak_in_group(group.group_id, content)
             results.append(result)
@@ -271,7 +687,11 @@ class Speaker:
             if settings.LLM_PROVIDER in {item.value for item in LLMProvider}
             else LLMProvider.OPENAI
         )
-        api_key = settings.OPENAI_API_KEY if provider == LLMProvider.OPENAI else settings.ANTHROPIC_API_KEY
+        api_key = (
+            settings.OPENAI_API_KEY
+            if provider == LLMProvider.OPENAI
+            else settings.ANTHROPIC_API_KEY
+        )
         if provider != LLMProvider.LOCAL and not api_key:
             return None
         if self._llm_client is None:
@@ -315,7 +735,10 @@ class Speaker:
                 model=llm_client.model_for("fast"),
                 temperature=float(ai_settings.get("temperature", 0.6)),
                 max_tokens=min(int(ai_settings.get("maxTokens", 180) or 180), 120),
-                system_prompt=str(ai_settings.get("systemPrompt") or "Natural Chinese group chat warmup without automation disclosure."),
+                system_prompt=str(
+                    ai_settings.get("systemPrompt")
+                    or "Natural Chinese group chat warmup without automation disclosure."
+                ),
             )
             return sanitize_natural_group_reply(generated, ai_settings, fallback=fallback)
         except Exception as exc:
@@ -333,21 +756,29 @@ class Speaker:
                 return value
         return None
 
-    def _configured_warmup_topics(self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None) -> list[str]:
+    def _configured_warmup_topics(
+        self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None
+    ) -> list[str]:
         _ = group_id
         topics = (override or {}).get("topics") if override else None
         if not isinstance(topics, list) or not topics:
             topics = ai_settings.get("proactiveWarmupTopics")
-        return [str(item).strip() for item in (topics or []) if str(item).strip()] or ["群内使用体验"]
+        return [str(item).strip() for item in (topics or []) if str(item).strip()] or [
+            "群内使用体验"
+        ]
 
-    def _configured_warmup_templates(self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None) -> list[str]:
+    def _configured_warmup_templates(
+        self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None
+    ) -> list[str]:
         _ = group_id
         templates = (override or {}).get("templates") if override else None
         if not isinstance(templates, list) or not templates:
             templates = ai_settings.get("proactiveWarmupTemplates")
         return [str(item).strip() for item in (templates or []) if str(item).strip()]
 
-    def _configured_warmup_template(self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None) -> str:
+    def _configured_warmup_template(
+        self, ai_settings: dict, group_id: int, *, override: Optional[dict] = None
+    ) -> str:
         templates = self._configured_warmup_templates(ai_settings, group_id, override=override)
         if not templates:
             return ""
@@ -467,11 +898,19 @@ class Speaker:
             account_daily_limit = configured_account_limit
             min_interval = max(min_interval, configured_cooldown)
 
-        account_key = self.rate_limit_service.build_key("speaker", "account", account_id, "group", group_id)
-        group_key = self.rate_limit_service.build_key("speaker", "group", group_id, "account", account_id)
+        account_key = self.rate_limit_service.build_key(
+            "speaker", "account", account_id, "group", group_id
+        )
+        group_key = self.rate_limit_service.build_key(
+            "speaker", "group", group_id, "account", account_id
+        )
         daily_group_key = self.rate_limit_service.build_key("speaker", "group_daily", group_id)
-        daily_account_key = self.rate_limit_service.build_key("speaker", "account_daily", account_id)
-        cooldown_key = self.rate_limit_service.build_key("speaker", "last_sent", group_id, account_id)
+        daily_account_key = self.rate_limit_service.build_key(
+            "speaker", "account_daily", account_id
+        )
+        cooldown_key = self.rate_limit_service.build_key(
+            "speaker", "last_sent", group_id, account_id
+        )
 
         allowed = await self.rate_limit_service.allow_daily(account_key, rate=group_limit)
         if not allowed:
@@ -481,7 +920,9 @@ class Speaker:
         if not allowed:
             return False
 
-        allowed = await self.rate_limit_service.allow_daily(daily_account_key, rate=account_daily_limit)
+        allowed = await self.rate_limit_service.allow_daily(
+            daily_account_key, rate=account_daily_limit
+        )
         if not allowed:
             return False
 
@@ -575,7 +1016,9 @@ class Speaker:
     def _infer_message_type(self, content: str) -> MessageType:
         """Infer message type from content and template intent."""
         normalized = (content or "").strip().lower()
-        if any(token in normalized for token in ("注册", "体验", "点击链接", "立即注册", "试试这个")):
+        if any(
+            token in normalized for token in ("注册", "体验", "点击链接", "立即注册", "试试这个")
+        ):
             return MessageType.GUIDE
         if any(token in normalized for token in ("分享", "推荐", "不错", "优惠", "活动")):
             return MessageType.SHARE

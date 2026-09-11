@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api.managed_groups import (
@@ -11,11 +12,16 @@ from app.api.managed_groups import (
     ManagedChannelMessageRequest,
     ManagedChannelUsernameRequest,
     ManagedGroupMuteAllRequest,
+    ManagedGroupPinnedMessageConfig,
+    ManagedGroupPinnedMessageRequest,
+    _assert_bot_admin_permission,
     _fallback_unmuted_permissions,
     _lockdown_permissions,
     create_managed_channel,
     refresh_managed_channel_status,
+    save_managed_group_pinned_message_config,
     send_managed_channel_message,
+    send_managed_group_pinned_message,
     set_managed_group_mute_all,
     update_managed_channel_username,
 )
@@ -28,6 +34,7 @@ from app.modules.guardian.models import (
     ManagedGroupBotRole,
 )
 from app.modules.guardian.sync import sync_managed_group_binding
+from app.modules.owned_group.models import OwnedGroupAsset
 
 managed_groups_module = importlib.import_module("app.api.managed_groups")
 
@@ -178,6 +185,175 @@ async def test_mute_all_saves_then_restores_previous_permissions(test_db, monkey
 
 
 @pytest.mark.asyncio
+async def test_owned_group_bulk_mute_is_rejected_without_mutating_permission_snapshot(
+    test_db,
+    monkeypatch,
+):
+    binding = await _create_guardian_binding(
+        test_db, telegram_id=-1007010, chat_type="supergroup"
+    )
+    strict_snapshot = {
+        "schema_version": 1,
+        "source": "owned_group_governance_bind",
+        "chat_type": "supergroup",
+        "bot_user_id": 7010,
+        "bot_status": "administrator",
+        "granted_permissions": [
+            "can_delete_messages",
+            "can_restrict_members",
+            "can_invite_users",
+            "can_pin_messages",
+        ],
+        "missing_permissions": [],
+        "probed_at": "2026-09-10T00:00:00Z",
+    }
+    binding.permissions_snapshot = json.dumps(strict_snapshot)
+    await test_db.commit()
+    monkeypatch.setattr(
+        managed_groups_module,
+        "_require_owned_governance_action",
+        AsyncMock(return_value=SimpleNamespace(id=1)),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await set_managed_group_mute_all(
+            binding.id,
+            ManagedGroupMuteAllRequest(muted=True),
+            test_db,
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "owned_group_bulk_mute_not_supported"
+    await test_db.refresh(binding)
+    assert json.loads(binding.permissions_snapshot) == strict_snapshot
+
+
+@pytest.mark.asyncio
+async def test_owned_group_pinned_config_cannot_reuse_permission_snapshot(test_db):
+    binding = await _create_guardian_binding(
+        test_db, telegram_id=-1007011, chat_type="supergroup"
+    )
+    owner = TelegramAccount(
+        identifier="owned-pinned-config-owner",
+        session_name="owned-pinned-config-owner",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(owner)
+    await test_db.flush()
+    asset = OwnedGroupAsset(
+        internal_name="owned-pinned-config-asset",
+        title="Owned Pinned Config",
+        owner_account_id=owner.id,
+        status="ready",
+        telegram_chat_id=binding.telegram_group_id,
+        core_group_id=binding.group_id,
+        managed_binding_id=binding.id,
+        guardian_bot_account_id=binding.bot_account_id,
+        governance_status="managed",
+    )
+    test_db.add(asset)
+    await test_db.commit()
+    snapshot_before = binding.permissions_snapshot
+
+    with pytest.raises(HTTPException) as caught:
+        await save_managed_group_pinned_message_config(
+            binding.id,
+            ManagedGroupPinnedMessageConfig(content="do not persist here"),
+            test_db,
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "owned_group_binding_managed_by_governance"
+    await test_db.refresh(binding)
+    assert binding.permissions_snapshot == snapshot_before
+
+
+@pytest.mark.asyncio
+async def test_managed_action_does_not_overwrite_verified_bot_identity():
+    profile = SimpleNamespace(bot_user_id=7012, bot_username="verified-bot")
+    client = SimpleNamespace(
+        get_me=AsyncMock(
+            return_value=SimpleNamespace(
+                user_id=9999,
+                username="wrong-bot",
+                is_bot=True,
+            )
+        ),
+        get_chat_member=AsyncMock(),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await _assert_bot_admin_permission(
+            client,
+            profile,
+            -1007012,
+            "can_pin_messages",
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["reason"] == "guardian_bot_identity_mismatch"
+    assert profile.bot_user_id == 7012
+    client.get_chat_member.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_owned_group_announcement_uses_telegram_chat_id_without_snapshot_write(
+    test_db,
+    monkeypatch,
+):
+    binding = await _create_guardian_binding(
+        test_db, telegram_id=-1007013, chat_type="supergroup"
+    )
+    snapshot_before = binding.permissions_snapshot
+
+    class FakeBotClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def get_me(self):
+            return SimpleNamespace(user_id=7013, username="guardian", is_bot=True)
+
+        async def get_chat_member(self, _chat_id, _user_id):
+            return {"status": "administrator", "can_pin_messages": True}
+
+        async def close(self):
+            return None
+
+    send_pinned = AsyncMock(return_value=313)
+    owned_asset = SimpleNamespace(id=13)
+    require_action = AsyncMock(return_value=owned_asset)
+    monkeypatch.setattr(managed_groups_module, "TelegramClient", FakeBotClient)
+    monkeypatch.setattr(
+        managed_groups_module,
+        "_require_owned_governance_action",
+        require_action,
+    )
+    monkeypatch.setattr(
+        managed_groups_module.TelegramExecutionService,
+        "send_pinned_bot_message",
+        send_pinned,
+    )
+
+    response = await send_managed_group_pinned_message(
+        binding.id,
+        ManagedGroupPinnedMessageRequest(content="Governance announcement"),
+        test_db,
+    )
+
+    assert response.data["message_id"] == 313
+    assert response.data["telegram_group_id"] == -1007013
+    assert send_pinned.await_args.args[1:3] == (
+        -1007013,
+        "Governance announcement",
+    )
+    require_action.assert_awaited_once_with(test_db, binding)
+    await test_db.refresh(binding)
+    assert binding.permissions_snapshot == snapshot_before
+
+
+@pytest.mark.asyncio
 async def test_channel_message_requires_channel_binding_and_returns_message_id(
     test_db, monkeypatch
 ):
@@ -281,6 +457,12 @@ async def test_create_channel_uses_user_session_and_returns_active_binding(test_
         AsyncMock(return_value=created_channel),
     )
     monkeypatch.setattr("telethon.utils.get_peer_id", lambda _channel: -1007003)
+    sync_binding = AsyncMock(wraps=sync_managed_group_binding)
+    monkeypatch.setattr(
+        managed_groups_module,
+        "sync_managed_group_binding",
+        sync_binding,
+    )
 
     response = await create_managed_channel(
         ManagedChannelCreateRequest(
@@ -304,6 +486,7 @@ async def test_create_channel_uses_user_session_and_returns_active_binding(test_
     assert "InviteToChannelRequest" not in user_request_types
     pool.acquire_by_id.assert_awaited_once_with(creator.id, purpose="managed_channel_create")
     pool.release.assert_awaited_once_with(wrapper)
+    assert sync_binding.await_args.kwargs["reject_owned_group_auto_bind"] is True
 
 
 @pytest.mark.asyncio

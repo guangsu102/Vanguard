@@ -38,7 +38,9 @@ from app.core.account.operation_lease import (
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
 from app.core.account.session_crypto import decrypt_session_string
+from app.core.account.session_files import resolve_telegram_session_file
 from app.core.network.fingerprint import FingerprintManager
+from app.modules.owned_group.security import safe_exception_message
 
 if TYPE_CHECKING:
     from app.core.account.models import TelegramAccount
@@ -151,9 +153,13 @@ class TelegramAccountWrapper:
     def session_file_path(self) -> Path:
         """Get the session file path."""
         from app.core.config import get_settings
+
         settings = get_settings()
-        session_dir = Path(settings.TELEGRAM_SESSION_DIR)
-        return session_dir / f"{self.session_name}.session"
+        return resolve_telegram_session_file(
+            settings.TELEGRAM_SESSION_DIR,
+            self.session_name,
+            allow_empty=True,
+        )
 
     @property
     def session_exists(self) -> bool:
@@ -230,7 +236,7 @@ class AccountPool:
                 "account_operation_lease_unavailable",
                 account_id=account.account_id,
                 purpose=purpose,
-                error=str(exc),
+                error=safe_exception_message(exc, max_length=500),
             )
             if raise_on_failure:
                 raise
@@ -269,7 +275,7 @@ class AccountPool:
                     renewed = await self._operation_lease_manager.refresh(handle)
                 except AccountOperationLeaseUnavailable as exc:
                     renewed = False
-                    error = str(exc)
+                    error = safe_exception_message(exc, max_length=500)
                 else:
                     error = "账号操作租约所有权已丢失" if not renewed else None
                 if renewed:
@@ -337,7 +343,7 @@ class AccountPool:
                     "account_policy_disconnect_failed",
                     account_id=account.account_id,
                     reason=reason,
-                    error=str(exc),
+                    error=safe_exception_message(exc, max_length=500),
                 )
 
     async def _assert_proxy_policy_current(self, account: TelegramAccountWrapper) -> None:
@@ -376,6 +382,7 @@ class AccountPool:
         """Ensure session directory exists."""
         if self._session_dir is None:
             from app.core.config import get_settings
+
             settings = get_settings()
             self._session_dir = Path(settings.TELEGRAM_SESSION_DIR)
             self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -501,7 +508,9 @@ class AccountPool:
             await self.sync_from_db([account])
             existing = self._accounts.get(account.session_name)
             if existing is None:
-                raise RuntimeError(f"Account {account.id} was invalidated while refreshing proxy policy")
+                raise RuntimeError(
+                    f"Account {account.id} was invalidated while refreshing proxy policy"
+                )
             return existing
 
         api_id, api_hash = _resolve_account_api_credentials(account)
@@ -642,7 +651,10 @@ class AccountPool:
             try:
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
-                if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
+                if (
+                    selected.client is None
+                    or not getattr(selected.client, "is_connected", lambda: False)()
+                ):
                     selected.client = await self._create_client(selected)
                 self.logger.info(
                     "proxy_acquired",
@@ -661,7 +673,7 @@ class AccountPool:
                     "account_acquire_failed",
                     session_name=selected.session_name,
                     country=selected.country_code,
-                    error=str(e),
+                    error=safe_exception_message(e, max_length=500),
                 )
                 return None
 
@@ -707,7 +719,11 @@ class AccountPool:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
                 return None
 
-            if selected.status not in [AccountStatus.IDLE, AccountStatus.ONLINE, AccountStatus.OFFLINE]:
+            if selected.status not in [
+                AccountStatus.IDLE,
+                AccountStatus.ONLINE,
+                AccountStatus.OFFLINE,
+            ]:
                 self.logger.warning(
                     "account_not_available",
                     account_id=account_id,
@@ -721,7 +737,9 @@ class AccountPool:
                 return None
 
             if require_session and not selected.session_exists:
-                self.logger.warning("account_session_missing", account_id=account_id, purpose=purpose)
+                self.logger.warning(
+                    "account_session_missing", account_id=account_id, purpose=purpose
+                )
                 return None
 
             if operation_lease is not None:
@@ -740,7 +758,10 @@ class AccountPool:
             try:
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
-                if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
+                if (
+                    selected.client is None
+                    or not getattr(selected.client, "is_connected", lambda: False)()
+                ):
                     selected.client = await self._create_client(selected)
             except asyncio.CancelledError:
                 selected.status = previous_status
@@ -755,7 +776,7 @@ class AccountPool:
                     "account_acquire_by_id_failed",
                     account_id=account_id,
                     purpose=purpose,
-                    error=str(e),
+                    error=safe_exception_message(e, max_length=500),
                 )
                 raise
 
@@ -802,14 +823,19 @@ class AccountPool:
                 return None
 
             if require_session and not selected.session_exists:
-                self.logger.warning("account_session_missing", account_id=account_id, purpose=purpose)
+                self.logger.warning(
+                    "account_session_missing", account_id=account_id, purpose=purpose
+                )
                 return None
 
             try:
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 connected_now = False
-                if selected.client is None or not getattr(selected.client, "is_connected", lambda: False)():
+                if (
+                    selected.client is None
+                    or not getattr(selected.client, "is_connected", lambda: False)()
+                ):
                     selected.client = await self._create_client(selected)
                     connected_now = True
                 selected.keep_connected = keep_connected
@@ -820,7 +846,7 @@ class AccountPool:
                     "account_connect_by_id_failed",
                     account_id=account_id,
                     purpose=purpose,
-                    error=str(e),
+                    error=safe_exception_message(e, max_length=500),
                 )
                 raise
 
@@ -864,11 +890,18 @@ class AccountPool:
                 proxy.password,
             )
 
-        session = StringSession(account.session_string) if account.session_string else (
-            str(session_path) if session_path.exists() else StringSession()
+        session = (
+            StringSession(account.session_string)
+            if account.session_string
+            else (str(session_path) if session_path.exists() else StringSession())
         )
 
-        profile_key = account.fingerprint_id or account.phone or account.session_name or str(account.account_id)
+        profile_key = (
+            account.fingerprint_id
+            or account.phone
+            or account.session_name
+            or str(account.account_id)
+        )
         telegram_profile = FingerprintManager().generate_telegram_device_profile(
             profile_key,
             device_model=account.device_model,
@@ -911,6 +944,7 @@ class AccountPool:
         if ok:
             return
         raise RuntimeError(f"account runtime environment blocked: {reason}")
+
     def _proxy_required_for_account(self, account: TelegramAccountWrapper) -> bool:
         """Return whether this account must use a proxy."""
         if account.proxy_mode == ProxyMode.NONE:
@@ -921,6 +955,7 @@ class AccountPool:
             return False
 
         from app.core.config import get_settings
+
         settings = get_settings()
         return bool(getattr(settings, "PROMOTER_PROXY_REQUIRED", True))
 
@@ -946,7 +981,7 @@ class AccountPool:
                 self.logger.warning(
                     "proxy_refresh_disconnect_failed",
                     session_name=account.session_name,
-                    error=str(e),
+                    error=safe_exception_message(e, max_length=500),
                 )
             finally:
                 account.client = None
@@ -984,6 +1019,7 @@ class AccountPool:
             ProxyInfo or None if acquisition fails
         """
         from app.core.config import get_settings
+
         settings = get_settings()
         provider = getattr(settings, "PROXY_PROVIDER", "evomi").lower()
 
@@ -994,7 +1030,9 @@ class AccountPool:
                         raise RuntimeError(
                             f"Static proxy {account.static_proxy_id} is not loaded for account {account.account_id}"
                         )
-                    account.static_proxy = await self._static_proxy_resolver(account.static_proxy_id)
+                    account.static_proxy = await self._static_proxy_resolver(
+                        account.static_proxy_id
+                    )
                 return account.static_proxy.to_proxy_info()
 
             if provider == "decodo":
@@ -1017,7 +1055,7 @@ class AccountPool:
                 provider=provider,
                 country=account.country_code,
                 session_name=account.session_name,
-                error=str(e),
+                error=safe_exception_message(e, max_length=500),
             )
 
         return None
@@ -1048,7 +1086,7 @@ class AccountPool:
                     self.logger.warning(
                         "release_disconnect_failed",
                         session_name=account.session_name,
-                        error=str(e),
+                        error=safe_exception_message(e, max_length=500),
                     )
             if not account.keep_connected:
                 account.client = None
@@ -1102,7 +1140,7 @@ class AccountPool:
                     self.logger.warning(
                         "set_offline_disconnect_failed",
                         session_name=session_name,
-                        error=str(e),
+                        error=safe_exception_message(e, max_length=500),
                     )
             account.status = AccountStatus.OFFLINE
             account.client = None
@@ -1192,6 +1230,7 @@ class AccountPool:
             return selected
         elif self._strategy == "random":
             import random
+
             return random.choice(available)
         else:
             return available[0]
@@ -1287,9 +1326,7 @@ class AccountPool:
         """
         synced = 0
         for account in accounts:
-            new_proxy_mode = normalize_proxy_mode(
-                getattr(account, "proxy_mode", ProxyMode.DYNAMIC)
-            )
+            new_proxy_mode = normalize_proxy_mode(getattr(account, "proxy_mode", ProxyMode.DYNAMIC))
             new_static_proxy_id = getattr(account, "static_proxy_id", None)
             policy_state = await get_account_proxy_policy_state(account.id)
             if policy_state is not None and (
@@ -1311,18 +1348,18 @@ class AccountPool:
                 continue
 
             existing = self._accounts.get(account.session_name)
-            
+
             if existing:
                 api_id, api_hash = _resolve_account_api_credentials(account)
-                keep_runtime_status = (
-                    account.status not in [AccountStatus.ERROR, AccountStatus.BANNED]
-                    and (
-                        existing.status == AccountStatus.WORKING
-                        or (
-                            existing.keep_connected
-                            and existing.client is not None
-                            and existing.client.is_connected()
-                        )
+                keep_runtime_status = account.status not in [
+                    AccountStatus.ERROR,
+                    AccountStatus.BANNED,
+                ] and (
+                    existing.status == AccountStatus.WORKING
+                    or (
+                        existing.keep_connected
+                        and existing.client is not None
+                        and existing.client.is_connected()
                     )
                 )
                 if not keep_runtime_status:
@@ -1368,7 +1405,7 @@ class AccountPool:
                             self.logger.warning(
                                 "proxy_policy_refresh_disconnect_failed",
                                 session_name=existing.session_name,
-                                error=str(e),
+                                error=safe_exception_message(e, max_length=500),
                             )
                         finally:
                             existing.client = None
@@ -1394,7 +1431,7 @@ class AccountPool:
                         self.logger.warning(
                             "error_disconnecting",
                             session_name=account.session_name,
-                            error=str(e),
+                            error=safe_exception_message(e, max_length=500),
                         )
                     finally:
                         account.client = None
@@ -1431,7 +1468,7 @@ class AccountPool:
                         self.logger.error(
                             "session_delete_failed",
                             session_name=session_name,
-                            error=str(e),
+                            error=safe_exception_message(e, max_length=500),
                         )
 
         if dry_run:
@@ -1491,15 +1528,18 @@ async def init_account_pool(
     _account_pool = AccountPool(strategy=strategy)
 
     from app.core.config import get_settings
+
     settings = get_settings()
     provider = getattr(settings, "PROXY_PROVIDER", "evomi").lower()
 
     if provider == "decodo" and decodo_api_key:
         from app.core.account.decodo import init_decodo_client
+
         decodo_client = await init_decodo_client(decodo_api_key)
         _account_pool.set_decodo_client(decodo_client)
     elif provider == "evomi" and evomi_api_key:
         from app.core.account.evomi import init_evomi_client
+
         evomi_client = await init_evomi_client(evomi_api_key)
         _account_pool.set_evomi_client(evomi_client)
 
@@ -1515,5 +1555,6 @@ async def close_account_pool() -> None:
 
     from app.core.account.decodo import close_decodo_client
     from app.core.account.evomi import close_evomi_client
+
     await close_evomi_client()
     await close_decodo_client()

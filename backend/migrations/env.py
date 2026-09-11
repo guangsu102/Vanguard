@@ -35,6 +35,7 @@ def _import_models() -> None:
         "app.integrations.xboard.models",
         "app.modules.owned_group.models",
         "app.modules.owned_group.models_extra",
+        "app.modules.owned_group.messaging_models",
     ):
         importlib.import_module(model_module)
 

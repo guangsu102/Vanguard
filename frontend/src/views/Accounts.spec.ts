@@ -2,6 +2,17 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import Accounts from './Accounts.vue'
 
+interface AccountsViewModel {
+  columns: Array<{ slot?: string }>
+  deliveryBlockDrawerVisible: boolean
+  deliveryStatusLabel: (account: { id: number }) => string
+  deliveryStatusType: (account: { id: number }) => string
+  handleDisable: (account: { id: number }) => Promise<void>
+  handleEnable: (account: { id: number }) => Promise<void>
+  openDeliveryBlockDrawer: (account: { id: number; identifier: string }) => void
+  selectedDeliveryStatus: { account_id: number } | null
+}
+
 const {
   fetchList,
   update,
@@ -11,6 +22,7 @@ const {
   setPage,
   setPageSize,
   setAccountTypeFilter,
+  updatePersonaSummary,
   push,
   getAdDynamicStatus,
 } = vi.hoisted(() => ({
@@ -22,6 +34,7 @@ const {
   setPage: vi.fn(),
   setPageSize: vi.fn(),
   setAccountTypeFilter: vi.fn(),
+  updatePersonaSummary: vi.fn(),
   push: vi.fn(),
   getAdDynamicStatus: vi.fn().mockResolvedValue({
     data: {
@@ -56,6 +69,10 @@ vi.mock('vue-router', () => ({
   useRoute: () => ({
     query: {},
   }),
+}))
+
+vi.mock('@/stores/auth', () => ({
+  useAuthStore: () => ({ userInfo: { role: 'admin' } }),
 }))
 
 vi.mock('@/api/proxies', () => ({
@@ -118,6 +135,7 @@ vi.mock('@/stores/account', () => ({
     setPage,
     setPageSize,
     setAccountTypeFilter,
+    updatePersonaSummary,
   }),
 }))
 
@@ -139,6 +157,9 @@ vi.mock('@/components/StatusTag.vue', () => ({
 }))
 vi.mock('@/components/AccountLoginDialog.vue', () => ({
   default: { name: 'AccountLoginDialog', template: '<div />' },
+}))
+vi.mock('@/components/accounts/AccountPersonaDrawer.vue', () => ({
+  default: { name: 'AccountPersonaDrawer', template: '<div />' },
 }))
 
 const globalStubs = {
@@ -196,17 +217,17 @@ describe('Accounts view', () => {
     })
     await flushPromises()
 
-    const vm = wrapper.vm as any
+    const vm = wrapper.vm as unknown as AccountsViewModel
     const account = { id: 1, identifier: 'alice-promoter' }
 
     expect(getAdDynamicStatus).toHaveBeenCalledTimes(1)
-    expect(vm.columns.some((column: any) => column.slot === 'deliveryStatus')).toBe(true)
+    expect(vm.columns.some((column) => column.slot === 'deliveryStatus')).toBe(true)
     expect(vm.deliveryStatusLabel(account)).toBe('广告频控阻塞')
     expect(vm.deliveryStatusType(account)).toBe('warning')
 
     vm.openDeliveryBlockDrawer(account)
     expect(vm.deliveryBlockDrawerVisible).toBe(true)
-    expect(vm.selectedDeliveryStatus.account_id).toBe(1)
+    expect(vm.selectedDeliveryStatus?.account_id).toBe(1)
   })
 
   it('calls enable and disable actions', async () => {
@@ -214,7 +235,7 @@ describe('Accounts view', () => {
       global: globalConfig,
     })
 
-    const vm = wrapper.vm as any
+    const vm = wrapper.vm as unknown as AccountsViewModel
     await vm.handleEnable({ id: 1 })
     await vm.handleDisable({ id: 1 })
 

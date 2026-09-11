@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -37,6 +38,38 @@ class OwnedGroupAsset(Base):
     invite_mode: Mapped[str] = mapped_column(String(32), default="direct_invite", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
     member_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    core_group_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "group.id",
+            name="fk_owned_group_assets_core_group",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    managed_binding_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "managed_group_binding.id",
+            name="fk_owned_group_assets_managed_binding",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    guardian_bot_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey(
+            "telegram_account.id",
+            name="fk_owned_group_assets_guardian_bot_account",
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+    )
+    governance_status: Mapped[str] = mapped_column(
+        String(32), default="disabled", server_default="disabled", nullable=False
+    )
+    governance_pending_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    governance_enabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    governance_last_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    governance_last_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    governance_last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
@@ -45,6 +78,13 @@ class OwnedGroupAsset(Base):
     )
 
     owner_account = relationship("TelegramAccount", foreign_keys=[owner_account_id], lazy="joined")
+    core_group = relationship("Group", foreign_keys=[core_group_id], lazy="selectin")
+    managed_binding = relationship(
+        "ManagedGroupBinding", foreign_keys=[managed_binding_id], lazy="selectin"
+    )
+    guardian_bot_account = relationship(
+        "TelegramAccount", foreign_keys=[guardian_bot_account_id], lazy="selectin"
+    )
     operations = relationship(
         "OwnedGroupOperation", back_populates="group_asset", cascade="all, delete-orphan"
     )
@@ -56,6 +96,21 @@ class OwnedGroupAsset(Base):
         Index("idx_owned_group_assets_status", "status"),
         Index("idx_owned_group_assets_owner", "owner_account_id"),
         Index("idx_owned_group_assets_visibility", "visibility"),
+        Index("idx_owned_group_assets_core_group", "core_group_id"),
+        Index(
+            "uq_owned_group_assets_managed_binding",
+            "managed_binding_id",
+            unique=True,
+        ),
+        Index(
+            "idx_owned_group_assets_guardian_status",
+            "guardian_bot_account_id",
+            "governance_status",
+        ),
+        CheckConstraint(
+            "governance_status IN ('disabled', 'pending', 'managed', 'degraded')",
+            name="governance_status",
+        ),
     )
 
 

@@ -8,10 +8,10 @@ returned in a decision detail.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
+from app.core.account.session_files import resolve_telegram_session_file
 from app.core.config import settings
 from app.core.redis import RedisCache
 from app.modules.owned_group.contracts import ResourceType
@@ -79,6 +80,16 @@ def _has_usable_user_session(account: TelegramAccount) -> bool:
     the two forms the pool supports today.
     """
 
+    session_name = str(getattr(account, "session_name", "") or "")
+    try:
+        session_path = resolve_telegram_session_file(
+            str(_setting("TELEGRAM_SESSION_DIR", "sessions")),
+            session_name,
+            allow_empty=True,
+        )
+    except (OSError, ValueError):
+        return False
+
     raw_session = str(account.session_string or "").strip()
     if raw_session:
         # AccountPool decrypts ``vgs1:`` values immediately before creating a
@@ -86,18 +97,59 @@ def _has_usable_user_session(account: TelegramAccount) -> bool:
         # here so an operation cannot pass precheck and fail only after a worker
         # has claimed a resource.  Legacy plaintext sessions remain supported.
         try:
+            from telethon.sessions import StringSession
+
             from app.core.account.session_crypto import decrypt_session_string
 
-            return bool(str(decrypt_session_string(raw_session) or "").strip())
+            decrypted = str(decrypt_session_string(raw_session) or "").strip()
+            if not decrypted:
+                return False
+            session = StringSession(decrypted)
+            auth_key = getattr(session.auth_key, "key", None)
+            return bool(session.dc_id and isinstance(auth_key, bytes) and len(auth_key) == 256)
         except Exception:
             return False
-    session_name = str(getattr(account, "session_name", "") or "").strip()
-    if not session_name:
+    if not session_name.strip():
         return False
     try:
-        session_dir = Path(str(_setting("TELEGRAM_SESSION_DIR", "sessions")))
-        return (session_dir / f"{session_name}.session").is_file()
-    except (OSError, TypeError, ValueError):
+        if not session_path.is_file():
+            return False
+        from telethon.sessions.sqlite import CURRENT_VERSION
+
+        connection = sqlite3.connect(
+            f"{session_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            version_row = connection.execute("SELECT version FROM version LIMIT 1").fetchone()
+            columns = [
+                str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()
+            ]
+            if version_row is None or int(version_row[0]) != int(CURRENT_VERSION):
+                return False
+            if columns != [
+                "dc_id",
+                "server_address",
+                "port",
+                "auth_key",
+                "takeout_id",
+                "tmp_auth_key",
+            ]:
+                return False
+            row = connection.execute(
+                "SELECT dc_id, server_address, port, auth_key FROM sessions LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+        auth_key = bytes(row[3] or b"") if row else b""
+        return bool(
+            row
+            and int(row[0] or 0) > 0
+            and str(row[1] or "").strip()
+            and 0 < int(row[2] or 0) <= 65535
+            and len(auth_key) == 256
+        )
+    except (OSError, TypeError, ValueError, sqlite3.Error):
         return False
 
 

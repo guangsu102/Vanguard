@@ -1347,6 +1347,12 @@ class TelethonOwnedGroupTelegramAdapter:
             client = self._client(wrapper)
             if client is None:
                 raise AdapterConfigurationError("telegram_client_unavailable")
+            me = await self._call(client.get_me())
+            owner_telegram_user_id = int(
+                getattr(me, "id", None) or getattr(me, "user_id", None) or 0
+            )
+            if not owner_telegram_user_id:
+                raise AdapterConfigurationError("telegram_user_id_missing")
             if chat_id:
                 entity = await self._group_entity(client, asset)
                 username, public_link = await self._reconcile_existing_group(
@@ -1359,6 +1365,7 @@ class TelethonOwnedGroupTelegramAdapter:
                 return GroupCreateResult(
                     success=True,
                     telegram_chat_id=chat_id,
+                    telegram_user_id=owner_telegram_user_id,
                     telegram_username=username,
                     public_link=public_link,
                     reason_code="already_created",
@@ -1474,6 +1481,7 @@ class TelethonOwnedGroupTelegramAdapter:
             return GroupCreateResult(
                 success=True,
                 telegram_chat_id=chat_id,
+                telegram_user_id=owner_telegram_user_id,
                 telegram_username=username or None,
                 public_link=asset.public_link if asset.visibility == "public" else None,
                 reason_code="created",

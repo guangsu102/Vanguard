@@ -1,3 +1,9 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.core import automation_settings as automation_settings_module
 from app.core.automation_settings import (
     DEFAULT_NOTIFICATION_SETTINGS,
     normalize_account_asset_policy_settings,
@@ -9,8 +15,23 @@ from app.core.automation_settings import (
     normalize_ad_failure_policy,
     normalize_app_runtime_settings,
     normalize_group_ai_interaction_settings,
+    normalize_owned_group_messaging_settings,
 )
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+
+
+@pytest.mark.asyncio
+async def test_runtime_setting_read_bypasses_identity_map_cache() -> None:
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = SimpleNamespace(value='{"enabled": false}')
+    db = AsyncMock()
+    db.execute.return_value = result
+
+    payload = await automation_settings_module._read_setting_payload(db, "owned_group_messaging")
+
+    assert payload == {"enabled": False}
+    query = db.execute.await_args.args[0]
+    assert query.get_execution_options().get("populate_existing") is True
 
 
 def test_ad_failure_policy_defaults_to_48_hour_window():
@@ -335,6 +356,47 @@ def test_group_ai_legacy_double_switch_is_migrated_to_one_switch():
     assert disabled["enabled"] is False
     assert enabled["enabled"] is True
     assert "aiEnabled" not in disabled
+
+
+def test_owned_group_messaging_defaults_fail_closed_and_dry_run() -> None:
+    config = normalize_owned_group_messaging_settings(None)
+
+    assert config == {
+        "enabled": False,
+        "dryRun": True,
+        "globalMaxPerGroupPerDay": 20,
+        "globalMaxPerAccountPerDay": 30,
+        "minGroupCooldownSeconds": 300,
+        "contentDedupeWindowSeconds": 21600,
+        "reviewTtlHours": 24,
+        "maxSendAttempts": 3,
+    }
+
+
+def test_owned_group_messaging_settings_are_bounded_and_normalized() -> None:
+    config = normalize_owned_group_messaging_settings(
+        {
+            "enabled": True,
+            "dry_run": False,
+            "global_max_per_group_per_day": 5000,
+            "globalMaxPerAccountPerDay": -1,
+            "minGroupCooldownSeconds": 1,
+            "contentDedupeWindowSeconds": 999999,
+            "reviewTtlHours": 999,
+            "maxSendAttempts": 99,
+        }
+    )
+
+    assert config == {
+        "enabled": True,
+        "dryRun": False,
+        "globalMaxPerGroupPerDay": 1000,
+        "globalMaxPerAccountPerDay": 0,
+        "minGroupCooldownSeconds": 60,
+        "contentDedupeWindowSeconds": 86400,
+        "reviewTtlHours": 168,
+        "maxSendAttempts": 3,
+    }
 
 
 def test_app_runtime_settings_drop_fields_without_runtime_consumers():

@@ -6,7 +6,13 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 export const getApiErrorMessage = (data: unknown): string => {
   if (!data || typeof data !== 'object') return 'Request failed'
 
-  const payload = data as { message?: unknown; detail?: unknown }
+  const payload = data as { message?: unknown; detail?: unknown; error?: unknown }
+  if (payload.error && typeof payload.error === 'object' && !Array.isArray(payload.error)) {
+    const nested = payload.error as { message?: unknown }
+    if (typeof nested.message === 'string' && nested.message.trim()) {
+      return nested.message
+    }
+  }
   if (typeof payload.message === 'string' && payload.message.trim()) {
     return payload.message
   }

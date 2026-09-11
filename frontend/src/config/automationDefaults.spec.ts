@@ -42,6 +42,7 @@ describe('automation configuration defaults', () => {
     expect(risk.account_outbound_message_hard_cap_default).toBe(30)
     expect(risk.redis_fail_closed).toBe(true)
     expect(risk.actions.join).toEqual({ daily_limit: 10, cooldown_seconds: 7200 })
+    expect(risk.actions.owned_group_message).toEqual({ daily_limit: 0, cooldown_seconds: 0 })
     expect(risk.actions.ad_probe).toBeUndefined()
     expect(risk.actions.ad_delivery).toBeUndefined()
     const failurePolicy = createDefaultAdFailurePolicy()

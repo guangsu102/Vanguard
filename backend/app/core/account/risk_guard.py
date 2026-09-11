@@ -37,6 +37,7 @@ from app.core.automation_settings import (
 from app.core.config import get_settings
 from app.core.operating_time import operating_date
 from app.core.redis import RedisCache
+from app.modules.owned_group.security import redact_sensitive_text, redact_sensitive_value
 
 logger = structlog.get_logger()
 
@@ -50,6 +51,7 @@ class AccountRiskAction(str, Enum):
     AI_WARMUP = "ai_warmup"
     MODERATION = "moderation"
     AD_DELIVERY = "ad_delivery"
+    OWNED_GROUP_MESSAGE = "owned_group_message"
     PROFILE_UPDATE = "profile_update"
     REACTION = "reaction"
     FORWARD = "forward"
@@ -84,6 +86,9 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=1, cooldown_seconds=21600),
     AccountRiskAction.MODERATION: RiskBudget(daily_limit=60, cooldown_seconds=15),
     AccountRiskAction.AD_DELIVERY: RiskBudget(daily_limit=5, cooldown_seconds=9000),
+    # Owned-group messaging owns its business quotas and cooldowns. This risk
+    # action only participates in the shared account outbound hard cap.
+    AccountRiskAction.OWNED_GROUP_MESSAGE: RiskBudget(daily_limit=0, cooldown_seconds=0),
     AccountRiskAction.PROFILE_UPDATE: RiskBudget(daily_limit=5, cooldown_seconds=3600),
     AccountRiskAction.REACTION: RiskBudget(daily_limit=120, cooldown_seconds=10),
     AccountRiskAction.FORWARD: RiskBudget(daily_limit=25, cooldown_seconds=120),
@@ -139,12 +144,16 @@ MESSAGE_ACTIONS = {
     AccountRiskAction.AD_PROBE,
     AccountRiskAction.AI_WARMUP,
     AccountRiskAction.AD_DELIVERY,
+    AccountRiskAction.OWNED_GROUP_MESSAGE,
 }
 ACQUISITION_GROUP_WRITE_ACTIONS = {
     AccountRiskAction.GROUP_MESSAGE,
     AccountRiskAction.AD_PROBE,
     AccountRiskAction.AI_WARMUP,
     AccountRiskAction.AD_DELIVERY,
+}
+ACCOUNT_WIDE_GROUP_WRITE_ACTIONS = ACQUISITION_GROUP_WRITE_ACTIONS | {
+    AccountRiskAction.OWNED_GROUP_MESSAGE,
 }
 CONTENT_DEDUP_EXEMPT_SOURCES = {
     "managed_group_channel_announcement",
@@ -177,6 +186,26 @@ if cooldown_seconds > 0 then redis.call("SET", KEYS[3], now + cooldown_seconds, 
 return {1, 0, 0}
 """
 
+ATOMIC_OWNED_GROUP_BUDGET_RESERVATION_LUA = """
+if redis.call("EXISTS", KEYS[2]) == 1 then return {1, 0, 0} end
+local outbound_count = tonumber(redis.call("GET", KEYS[1]) or "0")
+local outbound_limit = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+if outbound_limit > 0 and outbound_count >= outbound_limit then return {0, 3, 0} end
+if outbound_limit > 0 then redis.call("INCR", KEYS[1]); redis.call("EXPIRE", KEYS[1], ttl) end
+redis.call("SET", KEYS[2], KEYS[1], "EX", ttl)
+return {1, 0, 0}
+"""
+
+ATOMIC_OWNED_GROUP_BUDGET_RELEASE_LUA = """
+local outbound_key = redis.call("GET", KEYS[1])
+if not outbound_key or outbound_key ~= KEYS[2] then return 0 end
+redis.call("DEL", KEYS[1])
+local outbound_count = tonumber(redis.call("GET", KEYS[2]) or "0")
+if outbound_count > 0 then redis.call("DECR", KEYS[2]) end
+return 1
+"""
+
 
 class AccountRiskGuard:
     """Central risk gate for account-level Telegram operations."""
@@ -197,6 +226,7 @@ class AccountRiskGuard:
         details: Optional[dict[str, Any]] = None,
     ) -> RiskDecision:
         action = AccountRiskAction(action)
+        owned_group_message = action == AccountRiskAction.OWNED_GROUP_MESSAGE
         account_id = self._account_id(account)
         db_account = await self._get_db_account(account_id)
         now = datetime.utcnow()
@@ -219,7 +249,7 @@ class AccountRiskGuard:
                 )
             if (
                 db_account.risk_reason == "platform_group_write_banned"
-                and action in ACQUISITION_GROUP_WRITE_ACTIONS
+                and action in ACCOUNT_WIDE_GROUP_WRITE_ACTIONS
             ):
                 return await self._block(
                     account,
@@ -232,6 +262,18 @@ class AccountRiskGuard:
             if db_account.risk_level == AccountRiskLevel.QUARANTINED.value:
                 return await self._block(
                     account, action, "account_risk_quarantined", target_type, target_id, details
+                )
+            if owned_group_message and str(self._enum_value(db_account.risk_level)) not in {
+                AccountRiskLevel.NORMAL.value,
+                AccountRiskLevel.WATCH.value,
+            }:
+                return await self._block(
+                    account,
+                    action,
+                    "account_risk_level_not_allowed",
+                    target_type,
+                    target_id,
+                    details,
                 )
             if db_account.risk_pause_until and db_account.risk_pause_until > now:
                 retry_after = max(1, int((db_account.risk_pause_until - now).total_seconds()))
@@ -250,7 +292,7 @@ class AccountRiskGuard:
                 account, action, "account_missing", target_type, target_id, details
             )
 
-        if not risk_settings["enabled"]:
+        if not risk_settings["enabled"] and not owned_group_message:
             await self.record_event(
                 account,
                 action,
@@ -264,7 +306,7 @@ class AccountRiskGuard:
         delivery_policy = str((details or {}).get("delivery_policy") or "growth")
         ad_only_delivery = action == AccountRiskAction.AD_DELIVERY and delivery_policy == "ad_only"
         budget = self._budget_for_action(action, risk_settings)
-        if not ad_only_delivery:
+        if not ad_only_delivery and not owned_group_message:
             warmup_settings = await get_account_warmup_policy_settings(self.db)
             warmup = account_warmup_context(
                 warmup_settings, db_account, now, action=action, details=details
@@ -290,8 +332,17 @@ class AccountRiskGuard:
             return await self._block(
                 account, action, content_decision.reason, target_type, target_id, details
             )
+        reservation_id = (
+            str((details or {}).get("risk_reservation_id") or "")
+            if owned_group_message
+            else None
+        )
         allowed, reason, retry_after = await self._reserve_budget(
-            account_id, action, budget, risk_settings
+            account_id,
+            action,
+            budget,
+            risk_settings,
+            reservation_id=reservation_id,
         )
         if not allowed:
             return await self._block(
@@ -304,15 +355,30 @@ class AccountRiskGuard:
                 retry_after_seconds=retry_after,
             )
 
-        await self.record_event(
-            account,
-            action,
-            "allow",
-            reason="allowed",
-            target_type=target_type,
-            target_id=target_id,
-            details=details,
-        )
+        try:
+            await self.record_event(
+                account,
+                action,
+                "allow",
+                reason="allowed",
+                target_type=target_type,
+                target_id=target_id,
+                details=details,
+            )
+        except Exception as exc:
+            if not owned_group_message:
+                raise
+            try:
+                await self.db.rollback()
+            except Exception:
+                pass
+            self.logger.error(
+                "owned_group_risk_allow_audit_failed",
+                account_id=account_id,
+                target_id=target_id,
+                error_type=type(exc).__name__,
+                error=redact_sensitive_text(exc, max_length=500),
+            )
         return RiskDecision(True)
 
     async def record_success(
@@ -340,6 +406,7 @@ class AccountRiskGuard:
                 AccountRiskAction.GROUP_MESSAGE,
                 AccountRiskAction.AD_PROBE,
                 AccountRiskAction.AI_WARMUP,
+                AccountRiskAction.OWNED_GROUP_MESSAGE,
             }
             and target_type == "group"
         ):
@@ -366,8 +433,8 @@ class AccountRiskGuard:
         )
         risk_settings = await get_account_risk_guard_settings(self.db)
         lifecycle = risk_settings.get("lifecycle", {})
-        merged_details = dict(details or {})
-        merged_details.setdefault("error", str(exc))
+        merged_details = redact_sensitive_value(dict(details or {}), max_length=1000)
+        merged_details.setdefault("error", redact_sensitive_text(exc, max_length=1000))
         await self.record_event(
             account,
             action,
@@ -588,7 +655,8 @@ class AccountRiskGuard:
     ) -> None:
         account_id = self._account_id(account)
         event_account_id = account_id if account_id and account_id > 0 else None
-        event_details = dict(details or {})
+        redacted_details = redact_sensitive_value(dict(details or {}), max_length=1000)
+        event_details = redacted_details if isinstance(redacted_details, dict) else {}
         risk_settings = await get_account_risk_guard_settings(self.db)
         if account_id is not None and account_id <= 0:
             event_details.setdefault("system_account_id", account_id)
@@ -823,6 +891,8 @@ class AccountRiskGuard:
         action: AccountRiskAction,
         budget: RiskBudget,
         risk_settings: dict[str, Any],
+        *,
+        reservation_id: Optional[str] = None,
     ) -> tuple[bool, str, Optional[int]]:
         if self.cache.client is None:
             return False, "risk_budget_unavailable", None
@@ -836,14 +906,59 @@ class AccountRiskGuard:
             if action in MESSAGE_ACTIONS
             else 0
         )
-        action_limit = 0 if action == AccountRiskAction.AD_DELIVERY else int(budget.daily_limit)
+        business_budget_actions = {
+            AccountRiskAction.AD_DELIVERY,
+            AccountRiskAction.OWNED_GROUP_MESSAGE,
+        }
+        action_limit = 0 if action in business_budget_actions else int(budget.daily_limit)
         cooldown_seconds = (
-            0 if action == AccountRiskAction.AD_DELIVERY else int(budget.cooldown_seconds)
+            0 if action in business_budget_actions else int(budget.cooldown_seconds)
         )
         now = int(datetime.utcnow().timestamp())
         ttl = 48 * 3600
+        reservation_key = self._owned_group_reservation_key(account_id, reservation_id)
 
         client = self.cache.client
+        if action == AccountRiskAction.OWNED_GROUP_MESSAGE and reservation_key:
+            if hasattr(client, "eval"):
+                result = await client.eval(
+                    ATOMIC_OWNED_GROUP_BUDGET_RESERVATION_LUA,
+                    2,
+                    outbound_key,
+                    reservation_key,
+                    outbound_limit,
+                    ttl,
+                )
+                allowed, reason_code, retry_after = (int(value) for value in result)
+                if allowed:
+                    return True, "reserved", None
+                reason = (
+                    "account_outbound_message_hard_cap"
+                    if reason_code == 3
+                    else "risk_budget_unavailable"
+                )
+                return False, reason, retry_after or None
+
+            # Lightweight cache adapters are only used by tests. Preserve the
+            # same idempotency contract even though they cannot execute Lua.
+            if await self.cache.get(reservation_key):
+                return True, "reserved", None
+            outbound_count = int(await self.cache.get(outbound_key) or 0)
+            if outbound_limit > 0 and outbound_count >= outbound_limit:
+                return False, "account_outbound_message_hard_cap", None
+            incremented = False
+            try:
+                if outbound_limit > 0:
+                    await self.cache.incr(outbound_key)
+                    incremented = True
+                    await self.cache.expire(outbound_key, ttl)
+                await self.cache.set(reservation_key, outbound_key, ttl=ttl)
+            except Exception:
+                if incremented:
+                    await self.cache.incr(outbound_key, -1)
+                raise
+            return True, "reserved", None
+
         if hasattr(client, "eval"):
             result = await client.eval(
                 ATOMIC_BUDGET_RESERVATION_LUA,
@@ -886,6 +1001,70 @@ class AccountRiskGuard:
         if cooldown_seconds > 0:
             await self.cache.set(cooldown_key, str(now + cooldown_seconds), ttl=cooldown_seconds)
         return True, "reserved", None
+
+    @staticmethod
+    def _owned_group_reservation_key(
+        account_id: int,
+        reservation_id: Optional[str],
+    ) -> Optional[str]:
+        value = str(reservation_id or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
+            return None
+        return f"risk:account:{int(account_id)}:owned_group_reservation:{value}"
+
+    @staticmethod
+    def owned_group_reservation_id(send_attempt_id: str) -> str:
+        """Derive the exact Redis reservation token for one durable send lease."""
+
+        digest = hashlib.sha256(str(send_attempt_id).encode("utf-8")).hexdigest()
+        return f"owned-group-attempt-{digest}"
+
+    async def release_owned_group_message_reservation(
+        self,
+        account: Any,
+        reservation_id: str,
+    ) -> bool:
+        """Atomically return a stage-two outbound slot before Telegram is called."""
+
+        account_id = self._account_id(account)
+        if account_id is None:
+            raise ValueError("owned-group reservation account is missing")
+        if self.cache.client is None:
+            raise RuntimeError("risk reservation backend unavailable")
+        reservation_key = self._owned_group_reservation_key(account_id, reservation_id)
+        if reservation_key is None:
+            raise ValueError("owned-group reservation id is invalid")
+        outbound_key_value = await self.cache.get(reservation_key)
+        if not outbound_key_value:
+            # Missing is a confirmed idempotent success: either nothing was
+            # reserved or another recovery already returned this exact slot.
+            return True
+        outbound_key = str(outbound_key_value)
+        if not re.fullmatch(
+            rf"risk:account:{int(account_id)}:daily:outbound_message:\d{{8}}",
+            outbound_key,
+        ):
+            raise RuntimeError("owned-group reservation marker is invalid")
+
+        client = self.cache.client
+        if hasattr(client, "eval"):
+            released = await client.eval(
+                ATOMIC_OWNED_GROUP_BUDGET_RELEASE_LUA,
+                2,
+                reservation_key,
+                outbound_key,
+            )
+            # A concurrent idempotent release may remove the marker between the
+            # read and Lua call; that is still a confirmed safe outcome.
+            return int(released) in {0, 1}
+
+        deleted = await self.cache.delete(reservation_key)
+        if int(deleted or 0) != 1:
+            return True
+        outbound_count = int(await self.cache.get(outbound_key) or 0)
+        if outbound_count > 0:
+            await self.cache.incr(outbound_key, -1)
+        return True
 
     async def decay_risk_scores(self, *, now: Optional[datetime] = None) -> dict[str, int]:
         now = now or datetime.utcnow()
@@ -1056,7 +1235,10 @@ class AccountRiskGuard:
 
     @staticmethod
     def _budget_for_action(action: AccountRiskAction, risk_settings: dict[str, Any]) -> RiskBudget:
-        if action == AccountRiskAction.AD_PROBE:
+        if action in {
+            AccountRiskAction.AD_PROBE,
+            AccountRiskAction.OWNED_GROUP_MESSAGE,
+        }:
             # Never trust a stale database row or an old client payload for
             # this system-owned safety valve.
             return DEFAULT_ACTION_BUDGETS[action]
@@ -1233,7 +1415,7 @@ class AccountRiskGuard:
         target_id: Optional[Any],
         details: Optional[dict[str, Any]],
     ) -> RiskDecision:
-        if action not in MESSAGE_ACTIONS:
+        if action not in MESSAGE_ACTIONS or action == AccountRiskAction.OWNED_GROUP_MESSAGE:
             return RiskDecision(True)
         details = details or {}
         if details.get("source") in CONTENT_DEDUP_EXEMPT_SOURCES:
@@ -1365,12 +1547,16 @@ class AccountRiskGuard:
         if account_id is None:
             return None
         result = await self.db.execute(
-            select(TelegramAccount).where(TelegramAccount.id == account_id)
+            select(TelegramAccount)
+            .where(TelegramAccount.id == account_id)
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
     @staticmethod
     def _account_id(account: Any) -> Optional[int]:
+        if isinstance(account, int):
+            return account
         value = getattr(account, "account_id", None) or getattr(account, "id", None)
         return int(value) if value is not None else None
 

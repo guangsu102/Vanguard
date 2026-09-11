@@ -35,6 +35,9 @@ _INVITE_LINK_RE = re.compile(
 _TG_INVITE_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_])tg://join\?invite=[A-Za-z0-9_-]{8,128}(?![A-Za-z0-9_])"
 )
+_URI_CREDENTIAL_RE = re.compile(
+    r"(?i)\b((?:https?|socks[45]?)://)[^\s/:@]+:[^\s/@]+@"
+)
 
 # Keys are compared after normalizing punctuation/case.  The list includes
 # aliases used by SQL models, Telethon, Bot API, and common exception payloads.
@@ -51,7 +54,30 @@ _SECRET_KEY_PARTS = {
     "linkciphertext",
     "access_token",
     "accesstoken",
+    "apikey",
+    "password",
+    "proxypassword",
+    "api_hash",
+    "telegram_api_hash",
+    "secret",
 }
+
+_SECRET_KEY_SUFFIXES = {
+    "token",
+    "password",
+    "secret",
+    "tokenciphertext",
+    "sessionstring",
+    "authkeybase64",
+    "invitelink",
+    "apihash",
+}
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])((?:(?:telegram|proxy|access|client|jwt)[_ -]?)?"
+    r"(?:api[_ -]?(?:key|hash)|bot[_ -]?token|access[_ -]?token|password|secret|"
+    r"session(?:[_ -]?string)?|auth[_ -]?key(?:[_ -]?base64)?|invite[_ -]?link))"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
 
 
 def _normalized_key(key: object) -> str:
@@ -65,10 +91,7 @@ def is_sensitive_key(key: object) -> bool:
     normalized = _normalized_key(key)
     if normalized in {part.replace("_", "") for part in _SECRET_KEY_PARTS}:
         return True
-    return any(
-        normalized.endswith(part.replace("_", ""))
-        for part in ("token", "tokenciphertext", "sessionstring", "authkeybase64", "invitelink")
-    )
+    return any(normalized.endswith(part) for part in _SECRET_KEY_SUFFIXES)
 
 
 def redact_sensitive_text(value: object, *, max_length: int = 2000) -> str:
@@ -83,15 +106,11 @@ def redact_sensitive_text(value: object, *, max_length: int = 2000) -> str:
     text = _BOT_TOKEN_RE.sub(REDACTED_TOKEN, text)
     text = _INVITE_LINK_RE.sub(REDACTED_INVITE, text)
     text = _TG_INVITE_RE.sub(REDACTED_INVITE, text)
+    text = _URI_CREDENTIAL_RE.sub(rf"\1{REDACTED}@", text)
     # Avoid accidentally persisting a long opaque value introduced by a
     # ``session=``/``token=`` query or exception string.  Keep the key and hide
     # only the value, without changing unrelated prose.
-    text = re.sub(
-        r"(?i)(\b(?:bot[_ -]?token|session(?:[_ -]?string)?|auth[_ -]?key(?:[_ -]?base64)?|"
-        r"invite[_ -]?link)\b\s*[:=]\s*)([^\s,;]+)",
-        rf"\1{REDACTED}",
-        text,
-    )
+    text = _SECRET_ASSIGNMENT_RE.sub(rf"\1={REDACTED}", text)
     if len(text) > max_length:
         return text[: max(0, max_length - 3)] + "..."
     return text

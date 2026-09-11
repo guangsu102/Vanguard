@@ -5,6 +5,8 @@ import json
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
+from telethon.crypto import AuthKey
+from telethon.sessions import StringSession
 
 from app.api.owned_groups import _is_admin_assignment_conflict
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
@@ -16,6 +18,13 @@ from app.modules.owned_group.models import (
     OwnedGroupOperationItem,
 )
 from app.modules.owned_group.models_extra import OwnedBotProfile, OwnedGroupAdminAssignment
+
+
+def _valid_string_session() -> str:
+    session = StringSession()
+    session.set_dc(2, "149.154.167.51", 443)
+    session.auth_key = AuthKey(bytes(range(256)))
+    return session.save()
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +45,7 @@ async def _seed_ready_asset(test_db):
         account_type=AccountType.PROMOTER,
         is_active=True,
         status=AccountStatus.ONLINE,
-        session_string="owner-session",
+        session_string=_valid_string_session(),
     )
     member = TelegramAccount(
         identifier="owned-group-member",
@@ -44,7 +53,7 @@ async def _seed_ready_asset(test_db):
         account_type=AccountType.PROMOTER,
         is_active=True,
         status=AccountStatus.ONLINE,
-        session_string="member-session",
+        session_string=_valid_string_session(),
     )
     test_db.add_all([owner, member])
     await test_db.flush()
@@ -238,7 +247,6 @@ async def test_operation_freezes_owner_and_admin_contract_without_telegram(
     )
     assert assignment_count == 1
 
-
     assignment = await test_db.scalar(
         select(OwnedGroupAdminAssignment).where(
             OwnedGroupAdminAssignment.group_asset_id == asset.id
@@ -346,8 +354,7 @@ async def test_strict_operation_precheck_is_read_only_and_checks_session(client,
     failed_body = failed.json()
     assert failed_body["allowed"] is False
     assert any(
-        violation["resource_id"] == member.id
-        and violation["reason"] == "account_session_missing"
+        violation["resource_id"] == member.id and violation["reason"] == "account_session_missing"
         for violation in failed_body["details"]["violations"]
     )
     assert await test_db.scalar(select(func.count(OwnedGroupOperation.id))) == 0
@@ -362,7 +369,7 @@ async def test_strict_operation_precheck_uses_owned_bot_profile_id(client, test_
         account_type=AccountType.GUARDIAN_BOT,
         is_active=True,
         status=AccountStatus.ONLINE,
-        session_string="bot-session",
+        session_string=_valid_string_session(),
     )
     test_db.add(bot_account)
     await test_db.flush()
@@ -426,9 +433,7 @@ async def test_operation_queries_are_readable_and_asset_scoped(client, test_db):
     assert listed.json()["total"] == 1
     assert listed.json()["data"][0]["id"] == operation_id
 
-    detail = await client.get(
-        f"/api/owned-groups/{asset.id}/operations/{operation_id}"
-    )
+    detail = await client.get(f"/api/owned-groups/{asset.id}/operations/{operation_id}")
     assert detail.status_code == 200
     assert detail.json()["items_total"] == 2
     assert detail.json()["selection_snapshot"]
@@ -451,7 +456,5 @@ async def test_operation_queries_are_readable_and_asset_scoped(client, test_db):
     assert root_list.status_code == 200
     assert root_list.json()["total"] == 1
 
-    wrong_asset = await client.get(
-        f"/api/owned-groups/999999/operations/{operation_id}"
-    )
+    wrong_asset = await client.get(f"/api/owned-groups/999999/operations/{operation_id}")
     assert wrong_asset.status_code == 404

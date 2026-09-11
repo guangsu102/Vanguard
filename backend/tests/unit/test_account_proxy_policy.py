@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app.api.accounts import _ensure_static_proxy_capacity, _propagate_account_proxy_policy_change
+from app.api.accounts import (
+    MAX_STATIC_PROXY_BINDINGS,
+    _ensure_static_proxy_capacity,
+    _propagate_account_proxy_policy_change,
+)
 from app.core.account.models import (
     AccountStatus,
     AccountType,
@@ -16,7 +20,7 @@ from app.core.account.models import (
 
 
 @pytest.mark.asyncio
-async def test_static_proxy_capacity_allows_three_accounts(test_db):
+async def test_static_proxy_capacity_enforces_configured_limit(test_db):
     proxy = Proxy(
         proxy_type=ProxyType.RESIDENTIAL,
         host="127.0.0.1",
@@ -28,7 +32,7 @@ async def test_static_proxy_capacity_allows_three_accounts(test_db):
     test_db.add(proxy)
     await test_db.flush()
 
-    for idx in range(3):
+    for idx in range(MAX_STATIC_PROXY_BINDINGS):
         test_db.add(
             TelegramAccount(
                 phone=f"+1555000000{idx}",
@@ -64,7 +68,7 @@ async def test_static_proxy_capacity_excludes_current_account(test_db):
     await test_db.flush()
 
     accounts = []
-    for idx in range(3):
+    for idx in range(MAX_STATIC_PROXY_BINDINGS):
         account = TelegramAccount(
             phone=f"+1555000010{idx}",
             identifier=f"+1555000010{idx}",

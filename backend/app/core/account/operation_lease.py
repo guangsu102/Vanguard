@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import structlog
 
 from app.core.redis import RedisCache
+from app.modules.owned_group.security import safe_exception_message
 
 logger = structlog.get_logger()
 
@@ -124,7 +125,7 @@ class AccountOperationLeaseManager:
                 "account_operation_lease_release_failed",
                 account_id=handle.account_id,
                 owner=handle.owner,
-                error=str(exc),
+                error=safe_exception_message(exc, max_length=500),
             )
             return False
         return bool(result)

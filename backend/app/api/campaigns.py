@@ -11,7 +11,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.guardian_validation import ensure_guardian_bot_account, ensure_managed_group_bindings
+from app.api.guardian_validation import (
+    ensure_guardian_bot_account,
+    ensure_managed_group_bindings,
+    require_guardian_operator,
+)
 from app.core.campaign.models import (
     Campaign,
     CampaignDistributionMode,
@@ -843,7 +847,12 @@ async def list_campaigns(
     )
 
 
-@router.post("", response_model=CampaignResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=CampaignResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def create_campaign(
     campaign_data: CampaignCreate,
     db: AsyncSession = Depends(get_db),
@@ -950,7 +959,11 @@ async def get_campaign(
     return _campaign_to_response(campaign)
 
 
-@router.put("/{campaign_id}", response_model=CampaignResponse)
+@router.put(
+    "/{campaign_id}",
+    response_model=CampaignResponse,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def update_campaign(
     campaign_id: int,
     campaign_data: CampaignUpdate,
@@ -1093,7 +1106,11 @@ async def update_campaign(
     return _campaign_to_response(campaign)
 
 
-@router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{campaign_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def delete_campaign(
     campaign_id: int,
     db: AsyncSession = Depends(get_db),
@@ -1109,7 +1126,10 @@ async def delete_campaign(
     await db.commit()
 
 
-@router.post("/{campaign_id}/toggle")
+@router.post(
+    "/{campaign_id}/toggle",
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def toggle_campaign(
     campaign_id: int,
     db: AsyncSession = Depends(get_db),
@@ -1245,7 +1265,10 @@ async def get_campaign_stats(
 # =============================================================================
 
 
-@router.post("/{campaign_id}/trigger")
+@router.post(
+    "/{campaign_id}/trigger",
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def trigger_campaign(
     campaign_id: int,
     user_id: Optional[int] = None,
@@ -1311,7 +1334,10 @@ async def trigger_campaign(
     }
 
 
-@router.post("/{campaign_id}/grant-trial")
+@router.post(
+    "/{campaign_id}/grant-trial",
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def grant_trial(
     campaign_id: int,
     user_id: int,

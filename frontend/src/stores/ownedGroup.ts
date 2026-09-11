@@ -7,6 +7,8 @@ import {
   type OwnedBotProfileRegisterInput,
   type OwnedGroupAsset,
   type OwnedGroupDraftInput,
+  type OwnedGroupGovernanceCandidate,
+  type OwnedGroupGovernanceStatus,
   type OwnedGroupInviteLink,
   type OwnedGroupInviteLinkListResponse,
   type OwnedGroupInviteLinkMutationResponse,
@@ -33,6 +35,16 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
   const inviteLinksLoading = ref(false);
   const inviteLinksAssetId = ref<number | null>(null);
   let inviteLinksRequestId = 0;
+  const governanceByAssetId = ref<
+    Record<number, OwnedGroupGovernanceStatus>
+  >({});
+  const governanceLoadingByAssetId = ref<Record<number, boolean>>({});
+  const governanceCandidatesByAssetId = ref<
+    Record<number, OwnedGroupGovernanceCandidate[]>
+  >({});
+  const governanceCandidatesLoadingByAssetId = ref<Record<number, boolean>>(
+    {},
+  );
 
   const fetchList = async () => {
     loading.value = true;
@@ -52,6 +64,114 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     const index = list.value.findIndex((item) => item.id === id);
     if (index >= 0) list.value[index] = asset;
     return asset;
+  };
+
+  const cacheGovernance = (result: OwnedGroupGovernanceStatus) => {
+    governanceByAssetId.value = {
+      ...governanceByAssetId.value,
+      [result.asset_id]: result,
+    };
+    const patchAsset = (asset: OwnedGroupAsset): OwnedGroupAsset => ({
+      ...asset,
+      status: result.asset_status,
+      telegram_chat_id: result.telegram_chat_id,
+      core_group_id: result.core_group_id,
+      managed_binding_id: result.managed_binding_id,
+      guardian_bot_account_id: result.guardian_bot_account_id,
+      governance_status: result.governance_status,
+      governance_pending_at: result.governance_pending_at,
+      governance_enabled_at: result.governance_enabled_at,
+      governance_last_checked_at: result.governance_last_checked_at,
+      governance_last_error_code: result.failure?.reason ?? null,
+      governance_last_error_message: result.failure?.message ?? null,
+    });
+    list.value = list.value.map((asset) =>
+      asset.id === result.asset_id ? patchAsset(asset) : asset,
+    );
+    if (current.value?.id === result.asset_id) {
+      current.value = patchAsset(current.value);
+    }
+    return result;
+  };
+
+  const setGovernanceLoading = (assetId: number, loadingValue: boolean) => {
+    governanceLoadingByAssetId.value = {
+      ...governanceLoadingByAssetId.value,
+      [assetId]: loadingValue,
+    };
+  };
+
+  const fetchGovernance = async (assetId: number) => {
+    setGovernanceLoading(assetId, true);
+    try {
+      return cacheGovernance(await ownedGroupsApi.getGovernance(assetId));
+    } finally {
+      setGovernanceLoading(assetId, false);
+    }
+  };
+
+  const refreshGovernanceAfterFailure = async (assetId: number) => {
+    try {
+      cacheGovernance(await ownedGroupsApi.getGovernance(assetId));
+    } catch {
+      // Preserve the original mutation error. A failed best-effort refresh
+      // must not replace the actionable bind/reconcile response.
+    }
+  };
+
+  const fetchGovernanceCandidates = async (assetId: number) => {
+    governanceCandidatesLoadingByAssetId.value = {
+      ...governanceCandidatesLoadingByAssetId.value,
+      [assetId]: true,
+    };
+    try {
+      const candidates =
+        await ownedGroupsApi.getGovernanceCandidates(assetId);
+      governanceCandidatesByAssetId.value = {
+        ...governanceCandidatesByAssetId.value,
+        [assetId]: candidates,
+      };
+      return candidates;
+    } finally {
+      governanceCandidatesLoadingByAssetId.value = {
+        ...governanceCandidatesLoadingByAssetId.value,
+        [assetId]: false,
+      };
+    }
+  };
+
+  const bindGovernance = async (
+    assetId: number,
+    guardianBotAccountId: number,
+  ) => {
+    setGovernanceLoading(assetId, true);
+    try {
+      return cacheGovernance(
+        await ownedGroupsApi.bindGovernance(
+          assetId,
+          guardianBotAccountId,
+        ),
+      );
+    } catch (error) {
+      await refreshGovernanceAfterFailure(assetId);
+      throw error;
+    } finally {
+      setGovernanceLoading(assetId, false);
+    }
+  };
+
+  const reconcileGovernance = async (assetId: number) => {
+    setGovernanceLoading(assetId, true);
+    try {
+      return cacheGovernance(
+        await ownedGroupsApi.reconcileGovernance(assetId),
+      );
+    } catch (error) {
+      await refreshGovernanceAfterFailure(assetId);
+      throw error;
+    } finally {
+      setGovernanceLoading(assetId, false);
+    }
   };
 
   const fetchInviteLinks = async (
@@ -278,8 +398,16 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     inviteLinksTotal,
     inviteLinksLoading,
     inviteLinksAssetId,
+    governanceByAssetId,
+    governanceLoadingByAssetId,
+    governanceCandidatesByAssetId,
+    governanceCandidatesLoadingByAssetId,
     fetchList,
     fetchAsset,
+    fetchGovernance,
+    fetchGovernanceCandidates,
+    bindGovernance,
+    reconcileGovernance,
     fetchInviteLinks,
     revokeInviteLink,
     regenerateInviteLink,

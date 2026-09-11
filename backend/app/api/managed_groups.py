@@ -2,16 +2,16 @@
 Managed group binding API for guardian bots.
 """
 
-from datetime import datetime
 import re
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.guardian_validation import ensure_guardian_bot_account
+from app.api.guardian_validation import ensure_guardian_bot_account, require_guardian_reader
 from app.core.account.models import (
     AccountRiskLevel,
     AccountStatus,
@@ -24,6 +24,7 @@ from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.telegram_execution import TelegramExecutionError, TelegramExecutionService
 from app.core.database import get_db
 from app.core.group.models import Group
+from app.core.security import get_current_user
 from app.integrations.telegram.client import TelegramAPIError, TelegramClient, TelegramConfig
 from app.modules.guardian.models import (
     ManagedGroupBinding,
@@ -35,8 +36,30 @@ from app.modules.guardian.sync import (
     guardian_role_and_status_from_member,
     sync_managed_group_binding,
 )
+from app.modules.owned_group.governance_worker import (
+    owned_group_governance_gate_reason,
+    resolve_governance_worker_target,
+)
+from app.modules.owned_group.models import OwnedGroupAsset
 
 router = APIRouter()
+
+
+async def require_managed_group_operator(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Limit every managed-group write and Telegram action to operators."""
+
+    if current_user.get("role") not in {"admin", "operator"}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "reason": "owned_group_role_forbidden",
+                "message": "Managed group operator access required",
+                "retryable": False,
+            },
+        )
+    return current_user
 
 
 class ManagedGroupBindingCreate(BaseModel):
@@ -76,6 +99,9 @@ class ManagedGroupBindingResponse(BaseModel):
     last_synced_at: Optional[str] = None
     chat_type: str = "group"
     all_members_muted: bool = False
+    source_type: Literal["owned_group", "managed_group"] = "managed_group"
+    owned_group_asset_id: Optional[int] = None
+    owned_group_asset_title: Optional[str] = None
 
 
 class ManagedGroupBindingListResponse(BaseModel):
@@ -202,6 +228,7 @@ class ManagedGroupSyncConfirmedResponse(BaseModel):
 async def create_managed_channel(
     request: ManagedChannelCreateRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedOperationResponse:
     """Create a broadcast channel with a user session and assign its guardian bot."""
     creator = await db.get(TelegramAccount, request.creator_account_id)
@@ -311,6 +338,7 @@ async def create_managed_channel(
             chat_type="channel",
             discovery_source="managed_channel_create",
             allow_existing=False,
+            reject_owned_group_auto_bind=True,
         )
         await db.commit()
         await db.refresh(result.binding, attribute_names=["group", "bot_account"])
@@ -407,7 +435,10 @@ def _bot_api_chat_id_candidates(group_id: int) -> list[int]:
     return list(dict.fromkeys(candidates))
 
 
-def _serialize_binding(binding: ManagedGroupBinding) -> ManagedGroupBindingResponse:
+def _serialize_binding(
+    binding: ManagedGroupBinding,
+    owned_asset: OwnedGroupAsset | None = None,
+) -> ManagedGroupBindingResponse:
     return ManagedGroupBindingResponse(
         id=binding.id,
         group_id=binding.group_id,
@@ -425,7 +456,67 @@ def _serialize_binding(binding: ManagedGroupBinding) -> ManagedGroupBindingRespo
         last_synced_at=binding.last_synced_at.isoformat() if binding.last_synced_at else None,
         chat_type=_binding_chat_type(binding),
         all_members_muted=_all_members_muted(binding),
+        source_type="owned_group" if owned_asset is not None else "managed_group",
+        owned_group_asset_id=owned_asset.id if owned_asset is not None else None,
+        owned_group_asset_title=owned_asset.title if owned_asset is not None else None,
     )
+
+
+async def _owned_asset_for_binding(
+    db: AsyncSession, binding: ManagedGroupBinding
+) -> OwnedGroupAsset | None:
+    return await db.scalar(
+        select(OwnedGroupAsset).where(
+            or_(
+                OwnedGroupAsset.managed_binding_id == binding.id,
+                OwnedGroupAsset.core_group_id == binding.group_id,
+                OwnedGroupAsset.telegram_chat_id == binding.telegram_group_id,
+            )
+        ).limit(1)
+    )
+
+
+async def _require_owned_governance_action(
+    db: AsyncSession, binding: ManagedGroupBinding
+) -> OwnedGroupAsset | None:
+    """Fail closed for owned assets while leaving legacy managed groups unchanged."""
+
+    asset = await _owned_asset_for_binding(db, binding)
+    if asset is None:
+        return None
+    gate_reason = await owned_group_governance_gate_reason()
+    target = await resolve_governance_worker_target(
+        db,
+        telegram_chat_id=binding.telegram_group_id,
+        bot_account_id=binding.bot_account_id,
+        owned_gate_reason=gate_reason,
+    )
+    if not target.allowed or target.owned_group_asset_id != asset.id:
+        reason = target.reason_code or "owned_group_governance_not_managed"
+        raise HTTPException(
+            status_code=503 if reason.startswith("governance_") else 409,
+            detail={
+                "reason": reason,
+                "message": "Self-owned group governance action is not available",
+                "retryable": reason
+                not in {"mismatched_guardian_bot", "owned_group_core_id_mismatch"},
+            },
+        )
+    return asset
+
+
+async def _reject_owned_binding_override(
+    db: AsyncSession, binding: ManagedGroupBinding
+) -> None:
+    if await _owned_asset_for_binding(db, binding) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "owned_group_binding_managed_by_governance",
+                "message": "Use the self-owned group governance API to change this binding",
+                "retryable": False,
+            },
+        )
 
 
 async def _enabled_guardian_profile(db: AsyncSession, account_id: int) -> GuardianBotProfile:
@@ -465,6 +556,18 @@ async def _assert_bot_admin_permission(
     permission: str,
 ) -> dict[str, Any]:
     bot_user = await client.get_me()
+    if getattr(bot_user, "is_bot", True) is not True or (
+        profile.bot_user_id is not None
+        and int(profile.bot_user_id) != int(bot_user.user_id)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "guardian_bot_identity_mismatch",
+                "message": "Guardian Bot runtime identity does not match its verified profile",
+                "retryable": False,
+            },
+        )
     member = await client.get_chat_member(chat_id, bot_user.user_id)
     status_value = member.get("status")
     allowed = status_value == "creator" or (
@@ -477,14 +580,21 @@ async def _assert_bot_admin_permission(
     return member
 
 
-@router.get("", response_model=ManagedGroupBindingListResponse)
+@router.get(
+    "",
+    response_model=ManagedGroupBindingListResponse,
+    dependencies=[Depends(require_guardian_reader)],
+)
 async def list_managed_groups(
     bot_account_id: Optional[int] = None,
     binding_status: Optional[str] = None,
     limit: int = Query(default=100, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ) -> ManagedGroupBindingListResponse:
-    query = select(ManagedGroupBinding)
+    query = select(ManagedGroupBinding, OwnedGroupAsset).outerjoin(
+        OwnedGroupAsset,
+        OwnedGroupAsset.managed_binding_id == ManagedGroupBinding.id,
+    )
     count_query = select(func.count(ManagedGroupBinding.id))
 
     if bot_account_id is not None:
@@ -502,7 +612,10 @@ async def list_managed_groups(
     rows = await db.execute(query.order_by(desc(ManagedGroupBinding.id)).limit(limit))
     total = (await db.execute(count_query)).scalar() or 0
     return ManagedGroupBindingListResponse(
-        data=[_serialize_binding(item) for item in rows.scalars().all()],
+        data=[
+            _serialize_binding(binding, owned_asset)
+            for binding, owned_asset in rows.all()
+        ],
         total=total,
     )
 
@@ -511,6 +624,7 @@ async def list_managed_groups(
 async def sync_confirmed_groups_for_bot(
     request: ManagedGroupSyncConfirmedRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedGroupSyncConfirmedResponse:
     await ensure_guardian_bot_account(db, request.bot_account_id)
 
@@ -538,6 +652,64 @@ async def sync_confirmed_groups_for_bot(
         .all()
     )
 
+    # Do not touch Telegram when the requested scan contains no legacy managed
+    # group.  Self-owned groups may only enter governance through the explicit
+    # bind/reconcile flow, including while the governance gate is stopped.
+    owned_rows: list[Any] = []
+    if groups:
+        owned_rows = list(
+            (
+                await db.execute(
+                    select(
+                        OwnedGroupAsset.id,
+                        OwnedGroupAsset.core_group_id,
+                        OwnedGroupAsset.telegram_chat_id,
+                    ).where(
+                        or_(
+                            OwnedGroupAsset.core_group_id.in_([group.id for group in groups]),
+                            OwnedGroupAsset.telegram_chat_id.in_(
+                                [group.group_id for group in groups]
+                            ),
+                        )
+                    )
+                )
+            ).all()
+        )
+    owned_by_core = {
+        int(row.core_group_id): int(row.id)
+        for row in owned_rows
+        if row.core_group_id is not None
+    }
+    owned_by_chat = {
+        int(row.telegram_chat_id): int(row.id)
+        for row in owned_rows
+        if row.telegram_chat_id is not None
+    }
+    owned_only_details = [
+        {
+            "telegram_group_id": group.group_id,
+            "action": "skip_owned_group_governance_required",
+            "owned_group_asset_id": owned_by_core.get(group.id)
+            or owned_by_chat.get(group.group_id),
+        }
+        for group in groups
+        if group.id in owned_by_core or group.group_id in owned_by_chat
+    ]
+    if not groups or len(owned_only_details) == len(groups):
+        profile.sync_status = "synced"
+        profile.last_synced_at = datetime.utcnow()
+        await db.commit()
+        return ManagedGroupSyncConfirmedResponse(
+            message="Confirmed groups sync completed",
+            data={
+                "checked": len(groups),
+                "synced": 0,
+                "skipped": len(owned_only_details),
+                "errors": [],
+                "details": owned_only_details[:50],
+            },
+        )
+
     client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
     synced = 0
     skipped = 0
@@ -549,6 +721,24 @@ async def sync_confirmed_groups_for_bot(
         profile.bot_user_id = bot_user.user_id or profile.bot_user_id
         for group in groups:
             try:
+                owned_asset_id = await db.scalar(
+                    select(OwnedGroupAsset.id).where(
+                        or_(
+                            OwnedGroupAsset.core_group_id == group.id,
+                            OwnedGroupAsset.telegram_chat_id == group.group_id,
+                        )
+                    )
+                )
+                if owned_asset_id is not None:
+                    skipped += 1
+                    details.append(
+                        {
+                            "telegram_group_id": group.group_id,
+                            "action": "skip_owned_group_governance_required",
+                            "owned_group_asset_id": owned_asset_id,
+                        }
+                    )
+                    continue
                 member: dict[str, Any] | None = None
                 telegram_group_id = group.group_id
                 last_member_error: Optional[Exception] = None
@@ -609,6 +799,7 @@ async def sync_confirmed_groups_for_bot(
                     chat_type=chat_type,
                     discovery_source="guardian_confirmed_scan",
                     allow_existing=True,
+                    reject_owned_group_auto_bind=True,
                 )
                 synced += 1
                 details.append(
@@ -652,8 +843,26 @@ async def sync_confirmed_groups_for_bot(
 async def create_managed_group_binding(
     request: ManagedGroupBindingCreate,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedGroupBindingResponse:
     await ensure_guardian_bot_account(db, request.bot_account_id)
+    owned_conditions = [
+        OwnedGroupAsset.telegram_chat_id == request.telegram_group_id,
+    ]
+    if request.group_id is not None:
+        owned_conditions.append(OwnedGroupAsset.core_group_id == request.group_id)
+    owned_asset_id = await db.scalar(
+        select(OwnedGroupAsset.id).where(or_(*owned_conditions)).limit(1)
+    )
+    if owned_asset_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "owned_group_binding_managed_by_governance",
+                "message": "Use the self-owned group governance bind API",
+                "retryable": False,
+            },
+        )
 
     try:
         result = await sync_managed_group_binding(
@@ -670,6 +879,7 @@ async def create_managed_group_binding(
             chat_type=request.chat_type,
             discovery_source="guardian_binding",
             allow_existing=False,
+            reject_owned_group_auto_bind=True,
         )
     except ManagedGroupSyncConflict as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -684,10 +894,12 @@ async def update_managed_group_binding(
     binding_id: int,
     request: ManagedGroupBindingUpdate,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedGroupBindingResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed group binding not found")
+    await _reject_owned_binding_override(db, binding)
 
     data = request.model_dump(exclude_none=True)
     if "binding_status" in data:
@@ -712,6 +924,7 @@ async def set_managed_group_mute_all(
     binding_id: int,
     request: ManagedGroupMuteAllRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedOperationResponse:
     """Mute or restore all ordinary members by changing the group's default permissions."""
     binding = await db.get(ManagedGroupBinding, binding_id)
@@ -725,6 +938,19 @@ async def set_managed_group_mute_all(
         return ManagedOperationResponse(
             message="Mute-all state unchanged",
             data={"binding_id": binding.id, "all_members_muted": request.muted},
+        )
+    owned_asset = await _require_owned_governance_action(db, binding)
+    if owned_asset is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "owned_group_bulk_mute_not_supported",
+                "message": (
+                    "Use Guardian moderation policies for self-owned groups; "
+                    "bulk mute state is not stored in the governance permission snapshot"
+                ),
+                "retryable": False,
+            },
         )
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
@@ -792,6 +1018,7 @@ async def send_managed_channel_message(
     binding_id: int,
     request: ManagedChannelMessageRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedOperationResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
@@ -800,6 +1027,7 @@ async def send_managed_channel_message(
         raise HTTPException(status_code=400, detail="This binding is not a channel")
     if binding.binding_status != ManagedGroupBindingStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Managed channel binding is not active")
+    await _require_owned_governance_action(db, binding)
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
     client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
@@ -857,12 +1085,14 @@ async def update_managed_channel_username(
     binding_id: int,
     request: ManagedChannelUsernameRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedOperationResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed channel binding not found")
     if _binding_chat_type(binding) != "channel":
         raise HTTPException(status_code=400, detail="This binding is not a channel")
+    await _require_owned_governance_action(db, binding)
 
     creator = await _channel_creator_account(db, binding)
     account_pool = get_account_pool()
@@ -929,12 +1159,14 @@ async def update_managed_channel_username(
 async def refresh_managed_channel_status(
     binding_id: int,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedOperationResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed channel binding not found")
     if _binding_chat_type(binding) != "channel":
         raise HTTPException(status_code=400, detail="This binding is not a channel")
+    await _require_owned_governance_action(db, binding)
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
     client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
@@ -1006,6 +1238,7 @@ async def refresh_managed_channel_status(
 @router.get(
     "/{binding_id:int}/pinned-message-config",
     response_model=ManagedGroupPinnedMessageConfigResponse,
+    dependencies=[Depends(require_guardian_reader)],
 )
 async def get_managed_group_pinned_message_config(
     binding_id: int,
@@ -1025,10 +1258,12 @@ async def save_managed_group_pinned_message_config(
     binding_id: int,
     request: ManagedGroupPinnedMessageConfig,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedGroupPinnedMessageConfigResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed group binding not found")
+    await _reject_owned_binding_override(db, binding)
     _set_permissions_key(binding, "pinned_message_config", request.model_dump())
     binding.last_synced_at = datetime.utcnow()
     await db.commit()
@@ -1040,12 +1275,14 @@ async def send_managed_group_pinned_message(
     binding_id: int,
     request: ManagedGroupPinnedMessageRequest,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
 ) -> ManagedGroupPinnedMessageResponse:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed group binding not found")
     if binding.binding_status != ManagedGroupBindingStatus.ACTIVE:
         raise HTTPException(status_code=400, detail="Managed group binding is not active")
+    await _require_owned_governance_action(db, binding)
 
     profile_result = await db.execute(
         select(GuardianBotProfile).where(GuardianBotProfile.account_id == binding.bot_account_id)
@@ -1098,9 +1335,14 @@ async def send_managed_group_pinned_message(
 
 
 @router.delete("/{binding_id:int}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_managed_group_binding(binding_id: int, db: AsyncSession = Depends(get_db)) -> None:
+async def delete_managed_group_binding(
+    binding_id: int,
+    db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_managed_group_operator),
+) -> None:
     binding = await db.get(ManagedGroupBinding, binding_id)
     if not binding:
         raise HTTPException(status_code=404, detail="Managed group binding not found")
+    await _reject_owned_binding_override(db, binding)
     await db.delete(binding)
     await db.commit()

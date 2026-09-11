@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +42,17 @@ class SemanticReplyResult:
     reply: str = ""
     intent: str = ""
     confidence: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticReplyDecision:
+    """Side-effect-free semantic decision for callers that own delivery."""
+
+    should_reply: bool
+    target_message_id: Optional[int] = None
+    intent: str = ""
+    confidence: float = 0.0
+    reason: str = ""
 
 
 class SemanticGroupReplyEngine:
@@ -162,6 +174,61 @@ class SemanticGroupReplyEngine:
         finally:
             if account is not None:
                 await self.account_pool.release(account)
+
+    @classmethod
+    async def evaluate_only(
+        cls,
+        *,
+        llm_client: LLMClient,
+        messages: Sequence[SemanticMessage],
+        settings: Mapping[str, Any],
+        allowed_topics: Sequence[str],
+        minimum_confidence: float,
+        required_target_message_id: Optional[int] = None,
+    ) -> SemanticReplyDecision:
+        """Reuse semantic selection without Redis quotas, account leases, or sends."""
+
+        rows = list(messages)
+        if not rows:
+            return SemanticReplyDecision(False, reason="empty_context")
+
+        engine = cls.__new__(cls)
+        engine.llm_client = llm_client
+        engine.logger = logger.bind(module="semantic_group_reply_decision")
+        decision_settings = dict(settings)
+        topics = [str(item).strip() for item in allowed_topics if str(item).strip()]
+        base_prompt = str(
+            decision_settings.get("semanticDecisionPrompt")
+            or "判断最近群聊中是否有值得自然回应的真实问题。"
+        )
+        decision_settings["semanticDecisionPrompt"] = (
+            f"{base_prompt}\n仅当消息与允许话题相关才可回复。"
+            f"允许话题: {', '.join(topics) or '群内相关话题'}。"
+        )
+        decision_settings["semanticMinConfidence"] = min(
+            max(float(minimum_confidence), 0.0),
+            1.0,
+        )
+
+        decision = await engine._decide(rows, decision_settings)
+        allowed = engine._decision_allowed(decision, rows, decision_settings)
+        target_message_id = engine._int_or_none(decision.get("target_message_id"))
+        if (
+            required_target_message_id is not None
+            and target_message_id != int(required_target_message_id)
+        ):
+            allowed = False
+        return SemanticReplyDecision(
+            should_reply=allowed,
+            target_message_id=target_message_id,
+            intent=str(decision.get("intent") or ""),
+            confidence=engine._float_value(decision.get("confidence")),
+            reason=(
+                "matched"
+                if allowed
+                else str(decision.get("reason") or "decision_rejected")
+            ),
+        )
 
     async def _record_sent_reply(
         self,
@@ -376,7 +443,12 @@ class SemanticGroupReplyEngine:
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
-            self.logger.warning("semantic_reply_decision_parse_failed", raw=raw[:500])
+            encoded = str(raw or "").encode("utf-8", errors="replace")
+            self.logger.warning(
+                "semantic_reply_decision_parse_failed",
+                output_length=len(str(raw or "")),
+                output_sha256=hashlib.sha256(encoded).hexdigest(),
+            )
             return {"should_reply": False, "reason": "invalid_json"}
         return parsed if isinstance(parsed, dict) else {"should_reply": False, "reason": "invalid_json"}
 

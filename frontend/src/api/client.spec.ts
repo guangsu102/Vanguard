@@ -13,6 +13,20 @@ describe('getApiErrorMessage', () => {
     )
   })
 
+  it('reads the nested stage-two error envelope', () => {
+    expect(
+      getApiErrorMessage({
+        error: {
+          code: 'POLICY_REVISION_CONFLICT',
+          message: '策略已被其他管理员修改',
+          details: { revision: 3 },
+          retryable: false,
+        },
+        correlation_id: 'msg-conflict',
+      }),
+    ).toBe('策略已被其他管理员修改')
+  })
+
   it('joins FastAPI validation messages', () => {
     expect(
       getApiErrorMessage({

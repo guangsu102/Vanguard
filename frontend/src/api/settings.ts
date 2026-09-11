@@ -69,6 +69,17 @@ export interface KeywordPrivateReplySettings {
   enabled: boolean
 }
 
+export interface OwnedGroupMessagingSettings {
+  enabled: boolean
+  dryRun: boolean
+  globalMaxPerGroupPerDay: number
+  globalMaxPerAccountPerDay: number
+  minGroupCooldownSeconds: number
+  contentDedupeWindowSeconds: number
+  reviewTtlHours: number
+  maxSendAttempts: number
+}
+
 export interface PrivateReplyTemplatesSettings {
   startWelcome: string
   help: string
@@ -102,13 +113,71 @@ export interface PrivateMessagingSettings {
   templates?: Partial<PrivateReplyTemplatesSettings>
 }
 
-export interface SettingsFormData {
+export interface SettingsUpdatePayload {
   notification?: Partial<NotificationSettings>
   xboard?: Partial<XBoardSettings>
   aiReply?: Partial<AiReplySettings>
   groupAiInteraction?: Partial<GroupAiInteractionSettings>
+  ownedGroupMessaging?: Partial<OwnedGroupMessagingSettings>
   keywordPrivateReply?: Partial<KeywordPrivateReplySettings>
   privateMessaging?: Partial<PrivateMessagingSettings>
+}
+
+export interface OwnedGroupAiPersonaFeatureSettings {
+  enabled: boolean
+  revision: number
+  updatedAt: string | null
+  updatedBy: number | null
+  staticEnabled: boolean
+  effectiveEnabled: boolean
+}
+
+export interface SettingsReadData extends SettingsUpdatePayload {
+  readonly ownedGroupAiPersona: Readonly<OwnedGroupAiPersonaFeatureSettings>
+}
+
+export interface OwnedGroupAiPersonaFeatureUpdate {
+  expectedRevision: number
+  enabled: boolean
+}
+
+export interface SettingsApiError {
+  code: string
+  status: number | null
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+
+export const getSettingsApiError = (error: unknown): SettingsApiError => {
+  const outer = isRecord(error) ? error : {}
+  const response = isRecord(outer.response) ? outer.response : {}
+  const payload = isRecord(response.data) ? response.data : {}
+  const nested = isRecord(payload.error)
+    ? payload.error
+    : isRecord(payload.detail)
+      ? payload.detail
+      : payload
+
+  return {
+    code: typeof nested.code === 'string' ? nested.code : 'SETTINGS_REQUEST_FAILED',
+    status: typeof response.status === 'number' ? response.status : null,
+  }
+}
+
+const ownedGroupAiPersonaFeatureErrorMessages: Readonly<Record<string, string>> = {
+  ADMIN_REQUIRED: '仅管理员可以修改 Persona 功能开关',
+  PERSONA_FEATURE_REVISION_CONFLICT: '设置已被其他管理员修改，请确认后重试',
+  PERSONA_FEATURE_SETTING_NOT_INITIALIZED: 'Persona 运行时设置尚未初始化，请先完成数据库迁移',
+}
+
+export const getOwnedGroupAiPersonaFeatureErrorMessage = (error: SettingsApiError): string => {
+  if (ownedGroupAiPersonaFeatureErrorMessages[error.code]) {
+    return ownedGroupAiPersonaFeatureErrorMessages[error.code]
+  }
+  if (error.status === 403) return ownedGroupAiPersonaFeatureErrorMessages.ADMIN_REQUIRED
+  if (error.status === 503) return 'Persona 功能设置暂时不可用，请稍后重试'
+  return 'Persona 功能开关保存失败，请稍后重试'
 }
 
 export interface SystemInfo {
@@ -142,11 +211,18 @@ export interface LogListParams {
 
 export const settingsApi = {
   get: () => {
-    return apiClient.get<{ data: SettingsFormData }>('/settings')
+    return apiClient.get<{ data: SettingsReadData }>('/settings')
   },
 
-  update: (data: SettingsFormData) => {
+  update: (data: SettingsUpdatePayload) => {
     return apiClient.put('/settings', data)
+  },
+
+  updateOwnedGroupAiPersonaFeature: (data: OwnedGroupAiPersonaFeatureUpdate) => {
+    return apiClient.put<{ data: OwnedGroupAiPersonaFeatureSettings }>(
+      '/settings/owned-group-ai-persona',
+      data,
+    )
   },
 
   getSystemInfo: () => {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElAlert, ElButton, ElIcon, ElMessage, ElMessageBox, ElTag } from 'element-plus'
-import { ChatDotRound, CircleCheck, CircleClose, Delete, Edit, Plus, RefreshLeft, UserFilled, View } from '@element-plus/icons-vue'
+import { ChatDotRound, CircleCheck, CircleClose, Delete, Edit, MagicStick, Plus, RefreshLeft, UserFilled, View } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
@@ -10,26 +10,33 @@ import StatusTag from '@/components/StatusTag.vue'
 import AccountLoginDialog from '@/components/AccountLoginDialog.vue'
 import AccountOperationalStatusPanel from '@/components/AccountOperationalStatusPanel.vue'
 import AccountDeliveryBlockDrawer from '@/components/AccountDeliveryBlockDrawer.vue'
+import AccountPersonaDrawer from '@/components/accounts/AccountPersonaDrawer.vue'
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import { useAccountStore } from '@/stores/account'
+import { useAuthStore } from '@/stores/auth'
 import { proxiesApi, type Proxy } from '@/api/proxies'
 import {
   accountsApi,
   type Account,
   type AccountAssetTier,
   type AccountEnvironmentEvent,
+  type AccountListParams,
   type AccountRiskEvent,
   type AccountRiskSummary,
   type AccountWarmupStage,
 } from '@/api/accounts'
+import type { AccountPersonaDetail } from '@/api/accountPersonas'
 import { automationApi, type AdDynamicStatus } from '@/api/automation'
 import { useRoute, useRouter } from 'vue-router'
 import { accountAssetTierOptions } from '@/config/accountAssetTiers'
 import { useClientPagination } from '@/utils/clientPagination'
+import { parseSafePositiveId } from '@/utils/groupOpsAccess'
 
 const route = useRoute()
 const router = useRouter()
 const accountStore = useAccountStore()
+const authStore = useAuthStore()
+const returnAssetId = computed(() => parseSafePositiveId(route.query.assetId))
 
 const loading = ref(false)
 const activeAccountTab = ref(route.query.tab === 'operations' ? 'operations' : 'list')
@@ -38,6 +45,15 @@ const dynamicStatuses = ref<AdDynamicStatus[]>([])
 const deliveryBlockDrawerVisible = ref(false)
 const selectedDeliveryAccount = ref<Account | null>(null)
 const selectedDeliveryStatus = ref<AdDynamicStatus | null>(null)
+const personaDrawerVisible = ref(false)
+const selectedPersonaAccount = ref<Account | null>(null)
+const accountListLoaded = ref(false)
+const focusedAccountId = ref<number | null>(null)
+const focusedAccount = ref<Account | null>(null)
+const focusedAccountError = ref('')
+let accountLocationSequence = 0
+let accountLocationController: AbortController | null = null
+let personaRouteSequence = 0
 const drawerVisible = ref(false)
 const loginDialogVisible = ref(false)
 const editingId = ref<number | null>(null)
@@ -49,6 +65,7 @@ const riskSummary = ref<AccountRiskSummary | null>(null)
 const riskEvents = ref<AccountRiskEvent[]>([])
 const environmentEvents = ref<AccountEnvironmentEvent[]>([])
 const todayUsageRows = computed(() => riskSummary.value?.today_usage || [])
+const isAdmin = computed(() => authStore.userInfo?.role === 'admin')
 const todayUsagePagination = useClientPagination(todayUsageRows)
 const riskEventPagination = useClientPagination(riskEvents)
 const environmentEventPagination = useClientPagination(environmentEvents)
@@ -141,6 +158,7 @@ const assetTierOptions = accountAssetTierOptions
 const columns = [
   { prop: 'identifier', label: '账号标识', minWidth: '220', slot: 'identifier' },
   { prop: 'operation_mode', label: '账号职责', width: '130', slot: 'operationMode' },
+  { prop: 'persona', label: 'AI 性格', width: '150', slot: 'persona' },
   { prop: 'asset_tier', label: '资产等级', width: '110', slot: 'assetTier' },
   { prop: 'warmup_stage', label: '托管暖号', width: '130', slot: 'warmupStage' },
   { prop: 'status', label: '状态', width: '110', slot: 'status' },
@@ -152,7 +170,7 @@ const columns = [
   { prop: 'error_count', label: '错误数', width: '90' },
   { prop: 'last_active_at', label: '最近活跃', width: '170', slot: 'lastActive' },
   { prop: 'created_at', label: '创建时间', width: '170', slot: 'createdAt' },
-  { prop: 'actions', label: '操作', width: '380', fixed: 'right', slot: 'actions' },
+  { prop: 'actions', label: '操作', width: '450', fixed: 'right', slot: 'actions' },
 ]
 
 const promoterAccounts = computed(() => accountStore.list.filter((item) => item.account_type === 'promoter'))
@@ -163,9 +181,9 @@ const operationalStatusMap = computed(
   () => new Map(dynamicStatuses.value.map((item) => [item.account_id, item])),
 )
 
-const deliveryStatusFor = (account: any) => operationalStatusMap.value.get(account.id) || null
+const deliveryStatusFor = (account: Pick<Account, 'id'>) => operationalStatusMap.value.get(account.id) || null
 
-const deliveryStatusType = (account: any): DeliveryTagType => {
+const deliveryStatusType = (account: Pick<Account, 'id'>): DeliveryTagType => {
   const diagnostic = deliveryStatusFor(account)?.delivery_diagnostic
   if (!diagnostic) return 'info'
   if (diagnostic.ad_delivery_allowed) return 'success'
@@ -173,17 +191,114 @@ const deliveryStatusType = (account: any): DeliveryTagType => {
   return 'danger'
 }
 
-const deliveryStatusLabel = (account: any) => {
+const deliveryStatusLabel = (account: Pick<Account, 'id'>) => {
   const diagnostic = deliveryStatusFor(account)?.delivery_diagnostic
   if (!diagnostic) return '状态评估中'
   if (diagnostic.ad_delivery_allowed) return '可投放'
   return diagnostic.primary_block_label || '投放阻塞'
 }
 
-const openDeliveryBlockDrawer = (account: any) => {
+const openDeliveryBlockDrawer = (account: Account) => {
   selectedDeliveryAccount.value = account
   selectedDeliveryStatus.value = deliveryStatusFor(account)
   deliveryBlockDrawerVisible.value = true
+}
+
+const personaStatusLabel = (account: Account) => {
+  if (account.operation_mode === 'ad_only') return '当前不适用'
+  if (account.persona?.configured && !account.persona.name) return '配置异常'
+  if (account.persona?.effective_enabled === false) return '已暂停应用'
+  if (account.persona?.configured) return `已配置 · v${account.persona.revision}`
+  return '中性默认'
+}
+
+const personaStatusType = (account: Account): DeliveryTagType => {
+  if (account.operation_mode === 'ad_only') return 'info'
+  if (account.persona?.configured && !account.persona.name) return 'danger'
+  if (account.persona?.effective_enabled === false) return 'warning'
+  return account.persona?.configured ? 'success' : 'info'
+}
+
+const openPersonaDrawer = (account: Account) => {
+  if (!isAdmin.value) return
+  selectedPersonaAccount.value = account
+  personaDrawerVisible.value = true
+}
+
+const personaAccountIdFromRoute = () => {
+  return parseSafePositiveId(route.query.persona_account_id)
+}
+
+const openPersonaFromRoute = async () => {
+  const accountId = personaAccountIdFromRoute()
+  if (!accountListLoaded.value || !isAdmin.value || !accountId) return
+  const sequence = ++personaRouteSequence
+
+  activeAccountTab.value = 'list'
+  let account = accountStore.list.find((item) => item.id === accountId) || null
+  if (!account) {
+    try {
+      account = await accountsApi.getById(accountId)
+    } catch {
+      if (sequence === personaRouteSequence) ElMessage.warning(`未找到推广账号 #${accountId}，无法打开 Persona 设置`)
+      return
+    }
+  }
+  if (sequence !== personaRouteSequence || personaAccountIdFromRoute() !== accountId) return
+  openPersonaDrawer(account)
+}
+
+const clearAccountLocation = () => {
+  accountLocationSequence += 1
+  accountLocationController?.abort()
+  accountLocationController = null
+  focusedAccountId.value = null
+  focusedAccount.value = null
+  focusedAccountError.value = ''
+}
+
+const locateAccountFromRoute = async () => {
+  clearAccountLocation()
+  activeAccountTab.value = 'list'
+  if (!accountListLoaded.value || (isAdmin.value && personaAccountIdFromRoute())) return
+  const accountId = parseSafePositiveId(route.query.account_id)
+  if (!accountId) return
+  const sequence = accountLocationSequence
+  const existing = accountStore.list.find((item) => item.id === accountId)
+  if (existing) {
+    focusedAccountId.value = accountId
+    await nextTick()
+    document.querySelector('.focused-account')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    return
+  }
+  const controller = new AbortController()
+  accountLocationController = controller
+  try {
+    const result = await accountsApi.getById(accountId, controller.signal)
+    if (sequence !== accountLocationSequence || parseSafePositiveId(route.query.account_id) !== accountId) return
+    focusedAccount.value = result
+  } catch (error) {
+    const code = (error as { code?: string })?.code
+    if (code !== 'ERR_CANCELED' && sequence === accountLocationSequence) focusedAccountError.value = '账号不存在或无权限'
+  } finally {
+    if (sequence === accountLocationSequence) accountLocationController = null
+  }
+}
+
+const applyAccountRoute = async () => {
+  personaRouteSequence += 1
+  if (isAdmin.value && personaAccountIdFromRoute()) {
+    clearAccountLocation()
+    await openPersonaFromRoute()
+    return
+  }
+  await locateAccountFromRoute()
+}
+
+const handlePersonaUpdated = (detail: AccountPersonaDetail) => {
+  accountStore.updatePersonaSummary(detail)
+  const current = accountStore.list.find((item) => item.id === detail.account_id)
+  if (current) selectedPersonaAccount.value = current
 }
 
 const loadOperationalStatuses = async () => {
@@ -242,7 +357,7 @@ const warmupStageTagType = (stage?: string) => {
   return 'info'
 }
 
-const fetchData = async (params?: Record<string, any>) => {
+const fetchData = async (params?: AccountListParams) => {
   loading.value = true
   try {
     accountStore.setAccountTypeFilter('promoter')
@@ -255,7 +370,7 @@ const fetchData = async (params?: Record<string, any>) => {
   }
 }
 
-const handleSearch = (values: Record<string, any>) => {
+const handleSearch = (values: AccountListParams) => {
   accountStore.setPage(1)
   fetchData(values)
 }
@@ -502,11 +617,20 @@ const goToGuardianBots = () => {
   router.push('/guardian/bots')
 }
 
+watch(
+  () => [route.query.persona_account_id, route.query.account_id, route.query.assetId],
+  () => { void applyAccountRoute() },
+)
+
 onMounted(() => {
-  fetchData()
+  void fetchData().then(async () => {
+    accountListLoaded.value = true
+    await applyAccountRoute()
+  })
   loadProxyOptions()
   loadOperationalStatuses()
 })
+onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
 </script>
 
 <template>
@@ -517,6 +641,7 @@ onMounted(() => {
         <p class="page-desc">这里只管理用于搜群、加群、广告投放和私聊引导的推广账号。</p>
       </div>
       <div v-if="activeAccountTab === 'list'" class="header-actions">
+        <el-button v-if="returnAssetId" @click="router.push(`/owned-groups/${returnAssetId}/operations?tab=members`)">返回群运营中心</el-button>
         <el-button @click="goToGuardianBots">
           <el-icon><ChatDotRound /></el-icon>
           查看Bot账号
@@ -549,6 +674,17 @@ onMounted(() => {
       @reset="handleReset"
     />
 
+    <el-alert v-if="focusedAccountError" type="warning" :closable="false" show-icon :title="focusedAccountError" class="page-alert" />
+    <el-card v-if="focusedAccount" shadow="never" class="focused-result-card">
+      <template #header><strong>定位结果（不影响当前分页）</strong></template>
+      <el-descriptions :column="4" border>
+        <el-descriptions-item label="账号 ID">#{{ focusedAccount.id }}</el-descriptions-item>
+        <el-descriptions-item label="名称">{{ focusedAccount.display_name || `账号 #${focusedAccount.id}` }}</el-descriptions-item>
+        <el-descriptions-item label="职责">{{ focusedAccount.operation_mode === 'ad_only' ? '仅外部广告' : '增长综合' }}</el-descriptions-item>
+        <el-descriptions-item label="状态">{{ focusedAccount.status }}</el-descriptions-item>
+      </el-descriptions>
+    </el-card>
+
     <TableCard
       :columns="columns"
       :data="promoterAccounts"
@@ -561,7 +697,7 @@ onMounted(() => {
       @page-size-change="handlePageSizeChange"
     >
       <template #identifier="{ row }">
-        <div class="identifier-cell">
+        <div class="identifier-cell" :class="{ 'focused-account': row.id === focusedAccountId }">
           <div class="primary-line">
             <el-icon><UserFilled /></el-icon>
             <span>{{ row.display_name || row.identifier }}</span>
@@ -580,6 +716,17 @@ onMounted(() => {
         <el-tag :type="row.operation_mode === 'ad_only' ? 'warning' : 'success'" effect="plain">
           {{ row.operation_mode === 'ad_only' ? 'Ad-only 专用' : 'Growth 增长' }}
         </el-tag>
+      </template>
+
+      <template #persona="{ row }">
+        <div class="persona-status-cell">
+          <el-tag :type="personaStatusType(row)" effect="plain">
+            {{ personaStatusLabel(row) }}
+          </el-tag>
+          <span v-if="row.persona?.configured && row.persona.name" class="persona-name">
+            {{ row.persona.name }}
+          </span>
+        </div>
       </template>
 
       <template #assetTier="{ row }">
@@ -646,6 +793,10 @@ onMounted(() => {
 
       <template #actions="{ row }">
         <div class="account-action-buttons">
+          <el-button v-if="isAdmin" type="primary" link size="small" @click="openPersonaDrawer(row)">
+            <el-icon><MagicStick /></el-icon>
+            AI 性格
+          </el-button>
           <el-button type="primary" link size="small" @click="openEditDrawer(row)">
             <el-icon><Edit /></el-icon>
             编辑
@@ -709,6 +860,13 @@ onMounted(() => {
       :account="selectedDeliveryAccount"
       :status="selectedDeliveryStatus"
       @recovered="loadOperationalStatuses"
+    />
+
+    <AccountPersonaDrawer
+      v-model:visible="personaDrawerVisible"
+      :account="selectedPersonaAccount"
+      :can-edit="isAdmin"
+      @updated="handlePersonaUpdated"
     />
 
     <AccountLoginDialog
@@ -989,11 +1147,21 @@ onMounted(() => {
   gap: 12px;
 }
 
-.delivery-status-cell {
+.delivery-status-cell,
+.persona-status-cell {
   display: flex;
   align-items: flex-start;
   flex-direction: column;
   gap: 4px;
+}
+
+.persona-name {
+  max-width: 140px;
+  overflow: hidden;
+  color: #909399;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .account-action-buttons {

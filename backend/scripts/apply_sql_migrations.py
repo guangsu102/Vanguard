@@ -31,6 +31,12 @@ DEFAULT_MIGRATIONS = [
     "044_add_owned_group_orchestration.sql",
     "045_remove_ad_delivery_risk_budget.sql",
     "046_remove_redundant_probe_configuration.sql",
+    "047_add_owned_group_governance.sql",
+    "048_add_owned_group_messaging.sql",
+    "049_widen_owned_group_audit_resource_type.sql",
+    "050_add_account_ai_persona.sql",
+    "051_add_owned_group_message_persona_snapshot.sql",
+    "052_add_owned_group_member_observations.sql",
 ]
 
 

@@ -25,6 +25,8 @@ from app.core.p0_safety_gate import (
     is_owned_group_module_enabled,
     precheck_owned_group_resources,
 )
+from app.core.telegram_chat_lock import acquire_telegram_chat_transaction_lock
+from app.modules.guardian.models import ManagedGroupBinding, ManagedGroupBindingStatus
 from app.modules.owned_group.contracts import (
     AssetStatus,
     ItemStatus,
@@ -32,6 +34,7 @@ from app.modules.owned_group.contracts import (
     ReasonCode,
     assert_transition,
 )
+from app.modules.owned_group.lock_queries import owned_group_asset_for_update_query
 from app.modules.owned_group.models import (
     OwnedGroupAsset,
     OwnedGroupOperation,
@@ -81,6 +84,7 @@ class GroupCreateResult:
 
     success: bool
     telegram_chat_id: int | None = None
+    telegram_user_id: int | None = None
     telegram_username: str | None = None
     public_link: str | None = None
     reason_code: str | None = None
@@ -206,6 +210,7 @@ def _coerce_create(value: GroupCreateResult | dict[str, Any]) -> GroupCreateResu
     return GroupCreateResult(
         success=bool(value.get("success", False)),
         telegram_chat_id=value.get("telegram_chat_id") or value.get("chat_id"),
+        telegram_user_id=value.get("telegram_user_id") or value.get("user_id"),
         telegram_username=value.get("telegram_username") or value.get("username"),
         public_link=value.get("public_link"),
         reason_code=value.get("reason_code"),
@@ -281,6 +286,7 @@ async def _ensure_owner_membership(
     asset: OwnedGroupAsset,
     *,
     now: datetime,
+    telegram_user_id: int | None = None,
 ) -> None:
     """Persist the group owner as a verified member exactly once.
 
@@ -314,6 +320,8 @@ async def _ensure_owner_membership(
         membership.joined_at = membership.joined_at or now
         membership.last_verified_at = now
         membership.updated_at = now
+    if telegram_user_id is not None:
+        membership.telegram_user_id = int(telegram_user_id)
 
 
 async def _persist_item_result(
@@ -449,6 +457,45 @@ def _audit(
     )
 
 
+async def _claim_owned_group_chat_id(
+    db: AsyncSession,
+    asset: OwnedGroupAsset,
+    telegram_chat_id: int,
+    *,
+    actor_id: int | None = None,
+) -> None:
+    """Claim a chat as owned and quarantine a racing legacy auto-binding."""
+
+    chat_id = int(telegram_chat_id)
+    await acquire_telegram_chat_transaction_lock(db, chat_id)
+    bindings = (
+        await db.scalars(
+            select(ManagedGroupBinding).where(
+                ManagedGroupBinding.telegram_group_id == chat_id
+            )
+        )
+    ).all()
+    active_bindings = [
+        binding
+        for binding in bindings
+        if binding.binding_status == ManagedGroupBindingStatus.ACTIVE
+    ]
+    for binding in active_bindings:
+        binding.binding_status = ManagedGroupBindingStatus.INACTIVE
+    asset.telegram_chat_id = chat_id
+    if active_bindings:
+        _audit(
+            db,
+            event_type="owned_group_legacy_binding_quarantined",
+            asset_id=asset.id,
+            actor_id=actor_id,
+            before_state=f"active_bindings:{len(active_bindings)}",
+            after_state="active_bindings:0",
+            result="blocked",
+            reason_code="owned_group_requires_explicit_governance",
+        )
+
+
 async def enqueue_asset_precheck(
     db: AsyncSession, asset_id: int, *, actor_id: int | None = None
 ) -> OwnedGroupAsset:
@@ -460,9 +507,8 @@ async def enqueue_asset_precheck(
 
     # Serialize operator queue/retry changes for this asset.
     asset = await db.scalar(
-        select(OwnedGroupAsset)
+        owned_group_asset_for_update_query()
         .where(OwnedGroupAsset.id == asset_id)
-        .with_for_update()
         .execution_options(populate_existing=True)
     )
     if asset is None:
@@ -527,9 +573,8 @@ async def execute_asset_precheck(
     # scaled or a delayed Celery tick can overlap.  Without this lock two
     # workers could both commit CREATING and issue CreateChannelRequest.
     asset = await db.scalar(
-        select(OwnedGroupAsset)
+        owned_group_asset_for_update_query()
         .where(OwnedGroupAsset.id == asset_id)
-        .with_for_update()
         .execution_options(populate_existing=True)
     )
     if asset is None:
@@ -539,9 +584,8 @@ async def execute_asset_precheck(
         if durable_claims:
             await db.commit()
             asset = await db.scalar(
-                select(OwnedGroupAsset)
+                owned_group_asset_for_update_query()
                 .where(OwnedGroupAsset.id == asset_id)
-                .with_for_update()
                 .execution_options(populate_existing=True)
             )
             if asset is None:
@@ -626,7 +670,7 @@ async def execute_asset_precheck(
         }
 
     assert_transition("asset", AssetStatus.CREATING.value, AssetStatus.READY.value)
-    asset.telegram_chat_id = int(created.telegram_chat_id)
+    await _claim_owned_group_chat_id(db, asset, int(created.telegram_chat_id))
     if created.telegram_username:
         asset.telegram_username = created.telegram_username
     if created.public_link:
@@ -635,7 +679,12 @@ async def execute_asset_precheck(
         asset.public_link = f"https://t.me/{asset.telegram_username}"
     asset.status = AssetStatus.READY.value
     asset.updated_at = _now()
-    await _ensure_owner_membership(db, asset, now=asset.updated_at)
+    await _ensure_owner_membership(
+        db,
+        asset,
+        now=asset.updated_at,
+        telegram_user_id=created.telegram_user_id,
+    )
     _audit(
         db,
         event_type="owned_group_created",
@@ -671,7 +720,7 @@ async def reconcile_owned_group_asset(
     """
 
     asset = await db.scalar(
-        select(OwnedGroupAsset).where(OwnedGroupAsset.id == asset_id).with_for_update()
+        owned_group_asset_for_update_query().where(OwnedGroupAsset.id == asset_id)
     )
     if asset is None:
         return {"status": "not_found", "asset_id": asset_id}
@@ -830,7 +879,12 @@ async def reconcile_owned_group_asset(
         }
 
     assert_transition("asset", asset.status, AssetStatus.READY.value)
-    asset.telegram_chat_id = candidate_chat_id
+    await _claim_owned_group_chat_id(
+        db,
+        asset,
+        candidate_chat_id,
+        actor_id=actor_id,
+    )
     if reconciled.telegram_username:
         asset.telegram_username = reconciled.telegram_username
     if reconciled.public_link:
@@ -839,7 +893,12 @@ async def reconcile_owned_group_asset(
         asset.public_link = f"https://t.me/{asset.telegram_username}"
     asset.status = AssetStatus.READY.value
     asset.updated_at = _now()
-    await _ensure_owner_membership(db, asset, now=asset.updated_at)
+    await _ensure_owner_membership(
+        db,
+        asset,
+        now=asset.updated_at,
+        telegram_user_id=reconciled.telegram_user_id,
+    )
     _audit(
         db,
         event_type="owned_group_asset_reconciled",

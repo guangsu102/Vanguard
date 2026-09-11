@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.guardian_validation import ensure_managed_group_binding
+from app.api.guardian_validation import ensure_managed_group_binding, require_guardian_operator
 from app.core.database import get_db
 from app.modules.guardian.models import (
     GroupModerationPolicy,
@@ -18,7 +18,6 @@ from app.modules.guardian.models import (
     VerificationType,
     ViolationAction,
 )
-
 
 router = APIRouter()
 
@@ -58,9 +57,11 @@ class PunishmentPolicyPayload(BaseModel):
     severe_violation_direct_action: str = "mute"
 
 
-def _serialize_verification(config: GroupVerificationConfig) -> dict:
+def _serialize_verification(
+    config: GroupVerificationConfig, telegram_chat_id: int
+) -> dict:
     return {
-        "group_id": config.group_id,
+        "group_id": telegram_chat_id,
         "enable_verification": config.enable_verification,
         "verification_type": config.verification_type.value,
         "questions": config.get_questions(),
@@ -74,7 +75,9 @@ def _serialize_verification(config: GroupVerificationConfig) -> dict:
     }
 
 
-def _serialize_moderation(policy: GroupModerationPolicy) -> dict:
+def _serialize_moderation(
+    policy: GroupModerationPolicy, telegram_chat_id: int
+) -> dict:
     import json
 
     def parse(value: Optional[str]) -> Optional[dict]:
@@ -86,7 +89,7 @@ def _serialize_moderation(policy: GroupModerationPolicy) -> dict:
             return {"raw": value}
 
     return {
-        "group_id": policy.group_id,
+        "group_id": telegram_chat_id,
         "message_interval_seconds": policy.message_interval_seconds,
         "max_messages_per_minute": policy.max_messages_per_minute,
         "max_links_per_hour": policy.max_links_per_hour,
@@ -98,9 +101,11 @@ def _serialize_moderation(policy: GroupModerationPolicy) -> dict:
     }
 
 
-def _serialize_punishment(policy: GroupPunishmentPolicy) -> dict:
+def _serialize_punishment(
+    policy: GroupPunishmentPolicy, telegram_chat_id: int
+) -> dict:
     return {
-        "group_id": policy.group_id,
+        "group_id": telegram_chat_id,
         "warn_threshold": policy.warn_threshold,
         "mute_on_warn_threshold": policy.mute_on_warn_threshold,
         "mute_duration_seconds": policy.mute_duration_seconds,
@@ -114,24 +119,36 @@ def _serialize_punishment(policy: GroupPunishmentPolicy) -> dict:
 
 @router.get("/verification/{group_id}")
 async def get_verification_policy(group_id: int, db: AsyncSession = Depends(get_db)) -> dict:
-    await ensure_managed_group_binding(db, group_id)
-    result = await db.execute(select(GroupVerificationConfig).where(GroupVerificationConfig.group_id == group_id))
+    target = await ensure_managed_group_binding(db, group_id)
+    result = await db.execute(
+        select(GroupVerificationConfig).where(
+            GroupVerificationConfig.group_id == target.core_group_id
+        )
+    )
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="Verification policy not found")
-    return {"code": 0, "message": "success", "data": _serialize_verification(config)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_verification(config, target.telegram_chat_id),
+    }
 
 
-@router.put("/verification")
+@router.put("/verification", dependencies=[Depends(require_guardian_operator)])
 async def upsert_verification_policy(
     request: VerificationPolicyPayload,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await ensure_managed_group_binding(db, request.group_id)
-    result = await db.execute(select(GroupVerificationConfig).where(GroupVerificationConfig.group_id == request.group_id))
+    target = await ensure_managed_group_binding(db, request.group_id)
+    result = await db.execute(
+        select(GroupVerificationConfig).where(
+            GroupVerificationConfig.group_id == target.core_group_id
+        )
+    )
     config = result.scalar_one_or_none()
     if not config:
-        config = GroupVerificationConfig(group_id=request.group_id)
+        config = GroupVerificationConfig(group_id=target.core_group_id)
         db.add(config)
 
     config.enable_verification = request.enable_verification
@@ -146,31 +163,47 @@ async def upsert_verification_policy(
 
     await db.commit()
     await db.refresh(config)
-    return {"code": 0, "message": "success", "data": _serialize_verification(config)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_verification(config, target.telegram_chat_id),
+    }
 
 
 @router.get("/moderation/{group_id}")
 async def get_group_moderation_policy(group_id: int, db: AsyncSession = Depends(get_db)) -> dict:
-    await ensure_managed_group_binding(db, group_id)
-    result = await db.execute(select(GroupModerationPolicy).where(GroupModerationPolicy.group_id == group_id))
+    target = await ensure_managed_group_binding(db, group_id)
+    result = await db.execute(
+        select(GroupModerationPolicy).where(
+            GroupModerationPolicy.group_id == target.core_group_id
+        )
+    )
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Moderation policy not found")
-    return {"code": 0, "message": "success", "data": _serialize_moderation(policy)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_moderation(policy, target.telegram_chat_id),
+    }
 
 
-@router.put("/moderation")
+@router.put("/moderation", dependencies=[Depends(require_guardian_operator)])
 async def upsert_group_moderation_policy(
     request: ModerationPolicyPayload,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     if request.group_id is None:
         raise HTTPException(status_code=400, detail="group_id is required")
-    await ensure_managed_group_binding(db, request.group_id)
-    result = await db.execute(select(GroupModerationPolicy).where(GroupModerationPolicy.group_id == request.group_id))
+    target = await ensure_managed_group_binding(db, request.group_id)
+    result = await db.execute(
+        select(GroupModerationPolicy).where(
+            GroupModerationPolicy.group_id == target.core_group_id
+        )
+    )
     policy = result.scalar_one_or_none()
     if not policy:
-        policy = GroupModerationPolicy(group_id=request.group_id)
+        policy = GroupModerationPolicy(group_id=target.core_group_id)
         db.add(policy)
 
     import json
@@ -185,31 +218,47 @@ async def upsert_group_moderation_policy(
 
     await db.commit()
     await db.refresh(policy)
-    return {"code": 0, "message": "success", "data": _serialize_moderation(policy)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_moderation(policy, target.telegram_chat_id),
+    }
 
 
 @router.get("/punishment/{group_id}")
 async def get_group_punishment_policy(group_id: int, db: AsyncSession = Depends(get_db)) -> dict:
-    await ensure_managed_group_binding(db, group_id)
-    result = await db.execute(select(GroupPunishmentPolicy).where(GroupPunishmentPolicy.group_id == group_id))
+    target = await ensure_managed_group_binding(db, group_id)
+    result = await db.execute(
+        select(GroupPunishmentPolicy).where(
+            GroupPunishmentPolicy.group_id == target.core_group_id
+        )
+    )
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=404, detail="Punishment policy not found")
-    return {"code": 0, "message": "success", "data": _serialize_punishment(policy)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_punishment(policy, target.telegram_chat_id),
+    }
 
 
-@router.put("/punishment")
+@router.put("/punishment", dependencies=[Depends(require_guardian_operator)])
 async def upsert_group_punishment_policy(
     request: PunishmentPolicyPayload,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     if request.group_id is None:
         raise HTTPException(status_code=400, detail="group_id is required")
-    await ensure_managed_group_binding(db, request.group_id)
-    result = await db.execute(select(GroupPunishmentPolicy).where(GroupPunishmentPolicy.group_id == request.group_id))
+    target = await ensure_managed_group_binding(db, request.group_id)
+    result = await db.execute(
+        select(GroupPunishmentPolicy).where(
+            GroupPunishmentPolicy.group_id == target.core_group_id
+        )
+    )
     policy = result.scalar_one_or_none()
     if not policy:
-        policy = GroupPunishmentPolicy(group_id=request.group_id)
+        policy = GroupPunishmentPolicy(group_id=target.core_group_id)
         db.add(policy)
 
     policy.warn_threshold = request.warn_threshold
@@ -222,4 +271,8 @@ async def upsert_group_punishment_policy(
 
     await db.commit()
     await db.refresh(policy)
-    return {"code": 0, "message": "success", "data": _serialize_punishment(policy)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": _serialize_punishment(policy, target.telegram_chat_id),
+    }

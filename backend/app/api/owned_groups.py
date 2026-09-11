@@ -77,7 +77,14 @@ async def require_owned_group_operator(
     """Allow only administrators and operators to mutate owned-group plans."""
 
     if current_user.get("role") not in {"admin", "operator"}:
-        raise HTTPException(status_code=403, detail="Owned group operator access required")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "reason": "owned_group_role_forbidden",
+                "message": "Owned group operator access required",
+                "retryable": False,
+            },
+        )
     # Keep every operator-scoped write path (including Bot profile and control
     # routers that reuse this dependency) behind the same module switch.  A
     # disabled module must not accept a write merely because the caller has a
@@ -179,6 +186,7 @@ class OwnedGroupOperationCreate(BaseModel):
 class OwnedGroupAssetResponse(BaseModel):
     id: int
     internal_name: str
+    telegram_chat_id: int | None = None
     title: str
     about: str | None
     visibility: str
@@ -188,6 +196,15 @@ class OwnedGroupAssetResponse(BaseModel):
     invite_mode: str
     status: str
     member_count: int
+    core_group_id: int | None = None
+    managed_binding_id: int | None = None
+    guardian_bot_account_id: int | None = None
+    governance_status: str = "disabled"
+    governance_pending_at: datetime | None = None
+    governance_enabled_at: datetime | None = None
+    governance_last_checked_at: datetime | None = None
+    governance_last_error_code: str | None = None
+    governance_last_error_message: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -289,6 +306,7 @@ def _asset_response(asset: OwnedGroupAsset) -> OwnedGroupAssetResponse:
     return OwnedGroupAssetResponse(
         id=asset.id,
         internal_name=asset.internal_name,
+        telegram_chat_id=asset.telegram_chat_id,
         title=asset.title,
         about=asset.about,
         visibility=asset.visibility,
@@ -301,6 +319,19 @@ def _asset_response(asset: OwnedGroupAsset) -> OwnedGroupAssetResponse:
         invite_mode=asset.invite_mode,
         status=asset.status,
         member_count=asset.member_count,
+        core_group_id=asset.core_group_id,
+        managed_binding_id=asset.managed_binding_id,
+        guardian_bot_account_id=asset.guardian_bot_account_id,
+        governance_status=asset.governance_status,
+        governance_pending_at=asset.governance_pending_at,
+        governance_enabled_at=asset.governance_enabled_at,
+        governance_last_checked_at=asset.governance_last_checked_at,
+        governance_last_error_code=asset.governance_last_error_code,
+        governance_last_error_message=(
+            redact_sensitive_text(asset.governance_last_error_message, max_length=500)
+            if asset.governance_last_error_message
+            else None
+        ),
         created_at=asset.created_at,
         updated_at=asset.updated_at,
     )

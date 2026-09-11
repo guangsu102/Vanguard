@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.governance_gate import get_governance_gate_state, set_governance_stop
 from app.core.p0_safety_gate import (
     get_safety_gate_state,
     precheck_account_eligibility,
@@ -70,5 +71,41 @@ async def update_global_stop(
         raise HTTPException(
             status_code=503,
             detail={"reason": "safety_gate_backend_unavailable"},
+        )
+    return {"code": 0, "message": "success", "data": state.__dict__}
+
+
+@router.get("/governance/state")
+async def read_governance_gate_state(
+    current_user: dict = Depends(require_admin),
+) -> dict:
+    del current_user
+    state = await get_governance_gate_state()
+    return {"code": 0, "message": "success", "data": state.__dict__}
+
+
+@router.post("/governance/stop")
+async def update_governance_stop(
+    request: SafetyGateStopRequest,
+    current_user: dict = Depends(require_admin),
+) -> dict:
+    if request.enabled:
+        require_global_stop_reason(request.reason)
+    reason = request.reason.strip() or (
+        "manual_resume" if not request.enabled else "manual_stop"
+    )
+    state = await set_governance_stop(
+        enabled=request.enabled,
+        reason=reason,
+        operator=current_user.get("username"),
+    )
+    if not state.backend_available:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": "governance_gate_backend_unavailable",
+                "message": "Governance stop was not durably persisted",
+                "retryable": True,
+            },
         )
     return {"code": 0, "message": "success", "data": state.__dict__}

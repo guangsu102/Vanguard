@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.group.models import Group, GroupLevel
+from app.core.telegram_chat_lock import acquire_telegram_chat_transaction_lock
 from app.modules.guardian.models import (
     GroupModerationPolicy,
     GroupPunishmentPolicy,
@@ -20,6 +21,7 @@ from app.modules.guardian.models import (
     ManagedGroupBotRole,
     VerificationType,
 )
+from app.modules.owned_group.models import OwnedGroupAsset
 
 
 class ManagedGroupSyncConflict(ValueError):
@@ -34,7 +36,7 @@ class ManagedGroupSyncResult:
     updated_binding: bool = False
 
 
-def _merge_permissions_snapshot(existing_raw: Optional[str], incoming: dict[str, Any]) -> str:
+def _merge_permissions_snapshot(existing_raw: str | None, incoming: dict[str, Any]) -> str:
     existing: dict[str, Any] = {}
     if existing_raw:
         try:
@@ -63,16 +65,16 @@ def guardian_role_and_status_from_member(
     return ManagedGroupBotRole.MEMBER, ManagedGroupBindingStatus.DEGRADED
 
 
-async def ensure_default_group_governance(db: AsyncSession, telegram_group_id: int) -> None:
-    """Create default governance policy rows for a managed Telegram group."""
+async def ensure_default_group_governance(db: AsyncSession, core_group_id: int) -> None:
+    """Create default policies keyed by the internal ``Group.id``."""
 
     verification = await db.execute(
-        select(GroupVerificationConfig).where(GroupVerificationConfig.group_id == telegram_group_id)
+        select(GroupVerificationConfig).where(GroupVerificationConfig.group_id == core_group_id)
     )
     if verification.scalar_one_or_none() is None:
         db.add(
             GroupVerificationConfig(
-                group_id=telegram_group_id,
+                group_id=core_group_id,
                 enable_verification=False,
                 verification_type=VerificationType.CAPTCHA,
                 timeout_minutes=5,
@@ -84,16 +86,16 @@ async def ensure_default_group_governance(db: AsyncSession, telegram_group_id: i
         )
 
     moderation = await db.execute(
-        select(GroupModerationPolicy).where(GroupModerationPolicy.group_id == telegram_group_id)
+        select(GroupModerationPolicy).where(GroupModerationPolicy.group_id == core_group_id)
     )
     if moderation.scalar_one_or_none() is None:
-        db.add(GroupModerationPolicy(group_id=telegram_group_id))
+        db.add(GroupModerationPolicy(group_id=core_group_id))
 
     punishment = await db.execute(
-        select(GroupPunishmentPolicy).where(GroupPunishmentPolicy.group_id == telegram_group_id)
+        select(GroupPunishmentPolicy).where(GroupPunishmentPolicy.group_id == core_group_id)
     )
     if punishment.scalar_one_or_none() is None:
-        db.add(GroupPunishmentPolicy(group_id=telegram_group_id))
+        db.add(GroupPunishmentPolicy(group_id=core_group_id))
 
 
 async def sync_managed_group_binding(
@@ -101,18 +103,36 @@ async def sync_managed_group_binding(
     *,
     bot_account_id: int,
     telegram_group_id: int,
-    group_id: Optional[int] = None,
-    title: Optional[str] = None,
-    username: Optional[str] = None,
-    member_count: Optional[int] = None,
+    group_id: int | None = None,
+    title: str | None = None,
+    username: str | None = None,
+    member_count: int | None = None,
     binding_status: ManagedGroupBindingStatus = ManagedGroupBindingStatus.ACTIVE,
     bot_role: ManagedGroupBotRole = ManagedGroupBotRole.ADMIN,
-    permissions_snapshot: Optional[dict[str, Any]] = None,
+    permissions_snapshot: dict[str, Any] | None = None,
+    replace_permissions_snapshot: bool = False,
     chat_type: str = "group",
     discovery_source: str = "guardian_binding",
     allow_existing: bool = True,
+    reject_owned_group_auto_bind: bool = True,
 ) -> ManagedGroupSyncResult:
     """Create or update the primary guardian-bot binding for a Telegram group."""
+
+    # Keep the final ownership classification and binding write in one
+    # transaction-scoped chat critical section. Generic managed-group sync is
+    # fail-closed by default; only an explicit owned-governance path may opt out
+    # after it has validated the classified asset and selected Guardian bot.
+    await acquire_telegram_chat_transaction_lock(db, telegram_group_id)
+    if reject_owned_group_auto_bind:
+        owned_asset_id = await db.scalar(
+            select(OwnedGroupAsset.id).where(
+                OwnedGroupAsset.telegram_chat_id == int(telegram_group_id)
+            )
+        )
+        if owned_asset_id is not None:
+            raise ManagedGroupSyncConflict(
+                "Self-owned groups require explicit Guardian governance binding"
+            )
 
     now = datetime.utcnow()
     normalized_chat_type = chat_type if chat_type in {"group", "supergroup", "channel"} else "group"
@@ -120,10 +140,16 @@ async def sync_managed_group_binding(
     created_group = False
     updated_binding = False
 
-    group: Optional[Group] = None
+    group: Group | None = None
     if group_id is not None:
         group = await db.get(Group, group_id)
-    if group is None:
+        if group is None:
+            raise ManagedGroupSyncConflict("The requested core group does not exist")
+        if int(group.group_id) != int(telegram_group_id):
+            raise ManagedGroupSyncConflict(
+                "The requested core group does not match the Telegram group"
+            )
+    else:
         result = await db.execute(select(Group).where(Group.group_id == telegram_group_id))
         group = result.scalar_one_or_none()
 
@@ -166,8 +192,12 @@ async def sync_managed_group_binding(
         binding.telegram_group_id = telegram_group_id
         binding.binding_status = binding_status
         binding.bot_role = bot_role
-        binding.permissions_snapshot = _merge_permissions_snapshot(
-            binding.permissions_snapshot, incoming_permissions
+        binding.permissions_snapshot = (
+            json.dumps(incoming_permissions, ensure_ascii=False, sort_keys=True)
+            if replace_permissions_snapshot
+            else _merge_permissions_snapshot(
+                binding.permissions_snapshot, incoming_permissions
+            )
         )
         binding.last_synced_at = now
         updated_binding = True
@@ -184,7 +214,7 @@ async def sync_managed_group_binding(
         db.add(binding)
 
     if normalized_chat_type != "channel":
-        await ensure_default_group_governance(db, telegram_group_id)
+        await ensure_default_group_governance(db, group.id)
     await db.flush()
     return ManagedGroupSyncResult(
         binding=binding,

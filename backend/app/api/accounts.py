@@ -4,23 +4,23 @@ Accounts API Router
 RESTful API for Telegram account management with cursor pagination.
 """
 
-from datetime import datetime
-from typing import Optional
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import structlog
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status, UploadFile, File, Form
-from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc, or_
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, lazyload, undefer_group
 from sqlalchemy.orm.attributes import set_committed_value
 
-from app.core.database import get_db
-from app.core.config import settings
-from app.core.account.manager import AccountManager
 from app.core.account.auth_helper import TelegramAuthHelper
+from app.core.account.environment_guard import AccountEnvironmentGuard
+from app.core.account.manager import AccountManager
 from app.core.account.models import (
     AccountAssetTier,
     AccountEnvironmentEvent,
@@ -40,17 +40,18 @@ from app.core.account.operation_lease import (
     AccountOperationLeaseManager,
     AccountOperationLeaseUnavailable,
 )
+from app.core.account.persona import PersonaV1, hash_persona
 from app.core.account.pool import get_account_pool, invalidate_account_in_all_pools
 from app.core.account.proxy_policy_events import publish_account_proxy_policy_changed
 from app.core.account.proxy_resolver import normalize_proxy_mode, resolve_auth_proxy
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.session_crypto import encrypt_session_string
 from app.core.account.telegram_execution import TelegramExecutionService
-from app.core.account.environment_guard import AccountEnvironmentGuard
+from app.core.config import settings
+from app.core.database import get_db
 from app.core.group.membership_sync import sync_account_joined_groups
 from app.core.network.fingerprint import FingerprintManager
 from app.core.security import require_admin
-
 
 router = APIRouter()
 auth_helper = TelegramAuthHelper()
@@ -132,11 +133,22 @@ async def _apply_onboarding_operation_mode(
     if account.account_type != AccountType.PROMOTER:
         return None
     mode = AccountOperationMode(operation_mode)
+    locked_account = (
+        await db.execute(
+            select(TelegramAccount)
+            .options(lazyload(TelegramAccount.operation_config))
+            .where(TelegramAccount.id == account.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if locked_account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
     config = (
         await db.execute(
-            select(AccountOperationConfig).where(
-                AccountOperationConfig.account_id == account.id
-            )
+            select(AccountOperationConfig)
+            .options(lazyload(AccountOperationConfig.account))
+            .where(AccountOperationConfig.account_id == account.id)
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if config is None:
@@ -167,6 +179,9 @@ async def _apply_onboarding_operation_mode(
 
 class AccountCreate(BaseModel):
     """Account creation request."""
+
+    model_config = ConfigDict(extra="forbid")
+
     phone: Optional[str] = Field(None, description="Phone number with country code")
     identifier: Optional[str] = Field(None, description="Unified account identifier")
     display_name: Optional[str] = Field(None, description="Display name")
@@ -198,6 +213,9 @@ class CompleteLoginRequest(AccountCreate):
 
 class AccountUpdate(BaseModel):
     """Account update request."""
+
+    model_config = ConfigDict(extra="forbid")
+
     display_name: Optional[str] = Field(None, description="Display name")
     profile_bio: Optional[str] = Field(None, max_length=70, description="Telegram public bio")
     asset_tier: Optional[str] = Field(None, description="Asset tier: unknown/month_1/month_3_6/year_1/year_2/year_3_plus")
@@ -239,6 +257,10 @@ class AccountResponse(BaseModel):
     profile_bio_synced_at: Optional[str] = None
     account_type: str
     operation_mode: str = AccountOperationMode.GROWTH.value
+    persona_configured: bool = False
+    persona_name: Optional[str] = None
+    persona_revision: int = 0
+    persona_applicable: bool = False
     asset_tier: str = AccountAssetTier.UNKNOWN.value
     registered_at: Optional[str] = None
     asset_verified_at: Optional[str] = None
@@ -316,6 +338,9 @@ class AccountStatsResponse(BaseModel):
 
 class AccountBatchImportRequest(BaseModel):
     """Batch import request."""
+
+    model_config = ConfigDict(extra="forbid")
+
     accounts: list[AccountCreate] = Field(..., min_length=1, max_length=100)
 
 
@@ -354,8 +379,76 @@ class APIConfigResponse(BaseModel):
 # Helper Functions
 # =============================================================================
 
+def _account_persona_summary(account: TelegramAccount) -> dict[str, object]:
+    """Build the safe Persona summary without triggering ORM lazy loads."""
+    raw_persona = account.__dict__.get("ai_persona")
+    stored_hash = account.__dict__.get("ai_persona_hash")
+    configured = raw_persona is not None or stored_hash is not None
+    revision_value = account.__dict__.get("ai_persona_revision", 0)
+    revision = revision_value if type(revision_value) is int and revision_value >= 0 else 0
+    persona_name: str | None = None
+    persona_valid = not configured and revision_value == revision
+    if raw_persona is not None:
+        try:
+            persona = PersonaV1.model_validate(raw_persona)
+            persona_valid = (
+                type(revision_value) is int
+                and revision_value >= 1
+                and isinstance(stored_hash, str)
+                and stored_hash == hash_persona(persona)
+            )
+            if persona_valid:
+                persona_name = persona.name
+        except (TypeError, ValidationError):
+            persona_valid = False
+
+    operation_config = account.__dict__.get("operation_config")
+    operation_mode = (
+        getattr(operation_config, "operation_mode", None)
+        if operation_config is not None
+        else None
+    )
+    account_type = getattr(account.account_type, "value", account.account_type)
+    applicable = bool(
+        persona_valid
+        and account_type == AccountType.PROMOTER.value
+        and operation_config is not None
+        and operation_mode == AccountOperationMode.GROWTH.value
+    )
+    return {
+        "persona_configured": configured,
+        "persona_name": persona_name,
+        "persona_revision": revision,
+        "persona_applicable": applicable,
+    }
+
+
+def _account_response_query(account_id: int):
+    """Load all fields needed by AccountResponse in one account-row query."""
+    return (
+        select(TelegramAccount)
+        .options(
+            undefer_group("account_persona"),
+            joinedload(TelegramAccount.operation_config),
+            joinedload(TelegramAccount.static_proxy),
+        )
+        .where(TelegramAccount.id == account_id)
+        .execution_options(populate_existing=True)
+    )
+
+
+async def _reload_account_for_response(
+    db: AsyncSession,
+    account: TelegramAccount,
+) -> TelegramAccount:
+    """Refresh a single response entity with its Persona summary dependencies."""
+    result = await db.execute(_account_response_query(account.id))
+    return result.scalar_one_or_none() or account
+
+
 def _account_to_response(account: TelegramAccount) -> AccountResponse:
     """Convert TelegramAccount model to response."""
+    persona_summary = _account_persona_summary(account)
     return AccountResponse(
         id=account.id,
         phone=account.phone,
@@ -369,6 +462,7 @@ def _account_to_response(account: TelegramAccount) -> AccountResponse:
             if account.__dict__.get("operation_config") is not None
             else AccountOperationMode.GROWTH.value
         ),
+        **persona_summary,
         asset_tier=account.asset_tier or AccountAssetTier.UNKNOWN.value,
         registered_at=account.registered_at.isoformat() if account.registered_at else None,
         asset_verified_at=account.asset_verified_at.isoformat() if account.asset_verified_at else None,
@@ -622,7 +716,11 @@ async def list_accounts(
     - search: Search by phone number
     """
     # Build query
-    query = select(TelegramAccount)
+    query = select(TelegramAccount).options(
+        undefer_group("account_persona"),
+        joinedload(TelegramAccount.operation_config),
+        joinedload(TelegramAccount.static_proxy),
+    )
     count_query = select(func.count(TelegramAccount.id))
 
     # Cursor pagination (using ID)
@@ -765,6 +863,7 @@ async def create_account(
         )
         await db.commit()
         await db.refresh(created)
+        created = await _reload_account_for_response(db, created)
         return _account_to_response(created)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -776,8 +875,9 @@ async def get_account(
     db: AsyncSession = Depends(get_db),
 ) -> AccountResponse:
     """Get account by ID."""
-    manager = AccountManager(db)
-    account = await manager.get_account(account_id)
+    account = (
+        await db.execute(_account_response_query(account_id))
+    ).scalar_one_or_none()
 
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
@@ -846,6 +946,7 @@ async def update_account(
         updated = await manager.update_account(account_id, **update_kwargs)
         if proxy_policy_updated:
             await _propagate_account_proxy_policy_change(updated)
+        updated = await _reload_account_for_response(db, updated)
         return _account_to_response(updated)
     except Exception as e:
         if isinstance(e, HTTPException):
@@ -947,6 +1048,7 @@ async def sync_account_profile_bio(
             details={"source": "profile_bio_sync", "bio_length": len(account.profile_bio or "")},
         )
         await db.refresh(account)
+        account = await _reload_account_for_response(db, account)
         return _account_to_response(account)
     finally:
         if wrapper is not None:
@@ -1291,6 +1393,7 @@ async def manually_ban_account(
             raise HTTPException(status_code=404, detail="Account not found") from exc
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     await invalidate_account_in_all_pools(account.id, reason="manual_account_ban")
+    account = await _reload_account_for_response(db, account)
     return _account_to_response(account)
 
 # =============================================================================
@@ -1909,6 +2012,7 @@ async def complete_account_login(
             await _propagate_account_proxy_policy_change(account)
         await AccountEnvironmentGuard(db).record_event(account, "login", details={"source": "complete_login"})
         await _sync_promoter_joined_groups(account, db)
+        account = await _reload_account_for_response(db, account)
         return _account_to_response(account)
 
     except HTTPException:

@@ -1,8 +1,13 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { computed, ref, reactive, onMounted } from 'vue'
 import { ElButton, ElIcon, ElMessage, ElTabs, ElTabPane, ElForm, ElFormItem, ElInput, ElSwitch, ElCard, ElTable, ElTag, ElDivider, ElAlert } from 'element-plus'
 import { Select, Download, Delete, FolderOpened, Lock } from '@element-plus/icons-vue'
 import { authApi } from '@/api/auth'
+import {
+  getOwnedGroupAiPersonaFeatureErrorMessage,
+  getSettingsApiError,
+} from '@/api/settings'
+import { useAuthStore } from '@/stores/auth'
 import { useSettingsStore } from '@/stores/settings'
 import { settingsApi } from '@/api/settings'
 import { downloadBlob } from '@/utils/download'
@@ -10,9 +15,15 @@ import ClientListPagination from '@/components/ClientListPagination.vue'
 import dayjs from 'dayjs'
 
 const settingsStore = useSettingsStore()
+const authStore = useAuthStore()
+const isAdmin = computed(() => authStore.userInfo?.role === 'admin')
 
 const loading = ref(false)
 const activeTab = ref('notification')
+const personaRuntimeIntent = ref(false)
+const personaFeatureSaving = ref(false)
+const personaFeatureConflict = ref(false)
+const personaFeature = computed(() => settingsStore.settings?.ownedGroupAiPersona ?? null)
 
 const passwordForm = reactive({
   oldPassword: '',
@@ -148,6 +159,8 @@ const fetchSettings = async () => {
       Object.assign(xboardForm, settingsStore.settings.xboard || {})
       Object.assign(aiReplyForm, settingsStore.settings.aiReply || {})
       Object.assign(keywordPrivateReplyForm, settingsStore.settings.keywordPrivateReply || {})
+      personaRuntimeIntent.value = settingsStore.settings.ownedGroupAiPersona.enabled
+      personaFeatureConflict.value = false
       const privateMessaging = settingsStore.settings.privateMessaging || {}
       Object.assign(privateMessagingForm, {
         autoReplyEnabled: privateMessaging.autoReplyEnabled ?? privateMessaging.inboundRepliesEnabled ?? false,
@@ -160,6 +173,32 @@ const fetchSettings = async () => {
     console.error('Failed to fetch settings:', error)
   } finally {
     loading.value = false
+  }
+}
+
+const handlePersonaIntentChange = () => {
+  personaFeatureConflict.value = false
+}
+
+const handleSavePersonaFeature = async () => {
+  if (!isAdmin.value || !personaFeature.value) return
+
+  personaFeatureSaving.value = true
+  try {
+    const saved = await settingsStore.updateOwnedGroupAiPersonaFeature(personaRuntimeIntent.value)
+    personaRuntimeIntent.value = saved.enabled
+    personaFeatureConflict.value = false
+    ElMessage.success('Persona 功能开关已保存')
+  } catch (error) {
+    const failure = getSettingsApiError(error)
+    if (failure.code === 'PERSONA_FEATURE_REVISION_CONFLICT') {
+      personaFeatureConflict.value = true
+      ElMessage.warning('设置已被其他管理员修改，请确认后重试')
+      return
+    }
+    ElMessage.error(getOwnedGroupAiPersonaFeatureErrorMessage(failure))
+  } finally {
+    personaFeatureSaving.value = false
   }
 }
 
@@ -376,6 +415,62 @@ onMounted(() => {
           />
 
           <el-form :model="aiReplyForm" label-width="160px">
+            <el-divider content-position="left">自建群账号 Persona</el-divider>
+
+            <el-alert
+              v-if="personaFeature && !personaFeature.staticEnabled"
+              title="需启用环境开关并重启后端才会生效"
+              type="warning"
+              :closable="false"
+              style="margin-bottom: 20px;"
+            />
+
+            <el-descriptions v-if="personaFeature" :column="1" border class="persona-feature-status">
+              <el-descriptions-item label="静态开关">
+                <el-tag :type="personaFeature.staticEnabled ? 'success' : 'info'">
+                  {{ personaFeature.staticEnabled ? '已启用' : '未启用' }}
+                </el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="运行时开关">
+                <template v-if="isAdmin">
+                  <el-switch
+                    v-model="personaRuntimeIntent"
+                    :loading="personaFeatureSaving"
+                    @change="handlePersonaIntentChange"
+                  />
+                  <span class="form-tip">保存后只影响之后创建的 AI 任务</span>
+                </template>
+                <el-tag v-else :type="personaFeature.enabled ? 'success' : 'info'">
+                  {{ personaFeature.enabled ? '已启用' : '未启用' }}
+                </el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="最终生效">
+                <el-tag :type="personaFeature.effectiveEnabled ? 'success' : 'info'">
+                  {{ personaFeature.effectiveEnabled ? '已生效' : '未生效' }}
+                </el-tag>
+                <span class="form-tip">静态开关与运行时开关同时启用才会生效</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="设置版本">
+                v{{ personaFeature.revision }}
+                <span v-if="personaFeature.updatedAt" class="form-tip">
+                  最近更新：{{ formatDate(personaFeature.updatedAt) }}
+                </span>
+              </el-descriptions-item>
+            </el-descriptions>
+
+            <el-form-item v-if="isAdmin && personaFeature" class="persona-feature-save">
+              <el-button
+                data-testid="save-persona-feature"
+                type="primary"
+                :loading="personaFeatureSaving"
+                @click="handleSavePersonaFeature"
+              >
+                {{ personaFeatureConflict ? '确认并重试' : '保存 Persona 开关' }}
+              </el-button>
+            </el-form-item>
+
+            <el-divider content-position="left">私聊 AI 与模板</el-divider>
+
             <el-form-item label="私聊自动回复">
               <el-switch v-model="privateMessagingForm.autoReplyEnabled" />
               <span class="form-tip">默认关闭，开启后按下方模板处理未被人工接管的会话</span>
@@ -556,6 +651,15 @@ onMounted(() => {
   margin: -4px 0 18px 160px;
   color: #606266;
   font-size: 12px;
+}
+
+.persona-feature-status {
+  max-width: 760px;
+  margin-bottom: 18px;
+}
+
+.persona-feature-save {
+  margin-top: 16px;
 }
 
 .template-group {

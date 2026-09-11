@@ -8,14 +8,21 @@ import {
   watch,
 } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
+import dayjs from "dayjs";
+import { useRoute, useRouter } from "vue-router";
 import { accountsApi, type Account } from "@/api/accounts";
 import { getApiErrorMessage } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 import { useOwnedGroupStore } from "@/stores/ownedGroup";
 import {
+  getOwnedGroupGovernanceFailure,
   redactOwnedGroupError,
+  type GovernanceCapabilities,
+  type GovernanceFailure,
   type OwnedBotProfile,
   type OwnedGroupAsset,
+  type OwnedGroupGovernanceCandidate,
+  type OwnedGroupGovernanceState,
   type OwnedGroupInviteLink,
   type OwnedGroupOperationStatus,
   type OwnedGroupPrecheckResult,
@@ -25,6 +32,8 @@ import {
 
 const store = useOwnedGroupStore();
 const authStore = useAuthStore();
+const route = useRoute();
+const router = useRouter();
 const accounts = ref<Account[]>([]);
 const botAccounts = ref<Account[]>([]);
 const errorMessage = ref("");
@@ -53,6 +62,9 @@ const reconcileUsername = ref("");
 const botRegistrationVisible = ref(false);
 const registeringBot = ref(false);
 const verifyingBotId = ref<number | null>(null);
+const governanceDialogVisible = ref(false);
+const selectedGuardianBotAccountId = ref<number | undefined>();
+const governanceActionError = ref<GovernanceFailure | null>(null);
 const botForm = reactive({
   owner_account_id: undefined as number | undefined,
   account_id: undefined as number | undefined,
@@ -73,6 +85,35 @@ const ADMIN_PERMISSION_OPTIONS = [
   { key: "manage_call", label: "管理语音/视频" },
   { key: "anonymous", label: "匿名管理员" },
 ] as const;
+
+const GOVERNANCE_STATUS_LABELS: Record<OwnedGroupGovernanceState, string> = {
+  disabled: "未接入",
+  pending: "接入中",
+  managed: "治理正常",
+  degraded: "治理降级",
+};
+
+const GOVERNANCE_CAPABILITY_OPTIONS: Array<{
+  key: keyof GovernanceCapabilities;
+  label: string;
+}> = [
+  { key: "verification", label: "入群验证" },
+  { key: "sensitive_keywords", label: "敏感词" },
+  { key: "anti_spam", label: "反垃圾" },
+  { key: "warn", label: "警告" },
+  { key: "mute", label: "禁言" },
+  { key: "ban", label: "封禁" },
+  { key: "announcement", label: "公告" },
+  { key: "pin_message", label: "置顶" },
+  { key: "activity", label: "活动" },
+];
+
+const GOVERNANCE_PERMISSION_LABELS: Record<string, string> = {
+  can_delete_messages: "删除消息",
+  can_restrict_members: "限制成员",
+  can_invite_users: "邀请成员",
+  can_pin_messages: "置顶消息",
+};
 
 const draft = reactive({
   internal_name: "",
@@ -99,6 +140,123 @@ const selectedAsset = computed(
     store.list.find((asset) => asset.id === selectedId.value) || store.current,
 );
 const isAdmin = computed(() => authStore.userInfo?.role === "admin");
+const canOperateGovernance = computed(() =>
+  ["admin", "operator"].includes(authStore.userInfo?.role || ""),
+);
+const selectedAssetId = computed(() => selectedAsset.value?.id);
+const governance = computed(() => {
+  const assetId = selectedAssetId.value;
+  return assetId ? store.governanceByAssetId[assetId] ?? null : null;
+});
+const governanceStatus = computed<OwnedGroupGovernanceState>(
+  () =>
+    governance.value?.governance_status ||
+    selectedAsset.value?.governance_status ||
+    "disabled",
+);
+const governanceLoading = computed(() => {
+  const assetId = selectedAssetId.value;
+  return assetId
+    ? Boolean(store.governanceLoadingByAssetId[assetId])
+    : false;
+});
+const governanceCandidates = computed(() => {
+  const assetId = selectedAssetId.value;
+  return assetId
+    ? store.governanceCandidatesByAssetId[assetId] ?? []
+    : [];
+});
+const governanceCandidatesLoading = computed(() => {
+  const assetId = selectedAssetId.value;
+  return assetId
+    ? Boolean(store.governanceCandidatesLoadingByAssetId[assetId])
+    : false;
+});
+const selectedGovernanceCandidate = computed(() =>
+  governanceCandidates.value.find(
+    (candidate) =>
+      candidate.guardian_bot_account_id ===
+      selectedGuardianBotAccountId.value,
+  ),
+);
+const currentGovernanceCandidate = computed(() =>
+  governanceCandidates.value.find(
+    (candidate) =>
+      candidate.guardian_bot_account_id ===
+      governance.value?.guardian_bot_account_id,
+  ),
+);
+const currentGuardianBotAccount = computed(() =>
+  botAccounts.value.find(
+    (account) =>
+      account.id === governance.value?.guardian_bot_account_id,
+  ),
+);
+const governanceBotLabel = computed(
+  () =>
+    governance.value?.guardian_bot_display_name ||
+    currentGovernanceCandidate.value?.display_name ||
+    currentGuardianBotAccount.value?.display_name ||
+    currentGuardianBotAccount.value?.identifier ||
+    (governance.value?.guardian_bot_account_id
+      ? "Guardian Bot #" + governance.value.guardian_bot_account_id
+      : "-"),
+);
+const governanceBotUsername = computed(() => {
+  const raw =
+    governance.value?.guardian_bot_username ||
+    currentGovernanceCandidate.value?.username ||
+    currentGuardianBotAccount.value?.identifier ||
+    "";
+  if (!raw) return "-";
+  return raw.startsWith("@") ? raw : "@" + raw;
+});
+const governanceFailure = computed<GovernanceFailure | null>(() => {
+  if (governanceActionError.value) return governanceActionError.value;
+  if (governance.value?.failure) return governance.value.failure;
+  const asset = selectedAsset.value;
+  if (
+    asset?.governance_last_error_code ||
+    asset?.governance_last_error_message
+  ) {
+    return {
+      reason: asset.governance_last_error_code || "governance_failed",
+      message:
+        asset.governance_last_error_message || "Guardian 治理状态异常",
+      retryable: false,
+      missing_permissions: [],
+      correlation_id: null,
+    };
+  }
+  return null;
+});
+const governanceCapabilityRows = computed(() =>
+  GOVERNANCE_CAPABILITY_OPTIONS.map((item) => ({
+    ...item,
+    enabled: Boolean(governance.value?.capabilities[item.key]),
+  })),
+);
+const governanceGrantedPermissions = computed(
+  () => governance.value?.permission_probe?.granted_permissions ?? [],
+);
+const governanceMissingPermissions = computed(
+  () => governance.value?.permission_probe?.missing_permissions ?? [],
+);
+const assetReadyForGovernance = computed(
+  () => selectedAsset.value?.status === "ready",
+);
+const governanceDisabledReason = computed(() => {
+  if (selectedAsset.value?.status === "archived") return "资产已归档";
+  if (!assetReadyForGovernance.value) {
+    return (
+      "资产状态为 " +
+      (selectedAsset.value?.status || "unknown") +
+      "，必须达到 ready"
+    );
+  }
+  if (!canOperateGovernance.value) return "当前角色仅可查看治理状态";
+  return "";
+});
 const inviteLinks = computed(() => store.inviteLinks);
 const inviteLinksLoading = computed(() => store.inviteLinksLoading);
 const selectedResourceEntries = computed(() =>
@@ -288,6 +446,40 @@ const violationLabel = (violation: Record<string, unknown>) => {
   return `${resourceType} ${resourceId}: ${reason}`.trim();
 };
 
+const governanceStatusType = (status: OwnedGroupGovernanceState) => {
+  if (status === "managed") return "success";
+  if (status === "pending") return "warning";
+  if (status === "degraded") return "danger";
+  return "info";
+};
+
+const governancePermissionLabel = (permission: string) =>
+  GOVERNANCE_PERMISSION_LABELS[permission] || permission;
+
+const formatGovernanceTime = (value?: string | null) =>
+  value ? dayjs(value).format("YYYY-MM-DD HH:mm:ss") : "-";
+
+const governanceCandidateLabel = (
+  candidate: OwnedGroupGovernanceCandidate,
+) => {
+  const name =
+    candidate.display_name ||
+    candidate.username ||
+    "Guardian Bot #" + candidate.guardian_bot_account_id;
+  const username = candidate.username
+    ? candidate.username.startsWith("@")
+      ? candidate.username
+      : "@" + candidate.username
+    : "无用户名";
+  return (
+    name +
+    " · " +
+    username +
+    " · account #" +
+    candidate.guardian_bot_account_id
+  );
+};
+
 const showError = (error: unknown, fallback: string) => {
   const responseData = (error as any)?.response?.data;
   let message = "";
@@ -417,6 +609,235 @@ const regenerateInviteLink = async () => {
   }
 };
 
+const refreshGovernance = async (
+  assetId = selectedAsset.value?.id,
+  startPendingPolling = true,
+) => {
+  if (!assetId) return null;
+  try {
+    const result = await store.fetchGovernance(assetId);
+    governanceActionError.value = null;
+    if (result.governance_status === "pending" && startPendingPolling) {
+      startPolling();
+    }
+    return result;
+  } catch (error) {
+    governanceActionError.value = getOwnedGroupGovernanceFailure(
+      error,
+      "治理状态加载失败",
+    );
+    return null;
+  }
+};
+
+const openGovernanceDialog = async () => {
+  if (!selectedAsset.value || !assetReadyForGovernance.value) {
+    ElMessage.warning(governanceDisabledReason.value || "资产尚未 ready");
+    return;
+  }
+  if (!canOperateGovernance.value) {
+    ElMessage.warning("当前角色仅可查看治理状态");
+    return;
+  }
+  if (governanceStatus.value === "pending") {
+    ElMessage.warning("治理操作正在执行，不能选择不同 Bot");
+    return;
+  }
+  if (governanceStatus.value !== "disabled") {
+    ElMessage.warning("已接入治理的资产只能重新检测，不能更换 Bot");
+    return;
+  }
+  selectedGuardianBotAccountId.value =
+    governance.value?.guardian_bot_account_id ?? undefined;
+  governanceActionError.value = null;
+  governanceDialogVisible.value = true;
+  try {
+    const candidates = await store.fetchGovernanceCandidates(
+      selectedAsset.value.id,
+    );
+    if (
+      !selectedGuardianBotAccountId.value &&
+      candidates.length === 1
+    ) {
+      selectedGuardianBotAccountId.value =
+        candidates[0].guardian_bot_account_id;
+    }
+  } catch (error) {
+    governanceActionError.value = getOwnedGroupGovernanceFailure(
+      error,
+      "可用 Guardian Bot 加载失败",
+    );
+  }
+};
+
+const bindGovernance = async () => {
+  const assetId = selectedAsset.value?.id;
+  if (!assetId || !selectedGuardianBotAccountId.value) {
+    ElMessage.warning("请选择 Guardian Bot");
+    return;
+  }
+  governanceActionError.value = null;
+  try {
+    const result = await store.bindGovernance(
+      assetId,
+      selectedGuardianBotAccountId.value,
+    );
+    governanceDialogVisible.value = false;
+    actionMessage.value =
+      result.governance_status === "managed"
+        ? "Guardian 治理接入成功"
+        : "Guardian 治理请求已提交，当前状态：" +
+          result.governance_status;
+    if (result.governance_status === "managed") {
+      ElMessage.success("Guardian 治理接入成功");
+    } else {
+      ElMessage.warning(actionMessage.value);
+    }
+    if (result.governance_status === "pending") startPolling();
+  } catch (error) {
+    governanceActionError.value = getOwnedGroupGovernanceFailure(
+      error,
+      "Guardian 治理接入失败",
+    );
+  }
+};
+
+const reconcileGovernance = async () => {
+  const assetId = selectedAsset.value?.id;
+  if (!assetId || !canOperateGovernance.value) return;
+  try {
+    await ElMessageBox.confirm(
+      "将实时检测 Bot 身份、群成员角色和管理员权限，并修复内部绑定；不会自动拉 Bot 入群或授予管理员权限。",
+      "重新检测 Guardian 治理",
+      { type: "warning", confirmButtonText: "开始检测" },
+    );
+  } catch {
+    return;
+  }
+  governanceActionError.value = null;
+  try {
+    const result = await store.reconcileGovernance(assetId);
+    actionMessage.value =
+      result.governance_status === "managed"
+        ? "Guardian 治理检测通过"
+        : "Guardian 治理检测完成，当前状态：" +
+          result.governance_status;
+    if (result.governance_status === "managed") {
+      ElMessage.success("Guardian 治理检测通过");
+    } else {
+      ElMessage.warning(actionMessage.value);
+    }
+    if (result.governance_status === "pending") startPolling();
+  } catch (error) {
+    governanceActionError.value = getOwnedGroupGovernanceFailure(
+      error,
+      "Guardian 治理重新检测失败",
+    );
+  }
+};
+
+const openGovernancePolicies = () => {
+  const asset = selectedAsset.value;
+  const status = governance.value;
+  const telegramChatId =
+    status?.telegram_chat_id ?? asset?.telegram_chat_id;
+  const guardianBotAccountId =
+    status?.guardian_bot_account_id ?? asset?.guardian_bot_account_id;
+  if (
+    !asset ||
+    !Number.isSafeInteger(telegramChatId) ||
+    telegramChatId === 0 ||
+    !guardianBotAccountId
+  ) {
+    ElMessage.warning("治理关联 ID 尚未就绪，请先重新检测");
+    return;
+  }
+  router.push({
+    path: "/guardian/policies",
+    query: {
+      groupId: String(telegramChatId),
+      title: asset.title,
+      botId: String(guardianBotAccountId),
+      source: "owned_group",
+      assetId: String(asset.id),
+    },
+  });
+};
+
+const ownedGroupMessagingDisabledReason = (asset: OwnedGroupAsset) => {
+  if (asset.status === "archived") return "资产已归档";
+  if (asset.status !== "ready") return "资产必须达到 ready";
+  if (!Number.isSafeInteger(asset.core_group_id) || !asset.core_group_id)
+    return "核心群映射未就绪";
+  return "";
+};
+
+const asOwnedGroupAsset = (value: unknown) => value as OwnedGroupAsset;
+
+const openOperationsCenter = (asset: OwnedGroupAsset) => {
+  if (!Number.isSafeInteger(asset.id) || asset.id <= 0) return;
+  router.push(`/owned-groups/${asset.id}/operations`);
+};
+
+const openOwnedGroupMessaging = (asset: OwnedGroupAsset) => {
+  const reason = ownedGroupMessagingDisabledReason(asset);
+  if (reason) {
+    ElMessage.warning(reason);
+    return;
+  }
+  router.push(`/owned-groups/${asset.id}/messaging`);
+};
+
+const viewGovernanceFailure = () => {
+  const failure = governanceFailure.value;
+  if (!failure) {
+    ElMessage.info("暂无治理失败记录");
+    return;
+  }
+  const lines = [
+    failure.message,
+    "Reason: " + failure.reason,
+    failure.missing_permissions?.length
+      ? "缺失权限：" +
+        failure.missing_permissions
+          .map(governancePermissionLabel)
+          .join("、")
+      : "",
+    failure.correlation_id
+      ? "Correlation ID: " + failure.correlation_id
+      : "",
+  ].filter(Boolean);
+  ElMessageBox.alert(lines.join("\n"), "Guardian 治理失败原因", {
+    confirmButtonText: "知道了",
+  });
+};
+
+const applyRouteAssetSelection = async () => {
+  const rawValue = Array.isArray(route.query.assetId)
+    ? route.query.assetId[0]
+    : route.query.assetId;
+  if (rawValue === undefined || rawValue === null || rawValue === "") {
+    return false;
+  }
+  const assetId = Number(rawValue);
+  if (!Number.isSafeInteger(assetId) || assetId <= 0) return false;
+  let asset = store.list.find((item) => item.id === assetId);
+  if (!asset) {
+    try {
+      asset = await store.fetchAsset(assetId);
+    } catch (error) {
+      showError(error, "指定的自建群资产加载失败");
+      return false;
+    }
+  }
+  if (selectedId.value !== assetId) {
+    selectAsset(asset);
+  } else {
+    await refreshGovernance(assetId);
+  }
+  return true;
+};
+
 const stopPolling = () => {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = undefined;
@@ -427,13 +848,21 @@ const poll = async () => {
     if (operation.value) await store.refreshOperation();
     if (selectedId.value && assetActive.value)
       await store.fetchAsset(selectedId.value);
+    if (selectedId.value && governanceStatus.value === "pending") {
+      await refreshGovernance(selectedId.value, false);
+    }
     if (
       selectedId.value &&
       selectedAsset.value?.status === "ready" &&
       inviteLinksLoadedFor.value !== selectedId.value
     )
       await loadInviteLinks(selectedId.value);
-    if (!operationActive.value && !assetActive.value) stopPolling();
+    if (
+      !operationActive.value &&
+      !assetActive.value &&
+      governanceStatus.value !== "pending"
+    )
+      stopPolling();
   } catch (error) {
     showError(error, "刷新操作状态失败");
   }
@@ -467,6 +896,10 @@ const load = async () => {
       showBotProfileError(error, "自建 Bot profile 列表加载失败");
     }
     if (selectedId.value && !selectedAsset.value) selectedId.value = null;
+    const selectedFromRoute = await applyRouteAssetSelection();
+    if (!selectedFromRoute && selectedId.value) {
+      await refreshGovernance(selectedId.value);
+    }
   } catch (error) {
     showError(error, "自建群资产加载失败");
   }
@@ -762,6 +1195,7 @@ const selectAsset = (asset: OwnedGroupAsset) => {
   reconcileUsername.value = "";
   stopPolling();
   if (asset.status === "ready") void loadInviteLinks(asset.id);
+  void refreshGovernance(asset.id);
 };
 
 const statusType = (status: OwnedGroupOperationStatus | string) => {
@@ -794,6 +1228,13 @@ watch(
     precheckResult.value = null;
   },
   { deep: true },
+);
+
+watch(
+  () => route.query.assetId,
+  () => {
+    void applyRouteAssetSelection();
+  },
 );
 
 onMounted(load);
@@ -899,13 +1340,226 @@ onBeforeUnmount(() => {
               }}</el-tag></template
             ></el-table-column
           ><el-table-column prop="visibility" label="可见性" width="80" />
+          <el-table-column label="群运营" width="210" fixed="right">
+            <template #default="{ row }">
+              <el-button text type="primary" @click.stop="openOperationsCenter(asOwnedGroupAsset(row))">运营中心</el-button>
+              <el-tooltip
+                :disabled="!ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))"
+                :content="ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))"
+              >
+                <span>
+                  <el-button
+                    text
+                    type="primary"
+                    :disabled="Boolean(ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row)))"
+                    @click.stop="openOwnedGroupMessaging(asOwnedGroupAsset(row))"
+                  >群内消息</el-button>
+                </span>
+              </el-tooltip>
+            </template>
+          </el-table-column>
         </el-table>
         <div v-if="selectedAsset" class="operation-panel">
           <p>
             <strong>当前：</strong>{{ selectedAsset.title }}（#{{
               selectedAsset.id
             }}）
+            <el-button type="primary" plain @click="openOperationsCenter(selectedAsset)">运营中心</el-button>
           </p>
+          <el-card shadow="never" class="governance-card">
+            <template #header>
+              <div class="governance-header">
+                <div>
+                  <strong>Guardian 治理</strong>
+                  <el-tag
+                    class="governance-status-tag"
+                    :type="governanceStatusType(governanceStatus)"
+                  >
+                    {{ GOVERNANCE_STATUS_LABELS[governanceStatus] }}
+                  </el-tag>
+                </div>
+                <el-button
+                  text
+                  :loading="governanceLoading"
+                  @click="refreshGovernance()"
+                >
+                  刷新状态
+                </el-button>
+              </div>
+            </template>
+
+            <el-skeleton
+              v-if="governanceLoading && !governance"
+              animated
+              :rows="4"
+            />
+            <template v-else>
+              <el-descriptions :column="2" border size="small">
+                <el-descriptions-item label="Guardian Bot">
+                  {{ governanceBotLabel }}
+                </el-descriptions-item>
+                <el-descriptions-item label="用户名">
+                  {{ governanceBotUsername }}
+                </el-descriptions-item>
+                <el-descriptions-item label="Account ID">
+                  {{ governance?.guardian_bot_account_id ?? "-" }}
+                </el-descriptions-item>
+                <el-descriptions-item label="Bot 当前角色">
+                  {{ governance?.bot_role || "-" }}
+                </el-descriptions-item>
+                <el-descriptions-item label="最近检测时间">
+                  {{
+                    formatGovernanceTime(
+                      governance?.governance_last_checked_at,
+                    )
+                  }}
+                </el-descriptions-item>
+                <el-descriptions-item label="绑定状态">
+                  {{ governance?.binding_status || "-" }}
+                </el-descriptions-item>
+              </el-descriptions>
+
+              <el-alert
+                v-if="governance?.stale_pending"
+                type="warning"
+                show-icon
+                :closable="false"
+                title="治理操作已 pending 超过 2 分钟，请执行重新检测；不要更换 Bot 重复接入。"
+              />
+
+              <div class="governance-section">
+                <strong>管理员权限</strong>
+                <div class="governance-permissions">
+                  <span class="governance-section-label">已授予</span>
+                  <el-tag
+                    v-for="permission in governanceGrantedPermissions"
+                    :key="'granted:' + permission"
+                    size="small"
+                    type="success"
+                    effect="plain"
+                  >
+                    {{ governancePermissionLabel(permission) }}
+                  </el-tag>
+                  <span v-if="!governanceGrantedPermissions.length">-</span>
+                </div>
+                <div class="governance-permissions">
+                  <span class="governance-section-label">缺失</span>
+                  <el-tag
+                    v-for="permission in governanceMissingPermissions"
+                    :key="'missing:' + permission"
+                    size="small"
+                    type="danger"
+                    effect="plain"
+                  >
+                    {{ governancePermissionLabel(permission) }}
+                  </el-tag>
+                  <span v-if="!governanceMissingPermissions.length">无</span>
+                </div>
+              </div>
+
+              <div class="governance-section">
+                <strong>可用能力</strong>
+                <div class="governance-capabilities">
+                  <div
+                    v-for="capability in governanceCapabilityRows"
+                    :key="capability.key"
+                    class="governance-capability"
+                  >
+                    <el-tag
+                      :type="capability.enabled ? 'success' : 'info'"
+                      effect="plain"
+                      size="small"
+                    >
+                      {{ capability.label }} ·
+                      {{ capability.enabled ? "可用" : "不可用" }}
+                    </el-tag>
+                  </div>
+                </div>
+              </div>
+
+              <el-alert
+                v-if="governanceFailure"
+                type="error"
+                show-icon
+                :closable="false"
+                :title="governanceFailure.message"
+                :description="'Reason: ' + governanceFailure.reason"
+              />
+
+              <div class="governance-actions">
+                <template v-if="!assetReadyForGovernance">
+                  <el-button type="primary" disabled>接入治理</el-button>
+                  <small class="poll-hint">{{ governanceDisabledReason }}</small>
+                </template>
+                <template v-else-if="governanceStatus === 'disabled'">
+                  <el-button
+                    type="primary"
+                    :disabled="!canOperateGovernance"
+                    @click="openGovernanceDialog"
+                  >
+                    接入治理
+                  </el-button>
+                  <small
+                    v-if="governanceDisabledReason"
+                    class="poll-hint"
+                  >
+                    {{ governanceDisabledReason }}
+                  </small>
+                </template>
+                <template v-else-if="governanceStatus === 'pending'">
+                  <el-button type="primary" loading disabled>
+                    治理处理中
+                  </el-button>
+                  <el-button
+                    :loading="governanceLoading"
+                    @click="refreshGovernance()"
+                  >
+                    刷新状态
+                  </el-button>
+                  <el-button
+                    v-if="governance?.stale_pending"
+                    :loading="governanceLoading"
+                    :disabled="!canOperateGovernance"
+                    @click="reconcileGovernance"
+                  >
+                    重新检测
+                  </el-button>
+                </template>
+                <template v-else-if="governanceStatus === 'managed'">
+                  <el-button
+                    type="primary"
+                    :disabled="!canOperateGovernance"
+                    @click="openGovernancePolicies"
+                  >
+                    治理设置
+                  </el-button>
+                  <el-button
+                    :loading="governanceLoading"
+                    :disabled="!canOperateGovernance"
+                    @click="reconcileGovernance"
+                  >
+                    重新检测
+                  </el-button>
+                </template>
+                <template v-else>
+                  <el-button
+                    type="danger"
+                    plain
+                    @click="viewGovernanceFailure"
+                  >
+                    查看失败原因
+                  </el-button>
+                  <el-button
+                    :loading="governanceLoading"
+                    :disabled="!canOperateGovernance"
+                    @click="reconcileGovernance"
+                  >
+                    重新检测
+                  </el-button>
+                </template>
+              </div>
+            </template>
+          </el-card>
           <div v-if="assetNeedsReconcile" class="asset-reconcile-panel">
             <el-alert
               type="warning"
@@ -1298,6 +1952,131 @@ onBeforeUnmount(() => {
     </el-card>
 
     <el-dialog
+      v-model="governanceDialogVisible"
+      title="接入 Guardian 治理"
+      width="680px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="本操作只执行实时身份与权限探针，不会自动拉 Bot 入群或授予管理员权限。"
+      />
+      <el-form label-width="120px" class="governance-bind-form">
+        <el-form-item label="目标自建群">
+          <el-input
+            :model-value="
+              selectedAsset
+                ? selectedAsset.title + ' (#' + selectedAsset.id + ')'
+                : '-'
+            "
+            disabled
+          />
+        </el-form-item>
+        <el-form-item label="Guardian Bot" required>
+          <el-select
+            v-model="selectedGuardianBotAccountId"
+            filterable
+            :loading="governanceCandidatesLoading"
+            placeholder="选择符合归属、Profile、健康与风险条件的 Bot"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="candidate in governanceCandidates"
+              :key="candidate.guardian_bot_account_id"
+              :label="governanceCandidateLabel(candidate)"
+              :value="candidate.guardian_bot_account_id"
+            >
+              <div class="governance-candidate-option">
+                <strong>{{
+                  candidate.display_name ||
+                  candidate.username ||
+                  "Guardian Bot"
+                }}</strong>
+                <span>{{
+                  candidate.username
+                    ? candidate.username.startsWith("@")
+                      ? candidate.username
+                      : "@" + candidate.username
+                    : "无用户名"
+                }}</span>
+                <span
+                  >account #{{ candidate.guardian_bot_account_id }}</span
+                >
+                <el-tag size="small" effect="plain">
+                  Owned: {{ candidate.owned_profile_status }}
+                </el-tag>
+                <el-tag
+                  size="small"
+                  effect="plain"
+                  :type="
+                    candidate.guardian_health_status === 'healthy'
+                      ? 'success'
+                      : 'warning'
+                  "
+                >
+                  Guardian: {{ candidate.guardian_health_status }}
+                </el-tag>
+              </div>
+            </el-option>
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <el-alert
+        v-if="
+          selectedGovernanceCandidate &&
+          !selectedGovernanceCandidate.local_is_admin
+        "
+        type="warning"
+        :closable="false"
+        show-icon
+        :title="
+          '本地成员记录尚未核验为管理员（' +
+          (selectedGovernanceCandidate.local_membership_status || 'unknown') +
+          '）；仍可发起实时权限探针。'
+        "
+      />
+      <el-alert
+        v-if="
+          !governanceCandidatesLoading && !governanceCandidates.length
+        "
+        type="info"
+        :closable="false"
+        title="没有符合当前群主归属及双 Profile 条件的 Guardian Bot。"
+      />
+      <el-alert
+        v-if="governanceActionError"
+        type="error"
+        :closable="false"
+        show-icon
+        :title="governanceActionError.message"
+        :description="
+          governanceActionError.missing_permissions?.length
+            ? '缺失权限：' +
+              governanceActionError.missing_permissions
+                .map(governancePermissionLabel)
+                .join('、')
+            : 'Reason: ' + governanceActionError.reason
+        "
+      />
+      <template #footer>
+        <el-button @click="governanceDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="governanceLoading"
+          :disabled="
+            !selectedGuardianBotAccountId ||
+            governanceCandidatesLoading
+          "
+          @click="bindGovernance"
+        >
+          确认接入
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
       v-model="botRegistrationVisible"
       title="登记自建 Bot profile"
       width="520px"
@@ -1493,6 +2272,53 @@ onBeforeUnmount(() => {
 .violation-item {
   color: var(--el-color-danger);
 }
+.governance-card :deep(.el-card__body) {
+  display: grid;
+  gap: 12px;
+}
+.governance-header,
+.governance-actions,
+.governance-permissions,
+.governance-candidate-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.governance-header {
+  justify-content: space-between;
+}
+.governance-status-tag {
+  margin-left: 8px;
+}
+.governance-section {
+  display: grid;
+  gap: 8px;
+}
+.governance-permissions {
+  flex-wrap: wrap;
+}
+.governance-section-label {
+  min-width: 46px;
+  color: var(--el-text-color-secondary);
+}
+.governance-capabilities {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.governance-actions {
+  flex-wrap: wrap;
+}
+.governance-bind-form {
+  margin-top: 16px;
+}
+.governance-candidate-option {
+  width: 100%;
+  white-space: nowrap;
+}
+.governance-candidate-option > span:not(.el-tag) {
+  color: var(--el-text-color-secondary);
+}
 @media (max-width: 900px) {
   .grid {
     grid-template-columns: 1fr;
@@ -1500,6 +2326,9 @@ onBeforeUnmount(() => {
   .permission-grid,
   .invite-row {
     grid-template-columns: 1fr;
+  }
+  .governance-capabilities {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 </style>

@@ -2,9 +2,22 @@ import { describe, expect, it, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 import Settings from './Settings.vue'
 
+vi.mock('@/stores/auth', () => ({
+  useAuthStore: () => ({ userInfo: { role: 'admin' } }),
+}))
+
 vi.mock('@/stores/settings', () => ({
   useSettingsStore: () => ({
-    settings: {},
+    settings: {
+      ownedGroupAiPersona: {
+        enabled: false,
+        revision: 0,
+        updatedAt: null,
+        updatedBy: null,
+        staticEnabled: false,
+        effectiveEnabled: false,
+      },
+    },
     systemInfo: null,
     logs: [],
     logTotal: 0,
@@ -16,6 +29,14 @@ vi.mock('@/stores/settings', () => ({
     setPage: vi.fn(),
     setPageSize: vi.fn(),
     updateSettings: vi.fn().mockResolvedValue({}),
+    updateOwnedGroupAiPersonaFeature: vi.fn().mockResolvedValue({
+      enabled: false,
+      revision: 0,
+      updatedAt: null,
+      updatedBy: null,
+      staticEnabled: false,
+      effectiveEnabled: false,
+    }),
     clearLogs: vi.fn().mockResolvedValue({}),
     backupDatabase: vi.fn().mockResolvedValue({ filename: 'backup.sql' }),
   }),

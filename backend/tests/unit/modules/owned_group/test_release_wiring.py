@@ -35,6 +35,26 @@ def test_owned_group_sql_is_in_curated_default_migration_chain() -> None:
     assert "WHERE is_active = TRUE" in sql
 
 
+def test_owned_group_governance_sql_is_in_curated_default_migration_chain() -> None:
+    migration = "047_add_owned_group_governance.sql"
+    assert migration in DEFAULT_MIGRATIONS
+    sql = (REPOSITORY_ROOT / "backend" / "migrations" / migration).read_text(
+        encoding="utf-8"
+    )
+    assert "governance_status" in sql
+    assert "idx_owned_group_assets_guardian_status" in sql
+
+
+def test_owned_group_member_observation_sql_is_last_in_default_migration_chain() -> None:
+    migration = "052_add_owned_group_member_observations.sql"
+    assert DEFAULT_MIGRATIONS[-1] == migration
+    sql = (REPOSITORY_ROOT / "backend" / "migrations" / migration).read_text(
+        encoding="utf-8"
+    )
+    assert "CREATE TABLE IF NOT EXISTS owned_group_member_observations" in sql
+    assert "uq_owned_group_member_observations_asset_user" in sql
+
+
 def test_deploy_automation_uses_curated_runner_not_removed_raw_migrations() -> None:
     deploy = (REPOSITORY_ROOT / "scripts" / "codex_deploy_automation.py").read_text(
         encoding="utf-8"

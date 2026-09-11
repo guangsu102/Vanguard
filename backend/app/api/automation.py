@@ -10,9 +10,9 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
 
 from app.core.account.models import (
     AccountOperationConfig,
@@ -57,6 +57,7 @@ from app.modules.acquisition.automation import (
     AD_ONLY_GROUP_CONTROL_PAUSED_REASON_PREFIX,
     GROUP_STATUS_AD_BLOCKED,
     HTML_RESPONSE_RE,
+    OWNED_GROUP_AD_DOMAIN_EXCLUDED,
     WEB_ERROR_RESPONSE_RE,
     AcquisitionAutomationService,
 )
@@ -71,13 +72,14 @@ from app.modules.acquisition.models import (
     AdScheduleStatus,
     AdSendMode,
     AutoJoinAttempt,
-    GroupAdPolicyEvent,
     GroupAdHandover,
+    GroupAdPolicyEvent,
     GroupAdPolicyMode,
     GroupAdProfile,
     GroupFailoverStatus,
     GroupFailoverTask,
 )
+from app.modules.owned_group.models import OwnedGroupAsset
 
 router = APIRouter()
 
@@ -1008,6 +1010,7 @@ async def get_account_risk_guard_config(db: AsyncSession = Depends(get_db)) -> d
 async def update_account_risk_guard_config(
     request: AccountRiskGuardUpdate,
     db: AsyncSession = Depends(get_db),
+    _current_user: dict = Depends(require_admin),
 ) -> dict:
     config = await save_account_risk_guard_settings(db, request.model_dump())
     return {"code": 0, "message": "success", "data": config}
@@ -1428,6 +1431,7 @@ async def trigger_group_ad_policy_probe(
             "group_ad_policy_probe_already_pending",
             "group_ad_policy_probe_cooldown",
             "group_ad_policy_already_resolved",
+            OWNED_GROUP_AD_DOMAIN_EXCLUDED,
         }
         known_precondition_codes = {
             "group_ad_forbidden",
@@ -1865,10 +1869,17 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
 
 
 async def _get_or_create_operation_config(
-    db: AsyncSession, account_id: int
+    db: AsyncSession,
+    account_id: int,
+    *,
+    commit_created: bool = True,
 ) -> AccountOperationConfig:
+    """Lock account then config before returning a mutable operation config."""
     account_result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == account_id)
+        select(TelegramAccount)
+        .options(lazyload(TelegramAccount.operation_config))
+        .where(TelegramAccount.id == account_id)
+        .with_for_update()
     )
     account = account_result.scalar_one_or_none()
     if account is None:
@@ -1879,7 +1890,10 @@ async def _get_or_create_operation_config(
         )
 
     result = await db.execute(
-        select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id)
+        select(AccountOperationConfig)
+        .options(lazyload(AccountOperationConfig.account))
+        .where(AccountOperationConfig.account_id == account_id)
+        .with_for_update()
     )
     config = result.scalar_one_or_none()
     if config:
@@ -1887,9 +1901,62 @@ async def _get_or_create_operation_config(
 
     config = AccountOperationConfig(account_id=account_id)
     db.add(config)
-    await db.commit()
-    await db.refresh(config)
+    await db.flush()
+    if commit_created:
+        await db.commit()
+        await db.refresh(config)
     return config
+
+
+async def _lock_operation_configs_batch(
+    db: AsyncSession,
+    account_ids: list[int],
+) -> tuple[dict[int, AccountOperationConfig], dict[int, str]]:
+    """Lock all accounts, then all configs, using the same ascending ID order."""
+    sorted_ids = sorted(set(account_ids))
+    account_rows = await db.execute(
+        select(TelegramAccount)
+        .options(lazyload(TelegramAccount.operation_config))
+        .where(TelegramAccount.id.in_(sorted_ids))
+        .order_by(TelegramAccount.id.asc())
+        .with_for_update()
+    )
+    accounts = {int(account.id): account for account in account_rows.scalars().all()}
+
+    errors: dict[int, str] = {}
+    eligible_ids: list[int] = []
+    for account_id in sorted_ids:
+        account = accounts.get(account_id)
+        if account is None:
+            errors[account_id] = "Account not found"
+        elif account.account_type != AccountType.PROMOTER:
+            errors[account_id] = "Only promoter accounts support growth automation config"
+        else:
+            eligible_ids.append(account_id)
+
+    configs: dict[int, AccountOperationConfig] = {}
+    if eligible_ids:
+        config_rows = await db.execute(
+            select(AccountOperationConfig)
+            .options(lazyload(AccountOperationConfig.account))
+            .where(AccountOperationConfig.account_id.in_(eligible_ids))
+            .order_by(AccountOperationConfig.account_id.asc())
+            .with_for_update()
+        )
+        configs = {
+            int(config.account_id): config for config in config_rows.scalars().all()
+        }
+
+    created = False
+    for account_id in eligible_ids:
+        if account_id not in configs:
+            config = AccountOperationConfig(account_id=account_id)
+            db.add(config)
+            configs[account_id] = config
+            created = True
+    if created:
+        await db.flush()
+    return configs, errors
 
 
 def _prepare_operation_config_update(
@@ -2010,7 +2077,11 @@ async def update_account_operation_config(
     request: AccountOperationConfigUpdate,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    config = await _get_or_create_operation_config(db, account_id)
+    config = await _get_or_create_operation_config(
+        db,
+        account_id,
+        commit_created=False,
+    )
     payload = request.model_dump(exclude_unset=True)
     await _apply_operation_mode_transition_side_effects(config, payload, db)
     data = _prepare_operation_config_update(config, payload)
@@ -2034,9 +2105,14 @@ async def update_account_operation_configs_batch(
     updated: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     requested_mode = data.get("operation_mode")
+    configs, lock_errors = await _lock_operation_configs_batch(db, account_ids)
     for account_id in account_ids:
+        lock_error = lock_errors.get(account_id)
+        if lock_error is not None:
+            skipped.append({"account_id": account_id, "reason": lock_error})
+            continue
         try:
-            config = await _get_or_create_operation_config(db, account_id)
+            config = configs[account_id]
             mismatch_reason = _operation_mode_mismatch_reason(config, requested_mode)
             if mismatch_reason:
                 skipped.append({"account_id": account_id, "reason": mismatch_reason})
@@ -2639,6 +2715,38 @@ def _normalize_target_group_ids(values: Optional[list[int]]) -> list[int]:
     return normalized
 
 
+async def _reject_owned_group_ad_targets(
+    group_ids: list[int],
+    db: AsyncSession,
+) -> None:
+    if not group_ids:
+        return
+    rows = await db.execute(
+        select(Group.id)
+        .join(
+            OwnedGroupAsset,
+            or_(
+                OwnedGroupAsset.core_group_id == Group.id,
+                OwnedGroupAsset.telegram_chat_id == Group.group_id,
+            ),
+        )
+        .where(
+            OwnedGroupAsset.archived_at.is_(None),
+            Group.id.in_(group_ids),
+        )
+    )
+    owned_group_ids = sorted({int(value) for value in rows.scalars().all() if value is not None})
+    if owned_group_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "OWNED_GROUP_AD_DOMAIN_EXCLUDED",
+                "message": "自建群只能使用群内消息策略，不能作为增长广告目标",
+                "details": {"group_ids": owned_group_ids},
+            },
+        )
+
+
 async def _validate_target_group_ids(group_ids: list[int], db: AsyncSession) -> None:
     if not group_ids:
         return
@@ -2647,6 +2755,8 @@ async def _validate_target_group_ids(group_ids: list[int], db: AsyncSession) -> 
     missing_ids = [group_id for group_id in group_ids if group_id not in existing_ids]
     if missing_ids:
         raise HTTPException(status_code=400, detail=f"Target groups not found: {missing_ids}")
+
+    await _reject_owned_group_ad_targets(group_ids, db)
 
     joined_membership_exists = (
         select(GroupAccountMembership.id)
@@ -2770,6 +2880,7 @@ async def update_ad_campaign(
     _validate_campaign_schedule(send_mode, scheduled_times)
     delivery_policy = data.get("delivery_policy", campaign.delivery_policy)
     target_group_ids = data.get("target_group_ids", campaign.get_target_group_ids())
+    await _reject_owned_group_ad_targets(target_group_ids, db)
     _validate_campaign_delivery_policy(delivery_policy, send_mode, target_group_ids)
     if delivery_policy != campaign.delivery_policy and campaign.enabled:
         raise HTTPException(
@@ -2901,6 +3012,7 @@ async def _validate_ad_only_binding_scope(
     ).scalar_one_or_none()
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    await _reject_owned_group_ad_targets(campaign.get_target_group_ids(), db)
 
     config_rows = await db.execute(
         select(AccountOperationConfig).where(AccountOperationConfig.account_id.in_(account_ids))
@@ -3121,6 +3233,9 @@ async def ensure_ad_creative_pool(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     await _validate_ad_binding_accounts([request.account_id], db)
+    await _validate_ad_only_binding_scope(
+        [request.account_id], request.ad_campaign_id, db
+    )
     service = AcquisitionAutomationService(db)
     try:
         result = await service.ensure_ad_creative_pool(
@@ -3145,8 +3260,12 @@ async def update_account_ad_binding(
     ).scalar_one_or_none()
     if not binding:
         raise HTTPException(status_code=404, detail="Binding not found")
-    if request.enabled is True:
+    effective_enabled = binding.enabled if request.enabled is None else request.enabled
+    if effective_enabled:
         await _validate_ad_binding_accounts([binding.account_id], db)
+        await _validate_ad_only_binding_scope(
+            [binding.account_id], binding.ad_campaign_id, db
+        )
     for field, value in request.model_dump(exclude_unset=True).items():
         setattr(binding, field, value)
     await db.commit()

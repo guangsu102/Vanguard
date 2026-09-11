@@ -4,17 +4,29 @@ Rules API Router
 RESTful API for moderation rules and whitelist management with cursor pagination.
 """
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.guardian_validation import (
+    GuardianGroupTarget,
+    require_guardian_operator,
+    resolve_guardian_group_target,
+)
 from app.core.database import get_db
-from app.modules.guardian.models import ModerationRule, Whitelist, RuleType, ViolationAction, ViolationLevel
-
+from app.core.group.models import Group
+from app.modules.guardian.models import (
+    ModerationRule,
+    RuleType,
+    ViolationAction,
+    ViolationLevel,
+    Whitelist,
+)
 
 router = APIRouter()
 
@@ -116,7 +128,38 @@ class RuleStatsResponse(BaseModel):
 # Helper Functions
 # =============================================================================
 
-def _rule_to_response(rule: ModerationRule) -> RuleResponse:
+async def _require_group_target(
+    db: AsyncSession, telegram_chat_id: int
+) -> GuardianGroupTarget:
+    target = await resolve_guardian_group_target(db, telegram_chat_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Managed group binding not found")
+    return target
+
+
+async def _telegram_chat_id_map(
+    db: AsyncSession, core_group_ids: set[int]
+) -> dict[int, int]:
+    if not core_group_ids:
+        return {}
+    rows = await db.execute(
+        select(Group.id, Group.group_id).where(Group.id.in_(core_group_ids))
+    )
+    return {int(core_group_id): int(telegram_chat_id) for core_group_id, telegram_chat_id in rows}
+
+
+def _external_group_id(
+    core_group_id: int | None, telegram_chat_ids: Mapping[int, int] | None
+) -> int | None:
+    if core_group_id is None:
+        return None
+    return (telegram_chat_ids or {}).get(core_group_id, core_group_id)
+
+
+def _rule_to_response(
+    rule: ModerationRule,
+    telegram_chat_ids: Mapping[int, int] | None = None,
+) -> RuleResponse:
     """Convert ModerationRule model to response."""
     return RuleResponse(
         id=rule.id,
@@ -124,20 +167,23 @@ def _rule_to_response(rule: ModerationRule) -> RuleResponse:
         pattern=rule.pattern,
         level=rule.level.value,
         action=rule.action.value,
-        group_id=rule.group_id,
+        group_id=_external_group_id(rule.group_id, telegram_chat_ids),
         enabled=rule.enabled,
         created_at=rule.created_at.isoformat() if rule.created_at else "",
         updated_at=rule.updated_at.isoformat() if rule.updated_at else "",
     )
 
 
-def _whitelist_to_response(wl: Whitelist) -> WhitelistResponse:
+def _whitelist_to_response(
+    wl: Whitelist,
+    telegram_chat_ids: Mapping[int, int] | None = None,
+) -> WhitelistResponse:
     """Convert Whitelist model to response."""
     return WhitelistResponse(
         id=wl.id,
         whitelist_type=wl.whitelist_type,
         value=wl.value,
-        group_id=wl.group_id,
+        group_id=_external_group_id(wl.group_id, telegram_chat_ids),
         expires_at=wl.expires_at.isoformat() if wl.expires_at else None,
         created_at=wl.created_at.isoformat() if wl.created_at else "",
     )
@@ -167,6 +213,10 @@ async def list_rules(
     - enabled: Filter by enabled status
     - group_id: Filter by group ID (NULL for global rules)
     """
+    core_group_id = None
+    if group_id is not None:
+        core_group_id = (await _require_group_target(db, group_id)).core_group_id
+
     query = select(ModerationRule)
     count_query = select(func.count(ModerationRule.id))
 
@@ -199,9 +249,9 @@ async def list_rules(
         query = query.where(ModerationRule.enabled == enabled)
         count_query = count_query.where(ModerationRule.enabled == enabled)
 
-    if group_id is not None:
-        query = query.where(ModerationRule.group_id == group_id)
-        count_query = count_query.where(ModerationRule.group_id == group_id)
+    if core_group_id is not None:
+        query = query.where(ModerationRule.group_id == core_group_id)
+        count_query = count_query.where(ModerationRule.group_id == core_group_id)
 
     # Get total count
     total_result = await db.execute(count_query)
@@ -217,18 +267,27 @@ async def list_rules(
     if has_more:
         rules = rules[:limit]
 
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {rule.group_id for rule in rules if rule.group_id is not None}
+    )
+
     # Get next cursor
     next_cursor = str(rules[-1].id) if rules and has_more else None
 
     return RuleListResponse(
-        data=[_rule_to_response(r) for r in rules],
+        data=[_rule_to_response(rule, telegram_chat_ids) for rule in rules],
         total=total,
         next_cursor=next_cursor,
         has_more=has_more,
     )
 
 
-@router.post("", response_model=RuleResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=RuleResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def create_rule(
     rule_data: RuleCreate,
     db: AsyncSession = Depends(get_db),
@@ -258,12 +317,16 @@ async def create_rule(
             detail=f"Invalid action. Must be one of: {[a.value for a in ViolationAction]}"
         )
 
+    target = None
+    if rule_data.group_id is not None:
+        target = await _require_group_target(db, rule_data.group_id)
+
     rule = ModerationRule(
         rule_type=type_enum,
         pattern=rule_data.pattern,
         level=level_enum,
         action=action_enum,
-        group_id=rule_data.group_id,
+        group_id=target.core_group_id if target else None,
         enabled=rule_data.enabled,
     )
 
@@ -271,7 +334,10 @@ async def create_rule(
     await db.commit()
     await db.refresh(rule)
 
-    return _rule_to_response(rule)
+    telegram_chat_ids = (
+        {target.core_group_id: target.telegram_chat_id} if target is not None else {}
+    )
+    return _rule_to_response(rule, telegram_chat_ids)
 
 
 @router.get("/{rule_id:int}", response_model=RuleResponse)
@@ -286,10 +352,17 @@ async def get_rule(
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
 
-    return _rule_to_response(rule)
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {rule.group_id} if rule.group_id is not None else set()
+    )
+    return _rule_to_response(rule, telegram_chat_ids)
 
 
-@router.put("/{rule_id:int}", response_model=RuleResponse)
+@router.put(
+    "/{rule_id:int}",
+    response_model=RuleResponse,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def update_rule(
     rule_id: int,
     rule_data: RuleUpdate,
@@ -323,10 +396,17 @@ async def update_rule(
     await db.commit()
     await db.refresh(rule)
 
-    return _rule_to_response(rule)
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {rule.group_id} if rule.group_id is not None else set()
+    )
+    return _rule_to_response(rule, telegram_chat_ids)
 
 
-@router.delete("/{rule_id:int}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{rule_id:int}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def delete_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db),
@@ -342,7 +422,7 @@ async def delete_rule(
     await db.commit()
 
 
-@router.post("/{rule_id:int}/toggle")
+@router.post("/{rule_id:int}/toggle", dependencies=[Depends(require_guardian_operator)])
 async def toggle_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db),
@@ -372,7 +452,11 @@ async def toggle_rule(
 # Rule Test Endpoint
 # =============================================================================
 
-@router.post("/test", response_model=RuleTestResponse)
+@router.post(
+    "/test",
+    response_model=RuleTestResponse,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def test_rule(
     request: RuleTestRequest,
     db: AsyncSession = Depends(get_db),
@@ -431,6 +515,10 @@ async def list_whitelist(
     - group_id: Filter by group ID
     - include_expired: Include expired entries
     """
+    core_group_id = None
+    if group_id is not None:
+        core_group_id = (await _require_group_target(db, group_id)).core_group_id
+
     query = select(Whitelist)
     count_query = select(func.count(Whitelist.id))
 
@@ -447,9 +535,9 @@ async def list_whitelist(
         query = query.where(Whitelist.whitelist_type == whitelist_type)
         count_query = count_query.where(Whitelist.whitelist_type == whitelist_type)
 
-    if group_id is not None:
-        query = query.where(Whitelist.group_id == group_id)
-        count_query = count_query.where(Whitelist.group_id == group_id)
+    if core_group_id is not None:
+        query = query.where(Whitelist.group_id == core_group_id)
+        count_query = count_query.where(Whitelist.group_id == core_group_id)
 
     if not include_expired:
         query = query.where(
@@ -471,18 +559,27 @@ async def list_whitelist(
     if has_more:
         entries = entries[:limit]
 
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {entry.group_id for entry in entries if entry.group_id is not None}
+    )
+
     # Get next cursor
     next_cursor = str(entries[-1].id) if entries and has_more else None
 
     return WhitelistListResponse(
-        data=[_whitelist_to_response(e) for e in entries],
+        data=[_whitelist_to_response(entry, telegram_chat_ids) for entry in entries],
         total=total,
         next_cursor=next_cursor,
         has_more=has_more,
     )
 
 
-@router.post("/whitelist", response_model=WhitelistResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/whitelist",
+    response_model=WhitelistResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def create_whitelist(
     whitelist_data: WhitelistCreate,
     db: AsyncSession = Depends(get_db),
@@ -495,10 +592,14 @@ async def create_whitelist(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid datetime format")
 
+    target = None
+    if whitelist_data.group_id is not None:
+        target = await _require_group_target(db, whitelist_data.group_id)
+
     entry = Whitelist(
         whitelist_type=whitelist_data.whitelist_type,
         value=whitelist_data.value,
-        group_id=whitelist_data.group_id,
+        group_id=target.core_group_id if target else None,
         expires_at=expires_at,
     )
 
@@ -506,7 +607,10 @@ async def create_whitelist(
     await db.commit()
     await db.refresh(entry)
 
-    return _whitelist_to_response(entry)
+    telegram_chat_ids = (
+        {target.core_group_id: target.telegram_chat_id} if target is not None else {}
+    )
+    return _whitelist_to_response(entry, telegram_chat_ids)
 
 
 @router.get("/whitelist/{entry_id:int}", response_model=WhitelistResponse)
@@ -521,10 +625,17 @@ async def get_whitelist_entry(
     if not entry:
         raise HTTPException(status_code=404, detail="Whitelist entry not found")
 
-    return _whitelist_to_response(entry)
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {entry.group_id} if entry.group_id is not None else set()
+    )
+    return _whitelist_to_response(entry, telegram_chat_ids)
 
 
-@router.delete("/whitelist/{entry_id:int}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/whitelist/{entry_id:int}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def delete_whitelist_entry(
     entry_id: int,
     db: AsyncSession = Depends(get_db),
@@ -540,7 +651,10 @@ async def delete_whitelist_entry(
     await db.commit()
 
 
-@router.post("/whitelist/batch-delete")
+@router.post(
+    "/whitelist/batch-delete",
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def batch_delete_whitelist(
     entry_ids: list[int],
     db: AsyncSession = Depends(get_db),

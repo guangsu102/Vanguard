@@ -39,7 +39,7 @@ const currentGroupLabel = computed(() => {
 
 const applyRouteGroup = () => {
   const groupId = Number(route.query.groupId)
-  if (Number.isFinite(groupId) && groupId > 0) {
+  if (Number.isSafeInteger(groupId) && groupId !== 0) {
     currentGroupId.value = groupId
     form.group_id = groupId
   } else {
@@ -203,7 +203,7 @@ onMounted(async () => {
           </el-select>
         </el-form-item>
         <el-form-item label="群级覆盖">
-          <el-input-number v-model="form.group_id" :min="1" :precision="0" style="width: 100%" />
+          <el-input-number v-model="form.group_id" :precision="0" style="width: 100%" />
         </el-form-item>
         <el-form-item label="置信度">
           <el-input-number v-model="form.confidence" :min="0" :max="1" :step="0.1" style="width: 100%" />

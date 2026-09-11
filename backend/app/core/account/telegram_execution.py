@@ -7,17 +7,34 @@ plumbing every time.
 
 from __future__ import annotations
 
+import asyncio
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import parse_qs, urlparse
+
+import structlog
 
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
+from app.modules.owned_group.security import safe_exception_message
 
 
 class TelegramExecutionError(RuntimeError):
     """Raised when a Telegram operation cannot be executed."""
+
+
+class TelegramSendOutcomeUnknownError(TelegramExecutionError):
+    """A Telegram write may have occurred but its outcome cannot be confirmed."""
+
+
+class TelegramSendPreflightError(TelegramExecutionError):
+    """A confirmed pre-send failure where no Telegram write was attempted."""
+
+
+class TelegramSendReservationReleasePendingError(TelegramSendPreflightError):
+    """The write was not attempted, but its risk reservation still needs recovery."""
 
 
 class TelegramJoinRequestPendingError(TelegramExecutionError):
@@ -33,6 +50,7 @@ class ParsedTelegramGroupLink:
 
 
 _TELEGRAM_LINK_HOSTS = {"t.me", "telegram.me"}
+logger = structlog.get_logger()
 _RESERVED_PUBLIC_PATHS = {
     "addstickers",
     "addtheme",
@@ -108,8 +126,10 @@ def parse_telegram_group_link(value: str) -> ParsedTelegramGroupLink:
 
 
 def _is_valid_public_username(value: str) -> bool:
-    return 4 <= len(value) <= 32 and value[0].isalpha() and all(
-        char.isascii() and (char.isalnum() or char == "_") for char in value
+    return (
+        4 <= len(value) <= 32
+        and value[0].isalpha()
+        and all(char.isascii() and (char.isalnum() or char == "_") for char in value)
     )
 
 
@@ -139,6 +159,7 @@ class TelegramExecutionService:
     def __init__(self, risk_guard: Optional[AccountRiskGuard] = None):
         self.risk_guard = risk_guard
         self._bot_account = bot_risk_identity("telegram_execution")
+        self.logger = logger.bind(module="telegram_execution")
 
     @staticmethod
     def _get_client(account: Any) -> Any:
@@ -180,36 +201,110 @@ class TelegramExecutionService:
             yield
             return
 
-        decision = await self.risk_guard.check_and_reserve(
-            account,
-            action,
-            target_type=target_type,
-            target_id=target_id,
-            details=details,
-        )
+        try:
+            decision = await self.risk_guard.check_and_reserve(
+                account,
+                action,
+                target_type=target_type,
+                target_id=target_id,
+                details=details,
+            )
+        except BaseException as exc:
+            if action != AccountRiskAction.OWNED_GROUP_MESSAGE:
+                raise
+            released = await self._release_owned_group_preflight_reservation(
+                account,
+                str((details or {}).get("risk_reservation_id") or ""),
+            )
+            if not isinstance(exc, Exception):
+                raise
+            if not released:
+                raise TelegramSendReservationReleasePendingError(
+                    "owned-group risk reservation release is pending"
+                ) from exc
+            raise TelegramSendPreflightError(
+                "owned-group risk preflight unavailable"
+            ) from exc
         if not decision.allowed:
             raise TelegramExecutionError(f"risk_guard_blocked:{decision.reason}")
 
         try:
             yield
+        except TelegramSendPreflightError:
+            raise
         except Exception as exc:
-            await self.risk_guard.record_failure(
-                account,
-                action,
-                exc,
-                target_type=target_type,
-                target_id=target_id,
-                details=details,
-            )
+            try:
+                await self.risk_guard.record_failure(
+                    account,
+                    action,
+                    exc,
+                    target_type=target_type,
+                    target_id=target_id,
+                    details=details,
+                )
+            except Exception as audit_exc:
+                if action != AccountRiskAction.OWNED_GROUP_MESSAGE:
+                    raise
+                await self._rollback_owned_risk_audit()
+                self.logger.error(
+                    "owned_group_risk_failure_record_failed",
+                    error_type=type(audit_exc).__name__,
+                    error=safe_exception_message(audit_exc, max_length=500),
+                )
             raise
         else:
-            await self.risk_guard.record_success(
-                account,
-                action,
-                target_type=target_type,
-                target_id=target_id,
-                details=details,
+            try:
+                await self.risk_guard.record_success(
+                    account,
+                    action,
+                    target_type=target_type,
+                    target_id=target_id,
+                    details=details,
+                )
+            except Exception as audit_exc:
+                if action != AccountRiskAction.OWNED_GROUP_MESSAGE:
+                    raise
+                await self._rollback_owned_risk_audit()
+                self.logger.error(
+                    "owned_group_risk_success_record_failed",
+                    error_type=type(audit_exc).__name__,
+                    error=safe_exception_message(audit_exc, max_length=500),
+                )
+
+    async def _rollback_owned_risk_audit(self) -> None:
+        db = getattr(self.risk_guard, "db", None)
+        if db is None:
+            return
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+    async def _release_owned_group_preflight_reservation(
+        self,
+        account: Any,
+        reservation_id: str,
+    ) -> bool:
+        release = getattr(
+            self.risk_guard,
+            "release_owned_group_message_reservation",
+            None,
+        )
+        if not callable(release) or not reservation_id:
+            return True
+        try:
+            released = await release(account, reservation_id)
+        except Exception as exc:
+            self.logger.error(
+                "owned_group_risk_preflight_release_failed",
+                error_type=type(exc).__name__,
+                error=safe_exception_message(exc, max_length=500),
             )
+            return False
+        if not bool(released):
+            self.logger.error("owned_group_risk_preflight_release_unconfirmed")
+            return False
+        return True
 
     async def send_private_message(
         self,
@@ -282,6 +377,102 @@ class TelegramExecutionService:
         ):
             result = await client.send_message(group_id, message, reply_to=reply_to)
         return getattr(result, "id", getattr(result, "message_id", None))
+
+    async def send_owned_group_message(
+        self,
+        account: Any,
+        telegram_chat_id: int,
+        message: str,
+        *,
+        reply_to: Optional[int] = None,
+        execution_id: int,
+        send_attempt_id: Optional[str] = None,
+        before_telegram_write: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Optional[int]:
+        """Send one stage-2 owned-group message with its dedicated risk action.
+
+        The caller must pass the already acquired, policy-selected account.
+        Account selection and business quota checks intentionally stay outside
+        this Telegram boundary. The risk reservation is therefore performed
+        exactly once and immediately before the client write.
+        """
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramSendPreflightError("telegram client unavailable")
+
+        attempt_token = str(send_attempt_id or uuid.uuid4().hex)
+        risk_reservation_id = AccountRiskGuard.owned_group_reservation_id(
+            attempt_token
+        )
+        details = {
+            "source": "owned_group_message",
+            "execution_id": execution_id,
+            "reply_to": reply_to,
+            "risk_reservation_id": risk_reservation_id,
+        }
+        async with self._risk_operation(
+            account,
+            AccountRiskAction.OWNED_GROUP_MESSAGE,
+            target_type="group",
+            target_id=telegram_chat_id,
+            details=details,
+        ):
+            if before_telegram_write is not None:
+                try:
+                    await before_telegram_write()
+                except BaseException as exc:
+                    released = await self._release_owned_group_preflight_reservation(
+                        account,
+                        details["risk_reservation_id"],
+                    )
+                    if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                        raise
+                    if not released:
+                        raise TelegramSendReservationReleasePendingError(
+                            "owned-group risk reservation release is pending"
+                        ) from exc
+                    raise TelegramSendPreflightError(
+                        "owned-group send marker could not be persisted"
+                    ) from exc
+            try:
+                result = await client.send_message(
+                    telegram_chat_id,
+                    message,
+                    reply_to=reply_to,
+                )
+            except Exception as exc:
+                # Telegram RPC errors that explicitly reject the write retain
+                # their original type so Speaker can apply the established
+                # FloodWait/permanent-error policy. Transport and otherwise
+                # unclassified failures may have reached Telegram, so retrying
+                # them could duplicate a message.
+                reason = AccountRiskGuard.classify_error(
+                    exc,
+                    action="owned_group_message",
+                    target_type="group",
+                )
+                if reason in {
+                    "flood_wait",
+                    "peer_flood",
+                    "account_banned",
+                    "account_restricted",
+                    "group_write_forbidden",
+                }:
+                    raise
+                raise TelegramSendOutcomeUnknownError(
+                    "Telegram send outcome could not be confirmed"
+                ) from exc
+            message_id = getattr(result, "id", None) or getattr(
+                result,
+                "message_id",
+                None,
+            )
+            if message_id is None:
+                raise TelegramSendOutcomeUnknownError(
+                    "Telegram send returned without a message id"
+                )
+        return int(message_id)
 
     async def send_ad(
         self,

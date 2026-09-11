@@ -37,6 +37,9 @@ export interface ManagedGroupBinding {
   last_synced_at?: string
   chat_type: 'group' | 'supergroup' | 'channel'
   all_members_muted: boolean
+  source_type: 'owned_group' | 'managed_group'
+  owned_group_asset_id?: number | null
+  owned_group_asset_title?: string | null
 }
 
 export interface ManagedGroupPinnedMessageConfig {
@@ -83,6 +86,13 @@ export interface TelegramWorkerStatus {
 export const guardianApi = {
   listBots: (params?: { enabled?: boolean; health_status?: string; search?: string; limit?: number }) =>
     apiClient.get<{ data: GuardianBot[]; total: number }>('/guardian-bots', { params }),
+
+  getBot: async (profileId: number, signal?: AbortSignal): Promise<GuardianBot> => {
+    const response = signal
+      ? await apiClient.get<GuardianBot>(`/guardian-bots/${profileId}`, { signal })
+      : await apiClient.get<GuardianBot>(`/guardian-bots/${profileId}`)
+    return response.data
+  },
 
   createBot: (data: {
     identifier: string

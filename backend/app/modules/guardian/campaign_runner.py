@@ -8,7 +8,11 @@ manual broadcasts.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -28,6 +32,7 @@ from app.core.campaign.models import (
     CampaignType,
 )
 from app.core.campaign.runner import CampaignExecutionResult
+from app.core.config import settings
 from app.core.user.tracker import UserTracker
 from app.integrations.telegram.client import init_telegram_client
 from app.modules.guardian.broadcast.broadcaster import GuardianBroadcaster
@@ -36,14 +41,37 @@ from app.modules.guardian.coupon.coupon_distributor import (
     CouponDistributor,
     DistributeResult,
 )
-from app.modules.guardian.models import GroupCampaignTriggerEvent, ManagedGroupBinding
+from app.modules.guardian.models import (
+    GroupCampaignTriggerEvent,
+    ManagedGroupBinding,
+    ManagedGroupBindingStatus,
+)
+from app.modules.owned_group.governance_worker import (
+    GuardianWorkerTarget,
+    owned_group_governance_gate_reason,
+    resolve_governance_worker_target,
+)
 
 logger = structlog.get_logger()
 
 CAMPAIGN_SCHEDULE_TIMEZONE = ZoneInfo("Asia/Shanghai")
 CLAIM_PAYLOAD_PREFIX = "vgc"
+BOUND_CLAIM_PAYLOAD_PREFIX = "vg2"
 CLAIM_CONTEXT_ALLOWED_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
 CLAIM_PAYLOAD_MAX_LENGTH = 64
+CLAIM_SIGNATURE_BYTES = 8
+
+
+@dataclass(frozen=True, slots=True)
+class _ClaimPayload:
+    campaign_id: int
+    batch_context: str
+    telegram_group_id: int | None = None
+    managed_binding_id: int | None = None
+
+    @property
+    def is_bound(self) -> bool:
+        return self.telegram_group_id is not None and self.managed_binding_id is not None
 
 
 class ManagedGroupCampaignRunner:
@@ -195,23 +223,38 @@ class ManagedGroupCampaignRunner:
         if parsed is None:
             return None
 
-        campaign_id, batch_context = parsed
-        campaign = await self._get_claimable_campaign(campaign_id)
+        campaign = await self._get_claimable_campaign(parsed.campaign_id)
         if campaign is None:
             return "活动不存在或已结束。"
 
         current = now or datetime.utcnow()
-        active, reason = await self._is_claim_batch_active(campaign, batch_context, current)
+        active, reason = await self._is_claim_batch_active(
+            campaign,
+            parsed.batch_context,
+            current,
+        )
         if not active:
             if reason == "expired":
                 return "本批次兑换码领取已过期。"
             return "本批次领取入口尚未生效，请从群内最新活动消息进入。"
 
+        claim_target = await self._resolve_claim_target(
+            campaign=campaign,
+            payload=parsed,
+            side_effect="coupon_claim_tracking",
+        )
+        if claim_target is None:
+            return "活动当前不可领取，请稍后再试。"
+
         user = await self.user_tracker.get_or_create_user(
             telegram_id=user_telegram_id,
             username=username,
         )
-        batch_key = self._claim_distribution_batch_key(campaign, batch_context)
+        batch_key = self._claim_distribution_batch_key(
+            campaign,
+            parsed.batch_context,
+            target=claim_target if parsed.is_bound else None,
+        )
         existing = await self.coupon_distributor.get_distribution_for_batch(
             user_id=user.id,
             campaign_id=campaign.id,
@@ -229,6 +272,15 @@ class ManagedGroupCampaignRunner:
                     batch_key=batch_key,
                 ),
             )
+
+        current_target = await self._resolve_claim_target(
+            campaign=campaign,
+            payload=parsed,
+            side_effect="coupon_issue",
+            expected_binding_id=claim_target.managed_binding_id,
+        )
+        if current_target is None:
+            return "活动当前不可领取，请稍后再试。"
 
         result = await self.coupon_distributor.distribute_discount(
             user_id=user.id,
@@ -342,6 +394,19 @@ class ManagedGroupCampaignRunner:
                     reason="user_required",
                 )
             scheduled = await self._schedule_delayed_execution(campaign, telegram_group_id, user.id, metadata)
+            if scheduled is None:
+                return CampaignExecutionResult(
+                    campaign_id=campaign.id,
+                    campaign_name=campaign.name,
+                    campaign_scope=CampaignScope.MANAGED_GROUP.value,
+                    triggered=False,
+                    delivered=False,
+                    reward_granted=False,
+                    user_id=user.id,
+                    group_id=telegram_group_id,
+                    status=CampaignExecutionStatus.SKIPPED.value,
+                    reason="governance_target_not_allowed",
+                )
             return CampaignExecutionResult(
                 campaign_id=campaign.id,
                 campaign_name=campaign.name,
@@ -418,6 +483,30 @@ class ManagedGroupCampaignRunner:
 
         tracking = None
         if user is not None:
+            if not await self._owned_campaign_side_effect_allowed(
+                campaign=campaign,
+                telegram_group_ids=[telegram_group_id],
+                side_effect="campaign_tracking",
+            ):
+                await self._finish_execution(
+                    execution,
+                    CampaignExecutionStatus.SKIPPED,
+                    now,
+                    error="governance_target_not_allowed",
+                )
+                return CampaignExecutionResult(
+                    campaign_id=campaign.id,
+                    campaign_name=campaign.name,
+                    campaign_scope=CampaignScope.MANAGED_GROUP.value,
+                    triggered=False,
+                    delivered=False,
+                    reward_granted=False,
+                    user_id=getattr(user, "id", None),
+                    group_id=telegram_group_id,
+                    status=CampaignExecutionStatus.SKIPPED.value,
+                    reason="governance_target_not_allowed",
+                    execution_id=execution.id,
+                )
             tracking = await self._get_or_create_tracking(
                 campaign=campaign,
                 user_id=user.id,
@@ -429,6 +518,30 @@ class ManagedGroupCampaignRunner:
         reward_result: Optional[DistributeResult] = None
         reward_granted = False
         if user is not None:
+            if not await self._owned_campaign_side_effect_allowed(
+                campaign=campaign,
+                telegram_group_ids=[telegram_group_id],
+                side_effect="coupon_issue",
+            ):
+                await self._finish_execution(
+                    execution,
+                    CampaignExecutionStatus.SKIPPED,
+                    now,
+                    error="governance_target_not_allowed",
+                )
+                return CampaignExecutionResult(
+                    campaign_id=campaign.id,
+                    campaign_name=campaign.name,
+                    campaign_scope=CampaignScope.MANAGED_GROUP.value,
+                    triggered=False,
+                    delivered=False,
+                    reward_granted=False,
+                    user_id=getattr(user, "id", None),
+                    group_id=telegram_group_id,
+                    status=CampaignExecutionStatus.SKIPPED.value,
+                    reason="governance_target_not_allowed",
+                    execution_id=execution.id,
+                )
             reward_result = await self._grant_reward(campaign=campaign, user=user, tracking=tracking)
             reward_granted = reward_result.success
 
@@ -593,7 +706,7 @@ class ManagedGroupCampaignRunner:
         telegram_group_id: int,
         user_id: int,
         metadata: dict,
-    ) -> CampaignExecution:
+    ) -> Optional[CampaignExecution]:
         existing = await self._find_execution(
             campaign_id=campaign.id,
             user_id=user_id,
@@ -606,6 +719,13 @@ class ManagedGroupCampaignRunner:
         )
         if existing is not None:
             return existing
+
+        if not await self._owned_campaign_side_effect_allowed(
+            campaign=campaign,
+            telegram_group_ids=[telegram_group_id],
+            side_effect="campaign_tracking",
+        ):
+            return None
 
         delay_minutes = self._get_delay_minutes(campaign)
         await self._get_or_create_tracking(
@@ -747,29 +867,60 @@ class ManagedGroupCampaignRunner:
         reply_markup: Optional[dict] = None
 
         if self._should_use_group_coupon_claim_link(campaign):
-            claim_url = await self._build_group_coupon_claim_url(
+            targets = await self._resolve_campaign_targets(
                 campaign=campaign,
-                batch_context=batch_context,
+                telegram_group_ids=telegram_group_ids,
+                side_effect="claim_link_broadcast",
             )
-            if not claim_url:
-                self.logger.error(
-                    "managed_group_coupon_claim_link_failed",
-                    campaign_id=campaign.id,
-                    campaign_name=campaign.name,
-                    batch_context=batch_context,
-                    error="bot_username_missing",
-                )
+            if not targets:
                 return False
-            message = self._resolve_group_coupon_claim_message(
-                campaign=campaign,
-                base_message=message or "",
-                claim_url=claim_url,
-                batch_context=batch_context,
-                run_at=run_at,
-            )
-            parse_mode = ""
-            reply_markup = self._build_claim_reply_markup(claim_url)
+
+            delivered = False
+            for target in targets:
+                claim_link = await self._build_group_coupon_claim_url(
+                    campaign=campaign,
+                    batch_context=batch_context,
+                    target=target,
+                )
+                if not claim_link:
+                    self.logger.error(
+                        "managed_group_coupon_claim_link_failed",
+                        campaign_id=campaign.id,
+                        campaign_name=campaign.name,
+                        telegram_group_id=target.telegram_chat_id,
+                        managed_binding_id=target.managed_binding_id,
+                        batch_context=batch_context,
+                        error="bot_username_missing",
+                    )
+                    continue
+                claim_url, claim_payload = claim_link
+                target_message = self._resolve_group_coupon_claim_message(
+                    campaign=campaign,
+                    base_message=message or "",
+                    claim_url=claim_url,
+                    claim_payload=claim_payload,
+                    batch_context=batch_context,
+                    run_at=run_at,
+                    target=target,
+                )
+                target_delivered = await self._broadcast_to_groups(
+                    campaign=campaign,
+                    telegram_group_ids=[target.telegram_chat_id],
+                    message_override=target_message,
+                    parse_mode="",
+                    reply_markup=self._build_claim_reply_markup(claim_url),
+                )
+                delivered = delivered or target_delivered
+            return delivered
         elif self._should_generate_group_coupon_batch(campaign):
+            targets = await self._resolve_campaign_targets(
+                campaign=campaign,
+                telegram_group_ids=telegram_group_ids,
+                side_effect="coupon_batch_generation",
+            )
+            if not targets:
+                return False
+            telegram_group_ids = [target.telegram_chat_id for target in targets]
             batch_result = await self.coupon_distributor.generate_discount_batch(
                 campaign,
                 batch_context=batch_context,
@@ -799,6 +950,195 @@ class ManagedGroupCampaignRunner:
             reply_markup=reply_markup,
         )
 
+    async def _owned_campaign_side_effect_allowed(
+        self,
+        *,
+        campaign: Campaign,
+        telegram_group_ids: list[int],
+        side_effect: str,
+    ) -> bool:
+        """Require every supplied target to have one current eligible binding."""
+        unique_group_ids = list(dict.fromkeys(int(item) for item in telegram_group_ids))
+        if not unique_group_ids:
+            return False
+        targets = await self._resolve_campaign_targets(
+            campaign=campaign,
+            telegram_group_ids=unique_group_ids,
+            side_effect=side_effect,
+        )
+        return len(targets) == len(unique_group_ids)
+
+    async def _resolve_campaign_targets(
+        self,
+        *,
+        campaign: Campaign,
+        telegram_group_ids: list[int],
+        side_effect: str,
+    ) -> list[GuardianWorkerTarget]:
+        """Resolve only targets with one live ACTIVE binding and valid identity.
+
+        The ACTIVE binding requirement applies to legacy and self-owned groups.
+        Self-owned targets additionally pass the governance resolver's asset,
+        feature/stop-gate, profile, and bot identity checks.
+        """
+
+        unique_group_ids = list(dict.fromkeys(int(item) for item in telegram_group_ids))
+        if not unique_group_ids:
+            return []
+
+        active_bindings = (
+            await self.db.execute(
+                select(ManagedGroupBinding)
+                .where(
+                    ManagedGroupBinding.telegram_group_id.in_(unique_group_ids),
+                    ManagedGroupBinding.binding_status
+                    == ManagedGroupBindingStatus.ACTIVE,
+                )
+                .execution_options(populate_existing=True)
+            )
+        ).scalars().all()
+        bindings_by_chat: dict[int, list[ManagedGroupBinding]] = {}
+        for binding in active_bindings:
+            bindings_by_chat.setdefault(int(binding.telegram_group_id), []).append(
+                binding
+            )
+
+        try:
+            owned_gate_reason = await owned_group_governance_gate_reason()
+        except Exception:
+            owned_gate_reason = "governance_gate_backend_unavailable"
+
+        resolved: list[GuardianWorkerTarget] = []
+        for telegram_group_id in unique_group_ids:
+            candidates = bindings_by_chat.get(telegram_group_id, [])
+            if len(candidates) != 1:
+                self.logger.warning(
+                    "managed_group_campaign_side_effect_skipped",
+                    campaign_id=campaign.id,
+                    telegram_group_id=telegram_group_id,
+                    bot_account_id=campaign.bot_account_id,
+                    side_effect=side_effect,
+                    reason_code=(
+                        "managed_binding_missing_or_inactive"
+                        if not candidates
+                        else "managed_active_binding_ambiguous"
+                    ),
+                )
+                continue
+
+            binding = candidates[0]
+            if (
+                campaign.bot_account_id is not None
+                and int(binding.bot_account_id) != int(campaign.bot_account_id)
+            ):
+                self.logger.warning(
+                    "managed_group_campaign_side_effect_skipped",
+                    campaign_id=campaign.id,
+                    telegram_group_id=telegram_group_id,
+                    managed_binding_id=binding.id,
+                    bot_account_id=campaign.bot_account_id,
+                    bound_bot_account_id=binding.bot_account_id,
+                    side_effect=side_effect,
+                    reason_code="campaign_bot_binding_mismatch",
+                )
+                continue
+
+            target = await resolve_governance_worker_target(
+                self.db,
+                telegram_chat_id=telegram_group_id,
+                bot_account_id=int(binding.bot_account_id),
+                owned_gate_reason=owned_gate_reason,
+            )
+            if target.allowed and target.managed_binding_id == int(binding.id):
+                resolved.append(target)
+                continue
+
+            self.logger.warning(
+                "managed_group_campaign_side_effect_skipped",
+                campaign_id=campaign.id,
+                asset_id=target.owned_group_asset_id,
+                core_group_id=target.core_group_id,
+                telegram_group_id=telegram_group_id,
+                managed_binding_id=binding.id,
+                bot_account_id=binding.bot_account_id,
+                side_effect=side_effect,
+                reason_code=(
+                    target.reason_code
+                    if not target.allowed
+                    else "managed_binding_identity_mismatch"
+                ),
+            )
+
+        return resolved
+
+    async def _resolve_claim_target(
+        self,
+        *,
+        campaign: Campaign,
+        payload: _ClaimPayload,
+        side_effect: str,
+        expected_binding_id: int | None = None,
+    ) -> GuardianWorkerTarget | None:
+        """Resolve the one binding authorized by a claim payload.
+
+        Signed v2 payloads carry the exact Telegram chat and binding IDs. Legacy
+        payloads are accepted only for campaigns that currently have exactly one
+        configured target; multi-target legacy links are intentionally rejected.
+        """
+
+        campaign_group_ids = list(
+            dict.fromkeys(self._parse_json_list(campaign.target_group_ids))
+        )
+        if payload.is_bound:
+            telegram_group_id = int(payload.telegram_group_id)
+            payload_binding_id = int(payload.managed_binding_id)
+            if telegram_group_id not in campaign_group_ids:
+                self.logger.warning(
+                    "managed_group_coupon_claim_skipped",
+                    campaign_id=campaign.id,
+                    telegram_group_id=telegram_group_id,
+                    managed_binding_id=payload_binding_id,
+                    side_effect=side_effect,
+                    reason_code="claim_target_not_in_campaign",
+                )
+                return None
+        else:
+            if len(campaign_group_ids) != 1:
+                self.logger.warning(
+                    "managed_group_coupon_claim_skipped",
+                    campaign_id=campaign.id,
+                    side_effect=side_effect,
+                    reason_code="legacy_claim_target_ambiguous",
+                )
+                return None
+            telegram_group_id = int(campaign_group_ids[0])
+            payload_binding_id = None
+
+        targets = await self._resolve_campaign_targets(
+            campaign=campaign,
+            telegram_group_ids=[telegram_group_id],
+            side_effect=side_effect,
+        )
+        if len(targets) != 1:
+            return None
+        target = targets[0]
+        required_binding_id = payload_binding_id or expected_binding_id
+        if (
+            required_binding_id is not None
+            and target.managed_binding_id != int(required_binding_id)
+        ):
+            self.logger.warning(
+                "managed_group_coupon_claim_skipped",
+                campaign_id=campaign.id,
+                telegram_group_id=telegram_group_id,
+                managed_binding_id=target.managed_binding_id,
+                required_binding_id=required_binding_id,
+                side_effect=side_effect,
+                reason_code="claim_binding_changed",
+            )
+            return None
+        return target
+
     async def _broadcast_to_groups(
         self,
         campaign: Campaign,
@@ -814,20 +1154,21 @@ class ManagedGroupCampaignRunner:
         if not message:
             return False
 
-        rows = await self.db.execute(
-            select(ManagedGroupBinding).where(ManagedGroupBinding.telegram_group_id.in_(telegram_group_ids))
+        unique_group_ids = list(dict.fromkeys(int(item) for item in telegram_group_ids))
+        targets = await self._resolve_campaign_targets(
+            campaign=campaign,
+            telegram_group_ids=unique_group_ids,
+            side_effect="telegram_broadcast",
         )
-        bindings = list(rows.scalars().all())
         bot_group_map: dict[int, list[int]] = {}
-        for binding in bindings:
-            bot_group_map.setdefault(binding.bot_account_id, []).append(binding.telegram_group_id)
-
-        if not bot_group_map and campaign.bot_account_id is not None:
-            bot_group_map[campaign.bot_account_id] = telegram_group_ids
+        for target in targets:
+            bot_group_map.setdefault(int(target.bot_account_id), []).append(
+                target.telegram_chat_id
+            )
 
         overall_success = False
         total_success = 0
-        total_failed = 0
+        total_failed = len(unique_group_ids) - len(targets)
         for account_id, group_ids in bot_group_map.items():
             client = await self._create_guardian_client(account_id)
             try:
@@ -917,13 +1258,26 @@ class ManagedGroupCampaignRunner:
         )
         return str(raw).strip().lower()
 
-    async def _build_group_coupon_claim_url(self, *, campaign: Campaign, batch_context: str) -> Optional[str]:
-        bot_username = await self._get_guardian_bot_username(campaign.bot_account_id)
+    async def _build_group_coupon_claim_url(
+        self,
+        *,
+        campaign: Campaign,
+        batch_context: str,
+        target: GuardianWorkerTarget,
+    ) -> Optional[tuple[str, str]]:
+        if target.managed_binding_id is None:
+            return None
+        bot_username = await self._get_guardian_bot_username(target.bot_account_id)
         if not bot_username:
             return None
         username = bot_username.lstrip("@")
-        payload = self._build_claim_payload(campaign.id, batch_context)
-        return f"https://t.me/{username}?start={payload}"
+        payload = self._build_claim_payload(
+            campaign.id,
+            batch_context,
+            telegram_group_id=target.telegram_chat_id,
+            managed_binding_id=target.managed_binding_id,
+        )
+        return f"https://t.me/{username}?start={payload}", payload
 
     async def _get_guardian_bot_username(self, bot_account_id: Optional[int]) -> Optional[str]:
         if bot_account_id is None:
@@ -956,16 +1310,22 @@ class ManagedGroupCampaignRunner:
         campaign: Campaign,
         base_message: str,
         claim_url: str,
+        claim_payload: str,
         batch_context: str,
         run_at: datetime,
+        target: GuardianWorkerTarget,
     ) -> str:
         local_run_at = self._scheduled_local_datetime(run_at)
-        command = f"/start {self._build_claim_payload(campaign.id, batch_context)}"
+        command = f"/start {claim_payload}"
         context = _SafeFormatDict(
             campaign_name=campaign.name,
             claim_url=claim_url,
             claim_command=command,
-            batch_key=self._claim_distribution_batch_key(campaign, batch_context),
+            batch_key=self._claim_distribution_batch_key(
+                campaign,
+                batch_context,
+                target=target,
+            ),
             batch_context=batch_context,
             validity_hours=campaign.validity_hours,
             schedule_time=local_run_at.strftime("%H:%M"),
@@ -1129,11 +1489,74 @@ class ManagedGroupCampaignRunner:
         telegram_id = getattr(user, "telegram_id", None)
         return str(telegram_id or getattr(user, "id", "用户"))
 
-    def _build_claim_payload(self, campaign_id: int, batch_context: str) -> str:
+    def _build_claim_payload(
+        self,
+        campaign_id: int,
+        batch_context: str,
+        *,
+        telegram_group_id: int | None = None,
+        managed_binding_id: int | None = None,
+    ) -> str:
         context = self._normalize_claim_context(batch_context)
-        prefix = f"{CLAIM_PAYLOAD_PREFIX}_{campaign_id}_"
-        max_context_length = CLAIM_PAYLOAD_MAX_LENGTH - len(prefix)
-        return f"{prefix}{context[:max_context_length]}"
+        if telegram_group_id is None and managed_binding_id is None:
+            # Kept only for old single-target links. Production link generation
+            # always supplies both identity fields and emits signed v2 payloads.
+            prefix = f"{CLAIM_PAYLOAD_PREFIX}_{campaign_id}_"
+            max_context_length = CLAIM_PAYLOAD_MAX_LENGTH - len(prefix)
+            return f"{prefix}{context[:max_context_length]}"
+        if telegram_group_id is None or managed_binding_id is None:
+            raise ValueError("claim target and binding identity must be supplied together")
+
+        campaign_token = self._encode_base36(campaign_id)
+        binding_token = self._encode_base36(managed_binding_id)
+        chat_token = self._encode_signed_base36(telegram_group_id)
+        prefix = (
+            f"{BOUND_CLAIM_PAYLOAD_PREFIX}_{campaign_token}_"
+            f"{binding_token}_{chat_token}_"
+        )
+        signature_length = len(self._claim_payload_signature(f"{prefix}x"))
+        max_context_length = (
+            CLAIM_PAYLOAD_MAX_LENGTH - len(prefix) - signature_length - 1
+        )
+        if max_context_length < 1:
+            raise ValueError("claim identity exceeds Telegram payload length")
+        unsigned = f"{prefix}{context[:max_context_length]}"
+        signature = self._claim_payload_signature(unsigned)
+        return f"{unsigned}_{signature}"
+
+    def _claim_payload_signature(self, unsigned_payload: str) -> str:
+        digest = hmac.new(
+            settings.JWT_SECRET.encode("utf-8"),
+            f"managed-group-claim:v2:{unsigned_payload}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()[:CLAIM_SIGNATURE_BYTES]
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    def _encode_base36(self, value: int) -> str:
+        number = int(value)
+        if number <= 0:
+            raise ValueError("claim identity must be positive")
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+        encoded = ""
+        while number:
+            number, remainder = divmod(number, 36)
+            encoded = alphabet[remainder] + encoded
+        return encoded
+
+    def _encode_signed_base36(self, value: int) -> str:
+        number = int(value)
+        if number == 0:
+            raise ValueError("Telegram chat identity must be non-zero")
+        sign = "n" if number < 0 else "p"
+        return f"{sign}{self._encode_base36(abs(number))}"
+
+    def _decode_signed_base36(self, value: str) -> int:
+        if len(value) < 2 or value[0] not in {"n", "p"}:
+            raise ValueError("invalid signed base36 value")
+        decoded = int(value[1:], 36)
+        if decoded <= 0:
+            raise ValueError("invalid Telegram chat identity")
+        return -decoded if value[0] == "n" else decoded
 
     def _normalize_claim_context(self, batch_context: str) -> str:
         normalized = "".join(
@@ -1142,11 +1565,40 @@ class ManagedGroupCampaignRunner:
         )
         return normalized or "default"
 
-    def _parse_claim_payload(self, payload: str) -> Optional[tuple[int, str]]:
+    def _parse_claim_payload(self, payload: str) -> Optional[_ClaimPayload]:
         raw = str(payload or "").strip()
         if raw.startswith("/start"):
             parts = raw.split(maxsplit=1)
             raw = parts[1].strip() if len(parts) == 2 else ""
+
+        if raw.startswith(f"{BOUND_CLAIM_PAYLOAD_PREFIX}_"):
+            signature_length = len(self._claim_payload_signature("x"))
+            separator_index = len(raw) - signature_length - 1
+            if separator_index <= 0 or raw[separator_index] != "_":
+                return None
+            unsigned = raw[:separator_index]
+            signature = raw[separator_index + 1 :]
+            expected = self._claim_payload_signature(unsigned)
+            if not hmac.compare_digest(signature, expected):
+                return None
+            parts = unsigned.split("_", 4)
+            if len(parts) != 5 or parts[0] != BOUND_CLAIM_PAYLOAD_PREFIX:
+                return None
+            try:
+                campaign_id = int(parts[1], 36)
+                managed_binding_id = int(parts[2], 36)
+                telegram_group_id = self._decode_signed_base36(parts[3])
+            except ValueError:
+                return None
+            if campaign_id <= 0 or managed_binding_id <= 0:
+                return None
+            return _ClaimPayload(
+                campaign_id=campaign_id,
+                batch_context=self._normalize_claim_context(parts[4]),
+                telegram_group_id=telegram_group_id,
+                managed_binding_id=managed_binding_id,
+            )
+
         if not raw.startswith(f"{CLAIM_PAYLOAD_PREFIX}_"):
             return None
 
@@ -1157,10 +1609,24 @@ class ManagedGroupCampaignRunner:
             campaign_id = int(parts[1])
         except ValueError:
             return None
-        batch_context = self._normalize_claim_context(parts[2])
-        return campaign_id, batch_context
+        if campaign_id <= 0:
+            return None
+        return _ClaimPayload(
+            campaign_id=campaign_id,
+            batch_context=self._normalize_claim_context(parts[2]),
+        )
 
-    def _claim_distribution_batch_key(self, campaign: Campaign, batch_context: str) -> str:
+    def _claim_distribution_batch_key(
+        self,
+        campaign: Campaign,
+        batch_context: str,
+        *,
+        target: GuardianWorkerTarget | None = None,
+    ) -> str:
+        # The signed payload binds authorization to one exact chat/binding, but
+        # redemption remains campaign-batch scoped. A member who sees the same
+        # campaign in multiple groups must still receive at most one coupon.
+        del target
         reward_policy = self._parse_json_dict(campaign.reward_policy_json)
         raw = reward_policy.get("coupon_batch_key") or reward_policy.get("batch_key") or campaign.id
         base = str(raw).strip() or str(campaign.id)

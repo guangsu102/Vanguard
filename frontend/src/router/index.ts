@@ -2,6 +2,7 @@ import { createRouter, createWebHistory, RouteRecordRaw } from 'vue-router'
 import NProgress from 'nprogress'
 import 'nprogress/nprogress.css'
 import { useAuthStore } from '@/stores/auth'
+import { GROUP_OPS_READ_ROLES } from '@/utils/groupOpsAccess'
 
 NProgress.configure({ showSpinner: false })
 
@@ -76,7 +77,19 @@ const routes: RouteRecordRaw[] = [
         path: 'owned-groups',
         name: 'OwnedGroups',
         component: () => import('@/views/OwnedGroups.vue'),
-        meta: { title: '自建群编排', icon: 'OfficeBuilding' },
+        meta: { title: '群资产总览', icon: 'OfficeBuilding' },
+      },
+      {
+        path: 'owned-groups/:assetId/operations',
+        name: 'OwnedGroupOperationsCenter',
+        component: () => import('@/views/OwnedGroupOperationsCenter.vue'),
+        meta: { title: '群运营中心', allowedRoles: GROUP_OPS_READ_ROLES },
+      },
+      {
+        path: 'owned-groups/:assetId/messaging',
+        name: 'OwnedGroupMessaging',
+        component: () => import('@/views/OwnedGroupMessaging.vue'),
+        meta: { title: '群内消息' },
       },
       {
         path: 'keywords',
@@ -177,18 +190,16 @@ router.beforeEach(async (to, _from, next) => {
     const token = localStorage.getItem('token')
     if (token) {
       authStore.setToken(token)
-      try {
-        await authStore.fetchUserInfo()
-        document.title = `${to.meta.title || ''} - Vanguard`
-        next()
-      } catch {
+      const restoredUser = await authStore.fetchUserInfo()
+      if (!restoredUser) {
         localStorage.removeItem('token')
         next('/login')
+        return
       }
     } else {
       next('/login')
+      return
     }
-    return
   }
 
   if (to.matched.some((record) => record.meta.requiresAdmin === true)) {
@@ -196,6 +207,17 @@ router.beforeEach(async (to, _from, next) => {
       await authStore.fetchUserInfo()
     }
     if (authStore.userInfo?.role !== 'admin') {
+      next('/dashboard')
+      return
+    }
+  }
+
+  const allowedRoles = to.matched
+    .map((record) => record.meta.allowedRoles)
+    .find((roles): roles is readonly string[] => Array.isArray(roles))
+  if (allowedRoles) {
+    if (!authStore.userInfo) await authStore.fetchUserInfo()
+    if (!authStore.userInfo || !allowedRoles.includes(authStore.userInfo.role)) {
       next('/dashboard')
       return
     }

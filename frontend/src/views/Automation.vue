@@ -13,6 +13,7 @@ import {
 } from "@element-plus/icons-vue";
 import { useRouter } from 'vue-router'
 import { accountsApi } from '@/api/accounts'
+import { getApiErrorMessage } from '@/api/client'
 import { groupsApi, type Group } from '@/api/groups'
 import {
   automationApi,
@@ -45,6 +46,13 @@ type AccountOption = {
   session_name?: string
   status?: string
   is_active?: boolean
+}
+
+type TargetGroupJoinResult = {
+  accountId: number
+  success: boolean
+  group?: Group
+  error?: string
 }
 
 type CreativePoolSummary = {
@@ -111,6 +119,10 @@ const editingCampaignId = ref<number | null>(null)
 const savingCampaign = ref(false)
 const targetGroupDialogVisible = ref(false)
 const savingTargetGroup = ref(false)
+const targetGroupAttachToCampaign = ref(false)
+const targetGroupAccountSearch = ref('')
+const targetGroupJoinResults = ref<TargetGroupJoinResult[]>([])
+const targetGroupJoinProgress = reactive({ completed: 0, total: 0 })
 
 const autoJoinForm = reactive({
   max_accounts: 10,
@@ -193,7 +205,7 @@ const scheduledTimesText = ref('')
 
 const targetGroupForm = reactive({
   groupLink: '',
-  accountId: undefined as number | undefined,
+  accountIds: [] as number[],
 })
 
 const bindingForm = reactive({
@@ -629,6 +641,28 @@ const targetGroupJoinAccounts = computed(() =>
       && !['banned', 'error'].includes(account.status || '')
       && accountOperationModeMap.value.get(account.id) !== 'ad_only',
   ),
+)
+const filteredTargetGroupJoinAccounts = computed(() => {
+  const keyword = targetGroupAccountSearch.value.trim().toLowerCase()
+  if (!keyword) return targetGroupJoinAccounts.value
+  return targetGroupJoinAccounts.value.filter((account) =>
+    [account.id, account.display_name, account.identifier, account.phone, account.session_name]
+      .filter((value) => value !== undefined && value !== null)
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword),
+  )
+})
+const targetGroupJoinSuccessCount = computed(
+  () => targetGroupJoinResults.value.filter((item) => item.success).length,
+)
+const targetGroupJoinFailedCount = computed(
+  () => targetGroupJoinResults.value.filter((item) => !item.success).length,
+)
+const targetGroupJoinProgressPercent = computed(() =>
+  targetGroupJoinProgress.total
+    ? Math.round((targetGroupJoinProgress.completed / targetGroupJoinProgress.total) * 100)
+    : 0,
 )
 
 const selectedDynamicStatus = computed(() =>
@@ -1274,11 +1308,28 @@ const saveCampaign = async () => {
   }
 };
 
-const openTargetGroupDialog = () => {
+const selectAllTargetGroupAccounts = () => {
+  targetGroupForm.accountIds = targetGroupJoinAccounts.value.map((account) => account.id)
+}
+
+const clearTargetGroupAccounts = () => {
+  targetGroupForm.accountIds = []
+}
+
+const openTargetGroupDialog = (attachToCampaign = false) => {
+  const preferredAccountId = targetGroupJoinAccounts.value.some(
+    (account) => account.id === selectedAccountId.value,
+  )
+    ? selectedAccountId.value
+    : undefined
   Object.assign(targetGroupForm, {
     groupLink: "",
-    accountId: selectedAccountId.value,
+    accountIds: preferredAccountId ? [preferredAccountId] : [],
   });
+  targetGroupAttachToCampaign.value = attachToCampaign
+  targetGroupAccountSearch.value = ''
+  targetGroupJoinResults.value = []
+  Object.assign(targetGroupJoinProgress, { completed: 0, total: 0 })
   targetGroupDialogVisible.value = true;
 };
 
@@ -1288,25 +1339,61 @@ const saveTargetGroup = async () => {
     ElMessage.warning("请输入 Telegram 群链接");
     return;
   }
-  if (!targetGroupForm.accountId) {
-    ElMessage.warning("请选择执行入群的推广账号");
+  if (!targetGroupForm.accountIds.length) {
+    ElMessage.warning("请至少勾选一个执行入群的 Growth 推广账号");
     return;
   }
 
+  const accountIds = [...targetGroupForm.accountIds]
   savingTargetGroup.value = true;
+  targetGroupJoinResults.value = []
+  Object.assign(targetGroupJoinProgress, { completed: 0, total: accountIds.length })
   try {
-    const response = await groupsApi.joinByLink({
-      groupLink,
-      accountId: targetGroupForm.accountId,
-    });
-    const group = response.data.data;
-    await loadTargetGroups();
-    if (!campaignForm.target_group_ids.includes(group.id)) {
-      campaignForm.target_group_ids.push(group.id);
+    let lastJoinedGroup: Group | undefined
+    for (const accountId of accountIds) {
+      try {
+        const response = await groupsApi.joinByLink({ groupLink, accountId })
+        const group = response.data.data
+        lastJoinedGroup = group
+        targetGroupJoinResults.value.push({ accountId, success: true, group })
+      } catch (error) {
+        const responseData = (error as { response?: { data?: unknown } })?.response?.data
+        targetGroupJoinResults.value.push({
+          accountId,
+          success: false,
+          error: responseData
+            ? getApiErrorMessage(responseData)
+            : error instanceof Error
+              ? error.message
+              : '入群失败',
+        })
+      } finally {
+        targetGroupJoinProgress.completed += 1
+      }
     }
-    targetGroupDialogVisible.value = false;
-    const groupName = group.title || group.username || group.chatId;
-    ElMessage.success(`已加入并添加 ${groupName}`);
+
+    if (lastJoinedGroup) {
+      await loadTargetGroups()
+      if (
+        targetGroupAttachToCampaign.value
+        && !campaignForm.target_group_ids.includes(lastJoinedGroup.id)
+      ) {
+        campaignForm.target_group_ids.push(lastJoinedGroup.id)
+      }
+    }
+
+    const succeeded = targetGroupJoinSuccessCount.value
+    const failed = targetGroupJoinFailedCount.value
+    if (failed === 0) {
+      targetGroupDialogVisible.value = false
+      const groupName = lastJoinedGroup?.title || lastJoinedGroup?.username || lastJoinedGroup?.chatId
+      ElMessage.success(`${succeeded} 个账号已加入${groupName ? ` ${groupName}` : '指定群'}`)
+    } else {
+      targetGroupForm.accountIds = targetGroupJoinResults.value
+        .filter((item) => !item.success)
+        .map((item) => item.accountId)
+      ElMessage.warning(`批量入群完成：成功 ${succeeded} 个，失败 ${failed} 个`)
+    }
   } finally {
     savingTargetGroup.value = false;
   }
@@ -1531,6 +1618,31 @@ onBeforeUnmount(() => {
     <el-tabs v-model="activeTab" class="automation-tabs">
       <el-tab-pane label="加群" name="join">
         <div class="control-grid">
+          <el-card shadow="never" class="manual-join-card">
+            <template #header>
+              <div class="card-header">
+                <span>指定链接批量加群</span>
+                <el-tag type="success" effect="plain">Growth</el-tag>
+              </div>
+            </template>
+            <p class="manual-join-copy">
+              输入一个 Telegram 群链接，直接勾选多个 Growth 推广账号依次加入。
+              Ad-only 账号不会出现在可选列表中。
+            </p>
+            <div class="manual-join-count">
+              <strong>{{ targetGroupJoinAccounts.length }}</strong>
+              <span>个可用推广账号</span>
+            </div>
+            <el-button
+              type="primary"
+              :disabled="!targetGroupJoinAccounts.length"
+              @click="openTargetGroupDialog(false)"
+            >
+              <el-icon><Plus /></el-icon>
+              勾选账号并加入
+            </el-button>
+          </el-card>
+
           <el-card shadow="never">
             <template #header>搜群关键词补充</template>
             <el-form label-width="120px">
@@ -2428,7 +2540,7 @@ onBeforeUnmount(() => {
                       </div>
                     </el-option>
                   </el-select>
-                  <el-button @click="openTargetGroupDialog"
+                  <el-button @click="openTargetGroupDialog(true)"
                     ><el-icon><Plus /></el-icon>添加群</el-button
                   >
                 </div>
@@ -2926,8 +3038,14 @@ onBeforeUnmount(() => {
 
     </el-tabs>
 
-    <el-dialog v-model="targetGroupDialogVisible" title="通过链接加入群" width="520px">
-      <el-form label-width="110px">
+    <el-dialog
+      v-model="targetGroupDialogVisible"
+      title="多个账号加入同一个群"
+      width="min(680px, 92vw)"
+      :close-on-click-modal="!savingTargetGroup"
+      :close-on-press-escape="!savingTargetGroup"
+    >
+      <el-form label-width="100px">
         <el-form-item label="群链接" required>
           <el-input
             v-model="targetGroupForm.groupLink"
@@ -2936,20 +3054,94 @@ onBeforeUnmount(() => {
           />
         </el-form-item>
         <el-form-item label="推广账号" required>
-          <el-select v-model="targetGroupForm.accountId" filterable placeholder="选择执行入群的账号">
-            <el-option
-              v-for="item in targetGroupJoinAccounts"
-              :key="item.id"
-              :label="accountLabel(item.id)"
-              :value="item.id"
+          <div class="join-account-picker">
+            <el-alert
+              title="仅展示可用的 Growth 推广账号；Ad-only 账号必须继续走交接流程。"
+              type="info"
+              :closable="false"
+              show-icon
             />
-          </el-select>
+            <el-input
+              v-model="targetGroupAccountSearch"
+              class="join-account-search"
+              placeholder="搜索账号名称、手机号或 ID"
+              clearable
+            />
+            <div class="join-account-toolbar">
+              <span>已勾选 {{ targetGroupForm.accountIds.length }} / {{ targetGroupJoinAccounts.length }}</span>
+              <div>
+                <el-button
+                  type="primary"
+                  link
+                  :disabled="!targetGroupJoinAccounts.length"
+                  @click="selectAllTargetGroupAccounts"
+                >
+                  全选可用账号
+                </el-button>
+                <el-button link :disabled="!targetGroupForm.accountIds.length" @click="clearTargetGroupAccounts">
+                  清空
+                </el-button>
+              </div>
+            </div>
+            <el-scrollbar max-height="260px" class="join-account-scrollbar">
+              <el-checkbox-group
+                v-if="filteredTargetGroupJoinAccounts.length"
+                v-model="targetGroupForm.accountIds"
+                class="join-account-checkboxes"
+              >
+                <el-checkbox
+                  v-for="item in filteredTargetGroupJoinAccounts"
+                  :key="item.id"
+                  :label="item.id"
+                  border
+                  class="join-account-checkbox"
+                >
+                  <span class="join-account-name">{{ accountLabel(item.id) }}</span>
+                  <small>#{{ item.id }} · {{ accountStatusText(item.status) }}</small>
+                </el-checkbox>
+              </el-checkbox-group>
+              <el-empty v-else description="没有匹配的可用 Growth 账号" :image-size="56" />
+            </el-scrollbar>
+          </div>
+        </el-form-item>
+        <el-form-item v-if="savingTargetGroup" label="执行进度">
+          <el-progress
+            class="join-progress"
+            :percentage="targetGroupJoinProgressPercent"
+            :format="() => `${targetGroupJoinProgress.completed}/${targetGroupJoinProgress.total}`"
+          />
+        </el-form-item>
+        <el-form-item v-if="targetGroupJoinResults.length" label="执行结果">
+          <div class="join-result-list">
+            <div
+              v-for="result in targetGroupJoinResults"
+              :key="result.accountId"
+              class="join-result-row"
+            >
+              <span>{{ accountLabel(result.accountId) }}</span>
+              <div class="join-result-status">
+                <el-tag :type="result.success ? 'success' : 'danger'" size="small">
+                  {{ result.success ? '成功' : '失败' }}
+                </el-tag>
+                <small v-if="result.error" :title="result.error">{{ result.error }}</small>
+              </div>
+            </div>
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
-        <el-button @click="targetGroupDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="savingTargetGroup" @click="saveTargetGroup">
-          加入并添加
+        <el-button :disabled="savingTargetGroup" @click="targetGroupDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="savingTargetGroup"
+          :disabled="!targetGroupForm.accountIds.length"
+          @click="saveTargetGroup"
+        >
+          {{
+            savingTargetGroup
+              ? `正在处理 ${targetGroupJoinProgress.completed}/${targetGroupJoinProgress.total}`
+              : `批量加入 ${targetGroupForm.accountIds.length} 个账号`
+          }}
         </el-button>
       </template>
     </el-dialog>
@@ -3192,6 +3384,121 @@ onBeforeUnmount(() => {
   width: 100%;
 }
 
+.manual-join-copy {
+  min-height: 48px;
+  margin: 0 0 18px;
+  color: #606266;
+  line-height: 1.7;
+}
+
+.manual-join-count {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 18px;
+  color: #606266;
+}
+
+.manual-join-count strong {
+  color: #1f2937;
+  font-size: 28px;
+  line-height: 1;
+}
+
+.join-account-picker,
+.join-progress,
+.join-result-list {
+  width: 100%;
+}
+
+.join-account-search {
+  margin-top: 12px;
+}
+
+.join-account-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  color: #606266;
+  font-size: 13px;
+}
+
+.join-account-scrollbar {
+  padding: 10px;
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.join-account-checkboxes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.join-account-checkbox {
+  width: 100%;
+  height: auto;
+  min-height: 52px;
+  margin: 0 !important;
+}
+
+:deep(.join-account-checkbox .el-checkbox__label) {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  line-height: 1.45;
+}
+
+.join-account-name {
+  overflow: hidden;
+  color: #303133;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.join-account-checkbox small,
+.join-result-status small {
+  color: #909399;
+}
+
+.join-result-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+}
+
+.join-result-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+}
+
+.join-result-row + .join-result-row {
+  border-top: 1px solid #ebeef5;
+}
+
+.join-result-status {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.join-result-status small {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .log-card + .log-card {
   margin-top: 16px;
 }
@@ -3225,6 +3532,24 @@ onBeforeUnmount(() => {
     justify-content: flex-start;
   }
 }
+
+@media (max-width: 720px) {
+  .join-account-toolbar,
+  .join-result-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .join-account-checkboxes {
+    grid-template-columns: 1fr;
+  }
+
+  .join-result-status {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
 .ad-workbench {
   min-width: 0;
   color: #1f2937;

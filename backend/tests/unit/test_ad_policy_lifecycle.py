@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -23,6 +24,7 @@ from app.modules.acquisition.automation import (
 )
 from app.modules.acquisition.models import (
     AccountAdBinding,
+    AcquisitionMessage,
     AcquisitionTracking,
     AdCampaign,
     AdCreative,
@@ -36,6 +38,219 @@ from app.modules.acquisition.models import (
     GroupAdProfile,
     GroupAdTier,
 )
+
+
+@pytest.mark.asyncio
+async def test_ad_probe_final_owned_recheck_blocks_account_telegram_and_state(
+    test_db,
+    monkeypatch,
+):
+    account = TelegramAccount(
+        phone="+15550003991",
+        identifier="+15550003991",
+        session_name="owned_ad_probe_guard",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=939991,
+        title="Owned ad probe guard",
+        level=GroupLevel.A,
+        status="active",
+    )
+    membership = GroupAccountMembership(
+        group=group,
+        account=account,
+        telegram_group_id=group.group_id,
+        status="joined",
+        warmup_status="probe_scheduled",
+        probe_status="scheduled",
+        ad_status="warming",
+        note="unchanged",
+    )
+    test_db.add_all([account, group, membership])
+    await test_db.commit()
+    membership_before = {
+        "warmup_status": membership.warmup_status,
+        "probe_status": membership.probe_status,
+        "ad_status": membership.ad_status,
+        "note": membership.note,
+        "last_probe_at": membership.last_probe_at,
+        "ad_eligible_after": membership.ad_eligible_after,
+    }
+
+    pool = SimpleNamespace(acquire_by_id=AsyncMock(), release=AsyncMock())
+    service = AcquisitionAutomationService(test_db, account_pool=pool)
+    locked_path = AsyncMock()
+    monkeypatch.setattr(service, "_send_ad_probe_locked", locked_path)
+    service.telegram_execution.send_group_message = AsyncMock()
+    lock_active = False
+
+    @asynccontextmanager
+    async def tracked_chat_lock(_db, chat_id):
+        nonlocal lock_active
+        assert chat_id == group.group_id
+        lock_active = True
+        try:
+            yield
+        finally:
+            lock_active = False
+
+    async def owned_inside_lock(core_group_id, telegram_chat_id):
+        assert lock_active is True
+        assert (core_group_id, telegram_chat_id) == (group.id, group.group_id)
+        return True
+
+    monkeypatch.setattr(
+        acquisition_automation,
+        "telegram_chat_advisory_lock",
+        tracked_chat_lock,
+    )
+    monkeypatch.setattr(
+        service,
+        "_is_owned_group_ad_domain_excluded",
+        AsyncMock(side_effect=owned_inside_lock),
+    )
+
+    result = await service._send_ad_probe(account.id, membership)
+
+    assert result == "OWNED_GROUP_AD_DOMAIN_EXCLUDED"
+    assert lock_active is False
+    locked_path.assert_not_awaited()
+    pool.acquire_by_id.assert_not_awaited()
+    pool.release.assert_not_awaited()
+    service.telegram_execution.send_group_message.assert_not_awaited()
+    assert {
+        "warmup_status": membership.warmup_status,
+        "probe_status": membership.probe_status,
+        "ad_status": membership.ad_status,
+        "note": membership.note,
+        "last_probe_at": membership.last_probe_at,
+        "ad_eligible_after": membership.ad_eligible_after,
+    } == membership_before
+    assert list(
+        (
+            await test_db.execute(
+                select(AcquisitionMessage).where(
+                    AcquisitionMessage.group_id == group.group_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+    assert list(
+        (
+            await test_db.execute(
+                select(AdDeliveryLog).where(AdDeliveryLog.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+    assert list(
+        (
+            await test_db.execute(
+                select(GroupAdPolicyEvent).where(GroupAdPolicyEvent.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+    assert list(
+        (
+            await test_db.execute(
+                select(GroupAdProfile).where(GroupAdProfile.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_manual_policy_probe_final_owned_recheck_blocks_all_state(
+    test_db,
+    monkeypatch,
+):
+    group = Group(
+        group_id=939992,
+        title="Owned manual policy probe guard",
+        level=GroupLevel.A,
+        status="active",
+    )
+    test_db.add(group)
+    await test_db.commit()
+
+    pool = SimpleNamespace(acquire_by_id=AsyncMock(), release=AsyncMock())
+    service = AcquisitionAutomationService(test_db, account_pool=pool)
+    locked_path = AsyncMock()
+    monkeypatch.setattr(service, "_send_group_ad_policy_probe_locked", locked_path)
+    service._send_ad_text = AsyncMock()
+    lock_active = False
+
+    @asynccontextmanager
+    async def tracked_chat_lock(_db, chat_id):
+        nonlocal lock_active
+        assert chat_id == group.group_id
+        lock_active = True
+        try:
+            yield
+        finally:
+            lock_active = False
+
+    async def owned_inside_lock(core_group_id, telegram_chat_id):
+        assert lock_active is True
+        assert (core_group_id, telegram_chat_id) == (group.id, group.group_id)
+        return True
+
+    monkeypatch.setattr(
+        acquisition_automation,
+        "telegram_chat_advisory_lock",
+        tracked_chat_lock,
+    )
+    monkeypatch.setattr(
+        service,
+        "_is_owned_group_ad_domain_excluded",
+        AsyncMock(side_effect=owned_inside_lock),
+    )
+
+    with pytest.raises(RuntimeError, match="^OWNED_GROUP_AD_DOMAIN_EXCLUDED$"):
+        await service.send_group_ad_policy_probe(group.id, account_id=939993)
+
+    assert lock_active is False
+    locked_path.assert_not_awaited()
+    pool.acquire_by_id.assert_not_awaited()
+    pool.release.assert_not_awaited()
+    service._send_ad_text.assert_not_awaited()
+    assert list(
+        (
+            await test_db.execute(
+                select(AdDeliveryLog).where(AdDeliveryLog.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+    assert list(
+        (
+            await test_db.execute(
+                select(GroupAdPolicyEvent).where(GroupAdPolicyEvent.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
+    assert list(
+        (
+            await test_db.execute(
+                select(GroupAdProfile).where(GroupAdProfile.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    ) == []
 
 
 def test_no_link_campaign_generates_profile_cta_creatives_only():
@@ -1515,6 +1730,7 @@ async def test_telegram_success_never_releases_dispatcher_budget_when_log_confir
     service._choose_delivery_creative = AsyncMock(return_value=creative)
     service._ad_skip_reason = AsyncMock(return_value=None)
     service._reserve_ad_delivery_target = AsyncMock(return_value=True)
+    service._is_owned_group_ad_domain_excluded = AsyncMock(return_value=False)
     service._record_ad_delivery = AsyncMock(return_value=pending_log)
     service._claim_growth_campaign_daily_quota = AsyncMock(return_value=(pending_log, None))
     service._send_ad = AsyncMock(return_value=9001)

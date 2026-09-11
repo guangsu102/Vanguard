@@ -90,10 +90,10 @@ async def test_health_check_status_counts_are_mutually_exclusive():
     assert stats["healthy"] == 2
     assert stats["schedulable"] == 1
     assert stats["connected"] == 1
-    assert sum(
-        stats[key]
-        for key in ("online", "offline", "error", "banned", "working", "idle")
-    ) == stats["total"]
+    assert (
+        sum(stats[key] for key in ("online", "offline", "error", "banned", "working", "idle"))
+        == stats["total"]
+    )
 
 
 @pytest.mark.asyncio
@@ -362,6 +362,31 @@ async def test_create_client_reports_missing_api_credentials():
 
 
 @pytest.mark.asyncio
+async def test_create_client_rejects_session_path_traversal_before_filesystem_write(
+    monkeypatch,
+    tmp_path,
+):
+    session_dir = tmp_path / "sessions"
+    settings = SimpleNamespace(TELEGRAM_SESSION_DIR=str(session_dir))
+    monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
+    pool = AccountPool()
+    account = await pool.add_account(
+        account_id=8,
+        phone="+10000000008",
+        session_name="../escaped-session",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+    )
+
+    with pytest.raises(ValueError, match="safe file basename"):
+        await pool._create_client(account)
+
+    assert not (tmp_path / "escaped-session.session").exists()
+
+
+@pytest.mark.asyncio
 async def test_promoter_reuses_sticky_proxy_until_expired(monkeypatch):
     settings = SimpleNamespace(PROXY_PROVIDER="evomi", PROMOTER_PROXY_REQUIRED=True)
     monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
@@ -515,6 +540,7 @@ async def test_static_proxy_resolver_fallback_is_used(monkeypatch):
 
     assert account.current_proxy is not None
     assert account.current_proxy.host == "static-42.proxy.test"
+
 
 @pytest.mark.asyncio
 async def test_create_client_uses_stable_telegram_device_profile(monkeypatch, tmp_path):

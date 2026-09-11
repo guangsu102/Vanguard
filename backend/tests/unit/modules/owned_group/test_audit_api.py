@@ -72,6 +72,31 @@ async def test_audit_export_is_bounded_and_redacted(client, test_db):
 
 
 @pytest.mark.asyncio
+async def test_audit_list_accepts_stage2_message_execution_resource_type(client, test_db):
+    test_db.add(
+        OwnedGroupAuditEvent(
+            event_type="message_execution_skipped",
+            resource_type="message_execution",
+            resource_id=9001,
+            result="skipped",
+            reason_code="DRY_RUN_ENABLED",
+            correlation_id="stage2-audit-width",
+        )
+    )
+    await test_db.flush()
+
+    response = await client.get(
+        "/api/owned-groups/audit-events",
+        params={"resource_type": "message_execution"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["data"][0]["resource_type"] == "message_execution"
+
+
+@pytest.mark.asyncio
 async def test_audit_is_forbidden_for_unknown_role(client):
     app.dependency_overrides[get_current_user] = lambda: {"id": 7002, "role": "viewer"}
 

@@ -12,6 +12,7 @@ from typing import Optional
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     Enum as SQLEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.schema import conv
 
 from app.core.database import Base
 
@@ -510,11 +512,40 @@ class AcquisitionMessage(Base):
     message_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, nullable=True, comment="Telegram消息ID"
     )
+    message_purpose: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True, comment="阶段2生成方式: community_ai/template"
+    )
+    content_category: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True, comment="阶段2内容类别: community/promotion"
+    )
+    owned_group_execution_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        ForeignKey(
+            "group_account_message_execution.id",
+            name=conv(
+                "fk_acquisition_message_owned_group_execution_id_group_account_m"
+            ),
+            ondelete="SET NULL",
+        ),
+        nullable=True,
+        unique=True,
+        comment="对应的自建群消息执行",
+    )
+    core_group_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="内部群ID；group_id仍为Telegram Chat ID",
+    )
+    content_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, comment="阶段2规范化内容SHA-256"
+    )
     sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
         Index("idx_msg_account_group", "account_id", "group_id"),
         Index("idx_msg_sent_at", "sent_at"),
+        Index("idx_msg_core_group_sent", "core_group_id", "sent_at"),
+        Index("idx_msg_content_hash", "core_group_id", "content_hash"),
     )
 
 
@@ -586,6 +617,24 @@ class MessageTemplate(Base):
     message_type: Mapped[MessageType] = mapped_column(
         String(50), nullable=False, comment="消息类型"
     )
+    scope: Mapped[str] = mapped_column(
+        String(16),
+        default="acquisition",
+        server_default="acquisition",
+        nullable=False,
+        comment="模板所有权作用域: acquisition/owned_group",
+    )
+    owned_group_asset_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey(
+            "owned_group_assets.id",
+            name=conv(
+                "fk_acquisition_message_template_owned_group_asset_id_owned_grou"
+            ),
+            ondelete="CASCADE",
+        ),
+        nullable=True,
+        comment="owned_group作用域所属资产",
+    )
 
     # Usage constraints
     cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300, comment="冷却时间")
@@ -611,6 +660,24 @@ class MessageTemplate(Base):
             placeholder = f"{{{{{key}}}}}"
             content = content.replace(placeholder, str(value))
         return content
+
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('acquisition', 'owned_group')",
+            name="message_template_scope",
+        ),
+        CheckConstraint(
+            "(scope = 'acquisition' AND owned_group_asset_id IS NULL) OR "
+            "(scope = 'owned_group' AND owned_group_asset_id IS NOT NULL)",
+            name="message_template_scope_asset",
+        ),
+        Index(
+            "idx_message_template_scope_asset_enabled",
+            "scope",
+            "owned_group_asset_id",
+            "enabled",
+        ),
+    )
 
 
 class TriggerRecord(Base):

@@ -4,59 +4,68 @@ Vanguard Backend Application Entry Point
 XBoard Telegram Bot Matrix - Main Application Module
 """
 
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import (
+    account_personas,
     accounts,
-    proxies,
-    groups,
-    keywords,
-    users,
-    campaigns,
-    rules,
-    stats,
-    websocket as websocket_router,
-    moderation,
-    verification,
-    punishments,
     acquisition,
-    broadcasts,
-    xboard,
+    ad_only_recommendations,
     auth,
     automation,
-    ad_only_recommendations,
+    broadcasts,
+    campaigns,
     group_governance,
     group_search_keywords,
+    groups,
     guardian_bots,
+    keywords,
     managed_groups,
+    moderation,
     moderation_sensitive_keywords,
-    workers,
-    qq,
-    private_chats,
-    sub2api_alerts,
-    resource_search,
-    owned_groups,
-    owned_group_controls,
     owned_group_audit,
     owned_group_bots,
+    owned_group_controls,
+    owned_group_governance,
     owned_group_invites,
+    owned_group_messages,
+    owned_group_operations,
+    owned_groups,
+    private_chats,
+    proxies,
+    punishments,
+    qq,
+    resource_search,
+    rules,
+    stats,
+    sub2api_alerts,
+    users,
+    verification,
+    workers,
+    xboard,
 )
-from app.api.settings import router as settings_router
+from app.api import (
+    websocket as websocket_router,
+)
 from app.api.safety_gate import router as safety_gate_router
+from app.api.settings import router as settings_router
 from app.api.websocket import start_redis_bridge, stop_redis_bridge
-from app.core.config import settings
-from app.core.security import get_current_user
-from app.core.database import init_db, close_db
-from app.core.redis import init_redis, close_redis
 from app.core.account.proxy_policy_events import (
     start_account_proxy_policy_listener,
     stop_account_proxy_policy_listener,
 )
+from app.core.config import settings
+from app.core.database import close_db, init_db
+from app.core.persona_observability import (
+    refresh_persona_configured_gauge_at_startup,
+)
+from app.core.redis import close_redis, init_redis
+from app.core.security import get_current_user
 from app.integrations.sub2api import close_all_sub2api_clients
 from app.integrations.xboard import close_all_xboard_clients
 
@@ -66,6 +75,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan manager for startup and shutdown events."""
     # Startup
     await init_db(create_tables=not settings.is_production)
+    try:
+        await refresh_persona_configured_gauge_at_startup()
+    except Exception:
+        pass
     await init_redis()
     await start_account_proxy_policy_listener()
     await start_redis_bridge()
@@ -73,9 +86,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize Telegram client pools
     from app.core.account import AccountPool
     app.state.account_pool = AccountPool()
-    
+
     yield
-    
+
     # Shutdown
     await app.state.account_pool.close_all()
     await close_all_sub2api_clients()
@@ -113,7 +126,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     import structlog
     logger = structlog.get_logger()
     logger.error("unhandled_exception", error=str(exc), path=request.url.path)
-    
+
     return JSONResponse(
         status_code=500,
         content={"code": 5000, "message": "Internal server error", "data": None}
@@ -161,6 +174,10 @@ app.include_router(owned_group_controls, prefix="/api/owned-groups", tags=["Owne
 app.include_router(owned_group_audit, prefix="/api/owned-groups", tags=["Owned Group Audit"], dependencies=[Depends(get_current_user)])
 app.include_router(owned_group_bots, prefix="/api/owned-groups", tags=["Owned Group Bot Profiles"], dependencies=[Depends(get_current_user)])
 app.include_router(owned_group_invites, prefix="/api/owned-groups", tags=["Owned Group Invite Links"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_governance, prefix="/api/owned-groups", tags=["Owned Group Governance"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_messages, prefix="/api/owned-groups", tags=["Owned Group Messaging"], dependencies=[Depends(get_current_user)])
+app.include_router(account_personas, prefix="/api/accounts", tags=["Account AI Persona"], dependencies=[Depends(get_current_user)])
+app.include_router(owned_group_operations, prefix="/api/owned-groups", tags=["Owned Group Operations Center"], dependencies=[Depends(get_current_user)])
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ Pytest Configuration and Fixtures for Keyword Engine Tests
 """
 
 import asyncio
+import importlib
 import sys
 from typing import AsyncGenerator, Generator
 
@@ -32,6 +33,27 @@ def event_loop() -> Generator[asyncio.AbstractEventLoop, None, None]:
 async def test_db() -> AsyncGenerator[AsyncSession, None]:
     """Create test database session."""
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+    # Register the complete metadata dependency graph. This nested conftest may
+    # be collected by itself, so it cannot rely on unrelated tests importing
+    # foreign-key targets first.
+    for model_module in (
+        "app.core.account.models",
+        "app.core.group.models",
+        "app.core.keyword.models",
+        "app.core.user.models",
+        "app.core.campaign.models",
+        "app.core.worker_status",
+        "app.core.settings_models",
+        "app.modules.guardian.models",
+        "app.modules.acquisition.models",
+        "app.modules.private_chat.models",
+        "app.modules.qq.models",
+        "app.modules.owned_group.models",
+        "app.modules.owned_group.models_extra",
+        "app.modules.owned_group.messaging_models",
+        "app.integrations.xboard.models",
+    ):
+        importlib.import_module(model_module)
     
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

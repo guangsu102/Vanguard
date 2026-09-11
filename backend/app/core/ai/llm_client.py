@@ -12,19 +12,28 @@ Features:
 
 import hashlib
 import inspect
-from dataclasses import dataclass
+import json
+import math
+import re
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Literal, Optional
+from urllib.parse import quote, unquote, urlsplit
+from uuid import UUID
 
 import structlog
 
 from app.core.config import settings
+from app.core.persona_observability import record_llm_usage
 from app.core.redis import RedisCache
 
 logger = structlog.get_logger()
 
 
-class LLMProvider(str, Enum):
+class LLMProvider(str, Enum):  # noqa: UP042 - preserve existing public Enum semantics
     """LLM provider types."""
 
     OPENAI = "openai"
@@ -41,6 +50,116 @@ class LLMResponse:
     tokens_used: int
     cost: float
     cached: bool = False
+    provider: str = ""
+    usage: Mapping[str, int] = field(default_factory=dict)
+    finish_reason: str | None = None
+    request_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LLMProviderCapabilities:
+    """Immutable capabilities advertised by one provider adapter."""
+
+    provider: LLMProvider
+    supports_system_role: bool
+
+
+class LLMClientError(RuntimeError):
+    """Stable, content-free error returned by the stage-three LLM path."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CACHE_SCOPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$")
+_PERSONA_PROMPT_TEMPLATE_VERSIONS = frozenset({"owned-group-persona-v1"})
+
+
+def _is_strict_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True, slots=True)
+class LLMCacheContext:
+    """Complete business isolation material for the Persona LLM v2 cache."""
+
+    cache_scope: str
+    execution_id: int | None
+    account_id: int
+    persona_revision: int | None
+    generation_attempt: int
+    prompt_template_version: str
+    persona_hash: str
+    governance_rules_hash: str | None
+    policy_revision: int
+    asset_id: int
+    content_category: Literal["community", "promotion"]
+    preview_nonce: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cache_scope, str) or not _CACHE_SCOPE_RE.fullmatch(
+            self.cache_scope
+        ):
+            raise ValueError("cache_scope must be a non-empty, opaque safe identifier")
+        for name in ("account_id", "policy_revision", "asset_id"):
+            value = getattr(self, name)
+            if not _is_strict_int(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.execution_id is not None and (
+            not _is_strict_int(self.execution_id) or self.execution_id <= 0
+        ):
+            raise ValueError("execution_id must be a positive integer or null")
+        if self.persona_revision is not None and (
+            not _is_strict_int(self.persona_revision) or self.persona_revision < 0
+        ):
+            raise ValueError("persona_revision must be a non-negative integer or null")
+        if not _is_strict_int(self.generation_attempt) or not 1 <= self.generation_attempt <= 3:
+            raise ValueError("generation_attempt must be between 1 and 3")
+        if self.prompt_template_version not in _PERSONA_PROMPT_TEMPLATE_VERSIONS:
+            raise ValueError("prompt_template_version is unsupported")
+        if not _LOWER_SHA256_RE.fullmatch(self.persona_hash):
+            raise ValueError("persona_hash must be a lowercase SHA-256 digest")
+        if self.governance_rules_hash is not None and not _LOWER_SHA256_RE.fullmatch(
+            self.governance_rules_hash
+        ):
+            raise ValueError("governance_rules_hash must be a lowercase SHA-256 digest or null")
+        if self.content_category not in {"community", "promotion"}:
+            raise ValueError("content_category is unsupported")
+
+        is_preview = self.execution_id is None
+        if is_preview:
+            if self.preview_nonce is None:
+                raise ValueError("preview calls require preview_nonce")
+            try:
+                parsed_nonce = UUID(self.preview_nonce)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ValueError("preview_nonce must be a UUID") from exc
+            if str(parsed_nonce) != self.preview_nonce.lower():
+                raise ValueError("preview_nonce must use canonical UUID form")
+        elif self.preview_nonce is not None:
+            raise ValueError("execution calls must not provide preview_nonce")
+        elif self.persona_revision is None:
+            raise ValueError("execution calls require persona_revision")
+
+
+_PROVIDER_CAPABILITIES: Mapping[LLMProvider, LLMProviderCapabilities] = MappingProxyType(
+    {
+        LLMProvider.OPENAI: LLMProviderCapabilities(
+            provider=LLMProvider.OPENAI,
+            supports_system_role=True,
+        ),
+        LLMProvider.ANTHROPIC: LLMProviderCapabilities(
+            provider=LLMProvider.ANTHROPIC,
+            supports_system_role=True,
+        ),
+        LLMProvider.LOCAL: LLMProviderCapabilities(
+            provider=LLMProvider.LOCAL,
+            supports_system_role=False,
+        ),
+    }
+)
 
 
 @dataclass
@@ -59,6 +178,11 @@ class LLMClient:
 
     Supports multiple providers with automatic model selection.
     """
+
+    # A conservative common denominator for the stage-three adapters.  Callers
+    # must trim optional Prompt material before reaching this final fail-closed
+    # gate; max_tokens is the reserved response budget.
+    PERSONA_CONTEXT_TOKEN_LIMIT = 8192
 
     # Model configurations
     MODELS = {
@@ -91,8 +215,8 @@ class LLMClient:
     def __init__(
         self,
         provider: LLMProvider = LLMProvider.OPENAI,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         cache_ttl: int = 3600,
     ):
         """
@@ -124,8 +248,436 @@ class LLMClient:
                 return settings.LLM_MODEL
         return self.MODELS[self.provider][tier]
 
+    def capabilities(self) -> LLMProviderCapabilities:
+        """Return immutable local capabilities without making a provider request."""
+
+        return _PROVIDER_CAPABILITIES[self.provider]
+
+    def provider_endpoint_sha256(self) -> str:
+        """Hash the credential-free canonical endpoint used by this client."""
+
+        if self.provider != LLMProvider.OPENAI or not self.base_url:
+            material = f"official:{self.provider.value}:default"
+        else:
+            canonical_endpoint = self._canonical_custom_endpoint(self.base_url)
+            material = (
+                "official:openai:default"
+                if canonical_endpoint == "https://api.openai.com/v1"
+                else canonical_endpoint
+            )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
     @staticmethod
-    def _normalize_openai_base_url(base_url: Optional[str]) -> Optional[str]:
+    def _canonical_custom_endpoint(base_url: str) -> str:
+        """Return a credential-free canonical URL suitable only for hashing."""
+
+        try:
+            parsed = urlsplit(base_url)
+            port = parsed.port
+        except ValueError as exc:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint is invalid") from exc
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.hostname:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint is invalid")
+        if parsed.username is not None or parsed.password is not None:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint cannot contain userinfo")
+        if parsed.query or parsed.fragment:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint cannot contain query data")
+        try:
+            host = parsed.hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint host is invalid") from exc
+        if not host:
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider endpoint host is invalid")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+        authority = host if port is None or default_port else f"{host}:{port}"
+        decoded_path = unquote(parsed.path or "")
+        normalized_path = "/".join(part for part in decoded_path.split("/") if part)
+        encoded_path = quote(normalized_path, safe="@-._~!$&'()*+,;=:")
+        path = f"/{encoded_path}" if encoded_path else ""
+        return f"{scheme}://{authority}{path}"
+
+    def build_v2_cache_key(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        cache_context: LLMCacheContext,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> tuple[str, Mapping[str, Any]]:
+        """Build the complete canonical Persona cache key without raw prompt data."""
+
+        if not isinstance(cache_context, LLMCacheContext):
+            raise TypeError("cache_context must be LLMCacheContext")
+        if not isinstance(system_prompt, str) or not isinstance(user_prompt, str):
+            raise TypeError("system_prompt and user_prompt must be strings")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a non-empty string")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+            raise TypeError("temperature must be numeric")
+        if not math.isfinite(float(temperature)) or not 0 <= float(temperature) <= 2:
+            raise ValueError("temperature must be between 0 and 2")
+        if not _is_strict_int(max_tokens) or max_tokens <= 0:
+            raise ValueError("max_tokens must be a positive integer")
+
+        material: dict[str, Any] = {
+            "cache_schema_version": "llm:v2",
+            "provider": self.provider.value,
+            "model": model,
+            "temperature": float(temperature),
+            "max_tokens": max_tokens,
+            "system_prompt_sha256": hashlib.sha256(system_prompt.encode("utf-8")).hexdigest(),
+            "user_prompt_sha256": hashlib.sha256(user_prompt.encode("utf-8")).hexdigest(),
+            "provider_endpoint_sha256": self.provider_endpoint_sha256(),
+            "cache_scope": cache_context.cache_scope,
+            "execution_id": cache_context.execution_id,
+            "account_id": cache_context.account_id,
+            "persona_revision": cache_context.persona_revision,
+            "generation_attempt": cache_context.generation_attempt,
+            "prompt_template_version": cache_context.prompt_template_version,
+            "persona_hash": cache_context.persona_hash,
+            "governance_rules_hash": cache_context.governance_rules_hash,
+            "policy_revision": cache_context.policy_revision,
+            "asset_id": cache_context.asset_id,
+            "content_category": cache_context.content_category,
+            "preview_nonce": cache_context.preview_nonce,
+        }
+        canonical = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return f"llm:v2:{digest}", MappingProxyType(material)
+
+    async def generate_response(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        requires_system_role: bool,
+        cache_context: LLMCacheContext,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Generate a Persona response with strict role and cache isolation contracts."""
+
+        observation_started = time.perf_counter()
+        if not isinstance(requires_system_role, bool):
+            raise TypeError("requires_system_role must be bool")
+        capabilities = self.capabilities()
+        if requires_system_role and not capabilities.supports_system_role:
+            raise LLMClientError(
+                "AI_PROVIDER_SYSTEM_PROMPT_UNSUPPORTED",
+                "AI provider does not preserve the system role",
+            )
+
+        resolved_model = model if model is not None else self.model_for("balanced")
+        resolved_temperature = 0.7 if temperature is None else temperature
+        resolved_max_tokens = 500 if max_tokens is None else max_tokens
+        estimated_input_tokens = self._estimate_persona_input_tokens(
+            system_prompt,
+            user_prompt,
+        )
+        if estimated_input_tokens + resolved_max_tokens > self.PERSONA_CONTEXT_TOKEN_LIMIT:
+            raise LLMClientError(
+                "AI_PROMPT_TOO_LARGE",
+                "AI Prompt exceeds the provider token budget",
+            )
+        cache_key, _ = self.build_v2_cache_key(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            cache_context=cache_context,
+            model=resolved_model,
+            temperature=resolved_temperature,
+            max_tokens=resolved_max_tokens,
+        )
+
+        cached = await self._read_v2_cache(cache_key, resolved_model)
+        if cached is not None:
+            self.stats.cache_hits += 1
+            self.logger.debug("cache_hit", cache_schema="llm:v2", key_sha256=cache_key[7:])
+            record_llm_usage(
+                execution_id=cache_context.execution_id,
+                account_id=cache_context.account_id,
+                asset_id=cache_context.asset_id,
+                content_category=cache_context.content_category,
+                persona_source=self._persona_source_for_observability(cache_context),
+                revision=cache_context.persona_revision or 0,
+                persona_hash=cache_context.persona_hash,
+                prompt_template_version=cache_context.prompt_template_version,
+                provider=self.provider.value,
+                model=resolved_model,
+                input_tokens=0,
+                output_tokens=0,
+                cost_microunits=0,
+                cache_hit=True,
+                usage_source="cache",
+                result="success",
+                duration_ms=int((time.perf_counter() - observation_started) * 1000),
+            )
+            return cached
+
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+
+        try:
+            if self.provider == LLMProvider.OPENAI:
+                raw_response = await self._call_openai(
+                    messages,
+                    resolved_model,
+                    float(resolved_temperature),
+                    resolved_max_tokens,
+                )
+            elif self.provider == LLMProvider.ANTHROPIC:
+                raw_response = await self._call_anthropic(
+                    messages,
+                    resolved_model,
+                    float(resolved_temperature),
+                    resolved_max_tokens,
+                )
+            else:
+                raw_response = await self._call_local(
+                    user_prompt,
+                    resolved_model,
+                    float(resolved_temperature),
+                    resolved_max_tokens,
+                )
+        except LLMClientError:
+            raise
+        except Exception as exc:
+            self.logger.error(
+                "llm_error",
+                provider=self.provider.value,
+                error_type=type(exc).__name__,
+                cache_schema="llm:v2",
+            )
+            raise LLMClientError("AI_GENERATION_FAILED", "AI provider request failed") from exc
+
+        response = self._coerce_v2_response(
+            raw_response,
+            model=resolved_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        self.stats.total_requests += 1
+        self.stats.total_tokens += response.tokens_used
+        self.stats.total_cost += response.cost
+        await self._write_v2_cache(cache_key, response)
+        self.logger.debug(
+            "llm_response",
+            provider=self.provider.value,
+            model=resolved_model,
+            tokens=response.tokens_used,
+            cache_schema="llm:v2",
+            cached=False,
+        )
+        exact_usage = (
+            isinstance(raw_response, LLMResponse)
+            and _is_strict_int(response.usage.get("input_tokens"))
+            and _is_strict_int(response.usage.get("output_tokens"))
+            and response.usage["input_tokens"] >= 0
+            and response.usage["output_tokens"] >= 0
+        )
+        input_tokens = (
+            int(response.usage["input_tokens"])
+            if exact_usage
+            else estimated_input_tokens
+        )
+        output_tokens = (
+            int(response.usage["output_tokens"])
+            if exact_usage
+            else self._estimate_persona_input_tokens("", response.content)
+        )
+        cost = float(response.cost)
+        cost_microunits = (
+            int(round(cost * 1_000_000))
+            if math.isfinite(cost) and cost >= 0
+            else 0
+        )
+        record_llm_usage(
+            execution_id=cache_context.execution_id,
+            account_id=cache_context.account_id,
+            asset_id=cache_context.asset_id,
+            content_category=cache_context.content_category,
+            persona_source=self._persona_source_for_observability(cache_context),
+            revision=cache_context.persona_revision or 0,
+            persona_hash=cache_context.persona_hash,
+            prompt_template_version=cache_context.prompt_template_version,
+            provider=self.provider.value,
+            model=resolved_model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_microunits=cost_microunits,
+            cache_hit=False,
+            usage_source="provider" if exact_usage else "estimated",
+            result="success",
+            duration_ms=int((time.perf_counter() - observation_started) * 1000),
+            request_id=response.request_id,
+        )
+        return response
+
+    @staticmethod
+    def _persona_source_for_observability(cache_context: LLMCacheContext) -> str:
+        if cache_context.persona_revision is None:
+            return "draft"
+        if cache_context.persona_revision == 0:
+            return "neutral_default"
+        return "configured"
+
+    @staticmethod
+    def _estimate_persona_input_tokens(system_prompt: str, user_prompt: str) -> int:
+        """Conservatively estimate ASCII and CJK Prompt tokens together."""
+
+        combined = f"{system_prompt}\n{user_prompt}"
+        non_ascii = sum(ord(character) > 127 for character in combined)
+        ascii_count = len(combined) - non_ascii
+        return max(1, non_ascii + (ascii_count + 3) // 4)
+
+    def _coerce_v2_response(
+        self,
+        raw_response: str | LLMResponse,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> LLMResponse:
+        if isinstance(raw_response, LLMResponse):
+            content = raw_response.content
+            response = replace(
+                raw_response,
+                model=model,
+                provider=self.provider.value,
+                cached=False,
+            )
+        elif isinstance(raw_response, str):
+            content = raw_response
+            input_tokens = self._estimate_persona_input_tokens(system_prompt, user_prompt)
+            output_tokens = self._estimate_persona_input_tokens("", content)
+            tokens = input_tokens + output_tokens
+            response = LLMResponse(
+                content=content,
+                provider=self.provider.value,
+                model=model,
+                usage={"input_tokens": input_tokens, "output_tokens": output_tokens},
+                tokens_used=tokens,
+                cost=self._calculate_cost(model, tokens),
+            )
+        else:
+            raise LLMClientError("AI_GENERATION_FAILED", "AI provider response is invalid")
+        if not content.strip():
+            raise LLMClientError("AI_GENERATION_FAILED", "AI provider returned empty content")
+        if content == "API not configured. Please set API key.":
+            raise LLMClientError("AI_PROVIDER_UNSAFE", "AI provider fallback is unsafe")
+        return response
+
+    async def _read_v2_cache(self, cache_key: str, model: str) -> LLMResponse | None:
+        try:
+            raw_value = await self.cache.get(cache_key)
+        except Exception as exc:
+            self.logger.warning(
+                "cache_read_failed",
+                cache_schema="llm:v2",
+                error_type=type(exc).__name__,
+            )
+            return None
+        if not raw_value:
+            return None
+        try:
+            value = json.loads(raw_value)
+            if not isinstance(value, dict) or set(value) != {
+                "content",
+                "provider",
+                "model",
+                "usage",
+                "tokens_used",
+                "cost",
+                "finish_reason",
+                "request_id",
+            }:
+                raise ValueError("invalid envelope fields")
+            if value["provider"] != self.provider.value or value["model"] != model:
+                raise ValueError("cache envelope provider mismatch")
+            if not isinstance(value["content"], str) or not value["content"].strip():
+                raise ValueError("empty cached content")
+            if value["content"] == "API not configured. Please set API key.":
+                raise ValueError("unsafe cached fallback content")
+            usage = value["usage"]
+            if not isinstance(usage, dict) or any(
+                not isinstance(key, str) or not _is_strict_int(item) or item < 0
+                for key, item in usage.items()
+            ):
+                raise ValueError("invalid cached usage")
+            if (
+                not _is_strict_int(value["tokens_used"])
+                or value["tokens_used"] < 0
+                or isinstance(value["cost"], bool)
+                or not isinstance(value["cost"], (int, float))
+                or not math.isfinite(float(value["cost"]))
+                or value["cost"] < 0
+                or value["finish_reason"] is not None
+                and not isinstance(value["finish_reason"], str)
+                or value["request_id"] is not None
+                and not isinstance(value["request_id"], str)
+            ):
+                raise ValueError("invalid cached response metadata")
+            return LLMResponse(
+                content=value["content"],
+                provider=value["provider"],
+                model=value["model"],
+                usage=usage,
+                tokens_used=int(value["tokens_used"]),
+                cost=float(value["cost"]),
+                finish_reason=value["finish_reason"],
+                request_id=value["request_id"],
+                cached=True,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.logger.warning(
+                "cache_value_invalid",
+                cache_schema="llm:v2",
+                error_type=type(exc).__name__,
+            )
+            return None
+
+    async def _write_v2_cache(self, cache_key: str, response: LLMResponse) -> None:
+        try:
+            value = {
+                "content": response.content,
+                "provider": response.provider,
+                "model": response.model,
+                "usage": dict(response.usage),
+                "tokens_used": response.tokens_used,
+                "cost": response.cost,
+                "finish_reason": response.finish_reason,
+                "request_id": response.request_id,
+            }
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            await self.cache.set(cache_key, encoded, ttl=min(max(self.cache_ttl, 1), 3600))
+        except Exception as exc:
+            self.logger.warning(
+                "cache_write_failed",
+                cache_schema="llm:v2",
+                error_type=type(exc).__name__,
+            )
+
+    @staticmethod
+    def _normalize_openai_base_url(base_url: str | None) -> str | None:
         if not base_url:
             return None
         normalized = base_url.rstrip("/")
@@ -136,10 +688,10 @@ class LLMClient:
     async def generate(
         self,
         prompt: str,
-        model: Optional[str] = None,
+        model: Optional[str] = None,  # noqa: UP045 - preserve public signature
         temperature: float = 0.7,
         max_tokens: int = 500,
-        system_prompt: Optional[str] = None,
+        system_prompt: Optional[str] = None,  # noqa: UP045 - preserve public signature
     ) -> str:
         """
         Generate content using LLM.
@@ -194,7 +746,11 @@ class LLMClient:
             return response
 
         except Exception as e:
-            self.logger.error("llm_error", provider=self.provider.value, error=str(e))
+            self.logger.error(
+                "llm_error",
+                provider=self.provider.value,
+                error_type=type(e).__name__,
+            )
             raise
 
     async def _call_openai(
@@ -347,9 +903,9 @@ class LLMClient:
     def _get_cache_key(
         self,
         prompt: str,
-        model: Optional[str],
+        model: str | None,
         temperature: float,
-        system_prompt: Optional[str],
+        system_prompt: str | None,
     ) -> str:
         """Generate cache key for prompt."""
         content = f"{prompt}:{model}:{temperature}:{system_prompt}"

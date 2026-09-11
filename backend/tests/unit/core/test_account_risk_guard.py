@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -15,6 +16,58 @@ from app.core.account.models import (
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard, RiskBudget
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.models import AccountAdBinding, AdCampaign
+
+
+@pytest.mark.asyncio
+async def test_risk_guard_account_lookup_forces_identity_map_refresh() -> None:
+    account = SimpleNamespace(id=7)
+    result = SimpleNamespace(scalar_one_or_none=lambda: account)
+    db = AsyncMock()
+    db.execute.return_value = result
+
+    loaded = await AccountRiskGuard(db)._get_db_account(7)
+
+    assert loaded is account
+    statement = db.execute.await_args.args[0]
+    assert statement.get_execution_options()["populate_existing"] is True
+
+
+@pytest.mark.asyncio
+async def test_owned_group_message_rechecks_allowed_risk_level(monkeypatch) -> None:
+    from app.core.account import risk_guard as risk_guard_module
+
+    db_account = SimpleNamespace(
+        is_active=True,
+        status=AccountStatus.ONLINE,
+        risk_reason=None,
+        risk_level="limited",
+        risk_pause_until=None,
+    )
+    guard = AccountRiskGuard(AsyncMock())
+    guard._get_db_account = AsyncMock(return_value=db_account)
+    guard._apply_risk_lifecycle = AsyncMock()
+    guard._block = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=False,
+            reason="account_risk_level_not_allowed",
+        )
+    )
+    monkeypatch.setattr(
+        risk_guard_module,
+        "get_account_risk_guard_settings",
+        AsyncMock(return_value={"enabled": True}),
+    )
+
+    decision = await guard.check_and_reserve(
+        SimpleNamespace(account_id=7),
+        AccountRiskAction.OWNED_GROUP_MESSAGE,
+        target_type="group",
+        target_id=-100123,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "account_risk_level_not_allowed"
+    guard._block.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -71,6 +124,37 @@ async def test_manual_ban_account_sets_banned_state_and_audits(test_db):
     assert event.status == "quarantine"
     assert event.reason == "account_banned"
     assert "production_account_banned" in (event.details or "")
+
+
+@pytest.mark.asyncio
+async def test_risk_failure_event_redacts_proxy_credentials(test_db) -> None:
+    account = TelegramAccount(
+        identifier="risk-redaction-account",
+        session_name="risk-redaction-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    test_db.add(account)
+    await test_db.commit()
+
+    guard = AccountRiskGuard(test_db)
+    await guard.record_failure(
+        account,
+        AccountRiskAction.OWNED_GROUP_MESSAGE,
+        RuntimeError("proxy socks5://user:pass@host.example failed"),
+        target_type="group",
+        target_id=-100123,
+    )
+
+    event = await test_db.scalar(
+        select(AccountRiskEvent)
+        .where(AccountRiskEvent.account_id == account.id)
+        .order_by(AccountRiskEvent.id.desc())
+    )
+    assert event is not None
+    assert "user:pass" not in str(event.details)
+    assert "[REDACTED]" in str(event.details)
 
 
 @pytest.mark.asyncio
@@ -871,6 +955,66 @@ async def test_account_outbound_messages_use_config_center_default(test_db):
     )
     assert allowed is False
     assert reason == "account_outbound_message_hard_cap"
+
+
+@pytest.mark.asyncio
+async def test_owned_group_message_hard_cap_survives_disabled_general_guard(
+    test_db,
+    monkeypatch,
+):
+    from app.core.account import risk_guard as risk_guard_module
+
+    async def disabled_risk_guard_settings(_db):
+        return {
+            "enabled": False,
+            "account_outbound_message_hard_cap_default": 2,
+            "actions": {},
+        }
+
+    monkeypatch.setattr(
+        risk_guard_module,
+        "get_account_risk_guard_settings",
+        disabled_risk_guard_settings,
+    )
+    account = TelegramAccount(
+        identifier="owned-message-disabled-guard-cap",
+        session_name="owned-message-disabled-guard-cap",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+        created_at=datetime.utcnow() - timedelta(days=20),
+        managed_started_at=datetime.utcnow() - timedelta(days=20),
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    wrapper = SimpleNamespace(account_id=account.id, country_code="US")
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+
+    first = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.OWNED_GROUP_MESSAGE,
+        target_type="group",
+        target_id=-10001,
+    )
+    second = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.OWNED_GROUP_MESSAGE,
+        target_type="group",
+        target_id=-10002,
+    )
+    blocked = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.OWNED_GROUP_MESSAGE,
+        target_type="group",
+        target_id=-10003,
+    )
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert blocked.allowed is False
+    assert blocked.reason == "account_outbound_message_hard_cap"
 
 
 @pytest.mark.asyncio

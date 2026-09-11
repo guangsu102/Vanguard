@@ -18,6 +18,7 @@ from app.core.ai.keyword_generator import normalize_keyword_text
 from app.core.ai.llm_client import LLMClient, LLMProvider
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.security import require_admin
 from app.modules.acquisition.models import (
     GroupSearchRecord,
     AcquisitionTracking,
@@ -243,7 +244,13 @@ async def _save_inline_reply_template(
 
     template = None
     if template_id:
-        result = await db.execute(select(MessageTemplate).where(MessageTemplate.id == template_id))
+        result = await db.execute(
+            select(MessageTemplate).where(
+                MessageTemplate.id == template_id,
+                MessageTemplate.scope == "acquisition",
+                MessageTemplate.owned_group_asset_id.is_(None),
+            )
+        )
         template = result.scalar_one_or_none()
 
     if template:
@@ -258,6 +265,8 @@ async def _save_inline_reply_template(
             template_variables="user_name,group_name,bot_name,register_link,keyword",
             message_type=MessageType.GUIDE,
             enabled=True,
+            scope="acquisition",
+            owned_group_asset_id=None,
         )
         db.add(template)
         await db.flush()
@@ -543,6 +552,7 @@ async def list_search_records(
 async def create_message_record(
     request: MessageCreate,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Record a sent message."""
     message = AcquisitionMessage(
@@ -608,7 +618,10 @@ async def list_message_templates(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """List reusable marketing reply templates."""
-    query = select(MessageTemplate)
+    query = select(MessageTemplate).where(
+        MessageTemplate.scope == "acquisition",
+        MessageTemplate.owned_group_asset_id.is_(None),
+    )
 
     if message_type:
         try:
@@ -645,6 +658,7 @@ async def list_message_templates(
 async def create_message_template(
     request: MessageTemplateCreate,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Create a reusable marketing reply template."""
     try:
@@ -660,6 +674,8 @@ async def create_message_template(
         cooldown_seconds=request.cooldown_seconds,
         max_uses_per_day=request.max_uses_per_day,
         enabled=request.enabled,
+        scope="acquisition",
+        owned_group_asset_id=None,
     )
     db.add(template)
     await db.commit()
@@ -677,9 +693,16 @@ async def update_message_template(
     template_id: int,
     request: MessageTemplateUpdate,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Update a reusable marketing reply template."""
-    result = await db.execute(select(MessageTemplate).where(MessageTemplate.id == template_id))
+    result = await db.execute(
+        select(MessageTemplate).where(
+            MessageTemplate.id == template_id,
+            MessageTemplate.scope == "acquisition",
+            MessageTemplate.owned_group_asset_id.is_(None),
+        )
+    )
     template = result.scalar_one_or_none()
     if not template:
         raise HTTPException(status_code=404, detail="Message template not found")
@@ -714,9 +737,16 @@ async def update_message_template(
 async def delete_message_template(
     template_id: int,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> None:
     """Delete a reusable marketing reply template."""
-    result = await db.execute(select(MessageTemplate).where(MessageTemplate.id == template_id))
+    result = await db.execute(
+        select(MessageTemplate).where(
+            MessageTemplate.id == template_id,
+            MessageTemplate.scope == "acquisition",
+            MessageTemplate.owned_group_asset_id.is_(None),
+        )
+    )
     template = result.scalar_one_or_none()
     if not template:
         raise HTTPException(status_code=404, detail="Message template not found")
@@ -782,6 +812,7 @@ async def list_keyword_triggers(
 async def generate_keyword_triggers(
     request: KeywordTriggerGenerateRequest,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Generate marketing trigger keywords and place them into manual review."""
     try:
@@ -863,10 +894,15 @@ async def generate_keyword_triggers(
 async def batch_bind_keyword_trigger_template(
     request: KeywordTriggerBatchTemplateRequest,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Bind one reusable reply template to many marketing keyword triggers."""
     template_result = await db.execute(
-        select(MessageTemplate).where(MessageTemplate.id == request.template_id)
+        select(MessageTemplate).where(
+            MessageTemplate.id == request.template_id,
+            MessageTemplate.scope == "acquisition",
+            MessageTemplate.owned_group_asset_id.is_(None),
+        )
     )
     template = template_result.scalar_one_or_none()
     if not template:
@@ -915,6 +951,7 @@ async def batch_bind_keyword_trigger_template(
 async def create_keyword_trigger(
     request: KeywordTriggerCreate,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Create an acquisition keyword reply/private-message trigger."""
     keyword_text = request.keyword_text.strip()
@@ -974,6 +1011,7 @@ async def update_keyword_trigger(
     trigger_id: int,
     request: KeywordTriggerUpdate,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> dict:
     """Update an acquisition keyword trigger."""
     result = await db.execute(select(KeywordTrigger).where(KeywordTrigger.id == trigger_id))
@@ -1039,6 +1077,7 @@ async def update_keyword_trigger(
 async def delete_keyword_trigger(
     trigger_id: int,
     db: AsyncSession = Depends(get_db),
+    _admin: object = Depends(require_admin),
 ) -> None:
     """Delete an acquisition keyword trigger."""
     result = await db.execute(select(KeywordTrigger).where(KeywordTrigger.id == trigger_id))

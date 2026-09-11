@@ -6,11 +6,13 @@ Database models for Telegram account management.
 
 from datetime import date, datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Float,
@@ -24,9 +26,15 @@ from sqlalchemy import (
 from sqlalchemy import (
     Enum as SQLEnum,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+
+_ACCOUNT_PERSONA_JSON = JSON(none_as_null=True).with_variant(
+    JSONB(none_as_null=True),
+    "postgresql",
+)
 
 
 class AccountStatus(str, Enum):
@@ -295,6 +303,48 @@ class TelegramAccount(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
     )
 
+    # Account-level AI Persona is intentionally excluded from ordinary account
+    # queries. Persona endpoints and the AI execution snapshot path must opt in
+    # with undefer_group("account_persona") so templates and account lists do
+    # not load free-form prompt material accidentally.
+    ai_persona: Mapped[dict[str, Any] | None] = mapped_column(
+        _ACCOUNT_PERSONA_JSON,
+        nullable=True,
+        deferred=True,
+        deferred_group="account_persona",
+        comment="完整账号级 AI Persona；SQL NULL 表示中性默认",
+    )
+    ai_persona_revision: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+        deferred=True,
+        deferred_group="account_persona",
+        comment="Persona 乐观并发版本；reset 后保留历史版本",
+    )
+    ai_persona_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        deferred=True,
+        deferred_group="account_persona",
+        comment="规范化 Persona canonical JSON 的 SHA-256",
+    )
+    ai_persona_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        deferred=True,
+        deferred_group="account_persona",
+        comment="Persona 最近变更时间（UTC naive）",
+    )
+    ai_persona_updated_by: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        deferred=True,
+        deferred_group="account_persona",
+        comment="Persona 最近变更管理员 ID（逻辑关联）",
+    )
+
     # Health metrics
     connection_count: Mapped[int] = mapped_column(Integer, default=0, comment="连接次数")
     error_count: Mapped[int] = mapped_column(Integer, default=0, comment="错误次数")
@@ -338,6 +388,24 @@ class TelegramAccount(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "ai_persona_revision >= 0",
+            name="account_persona_revision_non_negative",
+        ),
+        CheckConstraint(
+            "(ai_persona IS NULL AND ai_persona_hash IS NULL) OR "
+            "(ai_persona IS NOT NULL AND ai_persona_revision >= 1 AND "
+            "ai_persona_hash ~ '^[0-9a-f]{64}$')",
+            name="account_persona_consistency_postgresql",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "(ai_persona IS NULL AND ai_persona_hash IS NULL) OR "
+            "(ai_persona IS NOT NULL AND ai_persona_revision >= 1 AND "
+            "length(ai_persona_hash) = 64 AND "
+            "lower(ai_persona_hash) = ai_persona_hash AND "
+            "ai_persona_hash NOT GLOB '*[^0-9a-f]*')",
+            name="account_persona_consistency_sqlite",
+        ).ddl_if(dialect="sqlite"),
         Index("idx_status", "status"),
         Index("idx_country", "country_code"),
         Index("idx_api_config", "api_config_name"),

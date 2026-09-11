@@ -3,11 +3,23 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from telethon.crypto import AuthKey
+from telethon.sessions import StringSession
 
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.config import settings
 from app.core.p0_safety_gate import precheck_owned_group_resources
 from app.modules.owned_group.models_extra import OwnedBotProfile
+
+
+def _valid_string_session() -> str:
+    session = StringSession()
+    session.set_dc(2, "149.154.167.51", 443)
+    session.auth_key = AuthKey(bytes(range(256)))
+    return session.save()
+
+
+_VALID_STRING_SESSION = _valid_string_session()
 
 
 async def _account(
@@ -16,7 +28,7 @@ async def _account(
     *,
     account_type: AccountType = AccountType.PROMOTER,
     status: AccountStatus = AccountStatus.ONLINE,
-    session_string: str | None = "session",
+    session_string: str | None = _VALID_STRING_SESSION,
     is_active: bool = True,
     risk_level: str = "normal",
     risk_pause_until: datetime | None = None,
@@ -67,6 +79,24 @@ async def test_precheck_rejects_runtime_unready_user(test_db):
 async def test_precheck_rejects_undecryptable_session_ciphertext(test_db):
     owner = await _account(
         test_db, "p0-invalid-ciphertext", session_string="vgs1:not-a-fernet-token"
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+    )
+
+    assert decision.allowed is False
+    assert decision.details["violations"][0]["reason"] == "account_session_missing"
+
+
+@pytest.mark.asyncio
+async def test_precheck_rejects_invalid_plaintext_session(test_db):
+    owner = await _account(
+        test_db,
+        "p0-invalid-plaintext",
+        session_string="legacy-session",
     )
 
     decision = await precheck_owned_group_resources(

@@ -10,6 +10,7 @@ from app.modules.owned_group.security import (
     redact_sensitive_text,
     redact_sensitive_value,
     redact_snapshot_text,
+    safe_exception_message,
 )
 
 
@@ -54,3 +55,24 @@ def test_redact_snapshot_text_preserves_json_shape_and_scrubs_values():
     assert redacted["batch_size"] == 5
     assert redacted["admin_configs"][0]["admin_title"] == "moderator"
     assert redacted["bot_token"] == REDACTED
+
+
+def test_safe_exception_message_scrubs_composite_secret_aliases():
+    raw = (
+        "proxy_password=ProxyPlain accessToken=AccessPlain "
+        "TELEGRAM_API_HASH=HashPlain jwt_secret=JwtPlain client-secret=ClientPlain"
+    )
+
+    redacted = safe_exception_message(RuntimeError(raw))
+
+    for secret in ("ProxyPlain", "AccessPlain", "HashPlain", "JwtPlain", "ClientPlain"):
+        assert secret not in redacted
+    assert redacted.count(REDACTED) == 5
+
+
+def test_sensitive_mapping_key_suffixes_cover_password_secret_and_api_hash():
+    assert is_sensitive_key("proxyPassword")
+    assert is_sensitive_key("jwt_secret")
+    assert is_sensitive_key("TELEGRAM_API_HASH")
+    assert is_sensitive_key("access_token")
+    assert not is_sensitive_key("content_hash")

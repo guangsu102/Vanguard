@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElCheckbox, ElDialog, ElForm, ElFormItem, ElInput, ElInputNumber, ElMessage, ElMessageBox, ElOption, ElSelect, ElTable, ElTableColumn, ElTag } from 'element-plus'
 import { guardianApi, type GuardianBot, type ManagedGroupBinding } from '@/api/guardian'
 import { accountsApi, type Account } from '@/api/accounts'
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import { useClientPagination } from '@/utils/clientPagination'
+import { parseSafePositiveId } from '@/utils/groupOpsAccess'
 
 const router = useRouter()
+const route = useRoute()
 const loading = ref(false)
 const dialogVisible = ref(false)
 const pinnedDialogVisible = ref(false)
@@ -30,6 +32,12 @@ const bots = ref<GuardianBot[]>([])
 const promoterAccounts = ref<Account[]>([])
 const groupPagination = useClientPagination(groups)
 const selectedSyncBotId = ref<number | undefined>()
+const focusedBindingId = ref<number | null>(null)
+const routeLocationError = ref('')
+const dataLoaded = ref(false)
+let routeSelectionSequence = 0
+const returnAssetId = computed(() => parseSafePositiveId(route.query.assetId))
+const managedRowClassName = ({ row }: { row: ManagedGroupBinding }) => row.id === focusedBindingId.value ? 'focused-row' : ''
 
 const form = reactive({
   telegram_group_id: 0,
@@ -96,6 +104,8 @@ const loadData = async () => {
     if (!channelCreateForm.creator_account_id && promoterAccounts.value.length > 0) {
       channelCreateForm.creator_account_id = promoterAccounts.value[0].id
     }
+    dataLoaded.value = true
+    await applyRouteSelection()
   } finally {
     loading.value = false
   }
@@ -282,6 +292,14 @@ const openPolicies = (row: ManagedGroupBinding) => {
   })
 }
 
+const openOwnedGroup = (row: ManagedGroupBinding) => {
+  if (!row.owned_group_asset_id) return
+  router.push({
+    path: '/owned-groups',
+    query: { assetId: String(row.owned_group_asset_id) },
+  })
+}
+
 const openSensitiveKeywords = (row: ManagedGroupBinding) => {
   router.push({
     path: '/guardian/keywords',
@@ -317,7 +335,7 @@ const openPeriodicCoupons = (row: ManagedGroupBinding) => {
   })
 }
 
-const openPinnedMessage = async (row: ManagedGroupBinding) => {
+const openPinnedMessage = async (row: ManagedGroupBinding, expectedSequence?: number) => {
   currentPinnedGroup.value = row
   Object.assign(pinnedForm, {
     enabled: true,
@@ -330,6 +348,7 @@ const openPinnedMessage = async (row: ManagedGroupBinding) => {
   })
   announcementChannelId.value = undefined
   const res = await guardianApi.getPinnedMessageConfig(row.id)
+  if (expectedSequence !== undefined && expectedSequence !== routeSelectionSequence) return
   Object.assign(pinnedForm, res.data.data)
   const configuredChannel = publicChannels.value.find(
     (item) => `https://t.me/${item.username}` === pinnedForm.button_url,
@@ -341,6 +360,34 @@ const openPinnedMessage = async (row: ManagedGroupBinding) => {
   }
   pinnedDialogVisible.value = true
 }
+
+const applyRouteSelection = async () => {
+  const sequence = ++routeSelectionSequence
+  focusedBindingId.value = null
+  routeLocationError.value = ''
+  pinnedDialogVisible.value = false
+  currentPinnedGroup.value = null
+  const assetId = returnAssetId.value
+  if (!assetId || !dataLoaded.value) return
+  const index = groups.value.findIndex((item) => item.owned_group_asset_id === assetId)
+  if (index < 0) {
+    routeLocationError.value = '该资产没有有效 Guardian 群绑定'
+    return
+  }
+  const row = groups.value[index]
+  focusedBindingId.value = row.id
+  groupPagination.page.value = Math.floor(index / groupPagination.pageSize.value) + 1
+  if (route.query.action === 'pinned-message') {
+    try { await openPinnedMessage(row, sequence) } catch {
+      if (sequence === routeSelectionSequence) routeLocationError.value = '公告配置读取失败'
+    }
+  }
+}
+
+watch(
+  () => [route.query.assetId, route.query.action],
+  () => { void applyRouteSelection() },
+)
 
 const applyAnnouncementChannel = (channelId?: number) => {
   announcementChannelId.value = channelId
@@ -403,6 +450,7 @@ onMounted(loadData)
         <p class="page-desc">统一管理已绑定 Guardian Bot 的群和频道资产。</p>
       </div>
       <div class="header-actions">
+        <el-button v-if="returnAssetId" @click="router.push(`/owned-groups/${returnAssetId}/operations?tab=overview`)">返回群运营中心</el-button>
         <el-select v-model="selectedSyncBotId" filterable placeholder="选择同步 Bot" class="sync-bot-select">
           <el-option v-for="item in bots" :key="item.account_id" :label="item.display_name || item.identifier" :value="item.account_id" />
         </el-select>
@@ -413,8 +461,26 @@ onMounted(loadData)
       </div>
     </div>
 
-    <el-table v-loading="loading" :data="groupPagination.rows.value" border>
+    <el-alert v-if="routeLocationError" type="warning" :closable="false" show-icon :title="routeLocationError" />
+
+    <el-table v-loading="loading" :data="groupPagination.rows.value" :row-class-name="managedRowClassName" border>
       <el-table-column prop="telegram_group_id" label="Telegram ID" min-width="150" />
+      <el-table-column label="来源" width="110">
+        <template #default="{ row }">
+          <el-tag :type="row.source_type === 'owned_group' ? 'primary' : 'info'" effect="plain">
+            {{ row.source_type === 'owned_group' ? '自建群' : '现有托管群' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="自建群资产" min-width="180">
+        <template #default="{ row }">
+          <template v-if="row.owned_group_asset_id">
+            <div>#{{ row.owned_group_asset_id }}</div>
+            <small>{{ row.owned_group_asset_title || '-' }}</small>
+          </template>
+          <span v-else>-</span>
+        </template>
+      </el-table-column>
       <el-table-column label="类型" width="90">
         <template #default="{ row }">
           <el-tag :type="row.chat_type === 'channel' ? 'primary' : 'success'">
@@ -431,8 +497,16 @@ onMounted(loadData)
           <el-tag :type="row.binding_status === 'active' ? 'success' : 'warning'">{{ row.binding_status }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" min-width="430">
+      <el-table-column label="操作" min-width="500">
         <template #default="{ row }">
+          <el-button
+            v-if="row.source_type === 'owned_group' && row.owned_group_asset_id"
+            type="primary"
+            link
+            @click="openOwnedGroup(row as ManagedGroupBinding)"
+          >
+            查看自建群
+          </el-button>
           <template v-if="row.chat_type === 'channel'">
             <el-button type="primary" link :disabled="row.binding_status !== 'active'" @click="openChannelMessage(row as ManagedGroupBinding)">发送消息</el-button>
             <el-button type="primary" link @click="openChannelUsername(row as ManagedGroupBinding)">设置用户名</el-button>
@@ -447,6 +521,7 @@ onMounted(loadData)
           </template>
           <template v-else>
             <el-button
+              v-if="row.source_type !== 'owned_group'"
               :type="row.all_members_muted ? 'success' : 'danger'"
               link
               :loading="mutingBindingId === row.id"
@@ -460,7 +535,12 @@ onMounted(loadData)
             <el-button type="success" link @click="openPeriodicCoupons(row as ManagedGroupBinding)">周期优惠券</el-button>
             <el-button type="warning" link @click="openPinnedMessage(row as ManagedGroupBinding)">群公告</el-button>
           </template>
-          <el-button v-if="row.chat_type !== 'channel'" type="primary" link @click="markDegraded(row as ManagedGroupBinding)">
+          <el-button
+            v-if="row.chat_type !== 'channel' && row.source_type !== 'owned_group'"
+            type="primary"
+            link
+            @click="markDegraded(row as ManagedGroupBinding)"
+          >
             {{ row.binding_status === 'active' ? '标记降级' : '恢复治理' }}
           </el-button>
         </template>
@@ -643,7 +723,13 @@ onMounted(loadData)
       </el-form>
       <template #footer>
         <el-button @click="pinnedDialogVisible = false">取消</el-button>
-        <el-button :loading="savingPinnedConfig" @click="savePinnedMessageConfig">保存默认配置</el-button>
+        <el-button
+          v-if="currentPinnedGroup?.source_type !== 'owned_group'"
+          :loading="savingPinnedConfig"
+          @click="savePinnedMessageConfig"
+        >
+          保存默认配置
+        </el-button>
         <el-button type="primary" :loading="sendingPinned" @click="sendPinnedMessage">发送并置顶</el-button>
       </template>
     </el-dialog>

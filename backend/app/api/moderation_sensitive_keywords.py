@@ -2,6 +2,7 @@
 Moderation sensitive keyword API.
 """
 
+from collections.abc import Mapping
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -9,15 +10,19 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.guardian_validation import ensure_managed_group_binding
+from app.api.guardian_validation import (
+    GuardianGroupTarget,
+    require_guardian_operator,
+    resolve_guardian_group_target,
+)
 from app.core.database import get_db
+from app.core.group.models import Group
 from app.modules.guardian.models import (
     ModerationSensitiveKeyword,
     SensitiveKeywordSource,
     ViolationAction,
     ViolationLevel,
 )
-
 
 router = APIRouter()
 
@@ -70,7 +75,33 @@ def _normalize_text(value: str) -> str:
     return value.strip().lower()
 
 
-def _serialize(item: ModerationSensitiveKeyword) -> SensitiveKeywordResponse:
+async def _require_group_target(
+    db: AsyncSession, telegram_chat_id: int
+) -> GuardianGroupTarget:
+    target = await resolve_guardian_group_target(db, telegram_chat_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Managed group binding not found")
+    return target
+
+
+async def _telegram_chat_id_map(
+    db: AsyncSession, core_group_ids: set[int]
+) -> dict[int, int]:
+    if not core_group_ids:
+        return {}
+    rows = await db.execute(
+        select(Group.id, Group.group_id).where(Group.id.in_(core_group_ids))
+    )
+    return {int(core_group_id): int(telegram_chat_id) for core_group_id, telegram_chat_id in rows}
+
+
+def _serialize(
+    item: ModerationSensitiveKeyword,
+    telegram_chat_ids: Mapping[int, int] | None = None,
+) -> SensitiveKeywordResponse:
+    external_group_id = None
+    if item.group_id is not None:
+        external_group_id = (telegram_chat_ids or {}).get(item.group_id, item.group_id)
     return SensitiveKeywordResponse(
         id=item.id,
         text=item.text,
@@ -78,7 +109,7 @@ def _serialize(item: ModerationSensitiveKeyword) -> SensitiveKeywordResponse:
         source=item.source.value,
         level=item.level.value,
         action=item.action.value,
-        group_id=item.group_id,
+        group_id=external_group_id,
         enabled=item.enabled,
         confidence=float(item.confidence),
         source_sample=item.source_sample,
@@ -97,15 +128,16 @@ async def list_sensitive_keywords(
     page_size: int = Query(default=20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ) -> SensitiveKeywordListResponse:
+    core_group_id = None
     if group_id is not None:
-        await ensure_managed_group_binding(db, group_id)
+        core_group_id = (await _require_group_target(db, group_id)).core_group_id
 
     query = select(ModerationSensitiveKeyword)
     count_query = select(func.count(ModerationSensitiveKeyword.id))
 
-    if group_id is not None:
-        query = query.where(ModerationSensitiveKeyword.group_id == group_id)
-        count_query = count_query.where(ModerationSensitiveKeyword.group_id == group_id)
+    if core_group_id is not None:
+        query = query.where(ModerationSensitiveKeyword.group_id == core_group_id)
+        count_query = count_query.where(ModerationSensitiveKeyword.group_id == core_group_id)
     if category:
         query = query.where(ModerationSensitiveKeyword.category == category)
         count_query = count_query.where(ModerationSensitiveKeyword.category == category)
@@ -121,10 +153,21 @@ async def list_sensitive_keywords(
     rows = await db.execute(
         query.order_by(desc(ModerationSensitiveKeyword.id)).offset((page - 1) * page_size).limit(page_size)
     )
-    return SensitiveKeywordListResponse(data=[_serialize(item) for item in rows.scalars().all()], total=total)
+    items = list(rows.scalars().all())
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {item.group_id for item in items if item.group_id is not None}
+    )
+    return SensitiveKeywordListResponse(
+        data=[_serialize(item, telegram_chat_ids) for item in items], total=total
+    )
 
 
-@router.post("", response_model=SensitiveKeywordResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=SensitiveKeywordResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def create_sensitive_keyword(
     request: SensitiveKeywordCreate,
     db: AsyncSession = Depends(get_db),
@@ -136,8 +179,9 @@ async def create_sensitive_keyword(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    target = None
     if request.group_id is not None:
-        await ensure_managed_group_binding(db, request.group_id)
+        target = await _require_group_target(db, request.group_id)
 
     item = ModerationSensitiveKeyword(
         text=request.text.strip(),
@@ -146,7 +190,7 @@ async def create_sensitive_keyword(
         source=source,
         level=level,
         action=action,
-        group_id=request.group_id,
+        group_id=target.core_group_id if target else None,
         enabled=request.enabled,
         confidence=request.confidence,
         source_sample=request.source_sample,
@@ -154,10 +198,17 @@ async def create_sensitive_keyword(
     db.add(item)
     await db.commit()
     await db.refresh(item)
-    return _serialize(item)
+    telegram_chat_ids = (
+        {target.core_group_id: target.telegram_chat_id} if target is not None else {}
+    )
+    return _serialize(item, telegram_chat_ids)
 
 
-@router.put("/{keyword_id:int}", response_model=SensitiveKeywordResponse)
+@router.put(
+    "/{keyword_id:int}",
+    response_model=SensitiveKeywordResponse,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def update_sensitive_keyword(
     keyword_id: int,
     request: SensitiveKeywordUpdate,
@@ -169,7 +220,8 @@ async def update_sensitive_keyword(
 
     data = request.model_dump(exclude_none=True)
     if "group_id" in data and data["group_id"] is not None:
-        await ensure_managed_group_binding(db, data["group_id"])
+        target = await _require_group_target(db, data["group_id"])
+        data["group_id"] = target.core_group_id
     if "level" in data:
         data["level"] = ViolationLevel(data["level"])
     if "action" in data:
@@ -179,10 +231,17 @@ async def update_sensitive_keyword(
 
     await db.commit()
     await db.refresh(item)
-    return _serialize(item)
+    telegram_chat_ids = await _telegram_chat_id_map(
+        db, {item.group_id} if item.group_id is not None else set()
+    )
+    return _serialize(item, telegram_chat_ids)
 
 
-@router.delete("/{keyword_id:int}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{keyword_id:int}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_guardian_operator)],
+)
 async def delete_sensitive_keyword(keyword_id: int, db: AsyncSession = Depends(get_db)) -> None:
     item = await db.get(ModerationSensitiveKeyword, keyword_id)
     if not item:

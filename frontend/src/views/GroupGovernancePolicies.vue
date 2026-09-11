@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElButton, ElCard, ElForm, ElFormItem, ElInput, ElInputNumber, ElMessage, ElOption, ElSelect, ElSwitch } from 'element-plus'
 import { guardianApi, type ManagedGroupBinding } from '@/api/guardian'
+import { parseSafePositiveId, parseSafeTelegramId } from '@/utils/groupOpsAccess'
 
 const route = useRoute()
+const router = useRouter()
 const loading = ref(false)
 const currentGroupId = ref<number>()
 const managedGroups = ref<ManagedGroupBinding[]>([])
+let policyRequestSequence = 0
+const returnAssetId = computed(() => parseSafePositiveId(route.query.assetId))
 
 const verificationForm = reactive({
   group_id: 0,
@@ -57,9 +61,11 @@ const loadManagedGroups = async () => {
 }
 
 const applyRouteGroup = () => {
-  const groupId = Number(route.query.groupId)
-  if (Number.isFinite(groupId) && groupId > 0) {
+  const groupId = parseSafeTelegramId(route.query.groupId)
+  if (groupId !== null) {
     currentGroupId.value = groupId
+  } else {
+    currentGroupId.value = undefined
   }
 }
 
@@ -68,19 +74,23 @@ const loadPolicies = async () => {
     ElMessage.warning('请先输入群 ID')
     return
   }
+  const requestedGroupId = currentGroupId.value
+  const sequence = ++policyRequestSequence
   loading.value = true
   try {
     const [verificationRes, moderationRes, punishmentRes] = await Promise.allSettled([
-      guardianApi.getVerificationPolicy(currentGroupId.value),
-      guardianApi.getModerationPolicy(currentGroupId.value),
-      guardianApi.getPunishmentPolicy(currentGroupId.value),
+      guardianApi.getVerificationPolicy(requestedGroupId),
+      guardianApi.getModerationPolicy(requestedGroupId),
+      guardianApi.getPunishmentPolicy(requestedGroupId),
     ])
+
+    if (sequence !== policyRequestSequence || currentGroupId.value !== requestedGroupId) return
 
     if (verificationRes.status === 'fulfilled') Object.assign(verificationForm, verificationRes.value.data.data)
     if (moderationRes.status === 'fulfilled') Object.assign(moderationForm, moderationRes.value.data.data)
     if (punishmentRes.status === 'fulfilled') Object.assign(punishmentForm, punishmentRes.value.data.data)
   } finally {
-    loading.value = false
+    if (sequence === policyRequestSequence) loading.value = false
   }
 }
 
@@ -106,8 +116,9 @@ const saveAll = async () => {
 }
 
 watch(
-  () => route.query.groupId,
+  () => [route.query.groupId, route.query.assetId],
   () => {
+    policyRequestSequence += 1
     applyRouteGroup()
     if (currentGroupId.value) {
       loadPolicies()
@@ -133,6 +144,7 @@ onMounted(async () => {
         <p v-if="currentGroupLabel" class="page-subtitle">当前管理群：{{ currentGroupLabel }}</p>
       </div>
       <div class="header-actions">
+        <el-button v-if="returnAssetId" @click="router.push(`/owned-groups/${returnAssetId}/operations?tab=overview`)">返回群运营中心</el-button>
         <el-select v-model="currentGroupId" filterable placeholder="选择 Bot 管理群" style="width: 300px">
           <el-option
             v-for="item in managedGroups"

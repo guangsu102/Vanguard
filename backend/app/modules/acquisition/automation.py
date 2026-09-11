@@ -71,6 +71,7 @@ from app.core.group.models import Group, GroupAccountMembership
 from app.core.keyword.models import KeywordType
 from app.core.operating_time import operating_day_start
 from app.core.runtime_settings import DEFAULT_AD_CAPACITY_SETTINGS
+from app.core.telegram_chat_lock import telegram_chat_advisory_lock
 from app.modules.acquisition.auto_reply.speaker import Speaker
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.config import AcquisitionConfig
@@ -114,8 +115,11 @@ from app.modules.acquisition.search_keyword_registry import (
     normalize_group_search_keyword,
     recent_keyword_texts,
 )
+from app.modules.owned_group.models import OwnedGroupAsset
 
 logger = structlog.get_logger()
+
+OWNED_GROUP_AD_DOMAIN_EXCLUDED = "OWNED_GROUP_AD_DOMAIN_EXCLUDED"
 
 AD_DELIVERY_THROTTLE_KEY_PREFIX = "vanguard:ad_delivery:account"
 AD_CREATIVE_TARGET_DEDUP_DAYS = 3
@@ -681,6 +685,18 @@ class AcquisitionAutomationService:
             return result.as_dict()
 
         candidate_limit = max(run_limit * 5, run_limit)
+        owned_group_asset_exists = (
+            select(OwnedGroupAsset.id)
+            .where(
+                OwnedGroupAsset.archived_at.is_(None),
+                or_(
+                    OwnedGroupAsset.core_group_id == Group.id,
+                    OwnedGroupAsset.telegram_chat_id
+                    == GroupAccountMembership.telegram_group_id,
+                ),
+            )
+            .exists()
+        )
         rows = await self.db.execute(
             select(GroupAccountMembership)
             .join(Group, Group.id == GroupAccountMembership.group_id)
@@ -699,6 +715,7 @@ class AcquisitionAutomationService:
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
                 TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                ~owned_group_asset_exists,
             )
             .order_by(desc(Group.level_score), GroupAccountMembership.updated_at.asc())
             .limit(candidate_limit)
@@ -724,6 +741,19 @@ class AcquisitionAutomationService:
             if sent >= run_limit:
                 break
             result.processed += 1
+            if await self._is_owned_group_ad_domain_excluded(
+                membership.group_id, membership.telegram_group_id
+            ):
+                result.skipped += 1
+                result.details.append(
+                    {
+                        "action": "skip",
+                        "reason": OWNED_GROUP_AD_DOMAIN_EXCLUDED,
+                        "account_id": membership.account_id,
+                        "group_id": membership.telegram_group_id,
+                    }
+                )
+                continue
             group_stats = (
                 await self.db.execute(
                     select(
@@ -803,11 +833,27 @@ class AcquisitionAutomationService:
                 )
                 continue
 
-            speak_result = await speaker.speak_in_group(
-                membership.telegram_group_id,
-                "",
-                account_id=membership.account_id,
-            )
+            async with telegram_chat_advisory_lock(
+                self.db, membership.telegram_group_id
+            ):
+                if await self._is_owned_group_ad_domain_excluded(
+                    membership.group_id, membership.telegram_group_id
+                ):
+                    result.skipped += 1
+                    result.details.append(
+                        {
+                            "action": "skip",
+                            "reason": OWNED_GROUP_AD_DOMAIN_EXCLUDED,
+                            "account_id": membership.account_id,
+                            "group_id": membership.telegram_group_id,
+                        }
+                    )
+                    continue
+                speak_result = await speaker.speak_in_group(
+                    membership.telegram_group_id,
+                    "",
+                    account_id=membership.account_id,
+                )
             if speak_result.success:
                 await self._record_group_ai_warmup_interaction(
                     membership, speak_result.message_id, now
@@ -5533,92 +5579,121 @@ class AcquisitionAutomationService:
                     )
                     continue
 
-                schedule_id, schedule_token, schedule_reason = await self._claim_ad_schedule_state(
-                    campaign=campaign,
-                    account_id=binding.account_id,
-                    membership=membership,
-                    lease_seconds=int(execution["job_lease_seconds"]),
-                )
-                if schedule_token is None:
-                    result.skipped += 1
-                    result.details.append(
-                        {
-                            "account_id": binding.account_id,
-                            "group_id": group.id,
-                            "campaign_id": campaign.id,
-                            "action": "skip",
-                            "reason": schedule_reason,
-                        }
-                    )
-                    continue
-
-                if not await self._reserve_ad_delivery_budget(
-                    delivery_budget, delivery_budget_lock
-                ):
-                    await self._finish_ad_schedule_state(
-                        schedule_id,
-                        schedule_token,
-                        campaign=campaign,
-                        succeeded=False,
-                        reason="dispatcher_page_exhausted",
-                    )
-                    result.details.append(
-                        {
-                            "account_id": binding.account_id,
-                            "action": "dispatcher_page_exhausted",
-                        }
-                    )
-                    return result
-
                 delivery_log: Optional[AdDeliveryLog] = None
                 telegram_send_completed = False
+                schedule_id: Optional[int] = None
+                schedule_token: Optional[str] = None
                 try:
-                    if delivery_policy == AdDeliveryPolicy.GROWTH.value:
-                        delivery_log, quota_reason = await self._claim_growth_campaign_daily_quota(
-                            campaign=campaign,
-                            account_id=binding.account_id,
-                            group=group,
-                            creative=creative,
-                        )
-                        if delivery_log is None:
-                            await self._release_ad_delivery_budget(
-                                delivery_budget, delivery_budget_lock
+                    async with telegram_chat_advisory_lock(
+                        self.db, membership.telegram_group_id
+                    ):
+                        # The API and candidate query are only the first guard.
+                        # Re-resolve ownership while holding the same chat lock
+                        # used by OwnedGroupAsset claims, and keep it until the
+                        # Telegram write returns. This closes legacy/bypass races.
+                        if await self._is_owned_group_ad_domain_excluded(
+                            group.id, membership.telegram_group_id
+                        ):
+                            result.skipped += 1
+                            result.details.append(
+                                {
+                                    "binding_id": binding.id,
+                                    "account_id": binding.account_id,
+                                    "campaign_id": campaign.id,
+                                    "group_id": group.id,
+                                    "reason": OWNED_GROUP_AD_DOMAIN_EXCLUDED,
+                                }
                             )
-                            await self._finish_ad_schedule_state(
-                                schedule_id,
-                                schedule_token,
+                            continue
+
+                        schedule_id, schedule_token, schedule_reason = (
+                            await self._claim_ad_schedule_state(
                                 campaign=campaign,
-                                succeeded=False,
-                                reason=quota_reason,
+                                account_id=binding.account_id,
+                                membership=membership,
+                                lease_seconds=int(execution["job_lease_seconds"]),
                             )
+                        )
+                        if schedule_token is None:
                             result.skipped += 1
                             result.details.append(
                                 {
                                     "account_id": binding.account_id,
                                     "group_id": group.id,
                                     "campaign_id": campaign.id,
-                                    "creative_id": creative.id,
                                     "action": "skip",
-                                    "reason": quota_reason,
+                                    "reason": schedule_reason,
                                 }
                             )
                             continue
-                    else:
-                        delivery_log = await self._record_ad_delivery(
+
+                        if not await self._reserve_ad_delivery_budget(
+                            delivery_budget, delivery_budget_lock
+                        ):
+                            await self._finish_ad_schedule_state(
+                                schedule_id,
+                                schedule_token,
+                                campaign=campaign,
+                                succeeded=False,
+                                reason="dispatcher_page_exhausted",
+                            )
+                            result.details.append(
+                                {
+                                    "account_id": binding.account_id,
+                                    "action": "dispatcher_page_exhausted",
+                                }
+                            )
+                            return result
+
+                        if delivery_policy == AdDeliveryPolicy.GROWTH.value:
+                            delivery_log, quota_reason = (
+                                await self._claim_growth_campaign_daily_quota(
+                                    campaign=campaign,
+                                    account_id=binding.account_id,
+                                    group=group,
+                                    creative=creative,
+                                )
+                            )
+                            if delivery_log is None:
+                                await self._release_ad_delivery_budget(
+                                    delivery_budget, delivery_budget_lock
+                                )
+                                await self._finish_ad_schedule_state(
+                                    schedule_id,
+                                    schedule_token,
+                                    campaign=campaign,
+                                    succeeded=False,
+                                    reason=quota_reason,
+                                )
+                                result.skipped += 1
+                                result.details.append(
+                                    {
+                                        "account_id": binding.account_id,
+                                        "group_id": group.id,
+                                        "campaign_id": campaign.id,
+                                        "creative_id": creative.id,
+                                        "action": "skip",
+                                        "reason": quota_reason,
+                                    }
+                                )
+                                continue
+                        else:
+                            delivery_log = await self._record_ad_delivery(
+                                binding.account_id,
+                                group,
+                                campaign,
+                                creative,
+                                DeliveryStatus.PENDING,
+                                reservation_token=uuid4().hex,
+                            )
+                        message_id = await self._send_ad(
                             binding.account_id,
-                            group,
-                            campaign,
+                            membership.telegram_group_id,
                             creative,
-                            DeliveryStatus.PENDING,
-                            reservation_token=uuid4().hex,
+                            delivery_policy=delivery_policy,
                         )
-                    message_id = await self._send_ad(
-                        binding.account_id,
-                        membership.telegram_group_id,
-                        creative,
-                        delivery_policy=delivery_policy,
-                    )
-                    telegram_send_completed = True
+                        telegram_send_completed = True
+
                     sent_at = _now()
                     await self._finalize_ad_delivery_log(
                         delivery_log,
@@ -5654,6 +5729,25 @@ class AcquisitionAutomationService:
                         }
                     )
                 except Exception as exc:
+                    if schedule_token is None:
+                        await self.db.rollback()
+                        classified_error = self._classify_ad_delivery_error(exc)
+                        result.failed += 1
+                        result.errors.append(
+                            f"ad pre-send guard failed account={binding.account_id} "
+                            f"group={group.group_id}: {exc}"
+                        )
+                        result.details.append(
+                            {
+                                "account_id": binding.account_id,
+                                "group_id": group.id,
+                                "campaign_id": campaign.id,
+                                "creative_id": creative.id,
+                                "action": "ad_pre_send_guard_failed",
+                                "reason": classified_error,
+                            }
+                        )
+                        continue
                     if not telegram_send_completed:
                         await self._release_ad_delivery_budget(
                             delivery_budget, delivery_budget_lock
@@ -6873,6 +6967,18 @@ class AcquisitionAutomationService:
             .group_by(AdDeliveryLog.telegram_group_id)
             .subquery()
         )
+        owned_group_asset_exists = (
+            select(OwnedGroupAsset.id)
+            .where(
+                OwnedGroupAsset.archived_at.is_(None),
+                or_(
+                    OwnedGroupAsset.core_group_id == Group.id,
+                    OwnedGroupAsset.telegram_chat_id
+                    == GroupAccountMembership.telegram_group_id,
+                ),
+            )
+            .exists()
+        )
         rows = await self.db.execute(
             select(GroupAccountMembership)
             .options(selectinload(GroupAccountMembership.group))
@@ -6925,6 +7031,7 @@ class AcquisitionAutomationService:
                         ),
                     ),
                 ),
+                ~owned_group_asset_exists,
             )
             .order_by(
                 last_sent_at.c.last_sent_at.asc().nullsfirst(),
@@ -6933,6 +7040,24 @@ class AcquisitionAutomationService:
             )
         )
         return list(rows.scalars().all())
+
+    async def _is_owned_group_ad_domain_excluded(
+        self, core_group_id: int | None, telegram_chat_id: int | None
+    ) -> bool:
+        """Return whether the target belongs to the independently managed owned-group domain."""
+        predicates = []
+        if core_group_id is not None:
+            predicates.append(OwnedGroupAsset.core_group_id == core_group_id)
+        if telegram_chat_id is not None:
+            predicates.append(OwnedGroupAsset.telegram_chat_id == telegram_chat_id)
+        if not predicates:
+            return False
+        row = await self.db.execute(
+            select(OwnedGroupAsset.id)
+            .where(OwnedGroupAsset.archived_at.is_(None), or_(*predicates))
+            .limit(1)
+        )
+        return row.scalar_one_or_none() is not None
 
     def _parse_membership_note_events(self, note: Optional[str]) -> list[dict[str, Any]]:
         if not note:
@@ -7006,6 +7131,35 @@ class AcquisitionAutomationService:
         return hours * 3600
 
     async def _maybe_send_ad_interaction(
+        self,
+        account_id: int,
+        membership: GroupAccountMembership,
+        now: datetime,
+        capacity: dict[str, Any],
+        *,
+        phase: str,
+        dry_run: bool,
+    ) -> str:
+        group = membership.group
+        if group is None:
+            return "group_missing"
+        async with telegram_chat_advisory_lock(
+            self.db, membership.telegram_group_id
+        ):
+            if await self._is_owned_group_ad_domain_excluded(
+                membership.group_id, membership.telegram_group_id
+            ):
+                return OWNED_GROUP_AD_DOMAIN_EXCLUDED
+            return await self._maybe_send_ad_interaction_locked(
+                account_id,
+                membership,
+                now,
+                capacity,
+                phase=phase,
+                dry_run=dry_run,
+            )
+
+    async def _maybe_send_ad_interaction_locked(
         self,
         account_id: int,
         membership: GroupAccountMembership,
@@ -7165,6 +7319,21 @@ class AcquisitionAutomationService:
         if group is None:
             return "group_missing"
 
+        async with telegram_chat_advisory_lock(
+            self.db, membership.telegram_group_id
+        ):
+            if await self._is_owned_group_ad_domain_excluded(
+                membership.group_id, membership.telegram_group_id
+            ):
+                return OWNED_GROUP_AD_DOMAIN_EXCLUDED
+            return await self._send_ad_probe_locked(account_id, membership, group)
+
+    async def _send_ad_probe_locked(
+        self,
+        account_id: int,
+        membership: GroupAccountMembership,
+        group: Group,
+    ) -> str:
         account = await self.account_pool.acquire_by_id(account_id, purpose="ad_probe")
         if account is None:
             return "account_unavailable_for_probe"
@@ -7284,6 +7453,34 @@ class AcquisitionAutomationService:
             await self.account_pool.release(account)
 
     async def send_group_ad_policy_probe(
+        self,
+        group_id: int,
+        *,
+        account_id: Optional[int] = None,
+        changed_by_user_id: Optional[int] = None,
+        source: str = AD_POLICY_PROBE_MANUAL_SOURCE,
+    ) -> dict[str, Any]:
+        identity_result = await self.db.execute(
+            select(Group.id, Group.group_id).where(Group.id == group_id)
+        )
+        identity = identity_result.one_or_none()
+        if identity is None:
+            raise ValueError("group_not_found")
+        core_group_id = int(identity[0])
+        telegram_group_id = int(identity[1])
+        async with telegram_chat_advisory_lock(self.db, telegram_group_id):
+            if await self._is_owned_group_ad_domain_excluded(
+                core_group_id, telegram_group_id
+            ):
+                raise RuntimeError(OWNED_GROUP_AD_DOMAIN_EXCLUDED)
+            return await self._send_group_ad_policy_probe_locked(
+                group_id,
+                account_id=account_id,
+                changed_by_user_id=changed_by_user_id,
+                source=source,
+            )
+
+    async def _send_group_ad_policy_probe_locked(
         self,
         group_id: int,
         *,
@@ -7920,6 +8117,7 @@ class AcquisitionAutomationService:
                     "ad_warmup_interaction_sent",
                     "ad_warmup_interaction_group_control",
                     "ad_warmup_interaction_account_issue",
+                    OWNED_GROUP_AD_DOMAIN_EXCLUDED,
                 }:
                     return warmup_interaction_reason
                 return "ad_warmup_not_complete"
@@ -7941,6 +8139,7 @@ class AcquisitionAutomationService:
                 "ad_mature_interaction_sent",
                 "ad_mature_interaction_group_control",
                 "ad_mature_interaction_account_issue",
+                OWNED_GROUP_AD_DOMAIN_EXCLUDED,
             }:
                 return mature_interaction_reason
             if membership.warmup_status != "ad_eligible":
@@ -8475,6 +8674,7 @@ class AcquisitionAutomationService:
             elif reason in {
                 "new_ad_group_daily_quota",
                 "ad_probe_risk_guard_skipped",
+                OWNED_GROUP_AD_DOMAIN_EXCLUDED,
             }:
                 result.skipped += 1
             else:
@@ -8692,6 +8892,7 @@ class AcquisitionAutomationService:
                     "group_delivery_inflight",
                     "campaign_account_daily_limit",
                     "campaign_group_daily_limit",
+                    OWNED_GROUP_AD_DOMAIN_EXCLUDED,
                 }
                 retryable = (
                     reason
@@ -9089,6 +9290,11 @@ class AcquisitionAutomationService:
         group = membership.group
         if group is None:
             return "group_missing"
+
+        if await self._is_owned_group_ad_domain_excluded(
+            group.id, membership.telegram_group_id
+        ):
+            return OWNED_GROUP_AD_DOMAIN_EXCLUDED
 
         op_config = await self._get_account_operation_config(binding.account_id)
         operation_mode_raw = (

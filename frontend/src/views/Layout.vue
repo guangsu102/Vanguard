@@ -8,6 +8,7 @@ import {
 } from '@element-plus/icons-vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { canReadGroupOps } from '@/utils/groupOpsAccess'
 
 const router = useRouter()
 const route = useRoute()
@@ -30,7 +31,6 @@ const menuItems = [
       { path: '/private-chats', title: '私聊工作台', icon: ChatLineSquare },
       { path: '/proxies', title: '静态代理IP', icon: Connection },
       { path: '/groups', title: '群池管理', icon: ChatDotRound },
-      { path: '/owned-groups', title: '自建群编排', icon: OfficeBuilding },
       { path: '/keywords', title: '关键词管理', icon: Key },
       { path: '/campaigns', title: '活动管理', icon: Present },
       { path: '/automation', title: '自动化管理', icon: Promotion },
@@ -38,14 +38,22 @@ const menuItems = [
     ],
   },
   {
-    path: '/guardian',
-    title: '群治理中心',
+    path: '/group-operations',
+    title: '群运营中心',
+    icon: OfficeBuilding,
+    groupOpsOnly: true,
+    children: [
+      { path: '/owned-groups', title: '群资产总览', icon: OfficeBuilding },
+      { path: '/guardian/groups', title: 'Guardian Bot 治理', icon: ChatDotRound },
+    ],
+  },
+  {
+    path: '/guardian-tools',
+    title: '群治理工具',
     icon: SetUp,
     children: [
       { path: '/guardian/bots', title: 'Bot账号', icon: User },
-      { path: '/guardian/groups', title: 'Bot管理群', icon: ChatDotRound },
       { path: '/guardian/qq', title: 'NapCat QQ群', icon: ChatLineSquare },
-      { path: '/guardian/policies', title: '群治理策略', icon: SetUp },
       { path: '/guardian/keywords', title: '群管敏感词', icon: Key },
     ],
   },
@@ -57,7 +65,10 @@ const menuItems = [
 
 const visibleMenuItems = computed(() =>
   menuItems
-    .filter((item) => !('adminOnly' in item) || !item.adminOnly || authStore.userInfo?.role === 'admin')
+    .filter((item) =>
+      (!('adminOnly' in item) || !item.adminOnly || authStore.userInfo?.role === 'admin') &&
+      (!('groupOpsOnly' in item) || !item.groupOpsOnly || canReadGroupOps(authStore.userInfo?.role)),
+    )
     .map((item) => ({
       ...item,
       children: item.children?.filter(

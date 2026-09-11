@@ -4,15 +4,44 @@ from __future__ import annotations
 
 import random
 import re
+import unicodedata
 from typing import Any
 
 AI_SELF_DISCLOSURE_RE = re.compile(
     r"(我是|作为|身为|本质上是|我只是|我并不是真人|由).{0,12}"
-    r"(AI|人工智能|机器人|bot|语言模型|大模型|模型|ChatGPT|GPT|OpenAI|系统)",
+    r"(AI|人工智能|机器人|bot|语言模型|大模型|模型|ChatGPT|GPT|OpenAI|系统|"
+    r"(?:智能|虚拟|自动)?助手|自动化(?:程序|系统|工具|流程)?)",
+    re.IGNORECASE,
+)
+
+PROMPT_DISCLOSURE_RE = re.compile(
+    r"系统\s*(?:提示词|指令)|system\s+prompt",
+    re.IGNORECASE,
+)
+
+AUTOMATION_DISCLOSURE_RE = re.compile(
+    r"自动化(?:程序|系统|工具|流程)?.{0,8}(?:生成|回复|发送|撰写|创建|运行)",
+    re.IGNORECASE,
+)
+
+OUTPUT_DISCLOSURE_RE = re.compile(
+    r"(?:AI|人工智能|机器人|bot|语言模型|大模型|模型|ChatGPT|GPT|OpenAI|系统|"
+    r"(?:智能|虚拟|自动)?助手|程序|自动化(?:程序|系统|工具|流程)?).{0,8}"
+    r"(?:生成|回复|发送|撰写|创建|输出|作答)",
+    re.IGNORECASE,
+)
+
+ENGLISH_AI_SELF_DISCLOSURE_RE = re.compile(
+    r"\b(?:(?:i\s+am|i['’]m|as)\s+(?:an?\s+)?"
+    r"(?:ai|chatbot|bot|automated\s+assistant|virtual\s+assistant|"
+    r"artificial\s+intelligence|language\s+model)|"
+    r"this\s+(?:response|reply|message)\s+(?:was|is)\s+generated\s+by\s+"
+    r"(?:an?\s+)?(?:ai|automated\s+system|chatbot|language\s+model))\b",
     re.IGNORECASE,
 )
 
 ROLE_PREFIX_RE = re.compile(r"^\s*(assistant|ai|bot|客服助手|系统)\s*[:：]\s*", re.IGNORECASE)
+_ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
 
 SAFE_GROUP_FALLBACKS = (
     "这个我也想听听大家怎么用的。",
@@ -23,7 +52,9 @@ SAFE_GROUP_FALLBACKS = (
 
 
 def _collapse_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text.replace("\u200b", " ")).strip()
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = _ZERO_WIDTH_RE.sub("", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def has_ai_self_disclosure(text: str) -> bool:
@@ -31,7 +62,13 @@ def has_ai_self_disclosure(text: str) -> bool:
     normalized = _collapse_text(text)
     if not normalized:
         return False
-    if AI_SELF_DISCLOSURE_RE.search(normalized):
+    if (
+        AI_SELF_DISCLOSURE_RE.search(normalized)
+        or PROMPT_DISCLOSURE_RE.search(normalized)
+        or AUTOMATION_DISCLOSURE_RE.search(normalized)
+        or OUTPUT_DISCLOSURE_RE.search(normalized)
+        or ENGLISH_AI_SELF_DISCLOSURE_RE.search(normalized)
+    ):
         return True
     lowered = normalized.casefold()
     return any(

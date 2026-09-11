@@ -134,6 +134,47 @@ def test_guardian_worker_maps_member_status_to_binding_state():
 
 
 @pytest.mark.asyncio
+async def test_guardian_dispatch_preserves_outer_update_id_and_message_kind(
+    monkeypatch,
+):
+    worker = TelegramWorker(TelegramWorkerRole.GUARDIAN_BOT, worker_id="test-guardian")
+    db = object()
+    bot = SimpleNamespace(cleanup=AsyncMock())
+
+    @asynccontextmanager
+    async def fake_db_session():
+        yield db
+
+    dispatch = AsyncMock(return_value=1)
+    monkeypatch.setattr(telegram_worker_module, "get_db_session", fake_db_session)
+    monkeypatch.setattr(
+        telegram_worker_module,
+        "create_guardian_bot",
+        AsyncMock(return_value=bot),
+    )
+    monkeypatch.setattr(worker, "_dispatch_guardian_message", dispatch)
+    telegram_client = SimpleNamespace()
+
+    processed = await worker._dispatch_guardian_updates(
+        9,
+        telegram_client,
+        [
+            {"update_id": 101, "message": {"message_id": 1}},
+            {"update_id": 102, "edited_message": {"message_id": 2}},
+            {"update_id": 103, "my_chat_member": {"chat": {"id": -1001}}},
+        ],
+    )
+
+    assert processed == 2
+    assert [call.kwargs["update_id"] for call in dispatch.await_args_list] == [101, 102]
+    assert [call.kwargs["update_kind"] for call in dispatch.await_args_list] == [
+        "message",
+        "edited_message",
+    ]
+    bot.cleanup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_growth_event_dispatch_is_bounded():
     worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
     active = 0
