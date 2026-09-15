@@ -202,6 +202,18 @@ router.beforeEach(async (to, _from, next) => {
     }
   }
 
+  // Pinia restores the token from localStorage, but userInfo is intentionally
+  // kept in memory. Rehydrate it before rendering role-gated navigation after
+  // a page refresh or a new browser session.
+  if (requiresAuth && authStore.isAuthenticated() && !authStore.userInfo) {
+    const restoredUser = await authStore.fetchUserInfo()
+    if (!restoredUser) {
+      localStorage.removeItem('token')
+      next('/login')
+      return
+    }
+  }
+
   if (to.matched.some((record) => record.meta.requiresAdmin === true)) {
     if (!authStore.userInfo) {
       await authStore.fetchUserInfo()
