@@ -59,6 +59,9 @@ class AccountRiskAction(str, Enum):
     BOT_MESSAGE = "bot_message"
     BOT_PIN = "bot_pin"
     CHANNEL_CREATE = "channel_create"
+    CHANNEL_DELETE = "channel_delete"
+    MANAGED_BOT_CREATE = "managed_bot_create"
+    SPAM_CHECK = "spam_check"
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,9 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.BOT_MESSAGE: RiskBudget(daily_limit=500, cooldown_seconds=1),
     AccountRiskAction.BOT_PIN: RiskBudget(daily_limit=100, cooldown_seconds=5),
     AccountRiskAction.CHANNEL_CREATE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
+    AccountRiskAction.CHANNEL_DELETE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
+    AccountRiskAction.MANAGED_BOT_CREATE: RiskBudget(daily_limit=1, cooldown_seconds=3600),
+    AccountRiskAction.SPAM_CHECK: RiskBudget(daily_limit=3, cooldown_seconds=300),
 }
 
 GLOBAL_DAILY_LIMIT = 30
@@ -140,6 +146,7 @@ RISK_LEVEL_BUDGET_MULTIPLIER: dict[str, float] = {
 }
 MESSAGE_ACTIONS = {
     AccountRiskAction.PRIVATE_MESSAGE,
+    AccountRiskAction.SPAM_CHECK,
     AccountRiskAction.GROUP_MESSAGE,
     AccountRiskAction.AD_PROBE,
     AccountRiskAction.AI_WARMUP,
@@ -182,9 +189,34 @@ if action_limit > 0 and action_count >= action_limit then return {0, 2, 0} end
 if outbound_limit > 0 and outbound_count >= outbound_limit then return {0, 3, 0} end
 if action_limit > 0 then redis.call("INCR", KEYS[1]); redis.call("EXPIRE", KEYS[1], ttl) end
 if outbound_limit > 0 then redis.call("INCR", KEYS[2]); redis.call("EXPIRE", KEYS[2], ttl) end
-if cooldown_seconds > 0 then redis.call("SET", KEYS[3], now + cooldown_seconds, "EX", cooldown_seconds) end
+if cooldown_seconds > 0 then
+  redis.call("SET", KEYS[3], now + cooldown_seconds, "EX", cooldown_seconds)
+end
 return {1, 0, 0}
 """
+
+ATOMIC_IDEMPOTENT_BUDGET_RESERVATION_LUA = """
+if redis.call("EXISTS", KEYS[4]) == 1 then return {1, 0, 0} end
+local action_count = tonumber(redis.call("GET", KEYS[1]) or "0")
+local outbound_count = tonumber(redis.call("GET", KEYS[2]) or "0")
+local cooldown_until = tonumber(redis.call("GET", KEYS[3]) or "0")
+local action_limit = tonumber(ARGV[1])
+local outbound_limit = tonumber(ARGV[2])
+local cooldown_seconds = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[5])
+if cooldown_until > now then return {0, 1, math.ceil(cooldown_until - now)} end
+if action_limit > 0 and action_count >= action_limit then return {0, 2, 0} end
+if outbound_limit > 0 and outbound_count >= outbound_limit then return {0, 3, 0} end
+if action_limit > 0 then redis.call("INCR", KEYS[1]); redis.call("EXPIRE", KEYS[1], ttl) end
+if outbound_limit > 0 then redis.call("INCR", KEYS[2]); redis.call("EXPIRE", KEYS[2], ttl) end
+if cooldown_seconds > 0 then
+  redis.call("SET", KEYS[3], now + cooldown_seconds, "EX", cooldown_seconds)
+end
+redis.call("SET", KEYS[4], KEYS[1], "EX", ttl)
+return {1, 0, 0}
+"""
+
 
 ATOMIC_OWNED_GROUP_BUDGET_RESERVATION_LUA = """
 if redis.call("EXISTS", KEYS[2]) == 1 then return {1, 0, 0} end
@@ -234,11 +266,18 @@ class AccountRiskGuard:
 
         if db_account is not None:
             await self._apply_risk_lifecycle(db_account, now, risk_settings=risk_settings)
+            restricted_spam_diagnostic = (
+                action == AccountRiskAction.SPAM_CHECK
+                and db_account.status == AccountStatus.RESTRICTED
+            )
             if not db_account.is_active:
                 return await self._block(
                     account, action, "account_inactive", target_type, target_id, details
                 )
-            if db_account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+            if db_account.status in {AccountStatus.ERROR, AccountStatus.BANNED} or (
+                db_account.status == AccountStatus.RESTRICTED
+                and action != AccountRiskAction.SPAM_CHECK
+            ):
                 return await self._block(
                     account,
                     action,
@@ -259,7 +298,10 @@ class AccountRiskGuard:
                     target_id,
                     details,
                 )
-            if db_account.risk_level == AccountRiskLevel.QUARANTINED.value:
+            if (
+                db_account.risk_level == AccountRiskLevel.QUARANTINED.value
+                and not restricted_spam_diagnostic
+            ):
                 return await self._block(
                     account, action, "account_risk_quarantined", target_type, target_id, details
                 )
@@ -275,7 +317,11 @@ class AccountRiskGuard:
                     target_id,
                     details,
                 )
-            if db_account.risk_pause_until and db_account.risk_pause_until > now:
+            if (
+                db_account.risk_pause_until
+                and db_account.risk_pause_until > now
+                and not restricted_spam_diagnostic
+            ):
                 retry_after = max(1, int((db_account.risk_pause_until - now).total_seconds()))
                 return await self._block(
                     account,
@@ -306,7 +352,11 @@ class AccountRiskGuard:
         delivery_policy = str((details or {}).get("delivery_policy") or "growth")
         ad_only_delivery = action == AccountRiskAction.AD_DELIVERY and delivery_policy == "ad_only"
         budget = self._budget_for_action(action, risk_settings)
-        if not ad_only_delivery and not owned_group_message:
+        if (
+            not ad_only_delivery
+            and not owned_group_message
+            and action != AccountRiskAction.SPAM_CHECK
+        ):
             warmup_settings = await get_account_warmup_policy_settings(self.db)
             warmup = account_warmup_context(
                 warmup_settings, db_account, now, action=action, details=details
@@ -334,7 +384,11 @@ class AccountRiskGuard:
             )
         reservation_id = (
             str((details or {}).get("risk_reservation_id") or "")
-            if owned_group_message
+            if action
+            in {
+                AccountRiskAction.OWNED_GROUP_MESSAGE,
+                AccountRiskAction.MANAGED_BOT_CREATE,
+            }
             else None
         )
         allowed, reason, retry_after = await self._reserve_budget(
@@ -366,14 +420,22 @@ class AccountRiskGuard:
                 details=details,
             )
         except Exception as exc:
-            if not owned_group_message:
+            if not (
+                owned_group_message
+                or action == AccountRiskAction.MANAGED_BOT_CREATE
+            ):
                 raise
             try:
                 await self.db.rollback()
             except Exception:
                 pass
+            event = (
+                "managed_bot_risk_allow_audit_failed"
+                if action == AccountRiskAction.MANAGED_BOT_CREATE
+                else "owned_group_risk_allow_audit_failed"
+            )
             self.logger.error(
-                "owned_group_risk_allow_audit_failed",
+                event,
                 account_id=account_id,
                 target_id=target_id,
                 error_type=type(exc).__name__,
@@ -469,6 +531,9 @@ class AccountRiskGuard:
                 account, reason=reason, action=action, details=merged_details
             )
         elif reason == "account_restricted":
+            rpc_user_restricted = self._is_user_restricted_error(exc)
+            if rpc_user_restricted:
+                await self._mark_telegram_rpc_restricted(account)
             await self.freeze_account(
                 account,
                 reason=reason,
@@ -480,6 +545,15 @@ class AccountRiskGuard:
                 action=action,
                 details=merged_details,
             )
+            if rpc_user_restricted:
+                from app.core.account.pool import invalidate_account_in_all_pools
+
+                account_id = self._account_id(account)
+                if account_id is not None:
+                    await invalidate_account_in_all_pools(
+                        account_id,
+                        reason="telegram_rpc_user_restricted",
+                    )
         elif reason == "group_write_forbidden" and self._confirmed_account_wide_group_write_ban(
             merged_details
         ):
@@ -546,7 +620,8 @@ class AccountRiskGuard:
                 "account_restricted, telegram_error.\n"
                 "Rules:\n"
                 "- Group/channel permission, cannot write, topic closed, private channel, "
-                "not participant, or banned from sending in a supergroup/channel => group_write_forbidden.\n"
+                "not participant, or banned from sending in a "
+                "supergroup/channel => group_write_forbidden.\n"
                 "- Flood wait/retry-after/too many requests => flood_wait.\n"
                 "- PEER_FLOOD or peer flood protection => peer_flood.\n"
                 "- Only explicit account/session/phone deactivation, revoked auth, or phone banned "
@@ -557,7 +632,7 @@ class AccountRiskGuard:
                 f"target_type={target_type}\n"
                 f"target_id={target_id}\n"
                 f"details={json.dumps(details or {}, ensure_ascii=False)[:800]}\n"
-                f"error={exc.__class__.__name__ if isinstance(exc, Exception) else 'str'}: {str(exc)[:1000]}\n\n"
+                f"error={type(exc).__name__}: {str(exc)[:1000]}\n\n"
                 "Return only the label."
             )
             response = (
@@ -574,6 +649,37 @@ class AccountRiskGuard:
                 "ad_error_ai_classifier_failed", error=str(exc_ai), fallback=fallback
             )
         return fallback
+
+    @staticmethod
+    def _is_user_restricted_error(exc: Exception | str) -> bool:
+        text = (
+            f"{exc.__class__.__name__}: {exc}".lower()
+            if isinstance(exc, Exception)
+            else str(exc).lower()
+        )
+        return any(
+            marker in text
+            for marker in (
+                "userrestrictederror",
+                "user_restricted_error",
+                "user_restricted",
+            )
+        )
+
+    async def _mark_telegram_rpc_restricted(self, account: Any) -> None:
+        account_id = self._account_id(account)
+        db_account = await self._get_db_account(account_id)
+        if db_account is None:
+            return
+        now = datetime.utcnow()
+        if db_account.status != AccountStatus.RESTRICTED:
+            db_account.restriction_previous_status = self._enum_value(db_account.status)
+        db_account.status = AccountStatus.RESTRICTED
+        db_account.restriction_source = "telegram_rpc"
+        db_account.restriction_reason = "user_restricted"
+        db_account.restriction_detected_at = now
+        self.db.add(db_account)
+        await self.db.flush()
 
     async def freeze_account(
         self,
@@ -833,7 +939,7 @@ class AccountRiskGuard:
         bindings = await self.db.execute(
             select(AccountAdBinding).where(
                 AccountAdBinding.account_id == account_id,
-                AccountAdBinding.enabled == True,
+                AccountAdBinding.enabled.is_(True),
             )
         )
         for binding in bindings.scalars().all():
@@ -885,6 +991,27 @@ class AccountRiskGuard:
         override = result.scalar_one_or_none()
         return max(1, int(override) if override is not None else configured_default)
 
+    async def peek_join_cooldown(self, account_id: int) -> int:
+        """Return remaining JOIN cooldown seconds WITHOUT reserving budget.
+
+        Lets schedulers skip an account before consuming a candidate group or
+        recording a futile attempt row; the key layout matches what
+        ``_reserve_budget`` writes (Lua and fallback paths alike).
+        """
+        client = self.cache.client
+        if client is None:
+            return 0
+        cooldown_key = f"risk:account:{int(account_id)}:cooldown:{AccountRiskAction.JOIN.value}"
+        raw = await self.cache.get(cooldown_key)
+        if not raw:
+            return 0
+        try:
+            deadline = float(raw)
+        except (TypeError, ValueError):
+            return 0
+        now = int(datetime.utcnow().timestamp())
+        return max(0, int(deadline - now))
+
     async def _reserve_budget(
         self,
         account_id: int,
@@ -911,12 +1038,15 @@ class AccountRiskGuard:
             AccountRiskAction.OWNED_GROUP_MESSAGE,
         }
         action_limit = 0 if action in business_budget_actions else int(budget.daily_limit)
-        cooldown_seconds = (
-            0 if action in business_budget_actions else int(budget.cooldown_seconds)
-        )
+        cooldown_seconds = 0 if action in business_budget_actions else int(budget.cooldown_seconds)
         now = int(datetime.utcnow().timestamp())
         ttl = 48 * 3600
-        reservation_key = self._owned_group_reservation_key(account_id, reservation_id)
+        if action == AccountRiskAction.OWNED_GROUP_MESSAGE:
+            reservation_key = self._owned_group_reservation_key(account_id, reservation_id)
+        elif action == AccountRiskAction.MANAGED_BOT_CREATE:
+            reservation_key = self._managed_bot_reservation_key(account_id, reservation_id)
+        else:
+            reservation_key = None
 
         client = self.cache.client
         if action == AccountRiskAction.OWNED_GROUP_MESSAGE and reservation_key:
@@ -957,6 +1087,45 @@ class AccountRiskGuard:
                 if incremented:
                     await self.cache.incr(outbound_key, -1)
                 raise
+            return True, "reserved", None
+
+        if (
+            action == AccountRiskAction.MANAGED_BOT_CREATE
+            and reservation_key
+            and hasattr(client, "eval")
+        ):
+            result = await client.eval(
+                ATOMIC_IDEMPOTENT_BUDGET_RESERVATION_LUA,
+                4,
+                action_key,
+                outbound_key,
+                cooldown_key,
+                reservation_key,
+                action_limit,
+                outbound_limit,
+                cooldown_seconds,
+                now,
+                ttl,
+            )
+            allowed, reason_code, retry_after = (int(value) for value in result)
+            if allowed:
+                return True, "reserved", None
+            reasons = {
+                1: f"{action.value}_cooldown",
+                2: f"{action.value}_daily_budget",
+                3: "account_outbound_message_hard_cap",
+            }
+            return (
+                False,
+                reasons.get(reason_code, "risk_budget_unavailable"),
+                retry_after or None,
+            )
+
+        if (
+            action == AccountRiskAction.MANAGED_BOT_CREATE
+            and reservation_key
+            and await self.cache.get(reservation_key)
+        ):
             return True, "reserved", None
 
         if hasattr(client, "eval"):
@@ -1000,7 +1169,19 @@ class AccountRiskGuard:
             await self.cache.expire(outbound_key, ttl)
         if cooldown_seconds > 0:
             await self.cache.set(cooldown_key, str(now + cooldown_seconds), ttl=cooldown_seconds)
+        if action == AccountRiskAction.MANAGED_BOT_CREATE and reservation_key:
+            await self.cache.set(reservation_key, action_key, ttl=ttl)
         return True, "reserved", None
+
+    @staticmethod
+    def _managed_bot_reservation_key(
+        account_id: int,
+        reservation_id: Optional[str],
+    ) -> Optional[str]:
+        value = str(reservation_id or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", value):
+            return None
+        return f"risk:account:{int(account_id)}:managed_bot_reservation:{value}"
 
     @staticmethod
     def _owned_group_reservation_key(

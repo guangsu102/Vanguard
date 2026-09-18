@@ -253,7 +253,7 @@ async def get_handover_options(
             TelegramAccount.account_type == AccountType.PROMOTER,
             TelegramAccount.is_active,
             TelegramAccount.status.notin_(
-                [AccountStatus.ERROR, AccountStatus.BANNED]
+                [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
             ),
             TelegramAccount.risk_level.in_(
                 [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]

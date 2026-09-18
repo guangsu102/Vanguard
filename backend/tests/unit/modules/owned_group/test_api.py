@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 
 import pytest
+from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
-from app.api.owned_groups import _is_admin_assignment_conflict
+from app.api.owned_groups import (
+    OwnedGroupOperationCreate,
+    OwnedGroupResourceSelection,
+    _build_selection_with_owner,
+    _is_admin_assignment_conflict,
+)
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.security import get_current_user
 from app.main import app
@@ -90,6 +97,44 @@ def test_other_integrity_error_is_not_admin_assignment_conflict():
     assert not _is_admin_assignment_conflict(error)
 
 
+def test_operation_plan_supports_2000_total_resources_including_owner():
+    explicit_resources = [
+        OwnedGroupResourceSelection(resource_type="user", resource_id=resource_id)
+        for resource_id in range(1, 2001)
+    ]
+    explicit_request = OwnedGroupOperationCreate(resources=explicit_resources)
+
+    selection, _digest, owner_auto_included = _build_selection_with_owner(
+        explicit_request.resources, 1
+    )
+
+    assert len(selection) == 2000
+    assert owner_auto_included is False
+
+    auto_request = OwnedGroupOperationCreate(resources=explicit_resources[1:])
+    selection, _digest, owner_auto_included = _build_selection_with_owner(auto_request.resources, 1)
+
+    assert len(selection) == 2000
+    assert owner_auto_included is True
+
+    overflow_request = OwnedGroupOperationCreate(
+        resources=[
+            OwnedGroupResourceSelection(resource_type="user", resource_id=resource_id)
+            for resource_id in range(2, 2002)
+        ]
+    )
+    with pytest.raises(HTTPException, match="At most 2000 resources"):
+        _build_selection_with_owner(overflow_request.resources, 1)
+
+    with pytest.raises(ValidationError):
+        OwnedGroupOperationCreate(
+            resources=[
+                OwnedGroupResourceSelection(resource_type="user", resource_id=resource_id)
+                for resource_id in range(1, 2002)
+            ]
+        )
+
+
 @pytest.mark.asyncio
 async def test_draft_records_creator(client, test_db):
     owner = TelegramAccount(
@@ -97,6 +142,8 @@ async def test_draft_records_creator(client, test_db):
         session_name="owned-group-draft-owner",
         account_type=AccountType.PROMOTER,
         is_active=True,
+        status=AccountStatus.ONLINE,
+        session_string=_valid_string_session(),
     )
     test_db.add(owner)
     await test_db.flush()
@@ -116,6 +163,53 @@ async def test_draft_records_creator(client, test_db):
     asset = await test_db.get(OwnedGroupAsset, response.json()["id"])
     assert asset is not None
     assert asset.created_by == 9001
+
+
+@pytest.mark.parametrize(
+    ("account_status", "spam_check_status", "risk_level", "expected_reason"),
+    [
+        (AccountStatus.RESTRICTED, "clear", "normal", "account_restricted"),
+        (AccountStatus.BANNED, "clear", "normal", "account_banned"),
+        (AccountStatus.ERROR, "clear", "normal", "account_error"),
+        (AccountStatus.ONLINE, "restricted", "normal", "account_spam_restricted"),
+        (AccountStatus.ONLINE, "clear", "limited", "account_cooldown"),
+        (AccountStatus.ONLINE, "clear", "frozen", "account_risk_blocked"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_draft_rejects_owner_that_is_not_healthy(
+    client,
+    test_db,
+    account_status,
+    spam_check_status,
+    risk_level,
+    expected_reason,
+):
+    owner = TelegramAccount(
+        identifier=f"unhealthy-owner-{expected_reason}",
+        session_name=f"unhealthy-owner-{expected_reason}",
+        account_type=AccountType.PROMOTER,
+        is_active=True,
+        status=account_status,
+        spam_check_status=spam_check_status,
+        risk_level=risk_level,
+        session_string=_valid_string_session(),
+    )
+    test_db.add(owner)
+    await test_db.commit()
+
+    response = await client.post(
+        "/api/owned-groups/drafts",
+        json={
+            "internal_name": f"draft-{expected_reason}",
+            "title": "Unhealthy Owner Draft",
+            "visibility": "private",
+            "owner_account_id": owner.id,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["reason"] == expected_reason
 
 
 @pytest.mark.asyncio

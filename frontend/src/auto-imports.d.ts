@@ -11,6 +11,7 @@ declare module 'vue' {
     AccountLoginDialog: typeof import('./components/AccountLoginDialog.vue')['default']
     AccountOperationalStatusPanel: typeof import('./components/AccountOperationalStatusPanel.vue')['default']
     AccountPersonaDrawer: typeof import('./components/accounts/AccountPersonaDrawer.vue')['default']
+    AccountProfileUpdateDialog: typeof import('./components/accounts/AccountProfileUpdateDialog.vue')['default']
     AdOnlyRecommendationPanel: typeof import('./components/AdOnlyRecommendationPanel.vue')['default']
     ClientListPagination: typeof import('./components/ClientListPagination.vue')['default']
     ECharts: typeof import('./components/ECharts.vue')['default']

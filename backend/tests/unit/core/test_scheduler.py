@@ -196,8 +196,9 @@ class TestCeleryConfig:
         assert set(auto_join_schedule["schedule"].minute) == set(range(0, 60, 5))
         assert auto_join_schedule["kwargs"] == {
             "scheduled": True,
-            "keywords_per_account": 10,
-            "max_groups_per_keyword": 20,
+            "max_accounts": 26,
+            "keywords_per_account": 30,
+            "max_groups_per_keyword": 50,
         }
         deliver_ads_schedule = beat_schedule["deliver-ads-every-10min"]
         assert deliver_ads_schedule["schedule"] == 600.0
@@ -293,6 +294,29 @@ class TestCeleryConfig:
 
         # Check for 5-minute tasks
         assert "health-check-accounts-every-5min" in beat_schedule
+
+    def test_beat_schedule_has_single_periodic_proxy_health_check(self):
+        """Only one periodic job may write proxy health observations."""
+        from app.celery import celery_app
+        from app.core.scheduler.tasks import check_proxy_status
+
+        assert check_proxy_status is not None
+        proxy_health_tasks = {
+            "app.core.scheduler.tasks.health_check_proxies",
+            "app.core.scheduler.tasks.check_proxy_status",
+        }
+        scheduled = [
+            (name, entry["task"])
+            for name, entry in celery_app.conf.beat_schedule.items()
+            if entry["task"] in proxy_health_tasks
+        ]
+
+        assert scheduled == [
+            (
+                "health-check-proxies-every-5min",
+                "app.core.scheduler.tasks.health_check_proxies",
+            )
+        ]
 
     def test_beat_schedule_has_hourly_tasks(self):
         """Test beat schedule includes hourly tasks."""

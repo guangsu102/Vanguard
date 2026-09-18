@@ -64,6 +64,7 @@ class AccountManager:
         api_id: str,
         api_hash: str,
         description: Optional[str] = None,
+        platform: str = "any",
     ) -> TelegramAPIConfig:
         """
         Create a new Telegram API configuration.
@@ -73,6 +74,8 @@ class AccountManager:
             api_id: Telegram API ID
             api_hash: Telegram API Hash
             description: Optional description
+            platform: Device platform the api_id was registered for
+                (windows/macos/android/ios/any)
 
         Returns:
             Created TelegramAPIConfig instance
@@ -88,13 +91,14 @@ class AccountManager:
             api_id=api_id,
             api_hash=api_hash,
             description=description,
+            platform=platform,
         )
 
         self.db.add(config)
         await self.db.commit()
         await self.db.refresh(config)
 
-        self.logger.info("api_config_created", name=name, api_id=api_id)
+        self.logger.info("api_config_created", name=name, api_id=api_id, platform=platform)
         return config
 
     async def get_api_config(self, name: str) -> Optional[TelegramAPIConfig]:

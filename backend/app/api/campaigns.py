@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import String, cast, desc, func, or_, select
+from sqlalchemy import String, cast, delete, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.guardian_validation import (
@@ -19,6 +19,7 @@ from app.api.guardian_validation import (
 from app.core.campaign.models import (
     Campaign,
     CampaignDistributionMode,
+    CampaignExecution,
     CampaignScope,
     CampaignTracking,
     CampaignTriggerTiming,
@@ -1122,7 +1123,13 @@ async def delete_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    await db.delete(campaign)
+    # The legacy backref has no delete cascade, so ORM deletion tries to
+    # NULL the non-nullable execution foreign key. Delete children explicitly
+    # and issue a Core DELETE so database cascades handle any other dependents.
+    await db.execute(
+        delete(CampaignExecution).where(CampaignExecution.campaign_id == campaign_id)
+    )
+    await db.execute(delete(Campaign).where(Campaign.id == campaign_id))
     await db.commit()
 
 

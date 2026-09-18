@@ -76,11 +76,15 @@ class ActionExecutor:
             )
         
         try:
-            if message_id and action in [ViolationAction.WARN, ViolationAction.MUTE]:
-                await self.delete_message(chat_id, message_id)
-            
-            if action == ViolationAction.DELETE or (message_id and action == ViolationAction.WARN):
-                result = await self.delete_message(chat_id, message_id) if message_id else False
+            if action == ViolationAction.WARN:
+                if message_id is None:
+                    return ActionResult(
+                        success=True,
+                        action=action,
+                        message="Warning recorded"
+                    )
+
+                result = await self.delete_message(chat_id, message_id)
                 return ActionResult(
                     success=result,
                     action=action,
@@ -88,6 +92,8 @@ class ActionExecutor:
                 )
             
             elif action == ViolationAction.MUTE:
+                if message_id is not None:
+                    await self.delete_message(chat_id, message_id)
                 return await self.mute_user(chat_id, user_id, duration or 300)
             
             elif action == ViolationAction.BAN:
@@ -95,13 +101,6 @@ class ActionExecutor:
             
             elif action == ViolationAction.KICK:
                 return await self.kick_user(chat_id, user_id)
-            
-            elif action == ViolationAction.WARN:
-                return ActionResult(
-                    success=True,
-                    action=action,
-                    message="Warning recorded"
-                )
             
             else:
                 return ActionResult(

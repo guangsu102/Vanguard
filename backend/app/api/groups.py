@@ -694,7 +694,7 @@ async def join_group_by_link(
         raise HTTPException(status_code=404, detail="Promoter account not found")
     if account.account_type != AccountType.PROMOTER:
         raise HTTPException(status_code=400, detail="Only promoter accounts can join ad groups")
-    if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+    if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
         raise HTTPException(status_code=400, detail="Promoter account is inactive or unavailable")
     if account.risk_level in {
         AccountRiskLevel.FROZEN.value,

@@ -11,7 +11,6 @@ from typing import Optional
 
 import structlog
 
-
 logger = structlog.get_logger()
 
 
@@ -37,6 +36,8 @@ QUEUE_CONFIGS = {
     "broadcast": {"concurrency": _env_int("CELERY_BROADCAST_CONCURRENCY", 3), "prefetch_multiplier": 1},
     "automation": {"concurrency": _env_int("CELERY_AUTOMATION_CONCURRENCY", 3), "prefetch_multiplier": 1},
     "resource_search": {"concurrency": 1, "prefetch_multiplier": 1},
+    "account_spam": {"concurrency": 1, "prefetch_multiplier": 1},
+    "account_profile_update": {"concurrency": 1, "prefetch_multiplier": 1},
     "qq_commands": {"concurrency": _env_int("CELERY_QQ_COMMANDS_CONCURRENCY", 2), "prefetch_multiplier": 1},
     # Owned-group operations are deliberately isolated from the general
     # automation queues.  They can hold a Telegram account lease while waiting
@@ -121,6 +122,8 @@ def start_multi_workers() -> None:
         ("worker-default", ["default", "bulk_import", "proxy_validation"], "default-worker@%h"),
         ("worker-automation", ["automation"], "automation-worker@%h"),
         ("worker-qq", ["qq_commands"], "qq-worker@%h"),
+        ("worker-account-spam", ["account_spam"], "account-spam-worker@%h"),
+        ("worker-account-profile-update", ["account_profile_update"], "account-profile-update-worker@%h"),
         ("worker-owned-group", ["owned_group"], "owned-group-worker@%h"),
     ]
 

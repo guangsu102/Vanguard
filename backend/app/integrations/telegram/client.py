@@ -6,9 +6,10 @@ Supports both Bot Token and User Session authentication.
 """
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
@@ -18,6 +19,13 @@ from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
 
 logger = structlog.get_logger()
+
+
+def _suppress_http_transport_info_logs() -> None:
+    """Keep Bot API credentials out of dependency request logs."""
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class TelegramAPIError(Exception):
@@ -40,7 +48,7 @@ class RateLimitError(TelegramAPIError):
 class TelegramConfig:
     """Telegram API configuration."""
 
-    bot_token: Optional[str] = None
+    bot_token: Optional[str] = field(default=None, repr=False)
     api_id: Optional[int] = None
     api_hash: Optional[str] = None
     session_name: str = "vanguard"
@@ -58,6 +66,7 @@ class User:
     last_name: Optional[str] = None
     is_bot: bool = False
     language_code: Optional[str] = None
+    can_manage_bots: bool = False
 
     @property
     def full_name(self) -> str:
@@ -83,6 +92,7 @@ class User:
             last_name=data.get("last_name"),
             is_bot=data.get("is_bot", False),
             language_code=data.get("language_code"),
+            can_manage_bots=bool(data.get("can_manage_bots", False)),
         )
 
 
@@ -170,6 +180,7 @@ class TelegramClient:
         Args:
             config: Telegram configuration
         """
+        _suppress_http_transport_info_logs()
         self.config = config
         self._client: Optional[httpx.AsyncClient] = None
         self._rate_limiter = RateLimiter()
@@ -326,6 +337,31 @@ class TelegramClient:
         """
         data = await self._request("getMe")
         return User.from_dict(data)
+
+    async def get_managed_bot_token(self, user_id: int) -> str:
+        """Fetch a managed Bot token without logging or embedding it in errors."""
+
+        method = "getManagedBotToken"
+        try:
+            result = await self._request(method, {"user_id": int(user_id)})
+        except TelegramAPIError as exc:
+            raise TelegramAPIError(
+                "Managed bot token request failed",
+                code=exc.code,
+                method=method,
+            ) from None
+        except Exception:
+            raise TelegramAPIError(
+                "Managed bot token request failed",
+                method=method,
+            ) from None
+        token = str(result or "").strip()
+        if not token:
+            raise TelegramAPIError(
+                "Managed bot token was not returned",
+                method=method,
+            )
+        return token
 
     async def get_updates(
         self,

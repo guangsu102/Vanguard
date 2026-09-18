@@ -42,6 +42,7 @@ from app.modules.owned_group.messaging_policy_service import (
 )
 from app.modules.owned_group.messaging_schemas import (
     ExecutionApprove,
+    ExecutionEnvelope,
     OwnedGroupTemplateWrite,
     PolicyCreate,
     PolicyUpdate,
@@ -1075,6 +1076,10 @@ async def test_admin_execution_response_summarizes_legacy_raw_prompt_context(
             "recent_context": [{"text": "CANARY_RECENT_CONTEXT"}],
             "variables": {"group_name": "CANARY_GROUP_NAME"},
             "request_fingerprint": "fingerprint-legacy",
+            "business_snapshot_v1": {
+                "allowed_topics": ["产品支持", "FAQ"],
+                "group_title": "测试群",
+            },
         },
         idempotency_key="legacy-admin-redaction",
         correlation_id="legacy-redaction-test",
@@ -1097,6 +1102,18 @@ async def test_admin_execution_response_summarizes_legacy_raw_prompt_context(
     assert response["prompt_context"]["request_fingerprint"] == "fingerprint-legacy"
     assert response["prompt_context"]["source_message_present"] is True
     assert response["prompt_context"]["recent_context_message_count"] == 1
+    validated = ExecutionEnvelope.model_validate(
+        {
+            "data": response,
+            "correlation_id": "legacy-redaction-test",
+        }
+    )
+    business_snapshot = validated.data.prompt_context.business_snapshot_v1
+    assert business_snapshot is not None
+    assert business_snapshot.model_dump() == {
+        "allowed_topics": ["产品支持", "FAQ"],
+        "group_title": "测试群",
+    }
     for canary in (
         "CANARY_MEMBER_MESSAGE",
         "CANARY_MEMBER_NAME",

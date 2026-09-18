@@ -285,7 +285,7 @@ class AdCapacityUpdate(BaseModel):
         description="写权限探针失败或探针广告被删除时是否封禁整个群的广告",
     )
     ad_policy_ai_enabled: bool = True
-    ad_policy_ai_model: str = Field(default="gpt-5.6-terra", min_length=1, max_length=100)
+    ad_policy_ai_model: str = Field(default="gpt-5.6-sol", min_length=1, max_length=100)
     ad_policy_ai_timeout_seconds: int = Field(default=45, ge=5, le=120)
     ad_policy_ai_min_confidence: int = Field(default=95, ge=90, le=100)
     ad_policy_ai_require_second_pass: bool = Field(
@@ -1187,6 +1187,7 @@ def _unknown_group_ad_policy_readiness(
         if not account.is_active or account_status in {
             AccountStatus.ERROR.value,
             AccountStatus.BANNED.value,
+            AccountStatus.RESTRICTED.value,
         }:
             reasons.add("account_unavailable")
             continue
@@ -1879,7 +1880,7 @@ async def _get_or_create_operation_config(
         select(TelegramAccount)
         .options(lazyload(TelegramAccount.operation_config))
         .where(TelegramAccount.id == account_id)
-        .with_for_update()
+        .with_for_update(of=TelegramAccount)
     )
     account = account_result.scalar_one_or_none()
     if account is None:
@@ -1893,7 +1894,7 @@ async def _get_or_create_operation_config(
         select(AccountOperationConfig)
         .options(lazyload(AccountOperationConfig.account))
         .where(AccountOperationConfig.account_id == account_id)
-        .with_for_update()
+        .with_for_update(of=AccountOperationConfig)
     )
     config = result.scalar_one_or_none()
     if config:
@@ -1919,7 +1920,7 @@ async def _lock_operation_configs_batch(
         .options(lazyload(TelegramAccount.operation_config))
         .where(TelegramAccount.id.in_(sorted_ids))
         .order_by(TelegramAccount.id.asc())
-        .with_for_update()
+        .with_for_update(of=TelegramAccount)
     )
     accounts = {int(account.id): account for account in account_rows.scalars().all()}
 
@@ -1941,7 +1942,7 @@ async def _lock_operation_configs_batch(
             .options(lazyload(AccountOperationConfig.account))
             .where(AccountOperationConfig.account_id.in_(eligible_ids))
             .order_by(AccountOperationConfig.account_id.asc())
-            .with_for_update()
+            .with_for_update(of=AccountOperationConfig)
         )
         configs = {
             int(config.account_id): config for config in config_rows.scalars().all()
@@ -2971,6 +2972,11 @@ async def _validate_ad_binding_accounts(
             raise HTTPException(
                 status_code=409,
                 detail=f"Errored account cannot be bound: {account_id}",
+            )
+        if account.status == AccountStatus.RESTRICTED:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Restricted account cannot be bound: {account_id}",
             )
         if not account.is_active:
             raise HTTPException(

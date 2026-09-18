@@ -12,6 +12,7 @@ from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.guardian_validation import ensure_guardian_bot_account, require_guardian_reader
+from app.core.account.bot_credentials import resolve_guardian_bot_token
 from app.core.account.models import (
     AccountRiskLevel,
     AccountStatus,
@@ -236,13 +237,13 @@ async def create_managed_channel(
         raise HTTPException(
             status_code=400, detail="creator_account_id must reference a promoter user account"
         )
-    if not creator.is_active or creator.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+    if not creator.is_active or creator.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
         raise HTTPException(status_code=400, detail="Creator account is inactive or unavailable")
     if creator.risk_level in {AccountRiskLevel.FROZEN.value, AccountRiskLevel.QUARANTINED.value}:
         raise HTTPException(status_code=400, detail="Creator account is frozen or quarantined")
 
     profile = await _enabled_guardian_profile(db, request.bot_account_id)
-    bot_client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    bot_client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     try:
         bot_user = await bot_client.get_me()
         profile.bot_user_id = bot_user.user_id
@@ -544,7 +545,7 @@ async def _channel_creator_account(
     account = await db.get(TelegramAccount, creator_account_id)
     if not account or account.account_type != AccountType.PROMOTER:
         raise HTTPException(status_code=400, detail="Channel creator account is unavailable")
-    if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+    if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
         raise HTTPException(status_code=400, detail="Channel creator account is inactive")
     return account
 
@@ -710,7 +711,7 @@ async def sync_confirmed_groups_for_bot(
             },
         )
 
-    client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     synced = 0
     skipped = 0
     errors: list[dict[str, Any]] = []
@@ -954,7 +955,7 @@ async def set_managed_group_mute_all(
         )
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
-    client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     snapshot = _permissions_dict(binding)
     try:
         member = await _assert_bot_admin_permission(
@@ -1030,7 +1031,7 @@ async def send_managed_channel_message(
     await _require_owned_governance_action(db, binding)
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
-    client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     try:
         member = await _assert_bot_admin_permission(
             client, profile, binding.telegram_group_id, "can_post_messages"
@@ -1169,7 +1170,7 @@ async def refresh_managed_channel_status(
     await _require_owned_governance_action(db, binding)
 
     profile = await _enabled_guardian_profile(db, binding.bot_account_id)
-    client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     try:
         bot_user = await client.get_me()
         member = await client.get_chat_member(binding.telegram_group_id, bot_user.user_id)
@@ -1291,7 +1292,7 @@ async def send_managed_group_pinned_message(
     if not profile or not profile.enabled:
         raise HTTPException(status_code=400, detail="Guardian bot profile is disabled or missing")
 
-    client = TelegramClient(TelegramConfig(bot_token=profile.bot_token))
+    client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token)))
     execution = TelegramExecutionService(AccountRiskGuard(db))
     try:
         await _assert_bot_admin_permission(

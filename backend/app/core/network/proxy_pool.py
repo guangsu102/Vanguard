@@ -21,10 +21,12 @@ from typing import Optional
 
 import aiohttp
 import structlog
-from sqlalchemy import select, delete, func
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import Proxy, ProxyType, TelegramAccount
+from app.core.account.proxy_policy_events import refresh_static_proxy_bindings
+from app.core.account.proxy_resolver import MAX_STATIC_PROXY_BINDINGS
 from app.core.network.ssrf_guard import get_safe_health_check_url, validate_url
 
 logger = structlog.get_logger()
@@ -44,6 +46,7 @@ class ProxyConfig:
         username: Auth username (optional)
         password: Auth password (optional)
         country: Country code (ISO 3166-1 alpha-2)
+        is_enabled: Operator-controlled enable/disable state
     """
 
     proxy_id: int
@@ -54,6 +57,9 @@ class ProxyConfig:
     protocol: str = "http"
     username: Optional[str] = None
     password: Optional[str] = None
+    # Persisted Proxy.is_active is the operator-controlled switch. Keep that
+    # separate from observed health so connectivity checks cannot override it.
+    is_enabled: bool = True
 
     def to_url(self) -> str:
         """Convert to proxy URL."""
@@ -69,7 +75,7 @@ class ProxyHealth:
 
     Attributes:
         proxy_id: Proxy ID
-        is_active: Whether proxy is active
+        is_active: Whether observed health is usable
         success_rate: Success rate (0-1)
         avg_latency: Average latency in ms
         last_checked: Last check time
@@ -137,14 +143,16 @@ class ProxyPool:
                 protocol=proxy.protocol,
                 username=proxy.username,
                 password=proxy.password,
+                is_enabled=proxy.is_active,
             )
+            consecutive_failures = proxy.consecutive_failures or 0
             self._health[proxy.id] = ProxyHealth(
                 proxy_id=proxy.id,
-                is_active=proxy.is_active,
+                is_active=consecutive_failures < 3,
                 success_rate=float(proxy.success_rate or 0),
                 avg_latency=proxy.avg_latency or 0,
                 last_checked=proxy.last_checked,
-                consecutive_failures=proxy.consecutive_failures or 0,
+                consecutive_failures=consecutive_failures,
             )
 
         self.logger.info("proxies_synced_from_db", count=len(proxy_rows))
@@ -217,6 +225,7 @@ class ProxyPool:
             protocol=protocol,
             username=username,
             password=password,
+            is_enabled=True,
         )
 
         self._health[proxy.id] = ProxyHealth(proxy_id=proxy.id)
@@ -313,6 +322,16 @@ class ProxyPool:
             proxy_id: Proxy database ID
         """
         async with self._lock:
+            current_proxy_id = self._account_bindings.get(account_id)
+            if current_proxy_id != proxy_id:
+                binding_count = sum(
+                    1 for bound_proxy_id in self._account_bindings.values()
+                    if bound_proxy_id == proxy_id
+                )
+                if binding_count >= MAX_STATIC_PROXY_BINDINGS:
+                    raise ValueError(
+                        f"Proxy {proxy_id} already has {MAX_STATIC_PROXY_BINDINGS} bound accounts"
+                    )
             self._account_bindings[account_id] = proxy_id
 
         self.logger.info(
@@ -365,11 +384,22 @@ class ProxyPool:
             ProxyConfig or None
         """
         async with self._lock:
+            # The success rate ranks usable proxies; manual enablement, observed
+            # health, and per-proxy account capacity decide eligibility.
+            binding_counts: dict[int, int] = {}
+            for bound_proxy_id in self._account_bindings.values():
+                binding_counts[bound_proxy_id] = binding_counts.get(bound_proxy_id, 0) + 1
+            current_proxy_id = (
+                self._account_bindings.get(account_id) if account_id is not None else None
+            )
             available = [
                 p for p in self._proxies.values()
-                if self._health.get(p.proxy_id, ProxyHealth(p.proxy_id)).is_active
-                and self._health.get(p.proxy_id, ProxyHealth(p.proxy_id)).success_rate >= 0.8
-                and p.proxy_id not in self._account_bindings.values()
+                if p.is_enabled
+                and self._health.get(p.proxy_id, ProxyHealth(p.proxy_id)).is_active
+                and (
+                    p.proxy_id == current_proxy_id
+                    or binding_counts.get(p.proxy_id, 0) < MAX_STATIC_PROXY_BINDINGS
+                )
             ]
 
             # Country matching
@@ -391,6 +421,7 @@ class ProxyPool:
             available.sort(
                 key=lambda p: (
                     -self._health.get(p.proxy_id, ProxyHealth(p.proxy_id)).success_rate,
+                    binding_counts.get(p.proxy_id, 0),
                     self._health.get(p.proxy_id, ProxyHealth(p.proxy_id)).avg_latency,
                 )
             )
@@ -416,6 +447,7 @@ class ProxyPool:
                 continue
 
             health = self._health.get(pid, ProxyHealth(pid))
+            was_operationally_healthy = health.consecutive_failures < 3
             try:
                 start_time = time.time()
 
@@ -445,14 +477,15 @@ class ProxyPool:
 
                         health.last_checked = datetime.utcnow()
                         health.avg_latency = latency
-                        health.is_active = is_active
 
                         if is_active:
+                            health.is_active = True
                             health.success_rate = min(1.0, health.success_rate + 0.1)
                             health.consecutive_failures = 0
                         else:
                             health.consecutive_failures += 1
                             health.success_rate = max(0, health.success_rate - 0.2)
+                            health.is_active = health.consecutive_failures < 3
 
                         results[pid] = {
                             "success": is_active,
@@ -461,9 +494,9 @@ class ProxyPool:
                         }
 
             except Exception as e:
-                health.is_active = False
                 health.consecutive_failures += 1
                 health.success_rate = max(0, health.success_rate - 0.2)
+                health.is_active = health.consecutive_failures < 3
                 health.last_checked = datetime.utcnow()
 
                 results[pid] = {
@@ -475,12 +508,35 @@ class ProxyPool:
             proxy_result = await self.db.execute(select(Proxy).where(Proxy.id == pid))
             proxy_obj = proxy_result.scalar_one_or_none()
             if proxy_obj:
-                proxy_obj.is_active = health.is_active
+                # is_active is an operator-controlled enable/disable flag.
+                # Health checks only persist observations.
                 proxy_obj.avg_latency = health.avg_latency
                 proxy_obj.success_rate = health.success_rate
                 proxy_obj.last_checked = health.last_checked
                 proxy_obj.consecutive_failures = health.consecutive_failures
                 await self.db.commit()
+
+                is_operationally_healthy = health.consecutive_failures < 3
+                if (
+                    not is_operationally_healthy
+                    or was_operationally_healthy != is_operationally_healthy
+                ):
+                    reason = (
+                        "static_proxy_health_recovered"
+                        if is_operationally_healthy
+                        else "static_proxy_health_unavailable"
+                    )
+                    refreshed = await refresh_static_proxy_bindings(
+                        self.db,
+                        pid,
+                        reason=reason,
+                    )
+                    self.logger.info(
+                        "static_proxy_health_binding_refresh_published",
+                        proxy_id=pid,
+                        is_healthy=is_operationally_healthy,
+                        refreshed_accounts=refreshed,
+                    )
 
         return results
 
@@ -538,7 +594,7 @@ class ProxyPool:
         if health.consecutive_failures >= 3:
             health.is_active = False
             self.logger.warning(
-                "proxy_disabled",
+                "proxy_marked_unhealthy",
                 proxy_id=proxy_id,
                 consecutive_failures=health.consecutive_failures,
             )

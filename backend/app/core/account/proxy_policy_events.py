@@ -8,6 +8,10 @@ import json
 from dataclasses import dataclass
 
 import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.account.models import ProxyMode, TelegramAccount
 
 ACCOUNT_PROXY_POLICY_CHANNEL = "vanguard:account:proxy-policy"
 ACCOUNT_PROXY_POLICY_STATE_PREFIX = "vanguard:account:proxy-policy:state"
@@ -31,6 +35,95 @@ def _state_key(account_id: int) -> str:
 
 def _version_key(account_id: int) -> str:
     return f"{ACCOUNT_PROXY_POLICY_VERSION_PREFIX}:{account_id}"
+
+
+async def get_bound_static_accounts(
+    db: AsyncSession,
+    proxy_id: int,
+    *,
+    populate_existing: bool = False,
+) -> list[TelegramAccount]:
+    """Return accounts whose persisted policy still references a static proxy."""
+    query = select(TelegramAccount).where(TelegramAccount.static_proxy_id == proxy_id)
+    if populate_existing:
+        query = query.execution_options(populate_existing=True)
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
+async def get_accounts_by_ids(
+    db: AsyncSession,
+    account_ids: list[int],
+    *,
+    populate_existing: bool = False,
+) -> list[TelegramAccount]:
+    """Reload affected accounts by ID after a proxy mutation commits."""
+    if not account_ids:
+        return []
+    query = select(TelegramAccount).where(TelegramAccount.id.in_(account_ids))
+    if populate_existing:
+        query = query.execution_options(populate_existing=True)
+    result = await db.execute(query)
+    accounts_by_id = {account.id: account for account in result.scalars().all()}
+    return [accounts_by_id[account_id] for account_id in account_ids if account_id in accounts_by_id]
+
+
+async def refresh_bound_static_accounts(
+    accounts: list[TelegramAccount],
+    *,
+    reason: str,
+) -> int:
+    """Evict local clients and publish a policy generation for every account."""
+    from app.core.account.pool import invalidate_account_in_all_pools
+
+    failures: list[Exception] = []
+    for account in accounts:
+        try:
+            await invalidate_account_in_all_pools(account.id, reason=reason)
+        except Exception as exc:
+            failures.append(exc)
+            logger.warning(
+                "static_proxy_bound_account_local_invalidation_failed",
+                account_id=account.id,
+                reason=reason,
+                error=str(exc),
+            )
+
+        proxy_mode = getattr(account.proxy_mode, "value", str(account.proxy_mode))
+        static_proxy_id = (
+            account.static_proxy_id if proxy_mode == ProxyMode.STATIC.value else None
+        )
+        try:
+            await publish_account_proxy_policy_changed(
+                account.id,
+                proxy_mode,
+                static_proxy_id,
+            )
+        except Exception as exc:
+            failures.append(exc)
+            logger.warning(
+                "static_proxy_bound_account_policy_publish_failed",
+                account_id=account.id,
+                reason=reason,
+                error=str(exc),
+            )
+
+    if failures:
+        raise RuntimeError(
+            f"Failed to refresh {len(failures)} static proxy account operations"
+        ) from failures[0]
+    return len(accounts)
+
+
+async def refresh_static_proxy_bindings(
+    db: AsyncSession,
+    proxy_id: int,
+    *,
+    reason: str,
+) -> int:
+    """Propagate a static proxy availability change to all bound accounts."""
+    accounts = await get_bound_static_accounts(db, proxy_id)
+    return await refresh_bound_static_accounts(accounts, reason=reason)
 
 
 def _decode_state(raw: object) -> ProxyPolicyState | None:

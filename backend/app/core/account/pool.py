@@ -55,6 +55,10 @@ TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS = 2
 TELEGRAM_CONNECTION_TIMEOUT_SECONDS = 20
 
 
+class StaticProxyUnavailableError(RuntimeError):
+    """Raised when a static proxy cannot be safely loaded for an account."""
+
+
 def _resolve_account_api_credentials(account: "TelegramAccount") -> tuple[str, str]:
     """Resolve account API credentials from DB config, falling back to env defaults."""
     api_config = getattr(account, "api_config", None)
@@ -116,6 +120,7 @@ class TelegramAccountWrapper:
     operation_lease: Optional[AccountOperationLeaseHandle] = field(default=None, repr=False)
     operation_lease_renewal_task: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     operation_lease_lost: bool = field(default=False, repr=False)
+    release_status_override: Optional[AccountStatus] = field(default=None, repr=False)
 
     def get_client(self) -> Optional[TelegramClient]:
         """Get the bound Telegram client."""
@@ -310,8 +315,44 @@ class AccountPool:
         await self._operation_lease_manager.release(handle)
 
     def set_static_proxy_resolver(self, resolver: Optional[StaticProxyResolver]) -> None:
-        """Set a fallback resolver for static proxies not preloaded from DB."""
+        """Set a custom validating resolver for static proxies."""
         self._static_proxy_resolver = resolver
+
+    async def _resolve_account_static_proxy(
+        self,
+        *,
+        account_id: int,
+        proxy_mode: ProxyMode,
+        static_proxy_id: Optional[int],
+    ) -> Optional[ResolvedProxy]:
+        """Resolve static proxies through validation before pool admission."""
+        if proxy_mode != ProxyMode.STATIC:
+            return None
+        if static_proxy_id is None:
+            raise StaticProxyUnavailableError(
+                f"Static proxy is not configured for account {account_id}"
+            )
+
+        resolver = self._static_proxy_resolver
+        try:
+            if resolver is not None:
+                resolved = await resolver(static_proxy_id)
+            else:
+                from app.core.account.proxy_resolver import resolve_static_proxy
+                from app.core.database import get_db_session
+
+                async with get_db_session() as db:
+                    resolved = await resolve_static_proxy(db, static_proxy_id)
+        except Exception as exc:
+            raise StaticProxyUnavailableError(
+                f"Static proxy {static_proxy_id} is unavailable for account {account_id}"
+            ) from exc
+
+        if not isinstance(resolved, ResolvedProxy) or resolved.proxy_id != static_proxy_id:
+            raise StaticProxyUnavailableError(
+                f"Static proxy resolver returned an unexpected proxy for account {account_id}"
+            )
+        return resolved
 
     @staticmethod
     def _policy_matches(account: TelegramAccountWrapper, state: ProxyPolicyState) -> bool:
@@ -418,6 +459,7 @@ class AccountPool:
         api_hash: str,
         session_string: Optional[str] = None,
         account_type: AccountType = AccountType.PROMOTER,
+        status: AccountStatus = AccountStatus.OFFLINE,
         api_config_name: str = "default",
         fingerprint_id: Optional[str] = None,
         proxy_mode: ProxyMode = ProxyMode.DYNAMIC,
@@ -461,6 +503,7 @@ class AccountPool:
                 api_hash=api_hash,
                 session_string=session_string,
                 account_type=account_type,
+                status=status,
                 api_config_name=api_config_name,
                 fingerprint_id=fingerprint_id,
                 proxy_mode=proxy_mode,
@@ -476,7 +519,7 @@ class AccountPool:
             self.logger.info(
                 "account_added",
                 session_name=session_name,
-                phone=phone,
+                account_id=account_id,
                 country=country_code,
                 total_accounts=len(self._accounts),
             )
@@ -513,19 +556,31 @@ class AccountPool:
                 )
             return existing
 
-        api_id, api_hash = _resolve_account_api_credentials(account)
-        static_proxy = None
-        db_proxy = getattr(account, "__dict__", {}).get("static_proxy")
-        if db_proxy is not None:
-            static_proxy = ResolvedProxy(
-                protocol=db_proxy.protocol,
-                host=db_proxy.host,
-                port=db_proxy.port,
-                username=db_proxy.username,
-                password=db_proxy.password,
-                source="static",
-                proxy_id=db_proxy.id,
+        if not (account.device_model and account.system_version and account.app_version):
+            # Legacy rows may lack a device fingerprint; regenerate one so the
+            # client never falls back to Telethon defaults. Values are set on
+            # the caller's session object and persist with its next commit.
+            profile = FingerprintManager().generate_telegram_device_profile(
+                account.fingerprint_id
+                or account.phone
+                or account.identifier
+                or account.session_name
+                or str(account.id),
+                device_model=account.device_model,
+                system_version=account.system_version,
+                app_version=account.app_version,
             )
+            account.device_model = account.device_model or profile["device_model"]
+            account.system_version = account.system_version or profile["system_version"]
+            account.app_version = account.app_version or profile["app_version"]
+            account.fingerprint_id = account.fingerprint_id or profile["fingerprint_id"]
+
+        api_id, api_hash = _resolve_account_api_credentials(account)
+        static_proxy = await self._resolve_account_static_proxy(
+            account_id=account.id,
+            proxy_mode=proxy_mode,
+            static_proxy_id=static_proxy_id,
+        )
         return await self.add_account(
             account_id=account.id,
             phone=account.phone,
@@ -535,6 +590,7 @@ class AccountPool:
             api_hash=api_hash,
             session_string=decrypt_session_string(account.session_string),
             account_type=getattr(account, "account_type", AccountType.PROMOTER),
+            status=getattr(account, "status", AccountStatus.OFFLINE),
             api_config_name=account.api_config_name,
             fingerprint_id=account.fingerprint_id,
             proxy_mode=proxy_mode,
@@ -695,6 +751,7 @@ class AccountPool:
         require_session: bool = True,
         operation_lease: Optional[AccountOperationLeaseHandle] = None,
         raise_on_lease_failure: bool = False,
+        allow_restricted: bool = False,
     ) -> Optional[TelegramAccountWrapper]:
         """
         Acquire a specific account by database ID.
@@ -719,11 +776,14 @@ class AccountPool:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
                 return None
 
-            if selected.status not in [
+            allowed_statuses = [
                 AccountStatus.IDLE,
                 AccountStatus.ONLINE,
                 AccountStatus.OFFLINE,
-            ]:
+            ]
+            if allow_restricted:
+                allowed_statuses.append(AccountStatus.RESTRICTED)
+            if selected.status not in allowed_statuses:
                 self.logger.warning(
                     "account_not_available",
                     account_id=account_id,
@@ -753,6 +813,11 @@ class AccountPool:
                 return None
 
             previous_status = selected.status
+            selected.release_status_override = (
+                AccountStatus.RESTRICTED
+                if previous_status == AccountStatus.RESTRICTED
+                else None
+            )
             selected.status = AccountStatus.WORKING
 
             try:
@@ -765,11 +830,17 @@ class AccountPool:
                     selected.client = await self._create_client(selected)
             except asyncio.CancelledError:
                 selected.status = previous_status
+                selected.release_status_override = None
                 if operation_lease is None:
                     await self._release_operation_lease(selected)
                 raise
             except Exception as e:
-                selected.status = AccountStatus.ERROR
+                selected.status = (
+                    AccountStatus.RESTRICTED
+                    if previous_status == AccountStatus.RESTRICTED
+                    else AccountStatus.ERROR
+                )
+                selected.release_status_override = None
                 if operation_lease is None:
                     await self._release_operation_lease(selected)
                 self.logger.warning(
@@ -813,7 +884,7 @@ class AccountPool:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
                 return None
 
-            if selected.status in [AccountStatus.ERROR, AccountStatus.BANNED]:
+            if selected.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
                 self.logger.warning(
                     "account_not_connectable",
                     account_id=account_id,
@@ -1092,8 +1163,11 @@ class AccountPool:
                 account.client = None
             await self._release_operation_lease(account)
             account.status = (
-                AccountStatus.ERROR if account.operation_lease_lost else AccountStatus.IDLE
+                AccountStatus.ERROR
+                if account.operation_lease_lost
+                else (account.release_status_override or AccountStatus.IDLE)
             )
+            account.release_status_override = None
 
             self.logger.debug(
                 "account_released",
@@ -1268,7 +1342,7 @@ class AccountPool:
                 if account.session_exists:
                     results["with_session"] += 1
 
-                if account.status not in [AccountStatus.ERROR, AccountStatus.BANNED]:
+                if account.status not in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
                     results["healthy"] += 1
                     total_health += account.health_score
 
@@ -1354,6 +1428,7 @@ class AccountPool:
                 keep_runtime_status = account.status not in [
                     AccountStatus.ERROR,
                     AccountStatus.BANNED,
+                    AccountStatus.RESTRICTED,
                 ] and (
                     existing.status == AccountStatus.WORKING
                     or (
@@ -1370,18 +1445,24 @@ class AccountPool:
                 existing.api_hash = api_hash or existing.api_hash
                 existing.account_type = getattr(account, "account_type", existing.account_type)
                 existing.country_code = account.country_code
-                static_proxy = None
-                db_proxy = getattr(account, "__dict__", {}).get("static_proxy")
-                if db_proxy is not None:
-                    static_proxy = ResolvedProxy(
-                        protocol=db_proxy.protocol,
-                        host=db_proxy.host,
-                        port=db_proxy.port,
-                        username=db_proxy.username,
-                        password=db_proxy.password,
-                        source="static",
-                        proxy_id=db_proxy.id,
+                try:
+                    static_proxy = await self._resolve_account_static_proxy(
+                        account_id=account.id,
+                        proxy_mode=new_proxy_mode,
+                        static_proxy_id=new_static_proxy_id,
                     )
+                except StaticProxyUnavailableError as exc:
+                    await self.invalidate_account(
+                        account.id,
+                        reason="static_proxy_unavailable",
+                    )
+                    self.logger.warning(
+                        "account_static_proxy_unavailable",
+                        account_id=account.id,
+                        static_proxy_id=new_static_proxy_id,
+                        error=safe_exception_message(exc, max_length=500),
+                    )
+                    continue
                 proxy_policy_changed = (
                     existing.proxy_mode != new_proxy_mode
                     or existing.static_proxy_id != new_static_proxy_id
@@ -1413,7 +1494,16 @@ class AccountPool:
                 existing.system_version = account.system_version
                 existing.app_version = account.app_version
             else:
-                await self.add_account_from_db(account)
+                try:
+                    await self.add_account_from_db(account)
+                except StaticProxyUnavailableError as exc:
+                    self.logger.warning(
+                        "account_static_proxy_unavailable",
+                        account_id=account.id,
+                        static_proxy_id=new_static_proxy_id,
+                        error=safe_exception_message(exc, max_length=500),
+                    )
+                    continue
                 synced += 1
 
         self.logger.info("accounts_synced_from_db", count=synced)

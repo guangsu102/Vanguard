@@ -20,6 +20,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.owned_groups import require_owned_group_operator
+from app.core.account.bot_credentials import resolve_guardian_bot_token
 from app.core.account.models import (
     AccountRiskLevel,
     AccountType,
@@ -126,7 +127,11 @@ async def _load_registration_inputs(
     legacy = await db.scalar(
         select(GuardianBotProfile).where(GuardianBotProfile.account_id == account.id)
     )
-    token = (request.bot_token or (legacy.bot_token if legacy else "") or "").strip()
+    token = (
+        request.bot_token
+        or (resolve_guardian_bot_token(legacy.bot_token) if legacy else "")
+        or ""
+    ).strip()
     if not token:
         raise HTTPException(
             status_code=422,

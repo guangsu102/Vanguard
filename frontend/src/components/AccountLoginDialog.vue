@@ -2,8 +2,9 @@
 import { ref, reactive, computed, watch } from 'vue'
 import { ElMessage, ElSteps, ElStep, ElForm, ElFormItem, ElInput, ElButton, ElSelect, ElOption, ElUpload, ElAlert, ElRadioGroup, ElRadioButton } from 'element-plus'
 import type { FormInstance, FormRules, UploadRawFile } from 'element-plus'
-import type { AccountAssetTier, AccountOperationMode } from '@/api/accounts'
-import { proxiesApi, type Proxy } from '@/api/proxies'
+import type { AccountAssetTier, AccountOperationMode, ApiConfig } from '@/api/accounts'
+import { apiConfigsApi } from '@/api/accounts'
+import { MAX_STATIC_PROXY_BINDINGS, proxiesApi, type Proxy } from '@/api/proxies'
 import { accountAssetTierOptions } from '@/config/accountAssetTiers'
 
 interface Props {
@@ -61,11 +62,12 @@ const countryOptions = countryCodes.map((code) => {
 const currentStep = ref(0)
 const loginMethod = ref<'code' | 'session'>('code')
 const proxyOptions = ref<Proxy[]>([])
+const apiConfigOptions = ref<ApiConfig[]>([])
 
 // Form data
 const formData = reactive({
   phone: '',
-  apiConfigName: 'default',
+  apiConfigName: 'auto',
   countryCode: 'US',
   countryName: '美国',
   assetTier: 'unknown' as AccountAssetTier,
@@ -83,7 +85,7 @@ const formData = reactive({
 // Session import data
 const sessionImportData = reactive({
   phone: '',
-  apiConfigName: 'default',
+  apiConfigName: 'auto',
   countryCode: 'US',
   countryName: '美国',
   assetTier: 'unknown' as AccountAssetTier,
@@ -101,11 +103,15 @@ const loading = ref(false)
 
 const formatProxyOption = (proxy: Proxy) => {
   const bound = proxy.bindAccountCount || 0
-  const suffix = bound > 0 ? ` (${bound}/3)` : ' (0/3)'
+  const capacity = proxy.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS
+  const suffix = ` (${bound}/${capacity})`
   return `${proxy.protocol}://${proxy.address}:${proxy.port}${suffix}`
 }
 
-const isProxyFull = (proxy: Proxy) => (proxy.remainingBindSlots ?? Math.max(3 - (proxy.bindAccountCount || 0), 0)) <= 0
+const isProxyFull = (proxy: Proxy) => {
+  const capacity = proxy.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS
+  return (proxy.remainingBindSlots ?? Math.max(capacity - (proxy.bindAccountCount || 0), 0)) <= 0
+}
 
 // Form rules
 const phoneRules: FormRules = {
@@ -199,9 +205,19 @@ const loadProxyOptions = async () => {
   }
 }
 
+const loadApiConfigOptions = async () => {
+  try {
+    const { configs } = await apiConfigsApi.list()
+    apiConfigOptions.value = configs
+  } catch (error) {
+    console.error('Load API configs error:', error)
+  }
+}
+
 watch(dialogVisible, (visible) => {
   if (visible) {
     loadProxyOptions()
+    loadApiConfigOptions()
   }
 })
 
@@ -210,7 +226,7 @@ const resetForm = () => {
   loginMethod.value = 'code'
   Object.assign(formData, {
     phone: '',
-    apiConfigName: 'default',
+    apiConfigName: 'auto',
     countryCode: 'US',
     countryName: '美国',
     assetTier: 'unknown',
@@ -226,7 +242,7 @@ const resetForm = () => {
   })
   Object.assign(sessionImportData, {
     phone: '',
-    apiConfigName: 'default',
+    apiConfigName: 'auto',
     countryCode: 'US',
     countryName: '美国',
     assetTier: 'unknown',
@@ -343,6 +359,9 @@ const handleVerifyCode = async () => {
       } else {
         // Login successful
         formData.sessionString = result.data.session_string
+        if (result.data.api_config_name) {
+          formData.apiConfigName = result.data.api_config_name
+        }
         await completeLogin()
       }
     } else {
@@ -384,6 +403,9 @@ const handleVerify2FA = async () => {
 
     if (response.ok && result.code === 0) {
       formData.sessionString = result.data.session_string
+      if (result.data.api_config_name) {
+        formData.apiConfigName = result.data.api_config_name
+      }
       await completeLogin()
     } else {
       ElMessage.error(formatApiError(result, '2FA密码错误'))
@@ -557,7 +579,14 @@ const handleNext = () => {
           </el-form-item>
           <el-form-item label="API配置" prop="apiConfigName" :rules="phoneRules.apiConfigName">
             <el-select v-model="formData.apiConfigName" placeholder="请选择" style="width: 100%">
-              <el-option label="默认配置" value="default" />
+              <el-option label="自动分配（按设备平台）" value="auto" />
+              <el-option
+                v-for="config in apiConfigOptions"
+                :key="config.id"
+                :label="`${config.name}（${config.platform}，已挂 ${config.account_count} 号）`"
+                :value="config.name"
+                :disabled="config.under_cap === false"
+              />
             </el-select>
           </el-form-item>
           <el-form-item label="国家代码" prop="countryCode" :rules="phoneRules.countryCode">
@@ -688,7 +717,14 @@ const handleNext = () => {
         </el-form-item>
         <el-form-item label="API配置" prop="apiConfigName" :rules="sessionImportRules.apiConfigName">
           <el-select v-model="sessionImportData.apiConfigName" placeholder="请选择" style="width: 100%">
-            <el-option label="默认配置" value="default" />
+            <el-option label="自动分配（按设备平台）" value="auto" />
+            <el-option
+              v-for="config in apiConfigOptions"
+              :key="config.id"
+              :label="`${config.name}（${config.platform}，已挂 ${config.account_count} 号）`"
+              :value="config.name"
+              :disabled="config.under_cap === false"
+            />
           </el-select>
         </el-form-item>
         <el-form-item label="国家代码" prop="countryCode" :rules="sessionImportRules.countryCode">

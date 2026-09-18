@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, reactive, onMounted } from 'vue'
-import { ElButton, ElIcon, ElMessage, ElTabs, ElTabPane, ElForm, ElFormItem, ElInput, ElSwitch, ElCard, ElTable, ElTag, ElDivider, ElAlert } from 'element-plus'
-import { Select, Download, Delete, FolderOpened, Lock } from '@element-plus/icons-vue'
+import { ElButton, ElIcon, ElMessage, ElTabs, ElTabPane, ElForm, ElFormItem, ElInput, ElSwitch, ElCard, ElTable, ElTableColumn, ElTag, ElDivider, ElAlert, ElPopconfirm } from 'element-plus'
+import { Select, Download, Delete, FolderOpened, Lock, Refresh } from '@element-plus/icons-vue'
 import { authApi } from '@/api/auth'
+import { apiConfigsApi, type ApiConfig, type ApiConfigAssignResult, type ApiConfigPlatform } from '@/api/accounts'
 import {
   getOwnedGroupAiPersonaFeatureErrorMessage,
   getSettingsApiError,
@@ -31,6 +32,112 @@ const passwordForm = reactive({
   confirmPassword: '',
 })
 const passwordLoading = ref(false)
+
+// ---- API 配置分池（api_id/app_hash 多套池化） ----
+const apiConfigList = ref<ApiConfig[]>([])
+const apiConfigSummary = ref<ApiConfigSummaryLite>({ max: 30, total: 0, bound: 0, unbound: 0, envFallback: 0, withSession: 0 })
+const apiConfigLoading = ref(false)
+const apiConfigCreating = ref(false)
+const apiConfigAssigning = ref(false)
+const apiConfigAssignResult = ref<ApiConfigAssignResult | null>(null)
+const apiConfigFormVisible = ref(false)
+const apiConfigForm = reactive({
+  name: '',
+  api_id: '',
+  api_hash: '',
+  description: '',
+  platform: 'any' as ApiConfigPlatform,
+})
+const apiConfigPlatformOptions: { value: ApiConfigPlatform; label: string }[] = [
+  { value: 'windows', label: 'Windows（Telegram Desktop）' },
+  { value: 'macos', label: 'macOS' },
+  { value: 'android', label: 'Android' },
+  { value: 'ios', label: 'iOS' },
+  { value: 'any', label: '通用（不限平台）' },
+]
+
+interface ApiConfigSummaryLite {
+  max: number
+  total: number
+  bound: number
+  unbound: number
+  envFallback: number
+  withSession: number
+}
+
+const loadApiConfigs = async () => {
+  apiConfigLoading.value = true
+  try {
+    const { configs, summary } = await apiConfigsApi.list()
+    apiConfigList.value = configs
+    if (summary) {
+      apiConfigSummary.value = {
+        max: summary.max_accounts_per_config ?? 30,
+        total: summary.accounts_total ?? 0,
+        bound: summary.accounts_bound ?? 0,
+        unbound: summary.accounts_unbound ?? 0,
+        envFallback: summary.accounts_env_fallback ?? 0,
+        withSession: summary.accounts_with_session ?? 0,
+      }
+    }
+  } catch (error) {
+    ElMessage.error('加载 API 配置失败')
+  } finally {
+    apiConfigLoading.value = false
+  }
+}
+
+const submitApiConfig = async () => {
+  if (!apiConfigForm.name.trim() || !apiConfigForm.api_id.trim() || !apiConfigForm.api_hash.trim()) {
+    ElMessage.warning('请填写名称、API ID 和 API Hash')
+    return
+  }
+  apiConfigCreating.value = true
+  try {
+    await apiConfigsApi.create({
+      name: apiConfigForm.name.trim(),
+      api_id: apiConfigForm.api_id.trim(),
+      api_hash: apiConfigForm.api_hash.trim(),
+      description: apiConfigForm.description.trim() || undefined,
+      platform: apiConfigForm.platform,
+    })
+    ElMessage.success('API 配置已创建')
+    apiConfigFormVisible.value = false
+    apiConfigForm.name = ''
+    apiConfigForm.api_id = ''
+    apiConfigForm.api_hash = ''
+    apiConfigForm.description = ''
+    apiConfigForm.platform = 'any'
+    await loadApiConfigs()
+  } catch (error) {
+    ElMessage.error('创建 API 配置失败（名称可能已存在）')
+  } finally {
+    apiConfigCreating.value = false
+  }
+}
+
+const removeApiConfig = async (name: string) => {
+  try {
+    await apiConfigsApi.delete(name)
+    ElMessage.success('已删除')
+    await loadApiConfigs()
+  } catch (error) {
+    ElMessage.error('删除失败（配置可能仍被账号使用）')
+  }
+}
+
+const assignApiConfigs = async () => {
+  apiConfigAssigning.value = true
+  apiConfigAssignResult.value = null
+  try {
+    apiConfigAssignResult.value = await apiConfigsApi.assign()
+    await loadApiConfigs()
+  } catch (error) {
+    ElMessage.error('分配失败')
+  } finally {
+    apiConfigAssigning.value = false
+  }
+}
 
 const notificationForm = reactive({
   sub2apiAlertsEnabled: false,
@@ -302,6 +409,7 @@ const formatDate = (date: string) => {
 
 onMounted(() => {
   fetchSettings()
+  loadApiConfigs()
 })
 </script>
 
@@ -402,6 +510,97 @@ onMounted(() => {
               {{ xboardForm.source === 'environment' ? '服务器环境变量' : xboardForm.source }}
             </el-descriptions-item>
           </el-descriptions>
+        </el-card>
+      </el-tab-pane>
+
+      <el-tab-pane label="API 分池" name="apiPool">
+        <el-card shadow="never">
+          <el-alert
+            type="info"
+            :closable="false"
+            style="margin-bottom: 16px;"
+            title="多套 api_id/app_hash 分池：同一 api_id 下所有账号共享反垃圾声誉，按设备平台匹配配置，每套配置最多挂 30 个账号。已有会话的账号不会切换 api_id（需重新登录时才生效）。"
+          />
+          <div class="api-pool-toolbar">
+            <span class="form-tip">
+              账号 {{ apiConfigSummary.total }} 个：{{ apiConfigSummary.bound }} 个已显式绑定配置；
+              {{ apiConfigSummary.envFallback }} 个未绑定配置、运行时经环境变量回退使用环境 api_id
+              （重新登录后才会显式绑定；这些账号已计入对应配置的负载与 30 上限）
+            </span>
+            <el-button :icon="Refresh" :loading="apiConfigLoading" @click="loadApiConfigs">刷新</el-button>
+            <el-button type="primary" :loading="apiConfigAssigning" @click="assignApiConfigs">一键分配</el-button>
+            <el-button type="success" @click="apiConfigFormVisible = true">新增配置</el-button>
+          </div>
+
+          <el-alert
+            v-if="apiConfigAssignResult"
+            type="success"
+            :closable="true"
+            style="margin-bottom: 16px;"
+            :title="`分配完成：本次绑定 ${apiConfigAssignResult.assigned.length} 个，待重新登录生效 ${apiConfigAssignResult.needs_relogin.length} 个，失败 ${apiConfigAssignResult.failed.length} 个`"
+          />
+
+          <el-table :data="apiConfigList" v-loading="apiConfigLoading" style="width: 100%">
+            <el-table-column prop="name" label="名称" min-width="120" />
+            <el-table-column prop="platform" label="平台" width="110">
+              <template #default="{ row }">
+                <el-tag :type="row.platform === 'any' ? 'info' : 'warning'" effect="plain">
+                  {{ row.platform }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="api_id" label="API ID" min-width="110" />
+            <el-table-column label="账号数" width="200">
+              <template #default="{ row }">
+                {{ row.account_count }} / {{ apiConfigSummary.max }}
+                <el-tag v-if="row.under_cap === false" type="danger" size="small" effect="plain">已满</el-tag>
+                <div v-if="row.env_fallback_count > 0" class="form-tip" style="margin-left: 0;">
+                  含环境回退 {{ row.env_fallback_count }} 个，显式绑定 {{ row.explicit_account_count }} 个
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column prop="description" label="备注" min-width="160" show-overflow-tooltip />
+            <el-table-column label="操作" width="90">
+              <template #default="{ row }">
+                <el-popconfirm title="确认删除该配置？" @confirm="removeApiConfig(row.name)">
+                  <template #reference>
+                    <el-button size="small" type="danger" plain>删除</el-button>
+                  </template>
+                </el-popconfirm>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <el-divider />
+
+          <el-form v-if="apiConfigFormVisible" :model="apiConfigForm" label-width="110px" style="max-width: 560px;">
+            <el-form-item label="配置名称" required>
+              <el-input v-model="apiConfigForm.name" placeholder="如 ios-pool-1" maxlength="50" />
+            </el-form-item>
+            <el-form-item label="API ID" required>
+              <el-input v-model="apiConfigForm.api_id" placeholder="my.telegram.org 申请的 api_id" />
+            </el-form-item>
+            <el-form-item label="API Hash" required>
+              <el-input v-model="apiConfigForm.api_hash" placeholder="my.telegram.org 申请的 api_hash" show-password />
+            </el-form-item>
+            <el-form-item label="注册平台" required>
+              <el-select v-model="apiConfigForm.platform" style="width: 100%;">
+                <el-option
+                  v-for="option in apiConfigPlatformOptions"
+                  :key="option.value"
+                  :label="option.label"
+                  :value="option.value"
+                />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="备注">
+              <el-input v-model="apiConfigForm.description" maxlength="200" />
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" :loading="apiConfigCreating" @click="submitApiConfig">保存</el-button>
+              <el-button @click="apiConfigFormVisible = false">取消</el-button>
+            </el-form-item>
+          </el-form>
         </el-card>
       </el-tab-pane>
 
@@ -645,6 +844,18 @@ onMounted(() => {
   margin-left: 12px;
   color: #909399;
   font-size: 12px;
+}
+
+.api-pool-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 16px;
+
+  .form-tip {
+    flex: 1;
+    margin-left: 0;
+  }
 }
 
 .template-vars {

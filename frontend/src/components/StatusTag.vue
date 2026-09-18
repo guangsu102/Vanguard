@@ -19,6 +19,7 @@ const statusConfig: Record<string, { label: string; type: string }> = {
   working: { label: '工作中', type: 'success' },
   idle: { label: '空闲', type: 'warning' },
   banned: { label: '封禁', type: 'danger' },
+  restricted: { label: '受限', type: 'danger' },
   account_banned: { label: '封禁', type: 'danger' },
   suspended: { label: '暂停', type: 'warning' },
 

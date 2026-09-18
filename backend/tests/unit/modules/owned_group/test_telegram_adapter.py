@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telethon import types
 
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.ephemeral_secret import encrypt_ephemeral_secret
@@ -21,8 +22,19 @@ from app.modules.owned_group.models_extra import OwnedBotProfile, OwnedGroupInvi
 from app.modules.owned_group.telegram_adapter import (
     InviteLinkMutationError,
     TelethonOwnedGroupTelegramAdapter,
+    _participant_is_admin,
+    _participant_is_creator,
+    _participant_is_member,
     classify_telegram_error,
 )
+
+
+@pytest.fixture(autouse=True)
+def load_related_models():
+    # This mock-only module must also run on its own, without another test's DB fixture.
+    from tests.conftest import _import_models
+
+    _import_models()
 
 
 class FakePool:
@@ -70,9 +82,11 @@ class FakeClient:
         self.requests: list[object] = []
 
     async def get_entity(self, value):
+        if isinstance(value, str) and value.startswith("@"):
+            return types.User(id=9001, access_hash=900100)
         if int(value) == 12345:
             return SimpleNamespace(id=12345, megagroup=True, broadcast=False, username="owned")
-        return value
+        return types.User(id=int(value), access_hash=int(value) * 100)
 
     async def get_me(self):
         return SimpleNamespace(id=2001)
@@ -111,7 +125,17 @@ def _account(account_id: int, *, account_type=AccountType.PROMOTER):
     )
 
 
+def _member(*, user_id=9001, admin_rights=None, rank=None):
+    name = "ChannelParticipantAdmin" if admin_rights is not None else "ChannelParticipant"
+    participant = type(name, (), {})()
+    participant.user_id = user_id
+    participant.admin_rights = admin_rights
+    participant.rank = rank
+    return participant
+
+
 def _creator(**values):
+    values.setdefault("user_id", 2001)
     participant_type = type("ChannelParticipantCreator", (), {})
     participant = participant_type()
     for key, value in values.items():
@@ -223,7 +247,7 @@ async def test_private_direct_invite_group_still_persists_recovery_link():
 @pytest.mark.asyncio
 async def test_existing_group_requires_owner_admin_before_ready():
     owner = _account(1)
-    client = FakeClient(participants=[SimpleNamespace(admin_rights=None)])
+    client = FakeClient(participants=[_member(user_id=2001)])
     wrapper = SimpleNamespace(account_id=1, client=client)
     db = FakeDB({(TelegramAccount, 1): owner})
     pool = FakePool({1: wrapper})
@@ -330,8 +354,8 @@ async def test_bot_invite_and_admin_promotion_do_not_acquire_bot_lease():
         status="verified",
         enabled=True,
     )
-    non_admin = SimpleNamespace(admin_rights=None)
-    admin = SimpleNamespace(
+    non_admin = _member()
+    admin = _member(
         admin_rights=SimpleNamespace(invite_users=True),
         rank="Ops",
     )
@@ -391,7 +415,7 @@ async def test_reconcile_bot_is_read_only_and_does_not_acquire_target():
         status="verified",
         enabled=True,
     )
-    admin = SimpleNamespace(admin_rights=SimpleNamespace(invite_users=True), rank="Ops")
+    admin = _member(admin_rights=SimpleNamespace(invite_users=True), rank="Ops")
     client = FakeClient(participants=[admin])
     owner_wrapper = SimpleNamespace(account_id=1, client=client)
     db = FakeDB(
@@ -420,12 +444,12 @@ async def test_reconcile_bot_is_read_only_and_does_not_acquire_target():
     ("participant", "expected_reason", "expected_is_admin"),
     [
         (
-            SimpleNamespace(admin_rights=None),
+            _member(),
             "admin_not_verified",
             False,
         ),
         (
-            SimpleNamespace(
+            _member(
                 admin_rights=SimpleNamespace(invite_users=False),
                 rank="Ops",
             ),
@@ -433,7 +457,7 @@ async def test_reconcile_bot_is_read_only_and_does_not_acquire_target():
             True,
         ),
         (
-            SimpleNamespace(
+            _member(
                 admin_rights=SimpleNamespace(invite_users=True),
                 rank="Different",
             ),
@@ -497,8 +521,8 @@ async def test_admin_promotion_requires_configured_title_on_second_read():
         status="verified",
         enabled=True,
     )
-    non_admin = SimpleNamespace(admin_rights=None)
-    wrong_title_admin = SimpleNamespace(
+    non_admin = _member()
+    wrong_title_admin = _member(
         admin_rights=SimpleNamespace(invite_users=True),
         rank="Different",
     )
@@ -545,3 +569,275 @@ def test_error_classification_is_conservative_and_redacted():
     privacy = classify_telegram_error(privacy_type("privacy denied"))
     assert privacy.status == ItemStatus.FAILED_PERMANENT.value
     assert privacy.reason_code == "privacy_restricted"
+
+
+class OwnerPeerClient(FakeClient):
+    def __init__(
+        self,
+        *,
+        participants=None,
+        resolve_id=3001,
+        phone_resolve_id=None,
+        imported_id=3001,
+        import_client_id=0,
+    ):
+        super().__init__(participants=participants)
+        self.resolve_id = resolve_id
+        self.phone_resolve_id = phone_resolve_id
+        self.imported_id = imported_id
+        self.import_client_id = import_client_id
+        self.lookups = []
+
+    async def get_input_entity(self, value):
+        self.lookups.append(value)
+        if self.resolve_id is None:
+            raise ValueError("Peer absent in owner session")
+        return types.InputPeerUser(self.resolve_id, 222222)
+
+    async def get_entity(self, value):
+        if value == 12345:
+            return await super().get_entity(value)
+        return await self.get_input_entity(value)
+
+    async def __call__(self, request):
+        if request.__class__.__name__ == "ResolvePhoneRequest":
+            self.requests.append(request)
+            user_id = self.phone_resolve_id
+            return SimpleNamespace(
+                peer=SimpleNamespace(user_id=user_id),
+                users=(
+                    [types.User(id=user_id, access_hash=444444)]
+                    if user_id is not None
+                    else []
+                ),
+            )
+        if request.__class__.__name__ == "ImportContactsRequest":
+            self.requests.append(request)
+            return SimpleNamespace(
+                imported=[
+                    SimpleNamespace(client_id=self.import_client_id, user_id=self.imported_id)
+                ],
+                users=[types.User(id=self.imported_id, access_hash=333333)],
+            )
+        return await super().__call__(request)
+
+
+def _user_invite_case(client, *, phone=None, username="selected_target", precheck=None):
+    owner, target = _account(1), _account(2)
+    # The target's real get_me carries is_self=True and a different access hash.
+    # Passing it to owner.get_participant was the production false-success bug.
+    me = types.User(id=3001, access_hash=999999, is_self=True, username=username, phone=phone)
+    target_client = SimpleNamespace(get_me=AsyncMock(return_value=me))
+    owner_wrapper = SimpleNamespace(account_id=1, client=client)
+    target_wrapper = SimpleNamespace(account_id=2, client=target_client)
+    db = FakeDB({(TelegramAccount, 1): owner, (TelegramAccount, 2): target})
+    pool = FakePool({1: owner_wrapper, 2: target_wrapper})
+    return _adapter(db, pool, precheck=precheck), db, pool
+
+
+def _request_names(client):
+    return [request.__class__.__name__ for request in client.requests]
+
+
+@pytest.mark.parametrize(
+    "check", [_participant_is_member, _participant_is_admin, _participant_is_creator]
+)
+def test_creator_response_for_owner_never_confirms_different_target(check):
+    assert check(_creator(user_id=2001), expected_user_id=3001) is False
+    assert check(_creator(user_id=3001), expected_user_id=3001) is True
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, "invalid"])
+def test_participant_requires_a_positive_verified_identity(value):
+    assert not _participant_is_member(_member(user_id=value), expected_user_id=3001)
+    assert not _participant_is_admin(_creator(user_id=value), expected_user_id=3001)
+
+
+def test_unknown_participant_shape_and_left_or_banned_states_cannot_be_members():
+    for name in ("UnknownParticipant", "ChannelParticipantLeft", "ChannelParticipantBanned"):
+        participant = type(name, (), {})()
+        participant.user_id = 3001
+        participant.admin_rights = SimpleNamespace(invite_users=True)
+        assert not _participant_is_member(participant, expected_user_id=3001)
+        assert not _participant_is_admin(participant, expected_user_id=3001)
+
+
+@pytest.mark.asyncio
+async def test_execute_owner_creator_response_cannot_create_false_target_membership():
+    client = OwnerPeerClient(participants=[_creator(), _creator(), _creator()])
+    adapter, db, _ = _user_invite_case(client)
+    result = await adapter.execute_item(
+        _asset(), OwnedGroupOperation(id=30), _operation_item(admin=True)
+    )
+    assert not result.success
+    assert not result.membership_verified
+    assert result.status == ItemStatus.INVITE_SENT.value
+    assert "EditAdminRequest" not in _request_names(client)
+    assert db.added == []
+    invitation = next(
+        r for r in client.requests if r.__class__.__name__ == "InviteToChannelRequest"
+    )
+    assert len(invitation.users) == 1
+    assert isinstance(invitation.users[0], types.InputUser)
+    assert invitation.users[0].user_id == 3001
+    assert invitation.users[0].access_hash == 222222
+    for query in (r for r in client.requests if r.__class__.__name__ == "GetParticipantRequest"):
+        assert query.participant.user_id == 3001
+        assert not isinstance(query.participant, (types.InputPeerSelf, types.InputUserSelf))
+
+
+@pytest.mark.asyncio
+async def test_reconcile_owner_creator_response_stays_unknown_without_writes():
+    client = OwnerPeerClient(participants=[_creator()])
+    adapter, db, _ = _user_invite_case(client, phone="15551234567")
+    result = await adapter.reconcile_item(_asset(), OwnedGroupOperation(id=30), _operation_item())
+    assert result.status == ItemStatus.UNKNOWN.value
+    assert not result.success
+    assert not result.membership_verified
+    assert db.added == []
+    assert _request_names(client) == ["GetParticipantRequest"]
+
+
+@pytest.mark.asyncio
+async def test_correct_target_is_verified_using_owner_session_access_hash():
+    participant = _member(user_id=3001)
+    client = OwnerPeerClient(participants=[None, participant, participant])
+    adapter, _, _ = _user_invite_case(client)
+    result = await adapter.execute_item(_asset(), OwnedGroupOperation(id=30), _operation_item())
+    assert result.success
+    assert result.membership_verified
+    assert result.telegram_user_id == 3001
+    invitation = next(
+        r for r in client.requests if r.__class__.__name__ == "InviteToChannelRequest"
+    )
+    assert isinstance(invitation.users[0], types.InputUser)
+    assert invitation.users[0].access_hash == 222222
+    assert client.lookups[0] == "@selected_target"
+    assert "ImportContactsRequest" not in _request_names(client)
+
+
+@pytest.mark.asyncio
+async def test_wrong_owner_resolved_id_fails_without_invite_or_promotion():
+    client = OwnerPeerClient(resolve_id=2001)
+    adapter, db, _ = _user_invite_case(client)
+    result = await adapter.execute_item(
+        _asset(), OwnedGroupOperation(id=30), _operation_item(admin=True)
+    )
+    assert not result.success
+    assert result.reason_code == "target_peer_unavailable"
+    assert not client.requests
+    assert not db.added
+
+
+@pytest.mark.asyncio
+async def test_single_contact_import_resolves_only_selected_target_before_inviting():
+    member = _member(user_id=3001)
+    client = OwnerPeerClient(resolve_id=None, participants=[None, member, member])
+    adapter, _, _ = _user_invite_case(client, phone="15551234567", username=None)
+    result = await adapter.execute_item(_asset(), OwnedGroupOperation(id=30), _operation_item())
+    assert result.success
+    imports = [r for r in client.requests if r.__class__.__name__ == "ImportContactsRequest"]
+    assert len(imports) == 1
+    assert len(imports[0].contacts) == 1
+    assert imports[0].contacts[0].phone == "+15551234567"
+    invitation = next(
+        r for r in client.requests if r.__class__.__name__ == "InviteToChannelRequest"
+    )
+    assert invitation.users[0].user_id == 3001
+    assert invitation.users[0].access_hash == 333333
+
+
+@pytest.mark.asyncio
+async def test_phone_resolution_avoids_contact_import_when_privacy_allows_it():
+    member = _member(user_id=3001)
+    client = OwnerPeerClient(
+        resolve_id=None,
+        phone_resolve_id=3001,
+        participants=[None, member, member],
+    )
+    adapter, _, _ = _user_invite_case(
+        client,
+        phone="15551234567",
+        username=None,
+    )
+
+    result = await adapter.execute_item(
+        _asset(), OwnedGroupOperation(id=30), _operation_item()
+    )
+
+    assert result.success
+    assert _request_names(client).count("ResolvePhoneRequest") == 1
+    assert "ImportContactsRequest" not in _request_names(client)
+    invitation = next(
+        request
+        for request in client.requests
+        if request.__class__.__name__ == "InviteToChannelRequest"
+    )
+    assert invitation.users[0].user_id == 3001
+    assert invitation.users[0].access_hash == 444444
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("imported_id,client_id", [(2001, 0), (3001, 9)])
+async def test_contact_import_must_match_selected_identity_and_request(imported_id, client_id):
+    client = OwnerPeerClient(resolve_id=None, imported_id=imported_id, import_client_id=client_id)
+    adapter, _, _ = _user_invite_case(client, phone="15551234567")
+    result = await adapter.execute_item(
+        _asset(), OwnedGroupOperation(id=30), _operation_item(admin=True)
+    )
+    assert not result.success
+    assert result.reason_code == "target_peer_unavailable"
+    assert _request_names(client) == ["ResolvePhoneRequest", "ImportContactsRequest"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_does_not_import_missing_peer_even_with_known_target_phone():
+    client = OwnerPeerClient(resolve_id=None)
+    adapter, _, _ = _user_invite_case(client, phone="15551234567")
+    result = await adapter.reconcile_item(_asset(), OwnedGroupOperation(id=30), _operation_item())
+    assert not result.success
+    assert result.reason_code == "target_peer_unavailable"
+    assert not client.requests
+
+
+@pytest.mark.asyncio
+async def test_contact_import_rechecks_safety_gate_immediately_before_write():
+    decisions = [
+        SafetyGateDecision(True, "eligible"),
+        SafetyGateDecision(False, "global_stop_enabled"),
+    ]
+    precheck = AsyncMock(side_effect=decisions)
+    client = OwnerPeerClient(resolve_id=None)
+    adapter, _, _ = _user_invite_case(client, phone="15551234567", precheck=precheck)
+    result = await adapter.execute_item(_asset(), OwnedGroupOperation(id=30), _operation_item())
+    assert not result.success
+    assert result.reason_code == "global_stop_enabled"
+    assert precheck.await_count == 2
+    assert _request_names(client) == ["ResolvePhoneRequest"]
+
+
+@pytest.mark.asyncio
+async def test_admin_verification_cannot_accept_owner_creator_for_target():
+    client = OwnerPeerClient(participants=[_member(user_id=3001), _creator()])
+    adapter, _, _ = _user_invite_case(client)
+    result = await adapter.execute_item(
+        _asset(), OwnedGroupOperation(id=30), _operation_item(admin=True)
+    )
+    assert not result.success
+    assert result.status == ItemStatus.ADMIN_PROMOTING.value
+    assert result.is_admin is False
+    promotion = next(r for r in client.requests if r.__class__.__name__ == "EditAdminRequest")
+    assert isinstance(promotion.user_id, types.InputUser)
+    assert promotion.user_id.user_id == 3001
+
+
+@pytest.mark.asyncio
+async def test_existing_group_owner_must_match_creator_identity():
+    owner = _account(1)
+    client = FakeClient(participants=[_creator(user_id=3001)])
+    wrapper = SimpleNamespace(account_id=1, client=client)
+    adapter = _adapter(FakeDB({(TelegramAccount, 1): owner}), FakePool({1: wrapper}))
+    result = await adapter.create_group(_asset(), owner)
+    assert not result.success
+    assert result.reason_code == "owner_not_group_member"
+    assert _request_names(client) == ["GetParticipantRequest"]

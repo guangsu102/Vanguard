@@ -312,6 +312,13 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
                 ),
                 default=default_filter["title_blacklist"],
             ),
+            "cjk_title_required": _bool_setting(
+                search_filter.get(
+                    "cjk_title_required",
+                    search_filter.get("cjkTitleRequired", default_filter["cjk_title_required"]),
+                ),
+                default_filter["cjk_title_required"],
+            ),
         },
         "join_verification": {
             "enabled": _bool_setting(
@@ -1340,12 +1347,14 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
         "group_message": 4,
         "ai_warmup": 1,
         "channel_create": 1,
+        "managed_bot_create": 1,
     }
     action_min_cooldowns = {
         "join": 7200,
         "group_message": 7200,
         "ai_warmup": 21600,
         "channel_create": 86400,
+        "managed_bot_create": 3600,
     }
     for action, default_budget in defaults["actions"].items():
         item = actions_raw.get(action, {})

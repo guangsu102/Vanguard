@@ -396,7 +396,7 @@ class OwnedGroupMessageTargetResolver:
             reasons.append("account_inactive")
         if not _has_usable_user_session(account):
             reasons.append("account_session_missing")
-        if _value(account.status) in {AccountStatus.ERROR.value, AccountStatus.BANNED.value}:
+        if _value(account.status) in {AccountStatus.ERROR.value, AccountStatus.BANNED.value, AccountStatus.RESTRICTED.value}:
             reasons.append("account_status_blocked")
         if str(_value(account.risk_level)) not in {
             AccountRiskLevel.NORMAL.value,

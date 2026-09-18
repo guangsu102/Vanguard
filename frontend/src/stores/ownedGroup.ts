@@ -15,6 +15,7 @@ import {
   type OwnedGroupOperationDetail,
   type OwnedGroupOperationInput,
   type OwnedGroupPrecheckResult,
+  type OwnedGroupDissolutionResolutionResponse,
 } from "@/api/ownedGroups";
 
 export const useOwnedGroupStore = defineStore("ownedGroup", () => {
@@ -35,16 +36,14 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
   const inviteLinksLoading = ref(false);
   const inviteLinksAssetId = ref<number | null>(null);
   let inviteLinksRequestId = 0;
-  const governanceByAssetId = ref<
-    Record<number, OwnedGroupGovernanceStatus>
-  >({});
+  const governanceByAssetId = ref<Record<number, OwnedGroupGovernanceStatus>>(
+    {},
+  );
   const governanceLoadingByAssetId = ref<Record<number, boolean>>({});
   const governanceCandidatesByAssetId = ref<
     Record<number, OwnedGroupGovernanceCandidate[]>
   >({});
-  const governanceCandidatesLoadingByAssetId = ref<Record<number, boolean>>(
-    {},
-  );
+  const governanceCandidatesLoadingByAssetId = ref<Record<number, boolean>>({});
 
   const fetchList = async () => {
     loading.value = true;
@@ -125,8 +124,7 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
       [assetId]: true,
     };
     try {
-      const candidates =
-        await ownedGroupsApi.getGovernanceCandidates(assetId);
+      const candidates = await ownedGroupsApi.getGovernanceCandidates(assetId);
       governanceCandidatesByAssetId.value = {
         ...governanceCandidatesByAssetId.value,
         [assetId]: candidates,
@@ -147,10 +145,7 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     setGovernanceLoading(assetId, true);
     try {
       return cacheGovernance(
-        await ownedGroupsApi.bindGovernance(
-          assetId,
-          guardianBotAccountId,
-        ),
+        await ownedGroupsApi.bindGovernance(assetId, guardianBotAccountId),
       );
     } catch (error) {
       await refreshGovernanceAfterFailure(assetId);
@@ -163,9 +158,7 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
   const reconcileGovernance = async (assetId: number) => {
     setGovernanceLoading(assetId, true);
     try {
-      return cacheGovernance(
-        await ownedGroupsApi.reconcileGovernance(assetId),
-      );
+      return cacheGovernance(await ownedGroupsApi.reconcileGovernance(assetId));
     } catch (error) {
       await refreshGovernanceAfterFailure(assetId);
       throw error;
@@ -247,6 +240,71 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     }
   };
 
+  const deleteFailedDraft = async (id: number) => {
+    loading.value = true;
+    try {
+      await ownedGroupsApi.deleteFailedDraft(id);
+      if (current.value?.id === id) {
+        current.value = null;
+        operation.value = null;
+        clearInviteLinks();
+      }
+      delete governanceByAssetId.value[id];
+      delete governanceLoadingByAssetId.value[id];
+      delete governanceCandidatesByAssetId.value[id];
+      delete governanceCandidatesLoadingByAssetId.value[id];
+      await fetchList();
+    } finally {
+      loading.value = false;
+    }
+  };
+  const queueDissolution = async (id: number, confirmation: string) => {
+    loading.value = true;
+    try {
+      const created = await ownedGroupsApi.queueDissolution(
+        id,
+        { confirmation },
+        "owned-group-dissolution-" + id + "-" + Date.now(),
+      );
+      const [asset, refreshedOperation] = await Promise.all([
+        fetchAsset(id),
+        refreshOperation(created.id),
+      ]);
+      // Keep the list and selected read model on the server-authoritative
+      // dissolving state before the one-shot worker can act.
+      current.value = asset;
+      return refreshedOperation ?? created;
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  /**
+   * Submit the administrator's out-of-band verdict for an uncertain
+   * dissolution and refresh the server-authoritative asset state.
+   */
+  const resolveDissolution = async (
+    id: number,
+    outcome: "archived" | "still_exists",
+    confirmation: string,
+  ): Promise<OwnedGroupDissolutionResolutionResponse> => {
+    loading.value = true;
+    try {
+      const response = await ownedGroupsApi.resolveDissolution(id, {
+        outcome,
+        confirmation,
+      });
+      const [asset] = await Promise.all([
+        fetchAsset(id),
+        refreshOperation(response.data.operation_id),
+      ]);
+      current.value = asset;
+      return response;
+    } finally {
+      loading.value = false;
+    }
+  };
+
   const precheck = async (id: number) => {
     loading.value = true;
     try {
@@ -286,10 +344,26 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
   const fetchBotProfiles = async (): Promise<OwnedBotProfileListResponse> => {
     botProfilesLoading.value = true;
     try {
-      const response = await ownedGroupsApi.listBotProfiles({ limit: 200 });
-      botProfiles.value = response.data;
-      botProfilesTotal.value = response.total;
-      return response;
+      const pageSize = 200;
+      let offset = 0;
+      let total = 0;
+      const profiles: OwnedBotProfile[] = [];
+      do {
+        const response = await ownedGroupsApi.listBotProfiles({
+          limit: pageSize,
+          offset,
+        });
+        total = response.total;
+        profiles.push(...response.data);
+        if (!response.data.length) break;
+        offset += response.data.length;
+      } while (offset < total);
+
+      botProfiles.value = Array.from(
+        new Map(profiles.map((profile) => [profile.id, profile])).values(),
+      );
+      botProfilesTotal.value = total;
+      return { data: botProfiles.value, total };
     } finally {
       botProfilesLoading.value = false;
     }
@@ -413,7 +487,10 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     regenerateInviteLink,
     clearInviteLinks,
     createDraft,
+    deleteFailedDraft,
     precheck,
+    queueDissolution,
+    resolveDissolution,
     reconcileAsset,
     precheckOperation,
     fetchBotProfiles,

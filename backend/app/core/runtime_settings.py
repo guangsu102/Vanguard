@@ -51,6 +51,9 @@ DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS: dict[str, Any] = {
     "search_filter": {
         "title_blacklist_enabled": True,
         "title_blacklist": DEFAULT_AUTO_JOIN_TITLE_BLACKLIST,
+        # Reject title-only-no-CJK groups at discovery so a join budget slot
+        # (10/day/account) is never spent on a chat the audit will leave anyway.
+        "cjk_title_required": True,
     },
     "join_verification": {
         "enabled": True,
@@ -186,6 +189,7 @@ DEFAULT_ACCOUNT_RISK_GUARD_SETTINGS: dict[str, Any] = {
         "bot_message": {"daily_limit": 500, "cooldown_seconds": 1},
         "bot_pin": {"daily_limit": 100, "cooldown_seconds": 5},
         "channel_create": {"daily_limit": 1, "cooldown_seconds": 86400},
+        "managed_bot_create": {"daily_limit": 1, "cooldown_seconds": 3600},
     },
     "level_thresholds": {
         "watch": 20.0,
@@ -414,7 +418,7 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "leave_on_deleted_ad": True,
     "block_group_on_probe_failure": True,
     "ad_policy_ai_enabled": True,
-    "ad_policy_ai_model": "gpt-5.6-terra",
+    "ad_policy_ai_model": "gpt-5.6-sol",
     "ad_policy_ai_timeout_seconds": 45,
     "ad_policy_ai_min_confidence": 95,
     "ad_policy_ai_require_second_pass": True,

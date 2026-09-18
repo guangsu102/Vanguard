@@ -14,7 +14,6 @@ from codex_deploy_automation import (
     run,
 )
 
-
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_COMPOSE = ROOT / "docker-compose.production.yml"
 
@@ -134,15 +133,15 @@ def main() -> int:
             (
                 f"set -e; mv {shlex.quote(remote_tmp)} {shlex.quote(REMOTE_ROOT)}/docker-compose.production.yml; "
                 f"cd {shlex.quote(REMOTE_ROOT)}; "
-                "docker compose -f docker-compose.production.yml config --services"
+                "docker compose --env-file .env.production -f docker-compose.production.yml config --services"
             ),
             timeout=180,
         )
         run(client, update_env_command(), timeout=120)
-        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml config --quiet", timeout=180)
+        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose --env-file .env.production -f docker-compose.production.yml config --quiet", timeout=180)
         run(
             client,
-            f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --force-recreate {services}",
+            f"cd {shlex.quote(REMOTE_ROOT)} && docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}",
             timeout=1200,
         )
         run(

@@ -61,6 +61,7 @@ from app.modules.owned_group.models_extra import (
 )
 from app.modules.owned_group.worker import (
     GroupCreateResult,
+    GroupDissolveResult,
     ItemExecutionResult,
     PreflightResult,
 )
@@ -367,31 +368,76 @@ def _is_supergroup(entity: Any) -> bool:
     return not bool(getattr(entity, "broadcast", False))
 
 
-def _participant_is_member(participant: Any) -> bool:
-    if participant is None:
+def _positive_user_id(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        parsed = int(value)
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _participant_matches_user(participant: Any, expected_user_id: int) -> bool:
+    expected = _positive_user_id(expected_user_id)
+    return (
+        expected is not None
+        and _positive_user_id(getattr(participant, "user_id", None)) == expected
+    )
+
+
+def _participant_is_member(participant: Any, *, expected_user_id: int) -> bool:
+    if not _participant_matches_user(participant, expected_user_id):
         return False
-    name = participant.__class__.__name__.lower()
-    if any(marker in name for marker in ("notparticipant", "forbidden", "banned", "kicked")):
-        return False
-    return True
+    return participant.__class__.__name__ in {
+        "ChannelParticipant",
+        "ChannelParticipantSelf",
+        "ChannelParticipantAdmin",
+        "ChannelParticipantCreator",
+        "ChatParticipant",
+        "ChatParticipantAdmin",
+        "ChatParticipantCreator",
+    }
 
 
-def _participant_is_admin(participant: Any) -> bool:
-    if participant is None:
-        return False
-    name = participant.__class__.__name__.lower()
-    if "creator" in name or "admin" in name:
-        return True
-    rights = getattr(participant, "admin_rights", None)
-    return rights is not None
+def _participant_is_admin(participant: Any, *, expected_user_id: int) -> bool:
+    return _participant_is_member(participant, expected_user_id=expected_user_id) and (
+        participant.__class__.__name__
+        in {
+            "ChannelParticipantAdmin",
+            "ChannelParticipantCreator",
+            "ChatParticipantAdmin",
+            "ChatParticipantCreator",
+        }
+    )
 
 
-def _participant_is_creator(participant: Any) -> bool:
-    """Return whether Telegram identifies the account as the group creator."""
+def _participant_is_creator(participant: Any, *, expected_user_id: int) -> bool:
+    """Require the creator identity, not merely a creator-shaped response."""
+    return _participant_matches_user(participant, expected_user_id) and (
+        participant.__class__.__name__ in {"ChannelParticipantCreator", "ChatParticipantCreator"}
+    )
 
-    if participant is None:
-        return False
-    return "creator" in participant.__class__.__name__.lower()
+
+def _owner_input_user(entity: Any, expected_user_id: int) -> Any | None:
+    """Accept only an explicit owner-resolved user and never InputUserSelf."""
+    from telethon import types
+
+    if not isinstance(entity, (types.User, types.InputUser, types.InputPeerUser)):
+        return None
+    actual_id = _positive_user_id(getattr(entity, "user_id", None) or getattr(entity, "id", None))
+    access_hash = getattr(entity, "access_hash", None)
+    if (
+        actual_id != expected_user_id
+        or getattr(entity, "min", False)
+        or isinstance(access_hash, bool)
+        or not isinstance(access_hash, int)
+        or access_hash == 0
+    ):
+        return None
+    # utils.get_input_user(User(is_self=True)) returns InputUserSelf. Explicit
+    # construction prevents any owner-session request from addressing itself.
+    return types.InputUser(user_id=expected_user_id, access_hash=access_hash)
 
 
 def _rights_snapshot(rights: Any) -> dict[str, bool]:
@@ -483,6 +529,11 @@ class TelethonOwnedGroupTelegramAdapter:
         self.execution_service = execution_service or TelegramExecutionService()
         self.require_redis_safety = require_redis_safety
         self._now = now or datetime.utcnow
+        # Telegram documents a client-side limit of one contacts.resolvePhone
+        # request every three seconds. A worker batch may contain several
+        # targets without usernames, so enforce that limit here.
+        self._phone_resolve_lock = asyncio.Lock()
+        self._last_phone_resolve_at = 0.0
 
     @staticmethod
     def _default_bot_client_factory(token: str) -> Any:
@@ -681,44 +732,140 @@ class TelethonOwnedGroupTelegramAdapter:
                 await self._call(close())
 
     async def _target_entity(
-        self, owner_client: Any, target: Any, target_wrapper: Any | None
+        self,
+        owner_client: Any,
+        target: Any,
+        target_wrapper: Any | None,
+        *,
+        allow_contact_import: bool = False,
+        owner_account_id: int | None = None,
     ) -> tuple[Any, int]:
-        if isinstance(target, OwnedBotProfile):
+        is_bot = isinstance(target, OwnedBotProfile)
+        if is_bot:
             user_id = await self._bot_user_id(target)
-            try:
-                entity = await self._call(owner_client.get_entity(user_id))
-            except Exception as first_exc:
-                # Bot API ``getMe`` gives us an id but not a Telethon access
-                # hash.  A fresh owner session therefore may not resolve the
-                # bare id.  Retry through the verified username, which lets
-                # Telethon resolve an InputPeer and preserves the access hash;
-                # never silently send a raw integer to an invite/admin RPC.
-                username = str(getattr(target, "bot_username", "") or "").strip().lstrip("@")
-                entity = None
-                if username:
-                    for resolver_name in ("get_input_entity", "get_entity"):
-                        resolver = getattr(owner_client, resolver_name, None)
-                        if resolver is None:
-                            continue
+            username = str(getattr(target, "bot_username", "") or "").strip().lstrip("@")
+            phone = None
+        else:
+            client = self._client(target_wrapper) if target_wrapper is not None else None
+            if client is None:
+                raise AdapterConfigurationError("telegram_client_unavailable")
+            me = await self._call(client.get_me())
+            user_id = _positive_user_id(getattr(me, "id", None) or getattr(me, "user_id", None))
+            if user_id is None:
+                raise AdapterConfigurationError("telegram_user_id_missing")
+            username = str(getattr(me, "username", "") or "").strip().lstrip("@")
+            phone = getattr(me, "phone", None) or getattr(target, "phone", None)
+
+        # A target-session User carries that session's access hash and is_self
+        # flag. Resolve in the owner session; never use or fall back to that User.
+        lookups: list[Any] = [f"@{username}"] if _PUBLIC_USERNAME_RE.fullmatch(username) else []
+        lookups.append(user_id)
+        for lookup in lookups:
+            for resolver_name in ("get_input_entity", "get_entity"):
+                resolver = getattr(owner_client, resolver_name, None)
+                if not callable(resolver):
+                    continue
+                try:
+                    resolved = await self._call(resolver(lookup))
+                except Exception:
+                    continue
+                entity = _owner_input_user(resolved, user_id)
+                if entity is not None:
+                    return entity, user_id
+
+        if not is_bot and allow_contact_import and owner_account_id is not None:
+            # This single contact belongs to the explicitly selected invitee.
+            # Reconciliation never reaches this mutation path.
+            normalized_phone = re.sub(r"[ ()-]", "", str(phone or "").strip())
+            if normalized_phone and not normalized_phone.startswith("+"):
+                normalized_phone = "+" + normalized_phone
+            if re.fullmatch(r"\+[1-9]\d{6,14}", normalized_phone):
+                from telethon import functions, types
+
+                # Resolve by phone first. Unlike importContacts this is
+                # read-only and does not add the target to the owner's contact
+                # list. The returned identity and access hash must still belong
+                # to the selected target in the owner's session.
+                try:
+                    async with self._phone_resolve_lock:
+                        loop = asyncio.get_running_loop()
+                        wait_seconds = 3.0 - (loop.time() - self._last_phone_resolve_at)
+                        if wait_seconds > 0:
+                            await asyncio.sleep(wait_seconds)
                         try:
-                            entity = await self._call(resolver(f"@{username}"))
-                            break
-                        except Exception:
-                            continue
-                if entity is None:
-                    raise AdapterConfigurationError(
-                        "bot_peer_unavailable",
-                        "Bot peer is not available in the owner Telegram session; open the bot chat or sync its username before retrying",
-                    ) from first_exc
-            return entity, user_id
-        client = self._client(target_wrapper) if target_wrapper is not None else None
-        if client is None:
-            raise AdapterConfigurationError("telegram_client_unavailable")
-        me = await self._call(client.get_me())
-        user_id = int(getattr(me, "id", None) or getattr(me, "user_id", None) or 0)
-        if not user_id:
-            raise AdapterConfigurationError("telegram_user_id_missing")
-        return me, user_id
+                            resolved_phone = await self._call(
+                                owner_client(
+                                    functions.contacts.ResolvePhoneRequest(
+                                        phone=normalized_phone
+                                    )
+                                )
+                            )
+                        finally:
+                            self._last_phone_resolve_at = loop.time()
+                    peer_user_id = _positive_user_id(
+                        getattr(getattr(resolved_phone, "peer", None), "user_id", None)
+                    )
+                    if peer_user_id == user_id:
+                        for resolved in getattr(resolved_phone, "users", []):
+                            entity = _owner_input_user(resolved, user_id)
+                            if entity is not None:
+                                return entity, user_id
+                except Exception as exc:
+                    error_name = type(exc).__name__.lower()
+                    if any(
+                        marker in error_name
+                        for marker in (
+                            "floodwait",
+                            "userrestricted",
+                            "authkey",
+                            "phonebanned",
+                        )
+                    ):
+                        raise
+
+                await self._assert_gate(
+                    resources=[
+                        {
+                            "resource_type": ResourceType.USER.value,
+                            "resource_id": int(owner_account_id),
+                        },
+                        {"resource_type": ResourceType.USER.value, "resource_id": int(target.id)},
+                    ],
+                    owner_account_id=int(owner_account_id),
+                )
+                try:
+                    result = await self._call(
+                        owner_client(
+                            functions.contacts.ImportContactsRequest(
+                                contacts=[
+                                    types.InputPhoneContact(
+                                        client_id=0,
+                                        phone=normalized_phone,
+                                        first_name="Vanguard",
+                                        last_name="",
+                                    )
+                                ]
+                            )
+                        )
+                    )
+                    imported_target = any(
+                        getattr(contact, "client_id", None) == 0
+                        and _positive_user_id(getattr(contact, "user_id", None)) == user_id
+                        for contact in getattr(result, "imported", [])
+                    )
+                    if imported_target:
+                        for resolved in getattr(result, "users", []):
+                            entity = _owner_input_user(resolved, user_id)
+                            if entity is not None:
+                                return entity, user_id
+                except Exception:
+                    # Never expose phone numbers or retry a contact write blindly.
+                    pass
+
+        raise AdapterConfigurationError(
+            "target_peer_unavailable",
+            "The selected target could not be verified in the owner Telegram session",
+        )
 
     async def _group_entity(self, client: Any, asset: OwnedGroupAsset) -> Any:
         if not asset.telegram_chat_id:
@@ -903,11 +1050,11 @@ class TelethonOwnedGroupTelegramAdapter:
         if not owner_user_id:
             raise AdapterConfigurationError("owner_identity_unavailable")
         owner_participant = await self._participant(client, entity, owner_me)
-        if not _participant_is_member(owner_participant):
+        if not _participant_is_member(owner_participant, expected_user_id=owner_user_id):
             raise AdapterConfigurationError("owner_not_group_member")
-        if not _participant_is_admin(owner_participant):
+        if not _participant_is_admin(owner_participant, expected_user_id=owner_user_id):
             raise AdapterConfigurationError("owner_not_group_admin")
-        if not _participant_is_creator(owner_participant):
+        if not _participant_is_creator(owner_participant, expected_user_id=owner_user_id):
             raise AdapterConfigurationError("owner_not_group_creator")
 
         remote_username = str(getattr(entity, "username", None) or "").strip().lstrip("@")
@@ -1026,12 +1173,17 @@ class TelethonOwnedGroupTelegramAdapter:
             if not callable(get_me):
                 raise AdapterConfigurationError("owner_identity_unavailable")
             owner_me = await self._call(get_me())
+            owner_user_id = _positive_user_id(
+                getattr(owner_me, "id", None) or getattr(owner_me, "user_id", None)
+            )
+            if owner_user_id is None:
+                raise AdapterConfigurationError("owner_identity_unavailable")
             owner_participant = await self._participant(client, entity, owner_me)
-            if not _participant_is_member(owner_participant):
+            if not _participant_is_member(owner_participant, expected_user_id=owner_user_id):
                 raise AdapterConfigurationError("owner_not_group_member")
-            if not _participant_is_admin(owner_participant):
+            if not _participant_is_admin(owner_participant, expected_user_id=owner_user_id):
                 raise AdapterConfigurationError("owner_not_group_admin")
-            if not _participant_is_creator(owner_participant):
+            if not _participant_is_creator(owner_participant, expected_user_id=owner_user_id):
                 raise AdapterConfigurationError("owner_not_group_creator")
             return owner, wrapper, client, entity
         except Exception:
@@ -1511,6 +1663,58 @@ class TelethonOwnedGroupTelegramAdapter:
         finally:
             await self._release(wrapper)
 
+    async def dissolve_group(self, asset: OwnedGroupAsset) -> GroupDissolveResult:
+        """Delete one creator-owned Telegram supergroup after all safety checks."""
+
+        wrapper = None
+        call_started = False
+        try:
+            _owner, wrapper, client, entity = await self._invite_context(
+                asset, purpose="owned_group_dissolve"
+            )
+            if not _is_supergroup(entity):
+                raise AdapterConfigurationError("existing_chat_not_supergroup")
+            from telethon import functions
+
+            await self._assert_gate(
+                resources=[
+                    {
+                        "resource_type": ResourceType.USER.value,
+                        "resource_id": int(asset.owner_account_id),
+                    }
+                ],
+                owner_account_id=int(asset.owner_account_id),
+            )
+            async with self._risk_operation(
+                wrapper,
+                AccountRiskAction.CHANNEL_DELETE,
+                target_type="group",
+                target_id=_telegram_peer_id(entity),
+                details={"source": "owned_group_dissolve"},
+            ):
+                call_started = True
+                await self._call(client(functions.channels.DeleteChannelRequest(channel=entity)))
+            return GroupDissolveResult(success=True, reason_code="telegram_group_deleted")
+        except (AdapterBlockedError, AdapterConfigurationError, InviteLinkMutationError) as exc:
+            return GroupDissolveResult(
+                success=False,
+                reason_code=exc.reason_code,
+                message=exc.message,
+            )
+        except Exception as exc:
+            classification = classify_telegram_error(exc, mutating=True, phase="dissolve")
+            return GroupDissolveResult(
+                success=False,
+                # Do not infer a failed deletion from a transport-side exception
+                # after the request may have been handed to Telegram.
+                unknown=call_started,
+                reason_code=classification.reason_code,
+                message=classification.message,
+            )
+        finally:
+            await self._release(wrapper)
+
+
     async def _promote_and_verify(
         self,
         *,
@@ -1537,6 +1741,9 @@ class TelethonOwnedGroupTelegramAdapter:
             ],
             owner_account_id=int(asset.owner_account_id),
         )
+        if _owner_input_user(target_entity, target_user_id) is None:
+            raise AdapterConfigurationError("target_peer_unavailable")
+
         from telethon import functions
 
         async with self._risk_operation(
@@ -1557,7 +1764,9 @@ class TelethonOwnedGroupTelegramAdapter:
                 )
             )
         participant = await self._participant(client, entity, target_entity)
-        if not _participant_is_member(participant) or not _participant_is_admin(participant):
+        if not _participant_is_member(
+            participant, expected_user_id=target_user_id
+        ) or not _participant_is_admin(participant, expected_user_id=target_user_id):
             return False, False, {}, title
         actual = _rights_snapshot(getattr(participant, "admin_rights", None))
         required = {key: bool(value) for key, value in permissions.items() if bool(value)}
@@ -1576,8 +1785,12 @@ class TelethonOwnedGroupTelegramAdapter:
         owner_client: Any,
         entity: Any,
         target_entity: Any,
+        target_user_id: int,
         risk_account: Any,
     ) -> ItemExecutionResult:
+        if _owner_input_user(target_entity, target_user_id) is None:
+            raise AdapterConfigurationError("target_peer_unavailable")
+
         from telethon import functions
 
         await self._assert_gate(
@@ -1623,7 +1836,7 @@ class TelethonOwnedGroupTelegramAdapter:
             already_member = True
 
         participant = await self._participant(owner_client, entity, target_entity)
-        if not _participant_is_member(participant):
+        if not _participant_is_member(participant, expected_user_id=target_user_id):
             return ItemExecutionResult(
                 status=ItemStatus.INVITE_SENT.value,
                 reason_code="invite_sent",
@@ -1675,11 +1888,15 @@ class TelethonOwnedGroupTelegramAdapter:
             # the owner Telethon session; they must not consume a linked
             # GuardianBot AccountPool/Telethon lease.
             target_entity, target_user_id = await self._target_entity(
-                owner_client, target, target_wrapper
+                owner_client,
+                target,
+                target_wrapper,
+                allow_contact_import=True,
+                owner_account_id=int(asset.owner_account_id),
             )
 
             participant = await self._participant(owner_client, entity, target_entity)
-            if not _participant_is_member(participant):
+            if not _participant_is_member(participant, expected_user_id=target_user_id):
                 mode = str(asset.invite_mode or "direct_invite").strip().lower()
                 if target_profile is not None and mode != "direct_invite":
                     raise AdapterConfigurationError("bot_self_join_unsupported")
@@ -1690,6 +1907,7 @@ class TelethonOwnedGroupTelegramAdapter:
                         owner_client=owner_client,
                         entity=entity,
                         target_entity=target_entity,
+                        target_user_id=target_user_id,
                         risk_account=owner_wrapper,
                     )
                     if not invited.success and invited.status != ItemStatus.MEMBER_VERIFIED.value:
@@ -1719,7 +1937,7 @@ class TelethonOwnedGroupTelegramAdapter:
                             telegram_user_id=target_user_id,
                         )
                     participant = await self._participant(owner_client, entity, target_entity)
-            if not _participant_is_member(participant):
+            if not _participant_is_member(participant, expected_user_id=target_user_id):
                 return ItemExecutionResult(
                     status=ItemStatus.INVITE_SENT.value,
                     reason_code="invite_sent",
@@ -1780,7 +1998,7 @@ class TelethonOwnedGroupTelegramAdapter:
                 item,
                 telegram_user_id=target_user_id,
                 status=status,
-                is_admin=_participant_is_admin(participant),
+                is_admin=_participant_is_admin(participant, expected_user_id=target_user_id),
             )
             return ItemExecutionResult(
                 status=status,
@@ -1788,7 +2006,7 @@ class TelethonOwnedGroupTelegramAdapter:
                 reason_code="member_verified",
                 telegram_user_id=target_user_id,
                 membership_verified=True,
-                is_admin=_participant_is_admin(participant),
+                is_admin=_participant_is_admin(participant, expected_user_id=target_user_id),
                 admin_permissions=_rights_snapshot(getattr(participant, "admin_rights", None)),
                 admin_title=getattr(participant, "rank", None),
             )
@@ -1844,14 +2062,14 @@ class TelethonOwnedGroupTelegramAdapter:
                 owner_client, target, target_wrapper
             )
             participant = await self._participant(owner_client, entity, target_entity)
-            if not _participant_is_member(participant):
+            if not _participant_is_member(participant, expected_user_id=target_user_id):
                 return ItemExecutionResult(
                     status=ItemStatus.UNKNOWN.value,
                     reason_code=ReasonCode.UNKNOWN_NEEDS_RECONCILE.value,
                     error_message="Telegram membership is not yet visible; no retry was attempted",
                     telegram_user_id=target_user_id,
                 )
-            is_admin = _participant_is_admin(participant)
+            is_admin = _participant_is_admin(participant, expected_user_id=target_user_id)
             rights = _rights_snapshot(getattr(participant, "admin_rights", None))
             title = str(getattr(participant, "rank", None) or "").strip() or None
             if item.admin_required:

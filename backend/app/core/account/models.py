@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy import (
     Enum as SQLEnum,
@@ -46,6 +47,7 @@ class AccountStatus(str, Enum):
     IDLE = "idle"
     ERROR = "error"
     BANNED = "banned"
+    RESTRICTED = "restricted"
 
 
 class ProxyType(str, Enum):
@@ -124,6 +126,88 @@ class AccountWarmupStage(str, Enum):
     RAMP = "ramp"
     NORMAL = "normal"
     COOLDOWN = "cooldown"
+
+
+class SpamCheckAccountStatus(str, Enum):
+    """Persisted account-level result of the latest official SpamBot check."""
+
+    UNKNOWN = "unknown"
+    QUEUED = "queued"
+    CHECKING = "checking"
+    CLEAR = "clear"
+    RESTRICTED = "restricted"
+    FLAGGED = "flagged"
+    ERROR = "error"
+
+
+class SpamCheckOperationStatus(str, Enum):
+    """Lifecycle for a manual or automatic SpamBot check batch."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    SUCCEEDED = "succeeded"
+    PARTIAL_FAILED = "partial_failed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class SpamCheckItemStatus(str, Enum):
+    """Lifecycle for one account in a SpamBot check batch."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AccountProfileUpdateOperationStatus(str, Enum):
+    """Lifecycle for a durable ad-account profile update batch."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    SUCCEEDED = "succeeded"
+    PARTIAL_FAILED = "partial_failed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class AccountProfileUpdateItemStatus(str, Enum):
+    """Lifecycle for one ad-account profile update."""
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+
+class ManagedBotProvisionStatus(str, Enum):
+    """Durable lifecycle for one managed Bot creation request."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    NEEDS_ATTENTION = "needs_attention"
+
+
+class ManagedBotProvisionStep(str, Enum):
+    """Last durable step reached by a managed Bot provision."""
+
+    PREFLIGHT = "preflight"
+    CHECK_USERNAME = "check_username"
+    CREATE_BOT = "create_bot"
+    FETCH_TOKEN = "fetch_token"
+    REGISTER_PROFILES = "register_profiles"
+    VERIFY = "verify"
+    COMPLETE = "complete"
 
 
 class TelegramAccount(Base):
@@ -282,6 +366,50 @@ class TelegramAccount(Base):
         SQLEnum(AccountStatus), default=AccountStatus.OFFLINE, nullable=False, comment="账号状态"
     )
 
+    spam_check_status: Mapped[str] = mapped_column(
+        String(20),
+        default=SpamCheckAccountStatus.UNKNOWN.value,
+        server_default=SpamCheckAccountStatus.UNKNOWN.value,
+        nullable=False,
+        comment="SpamBot检测状态: unknown/queued/checking/clear/restricted/flagged/error",
+    )
+    spam_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="最近SpamBot检测完成时间",
+    )
+    spam_check_summary: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="最近SpamBot回复摘要（已脱敏）",
+    )
+    spam_restriction_confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="最近明确确认受限时间",
+    )
+    restriction_previous_status: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        nullable=True,
+        comment="受限前状态，用于明确解除后恢复调度",
+    )
+
+    restriction_source: Mapped[Optional[str]] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="当前限制来源: spambot/telegram_rpc",
+    )
+    restriction_reason: Mapped[Optional[str]] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="当前限制原因（已脱敏）",
+    )
+    restriction_detected_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        nullable=True,
+        comment="当前限制最近确认时间",
+    )
+
     # Device info for re-authentication
     device_model: Mapped[Optional[str]] = mapped_column(
         String(100), nullable=True, comment="设备型号"
@@ -407,6 +535,7 @@ class TelegramAccount(Base):
             name="account_persona_consistency_sqlite",
         ).ddl_if(dialect="sqlite"),
         Index("idx_status", "status"),
+        Index("idx_account_spam_check_status", "spam_check_status"),
         Index("idx_country", "country_code"),
         Index("idx_api_config", "api_config_name"),
         Index("idx_account_type", "account_type"),
@@ -418,6 +547,295 @@ class TelegramAccount(Base):
         Index("idx_account_risk_pause_until", "risk_pause_until"),
         Index("idx_account_risk_level", "risk_level"),
         Index("idx_account_risk_recovery_until", "risk_recovery_until"),
+    )
+
+
+class AccountSpamCheckOperation(Base):
+    """Persistent administrator or automatic SpamBot check batch."""
+
+    __tablename__ = "account_spam_check_operation"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    account_ids_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger: Mapped[str] = mapped_column(String(20), default="manual", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default=SpamCheckOperationStatus.QUEUED.value,
+        server_default=SpamCheckOperationStatus.QUEUED.value,
+        nullable=False,
+    )
+    total_accounts: Mapped[int] = mapped_column(Integer, nullable=False)
+    processed_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    clear_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    restricted_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    failed_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    cancelled_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    items: Mapped[list["AccountSpamCheckItem"]] = relationship(
+        "AccountSpamCheckItem",
+        back_populates="operation",
+        cascade="all, delete-orphan",
+        order_by="AccountSpamCheckItem.id",
+    )
+
+    __table_args__ = (
+        Index("idx_account_spam_operation_status_created", "status", "created_at"),
+        CheckConstraint(
+            "total_accounts >= 1 AND total_accounts <= 2000",
+            name="account_spam_total_accounts_range",
+        ),
+        CheckConstraint("max_attempts >= 1", name="account_spam_max_attempts_positive"),
+    )
+
+
+class AccountSpamCheckItem(Base):
+    """Persistent execution state for one official SpamBot account check."""
+
+    __tablename__ = "account_spam_check_item"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_id: Mapped[int] = mapped_column(
+        ForeignKey("account_spam_check_operation.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default=SpamCheckItemStatus.PENDING.value,
+        server_default=SpamCheckItemStatus.PENDING.value,
+        nullable=False,
+    )
+    result: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    reason_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    response_summary: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    account_status_before: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    operation: Mapped["AccountSpamCheckOperation"] = relationship(
+        "AccountSpamCheckOperation",
+        back_populates="items",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_id",
+            "account_id",
+            name="uq_account_spam_item_operation_account",
+        ),
+        Index("idx_account_spam_item_operation_status", "operation_id", "status"),
+        Index("idx_account_spam_item_status_retry", "status", "next_retry_at"),
+        Index("idx_account_spam_item_account_created", "account_id", "created_at"),
+        CheckConstraint("attempts >= 0", name="account_spam_attempts_non_negative"),
+    )
+
+
+class AccountProfileUpdateOperation(Base):
+    """Durable, administrator-requested profile updates for ad-only accounts."""
+
+    __tablename__ = "account_profile_update_operation"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    account_ids_snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    profile_bio: Mapped[str] = mapped_column(String(70), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default=AccountProfileUpdateOperationStatus.QUEUED.value,
+        server_default=AccountProfileUpdateOperationStatus.QUEUED.value,
+        nullable=False,
+    )
+    total_accounts: Mapped[int] = mapped_column(Integer, nullable=False)
+    processed_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    succeeded_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    failed_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    cancelled_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    skipped_accounts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
+    last_error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cancel_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    items: Mapped[list["AccountProfileUpdateItem"]] = relationship(
+        "AccountProfileUpdateItem",
+        back_populates="operation",
+        cascade="all, delete-orphan",
+        order_by="AccountProfileUpdateItem.id",
+    )
+
+    __table_args__ = (
+        Index("idx_account_profile_update_operation_status_created", "status", "created_at"),
+        CheckConstraint(
+            "total_accounts >= 1 AND total_accounts <= 2000",
+            name="account_profile_update_total_accounts_range",
+        ),
+        CheckConstraint(
+            "max_attempts >= 1",
+            name="account_profile_update_max_attempts_positive",
+        ),
+    )
+
+
+class AccountProfileUpdateItem(Base):
+    """Per-account durable state, including an execution-time profile revision check."""
+
+    __tablename__ = "account_profile_update_item"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operation_id: Mapped[int] = mapped_column(
+        ForeignKey("account_profile_update_operation.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    baseline_bio_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    desired_bio_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default=AccountProfileUpdateItemStatus.PENDING.value,
+        server_default=AccountProfileUpdateItemStatus.PENDING.value,
+        nullable=False,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    reason_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    remote_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    operation: Mapped["AccountProfileUpdateOperation"] = relationship(
+        "AccountProfileUpdateOperation",
+        back_populates="items",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "operation_id",
+            "account_id",
+            name="uq_account_profile_update_item_operation_account",
+        ),
+        Index("idx_account_profile_update_item_operation_status", "operation_id", "status"),
+        Index("idx_account_profile_update_item_status_retry", "status", "next_retry_at"),
+        Index("idx_account_profile_update_item_account_created", "account_id", "created_at"),
+        CheckConstraint(
+            "attempts >= 0",
+            name="account_profile_update_attempts_non_negative",
+        ),
+    )
+
+
+class AccountProfileUpdateQueueLease(Base):
+    """One durable lease that prevents concurrent Telegram profile mutations."""
+
+    __tablename__ = "account_profile_update_queue_lease"
+
+    __table_args__ = (
+        CheckConstraint(
+            "id = 1",
+            name="account_profile_update_queue_lease_singleton",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lease_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
     )
 
 
@@ -434,6 +852,13 @@ class TelegramAPIConfig(Base):
     name: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, comment="配置名称")
     api_id: Mapped[str] = mapped_column(String(50), nullable=False, comment="API ID")
     api_hash: Mapped[str] = mapped_column(String(100), nullable=False, comment="API Hash")
+    platform: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="any",
+        server_default="any",
+        comment="注册平台: windows/macos/android/ios/any",
+    )
 
     # Optional description
     description: Mapped[Optional[str]] = mapped_column(
@@ -763,6 +1188,96 @@ class GuardianBotProfile(Base):
     __table_args__ = (
         Index("idx_guardian_bot_health_status", "health_status"),
         Index("idx_guardian_bot_sync_status", "sync_status"),
+    )
+
+
+class ManagedBotProvision(Base):
+    """Recoverable orchestration record for one official managed Bot creation."""
+
+    __tablename__ = "managed_bot_provision"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="RESTRICT"), nullable=False
+    )
+    manager_bot_profile_id: Mapped[int] = mapped_column(
+        ForeignKey("guardian_bot_profile.id", ondelete="RESTRICT"), nullable=False
+    )
+    display_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    username: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24),
+        default=ManagedBotProvisionStatus.QUEUED.value,
+        server_default=ManagedBotProvisionStatus.QUEUED.value,
+        nullable=False,
+    )
+    current_step: Mapped[str] = mapped_column(
+        String(32),
+        default=ManagedBotProvisionStep.PREFLIGHT.value,
+        server_default=ManagedBotProvisionStep.PREFLIGHT.value,
+        nullable=False,
+    )
+    bot_user_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, unique=True)
+    guardian_bot_profile_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("guardian_bot_profile.id", ondelete="SET NULL"), nullable=True
+    )
+    owned_bot_profile_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("owned_bot_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    max_attempts: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
+    retryable: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    error_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    celery_task_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    create_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    external_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_by_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        server_default="CURRENT_TIMESTAMP",
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_managed_bot_provision_reserved_username",
+            "username",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('queued','running','retry_wait','needs_attention','succeeded') "
+                "OR bot_user_id IS NOT NULL OR external_created_at IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status IN ('queued','running','retry_wait','needs_attention','succeeded') "
+                "OR bot_user_id IS NOT NULL OR external_created_at IS NOT NULL"
+            ),
+        ),
+        Index("idx_managed_bot_provision_status_retry", "status", "next_retry_at"),
+        Index("idx_managed_bot_provision_owner", "owner_account_id"),
+        Index("idx_managed_bot_provision_manager", "manager_bot_profile_id"),
+        CheckConstraint("attempts >= 0", name="managed_bot_provision_attempts_non_negative"),
+        CheckConstraint("max_attempts >= 1", name="managed_bot_provision_max_attempts_positive"),
     )
 
 

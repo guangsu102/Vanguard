@@ -64,6 +64,8 @@ FAILED_ITEM_STATUSES = {
     ItemStatus.FAILED_PERMANENT.value,
 }
 
+DISSOLVE_OPERATION_TYPE = "dissolve"
+
 _PUBLIC_USERNAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 _TELEGRAM_CHAT_ID_MIN = -(2**63)
 _TELEGRAM_CHAT_ID_MAX = 2**63 - 1
@@ -90,6 +92,15 @@ class GroupCreateResult:
     reason_code: str | None = None
     message: str | None = None
 
+
+@dataclass(frozen=True)
+class GroupDissolveResult:
+    """Terminal outcome of one explicitly confirmed Telegram group deletion."""
+
+    success: bool
+    unknown: bool = False
+    reason_code: str | None = None
+    message: str | None = None
 
 @dataclass(frozen=True)
 class ItemExecutionResult:
@@ -127,6 +138,9 @@ class OwnedGroupTelegramAdapter(Protocol):
         self, asset: OwnedGroupAsset, owner: TelegramAccount | None
     ) -> GroupCreateResult | dict[str, Any]: ...
 
+    async def dissolve_group(
+        self, asset: OwnedGroupAsset
+    ) -> GroupDissolveResult | dict[str, Any]: ...
     async def execute_item(
         self,
         asset: OwnedGroupAsset,
@@ -162,6 +176,14 @@ class NoopOwnedGroupTelegramAdapter:
             reason_code="telegram_adapter_not_configured",
             message="Telegram adapter is not configured; group creation was not attempted",
         )
+
+    async def dissolve_group(self, asset: OwnedGroupAsset) -> GroupDissolveResult:
+        return GroupDissolveResult(
+            success=False,
+            reason_code="telegram_adapter_not_configured",
+            message="Telegram adapter is not configured; group dissolution was not attempted",
+        )
+
 
     async def execute_item(
         self,
@@ -213,6 +235,17 @@ def _coerce_create(value: GroupCreateResult | dict[str, Any]) -> GroupCreateResu
         telegram_user_id=value.get("telegram_user_id") or value.get("user_id"),
         telegram_username=value.get("telegram_username") or value.get("username"),
         public_link=value.get("public_link"),
+        reason_code=value.get("reason_code"),
+        message=value.get("message") or value.get("error_message"),
+    )
+
+
+def _coerce_dissolve(value: GroupDissolveResult | dict[str, Any]) -> GroupDissolveResult:
+    if isinstance(value, GroupDissolveResult):
+        return value
+    return GroupDissolveResult(
+        success=bool(value.get("success", False)),
+        unknown=bool(value.get("unknown", False)),
         reason_code=value.get("reason_code"),
         message=value.get("message") or value.get("error_message"),
     )
@@ -1070,7 +1103,8 @@ async def _recompute_operation(db: AsyncSession, operation: OwnedGroupOperation)
     operation.completed_count = completed
     operation.skipped_count = skipped
     operation.failed_count = failed
-    operation.updated_at = _now()
+    current = _now()
+    operation.updated_at = current
 
     if operation.status == OperationStatus.STOPPING.value:
         # A stop request is not permission to forget an in-flight Telegram
@@ -1087,7 +1121,13 @@ async def _recompute_operation(db: AsyncSession, operation: OwnedGroupOperation)
             operation.status = OperationStatus.UNKNOWN.value
     elif pending:
         if operation.status == OperationStatus.RUNNING.value:
-            # Let the next beat tick pick up a future transient retry.
+            config = _config(operation)
+            try:
+                batch_interval_seconds = max(1, int(config.get("batch_interval_seconds", 600)))
+            except (TypeError, ValueError):
+                batch_interval_seconds = 600
+            next_batch_at = current + timedelta(seconds=batch_interval_seconds)
+            has_plain_pending = any(item.status == ItemStatus.PENDING.value for item in items)
             next_retry = min(
                 (
                     item.next_retry_at
@@ -1098,9 +1138,15 @@ async def _recompute_operation(db: AsyncSession, operation: OwnedGroupOperation)
             )
             assert_transition("operation", operation.status, OperationStatus.QUEUED.value)
             operation.status = OperationStatus.QUEUED.value
-            # Resume immediately when plain PENDING items remain; defer only
-            # when the earliest transient retry explicitly requests a delay.
-            operation.schedule_at = next_retry or _now()
+            # Every batch gets a quiet period before the operation can be
+            # claimed again. Plain pending work may resume after that period;
+            # when only transient failures remain, also honor the earliest
+            # adapter/server retry time.
+            operation.schedule_at = (
+                next_batch_at
+                if has_plain_pending or next_retry is None
+                else max(next_batch_at, next_retry)
+            )
     elif failed:
         target = (
             OperationStatus.PARTIAL_COMPLETED.value
@@ -1131,6 +1177,108 @@ async def _recompute_operation(db: AsyncSession, operation: OwnedGroupOperation)
     }
 
 
+async def _run_owned_group_dissolution(
+    db: AsyncSession,
+    operation: OwnedGroupOperation,
+    *,
+    adapter: OwnedGroupTelegramAdapter | None,
+) -> dict[str, Any]:
+    """Execute one irreversible deletion exactly once.
+
+    The operation row was durably claimed before this function is called. Any
+    exception after the RPC boundary becomes UNKNOWN and requires an operator to
+    verify Telegram; this path deliberately has no retry or reconcile replay.
+    """
+
+    asset = await db.get(OwnedGroupAsset, operation.group_asset_id)
+    if asset is None:
+        operation.last_error = "owned_group_asset_not_found"
+        assert_transition("operation", operation.status, OperationStatus.FAILED.value)
+        operation.status = OperationStatus.FAILED.value
+        operation.finished_at = _now()
+        await db.flush()
+        return {"operation_id": operation.id, "status": operation.status}
+    if asset.status != AssetStatus.DISSOLVING.value:
+        operation.last_error = "owned_group_asset_not_dissolving"
+        assert_transition("operation", operation.status, OperationStatus.FAILED.value)
+        operation.status = OperationStatus.FAILED.value
+        operation.finished_at = _now()
+        await db.flush()
+        return {"operation_id": operation.id, "status": operation.status}
+
+    executor = _adapter_or_noop(adapter)
+    try:
+        result = _coerce_dissolve(await executor.dissolve_group(asset))
+    except Exception as exc:  # A response may have been lost after remote deletion.
+        result = GroupDissolveResult(
+            success=False,
+            unknown=True,
+            reason_code=ReasonCode.UNKNOWN_NEEDS_RECONCILE.value,
+            message=safe_exception_message(exc),
+        )
+
+    now = _now()
+    previous_asset_status = asset.status
+    operation.planned_count = 1
+    operation.updated_at = now
+    if result.success:
+        assert_transition("asset", asset.status, AssetStatus.ARCHIVED.value)
+        asset.status = AssetStatus.ARCHIVED.value
+        asset.archived_at = now
+        asset.member_count = 0
+        asset.updated_at = now
+        assert_transition("operation", operation.status, OperationStatus.COMPLETED.value)
+        operation.status = OperationStatus.COMPLETED.value
+        operation.completed_count = 1
+        operation.failed_count = 0
+        operation.last_error = None
+        operation.finished_at = now
+        _audit(
+            db,
+            event_type="owned_group_dissolved",
+            asset_id=asset.id,
+            operation_id=operation.id,
+            actor_id=operation.created_by,
+            before_state=previous_asset_status,
+            after_state=asset.status,
+            result="success",
+            reason_code=result.reason_code or "telegram_group_deleted",
+        )
+    else:
+        # Whether Telegram refused before the call or its reply was lost, do not
+        # return the asset to READY: further writes must stay fenced until an
+        # administrator reviews the remote state.
+        assert_transition("asset", asset.status, AssetStatus.NEEDS_ATTENTION.value)
+        asset.status = AssetStatus.NEEDS_ATTENTION.value
+        asset.updated_at = now
+        target = OperationStatus.UNKNOWN.value if result.unknown else OperationStatus.FAILED.value
+        assert_transition("operation", operation.status, target)
+        operation.status = target
+        operation.failed_count = 0 if result.unknown else 1
+        operation.last_error = safe_exception_message(result.message or result.reason_code or "")
+        operation.finished_at = None if result.unknown else now
+        _audit(
+            db,
+            event_type="owned_group_dissolution_unknown" if result.unknown else "owned_group_dissolution_failed",
+            asset_id=asset.id,
+            operation_id=operation.id,
+            actor_id=operation.created_by,
+            before_state=previous_asset_status,
+            after_state=asset.status,
+            result="unknown" if result.unknown else "failed",
+            reason_code=result.reason_code or (
+                ReasonCode.UNKNOWN_NEEDS_RECONCILE.value if result.unknown else "telegram_group_delete_failed"
+            ),
+        )
+    await db.flush()
+    return {
+        "operation_id": operation.id,
+        "status": operation.status,
+        "planned_count": operation.planned_count,
+        "completed_count": operation.completed_count,
+        "failed_count": operation.failed_count,
+    }
+
 async def run_owned_group_operation(
     db: AsyncSession,
     operation_id: int,
@@ -1145,6 +1293,37 @@ async def run_owned_group_operation(
     operation = await db.get(OwnedGroupOperation, operation_id)
     if operation is None:
         return {"status": "not_found", "operation_id": operation_id}
+    if operation.operation_type == DISSOLVE_OPERATION_TYPE:
+        # A dissolution is a one-shot remote side effect. Never let generic
+        # item recomputation turn a terminal/unknown outcome into a new action.
+        if operation.status == OperationStatus.QUEUED.value:
+            assert_transition("operation", operation.status, OperationStatus.RUNNING.value)
+            operation.status = OperationStatus.RUNNING.value
+            operation.started_at = operation.started_at or _now()
+            operation.updated_at = _now()
+        if operation.status != OperationStatus.RUNNING.value:
+            return {
+                "operation_id": operation.id,
+                "status": operation.status,
+                "planned_count": operation.planned_count,
+                "completed_count": operation.completed_count,
+                "failed_count": operation.failed_count,
+            }
+        if durable_claims:
+            await db.flush()
+            await db.commit()
+            operation = await db.get(OwnedGroupOperation, operation_id)
+            if operation is None:
+                return {"status": "not_found", "operation_id": operation_id}
+            if operation.status != OperationStatus.RUNNING.value:
+                return {
+                    "operation_id": operation.id,
+                    "status": operation.status,
+                    "planned_count": operation.planned_count,
+                    "completed_count": operation.completed_count,
+                    "failed_count": operation.failed_count,
+                }
+        return await _run_owned_group_dissolution(db, operation, adapter=adapter)
     if operation.status in {
         OperationStatus.COMPLETED.value,
         OperationStatus.PARTIAL_COMPLETED.value,
@@ -1173,6 +1352,7 @@ async def run_owned_group_operation(
         operation = await db.get(OwnedGroupOperation, operation_id)
         if operation is None:
             return {"status": "not_found", "operation_id": operation_id}
+
 
     asset = await db.get(OwnedGroupAsset, operation.group_asset_id)
     if asset is None or asset.status != AssetStatus.READY.value:
@@ -1420,6 +1600,42 @@ async def reconcile_stale_owned_group_operations(
     changed = 0
     items_changed = 0
     for operation in operations:
+        if operation.operation_type == DISSOLVE_OPERATION_TYPE:
+            # A running one-shot deletion may have reached Telegram just before
+            # the worker died. Fence the asset and require manual verification;
+            # it is never safe to restart the RPC from a heartbeat recovery.
+            if operation.status == OperationStatus.QUEUED.value:
+                continue
+            previous_operation_status = operation.status
+            asset = await db.get(OwnedGroupAsset, operation.group_asset_id)
+            if asset is not None and asset.status == AssetStatus.DISSOLVING.value:
+                previous_asset_status = asset.status
+                assert_transition(
+                    "asset", previous_asset_status, AssetStatus.NEEDS_ATTENTION.value
+                )
+                asset.status = AssetStatus.NEEDS_ATTENTION.value
+                asset.updated_at = _now()
+            if operation.status == OperationStatus.PAUSED.value:
+                assert_transition(
+                    "operation", operation.status, OperationStatus.STOPPING.value
+                )
+                operation.status = OperationStatus.STOPPING.value
+            assert_transition("operation", operation.status, OperationStatus.UNKNOWN.value)
+            operation.status = OperationStatus.UNKNOWN.value
+            operation.last_error = "dissolution_worker_heartbeat_stale"
+            operation.updated_at = _now()
+            _audit(
+                db,
+                event_type="owned_group_dissolution_unknown",
+                asset_id=operation.group_asset_id,
+                operation_id=operation.id,
+                before_state=previous_operation_status,
+                after_state=operation.status,
+                result="unknown",
+                reason_code="worker_heartbeat_stale",
+            )
+            changed += 1
+            continue
         items = (
             await db.scalars(
                 select(OwnedGroupOperationItem).where(
@@ -1548,6 +1764,8 @@ async def reconcile_owned_group_operation(
     operation = await db.get(OwnedGroupOperation, operation_id)
     if operation is None:
         return {"status": "not_found", "operation_id": operation_id}
+    if operation.operation_type == DISSOLVE_OPERATION_TYPE:
+        raise ValueError("Dissolution outcomes require manual Telegram verification and cannot be reconciled here")
     asset = await db.get(OwnedGroupAsset, operation.group_asset_id)
     if asset is None:
         return {"status": "asset_not_found", "operation_id": operation.id}
@@ -1688,6 +1906,8 @@ async def retry_owned_group_operation(
     operation = await db.get(OwnedGroupOperation, operation_id)
     if operation is None:
         raise LookupError("Owned group operation not found")
+    if operation.operation_type == DISSOLVE_OPERATION_TYPE:
+        raise ValueError("Dissolution operations cannot be retried")
     if operation.status == OperationStatus.UNKNOWN.value:
         raise ValueError("Reconcile UNKNOWN operation before retrying")
     if operation.status not in {
@@ -1750,6 +1970,8 @@ async def _control_operation(
     operation = await db.get(OwnedGroupOperation, operation_id)
     if operation is None:
         raise LookupError("Owned group operation not found")
+    if operation.operation_type == DISSOLVE_OPERATION_TYPE:
+        raise ValueError("Dissolution operations cannot be controlled through generic operation actions")
     if operation.status == target:
         return operation
     if target == OperationStatus.STOPPED.value:
@@ -1911,7 +2133,9 @@ async def run_owned_group_worker_tick(
 
 
 __all__ = [
+    "DISSOLVE_OPERATION_TYPE",
     "GroupCreateResult",
+    "GroupDissolveResult",
     "ItemExecutionResult",
     "NoopOwnedGroupTelegramAdapter",
     "OwnedGroupTelegramAdapter",

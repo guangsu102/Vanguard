@@ -25,6 +25,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.account.bot_credentials import resolve_guardian_bot_token
 from app.core.account.models import (
     AccountRiskLevel,
     AccountStatus,
@@ -317,7 +318,7 @@ async def resolve_guardian_bot(
     """Resolve and revalidate both profiles for the selected runtime bot account."""
 
     account = await db.get(TelegramAccount, guardian_bot_account_id)
-    blocked_statuses = {AccountStatus.ERROR.value, AccountStatus.BANNED.value}
+    blocked_statuses = {AccountStatus.ERROR.value, AccountStatus.BANNED.value, AccountStatus.RESTRICTED.value}
     blocked_risks = {
         AccountRiskLevel.LIMITED.value,
         AccountRiskLevel.FROZEN.value,
@@ -405,7 +406,7 @@ async def probe_guardian_permissions(
 
     del source  # The caller selects the persisted snapshot source after success.
     client = TelegramClient(
-        TelegramConfig(bot_token=eligible_bot.guardian_profile.bot_token, timeout=15)
+        TelegramConfig(bot_token=resolve_guardian_bot_token(eligible_bot.guardian_profile.bot_token), timeout=15)
     )
     try:
         try:

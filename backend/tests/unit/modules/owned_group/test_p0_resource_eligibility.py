@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from telethon.crypto import AuthKey
 from telethon.sessions import StringSession
 
@@ -32,6 +33,7 @@ async def _account(
     is_active: bool = True,
     risk_level: str = "normal",
     risk_pause_until: datetime | None = None,
+    spam_check_status: str = "unknown",
 ) -> TelegramAccount:
     account = TelegramAccount(
         identifier=identifier,
@@ -42,6 +44,7 @@ async def _account(
         is_active=is_active,
         risk_level=risk_level,
         risk_pause_until=risk_pause_until,
+        spam_check_status=spam_check_status,
     )
     db.add(account)
     await db.flush()
@@ -71,6 +74,78 @@ async def test_precheck_rejects_runtime_unready_user(test_db):
     assert decision.reason == "resource_eligibility_failed"
     assert any(
         item["resource_id"] == offline.id and item["reason"] == "account_status_not_ready"
+        for item in decision.details["violations"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("blocked_status", "spam_check_status", "expected_reason"),
+    [
+        (AccountStatus.RESTRICTED, "clear", "account_restricted"),
+        (AccountStatus.BANNED, "clear", "account_banned"),
+        (AccountStatus.ERROR, "clear", "account_error"),
+        (AccountStatus.ONLINE, "restricted", "account_spam_restricted"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_precheck_rejects_blocked_account_when_runtime_readiness_is_deferred(
+    test_db,
+    blocked_status,
+    spam_check_status,
+    expected_reason,
+):
+    owner = await _account(test_db, "p0-deferred-owner")
+    blocked = await _account(
+        test_db,
+        "p0-deferred-blocked-" + expected_reason,
+        status=blocked_status,
+        spam_check_status=spam_check_status,
+    )
+
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [
+            {"resource_type": "user", "resource_id": owner.id},
+            {"resource_type": "user", "resource_id": blocked.id},
+        ],
+        owner.id,
+        require_runtime_ready=False,
+    )
+
+    assert decision.allowed is False
+    assert any(
+        item["resource_id"] == blocked.id and item["reason"] == expected_reason
+        for item in decision.details["violations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_precheck_refreshes_account_state_changed_by_another_session(test_db):
+    owner = await _account(test_db, "p0-stale-owner")
+    await test_db.commit()
+
+    # Keep the original ONLINE object in this session's identity map while a
+    # separate worker/session records a restriction after resource selection.
+    assert owner.status == AccountStatus.ONLINE
+    session_factory = async_sessionmaker(test_db.bind, expire_on_commit=False)
+    async with session_factory() as external_db:
+        updated_owner = await external_db.get(TelegramAccount, owner.id)
+        assert updated_owner is not None
+        updated_owner.status = AccountStatus.RESTRICTED
+        await external_db.commit()
+
+    assert owner.status == AccountStatus.ONLINE
+    decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+        require_runtime_ready=False,
+    )
+
+    assert decision.allowed is False
+    assert owner.status == AccountStatus.RESTRICTED
+    assert any(
+        item["resource_id"] == owner.id and item["reason"] == "account_restricted"
         for item in decision.details["violations"]
     )
 

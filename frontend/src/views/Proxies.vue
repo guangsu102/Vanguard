@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { ElButton, ElIcon, ElMessage, ElMessageBox, ElTag, ElProgress } from 'element-plus'
+import { ElAlert, ElButton, ElIcon, ElMessage, ElMessageBox, ElTag, ElProgress } from 'element-plus'
 import { Plus, Refresh, Download, Delete, Edit, Connection } from '@element-plus/icons-vue'
 import { useProxyStore } from '@/stores/proxy'
-import { proxiesApi, type ProxyFormData } from '@/api/proxies'
+import { MAX_STATIC_PROXY_BINDINGS, proxiesApi, type ProxyFormData } from '@/api/proxies'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
 import FormDrawer from '@/components/FormDrawer.vue'
@@ -17,6 +17,7 @@ const loading = ref(false)
 const drawerVisible = ref(false)
 const editingId = ref<number | null>(null)
 const testingId = ref<number | null>(null)
+const updatingStatusId = ref<number | null>(null)
 
 const formData = reactive({
   address: '',
@@ -85,7 +86,7 @@ const columns = [
   { prop: 'bindAccountCount', label: '绑定容量', width: '180', slot: 'bindAccount' },
   { prop: 'lastCheckedAt', label: '最后检测', width: '180', slot: 'lastChecked' },
   { prop: 'createdAt', label: '创建时间', width: '180', slot: 'createdAt' },
-  { prop: 'actions', label: '操作', width: '160', fixed: 'right', slot: 'actions' },
+  { prop: 'actions', label: '操作', width: '230', fixed: 'right', slot: 'actions' },
 ]
 
 const fetchData = async (params?: Record<string, any>) => {
@@ -208,6 +209,19 @@ const handleTest = async (row: any) => {
   }
 }
 
+const handleManualStatus = async (row: any) => {
+  const enabled = row.status !== 'active'
+  updatingStatusId.value = row.id
+  try {
+    await proxyStore.setEnabled(row.id, enabled)
+    ElMessage.success(enabled ? (row.status === 'error' ? '异常状态已恢复' : '代理已启用') : '代理已停用')
+  } catch (error) {
+    ElMessage.error(enabled ? '启用失败' : '停用失败')
+  } finally {
+    updatingStatusId.value = null
+  }
+}
+
 const handleRefreshStatus = async () => {
   loading.value = true
   try {
@@ -278,6 +292,14 @@ onMounted(() => {
       @reset="handleReset"
     />
 
+    <el-alert
+      class="status-help"
+      type="info"
+      :closable="false"
+      show-icon
+      title="停用仅代表人工关闭；异常表示连续检测失败。健康检测不会再自动停用代理，可使用“启用/恢复”人工修正。"
+    />
+
     <TableCard
       :columns="columns"
       :data="proxyStore.list"
@@ -328,10 +350,10 @@ onMounted(() => {
       <template #bindAccount="{ row }">
         <div class="binding-cell">
           <el-tag
-            :type="row.bindAccountCount >= 3 ? 'danger' : row.bindAccountCount > 0 ? 'warning' : 'success'"
+            :type="row.bindAccountCount >= (row.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS) ? 'danger' : row.bindAccountCount > 0 ? 'warning' : 'success'"
             effect="plain"
           >
-            {{ row.bindAccountCount || 0 }}/3
+            {{ row.bindAccountCount || 0 }}/{{ row.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS }}
           </el-tag>
           <span v-if="row.bindAccounts?.length" class="binding-accounts">
             {{ row.bindAccounts.map((item: any) => item.phone || item.identifier).join('，') }}
@@ -362,6 +384,15 @@ onMounted(() => {
         >
           <el-icon><Connection /></el-icon>
           测试
+        </el-button>
+        <el-button
+          :type="row.status === 'active' ? 'warning' : 'primary'"
+          link
+          size="small"
+          :loading="updatingStatusId === row.id"
+          @click="handleManualStatus(row)"
+        >
+          {{ row.status === 'active' ? '停用' : row.status === 'error' ? '恢复' : '启用' }}
         </el-button>
         <el-button type="danger" link size="small" @click="handleDelete(row)">
           <el-icon><Delete /></el-icon>
@@ -430,6 +461,10 @@ onMounted(() => {
 .header-actions {
   display: flex;
   gap: 12px;
+}
+
+.status-help {
+  margin-bottom: 16px;
 }
 
 .latency-cell {

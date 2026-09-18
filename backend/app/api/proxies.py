@@ -13,40 +13,34 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.account.models import Proxy, ProxyMode, ProxyType, TelegramAccount
-from app.core.account.pool import invalidate_account_in_all_pools
-from app.core.account.proxy_policy_events import publish_account_proxy_policy_changed
+from app.core.account.models import Proxy, ProxyType, TelegramAccount
+from app.core.account.proxy_policy_events import (
+    get_accounts_by_ids,
+    get_bound_static_accounts,
+    refresh_bound_static_accounts,
+)
+from app.core.account.proxy_resolver import MAX_STATIC_PROXY_BINDINGS
 from app.core.database import get_db
 from app.core.network.proxy_pool import ProxyPool
 from app.core.scheduler.tasks import validate_proxy_batch
 
-
 router = APIRouter()
-# A single healthy static proxy may safely serve up to ten accounts. Keep the
-# limit centralized so API responses and account-binding validation agree.
-MAX_STATIC_PROXY_BINDINGS = 10
 
-
-async def _bound_static_accounts(db: AsyncSession, proxy_id: int) -> list[TelegramAccount]:
-    return list(
-        (
-            await db.execute(
-                select(TelegramAccount).where(TelegramAccount.static_proxy_id == proxy_id)
-            )
-        ).scalars().all()
+async def _bound_static_accounts(
+    db: AsyncSession,
+    proxy_id: int,
+    *,
+    populate_existing: bool = False,
+) -> list[TelegramAccount]:
+    return await get_bound_static_accounts(
+        db,
+        proxy_id,
+        populate_existing=populate_existing,
     )
 
 
 async def _invalidate_bound_static_accounts(accounts: list[TelegramAccount], *, reason: str) -> None:
-    for account in accounts:
-        await invalidate_account_in_all_pools(account.id, reason=reason)
-        proxy_mode = getattr(account.proxy_mode, "value", str(account.proxy_mode))
-        static_proxy_id = account.static_proxy_id if proxy_mode == ProxyMode.STATIC.value else None
-        await publish_account_proxy_policy_changed(
-            account.id,
-            proxy_mode,
-            static_proxy_id,
-        )
+    await refresh_bound_static_accounts(accounts, reason=reason)
 
 
 # =============================================================================
@@ -94,6 +88,7 @@ class ProxyResponse(BaseModel):
     bindAccountPhone: Optional[str] = None
     bindAccountCount: int = 0
     bindAccounts: list[dict] = Field(default_factory=list)
+    maxBindAccounts: int = MAX_STATIC_PROXY_BINDINGS
     remainingBindSlots: int = MAX_STATIC_PROXY_BINDINGS
     lastCheckedAt: Optional[str] = None
     createdAt: str
@@ -165,6 +160,7 @@ def _proxy_to_response(proxy: Proxy, bound_accounts: Optional[list[TelegramAccou
             }
             for account in bound_accounts
         ],
+        maxBindAccounts=MAX_STATIC_PROXY_BINDINGS,
         remainingBindSlots=max(MAX_STATIC_PROXY_BINDINGS - len(bound_accounts), 0),
         lastCheckedAt=proxy.last_checked.isoformat() if proxy.last_checked else None,
         createdAt=proxy.created_at.isoformat() if proxy.created_at else "",
@@ -303,6 +299,7 @@ async def export_proxies(
             "latency": response["latency"] or "",
             "status": response["status"],
             "bind_account_count": response["bindAccountCount"],
+            "max_bind_accounts": response["maxBindAccounts"],
             "remaining_bind_slots": response["remainingBindSlots"],
             "last_checked_at": response["lastCheckedAt"] or "",
             "created_at": response["createdAt"],
@@ -323,6 +320,7 @@ async def export_proxies(
             "latency",
             "status",
             "bind_account_count",
+            "max_bind_accounts",
             "remaining_bind_slots",
             "last_checked_at",
             "created_at",
@@ -399,7 +397,6 @@ async def update_proxy(
     if not proxy:
         raise HTTPException(status_code=404, detail="Proxy not found")
 
-    bound_accounts = await _bound_static_accounts(db, proxy_id)
     update_data = proxy_data.model_dump(exclude_none=True)
 
     # Map frontend fields to backend fields
@@ -432,12 +429,17 @@ async def update_proxy(
 
     await db.commit()
     await db.refresh(proxy)
+    bound_accounts = await _bound_static_accounts(
+        db,
+        proxy_id,
+        populate_existing=True,
+    )
     await _invalidate_bound_static_accounts(bound_accounts, reason="static_proxy_updated")
 
     return {
         "code": 0,
         "message": "success",
-        "data": _proxy_to_response(proxy)
+        "data": _proxy_to_response(proxy, bound_accounts)
     }
 
 
@@ -447,16 +449,28 @@ async def delete_proxy(
     db: AsyncSession = Depends(get_db),
 ) -> None:
     """Delete proxy."""
-    result = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
+    result = await db.execute(
+        select(Proxy).where(Proxy.id == proxy_id).with_for_update()
+    )
     proxy = result.scalar_one_or_none()
 
     if not proxy:
         raise HTTPException(status_code=404, detail="Proxy not found")
 
-    bound_accounts = await _bound_static_accounts(db, proxy_id)
+    affected_account_ids = [
+        account.id for account in await _bound_static_accounts(db, proxy_id)
+    ]
     await db.delete(proxy)
     await db.commit()
-    await _invalidate_bound_static_accounts(bound_accounts, reason="static_proxy_deleted")
+    affected_accounts = await get_accounts_by_ids(
+        db,
+        affected_account_ids,
+        populate_existing=True,
+    )
+    await _invalidate_bound_static_accounts(
+        affected_accounts,
+        reason="static_proxy_deleted",
+    )
 
 
 # =============================================================================
@@ -520,10 +534,17 @@ async def toggle_proxy(
     if not proxy:
         raise HTTPException(status_code=404, detail="Proxy not found")
 
-    bound_accounts = await _bound_static_accounts(db, proxy_id)
-    proxy.is_active = not proxy.is_active
+    enabling = not proxy.is_active
+    proxy.is_active = enabling
+    if enabling:
+        proxy.consecutive_failures = 0
     await db.commit()
     await db.refresh(proxy)
+    bound_accounts = await _bound_static_accounts(
+        db,
+        proxy_id,
+        populate_existing=True,
+    )
     await _invalidate_bound_static_accounts(bound_accounts, reason="static_proxy_toggled")
 
     return {

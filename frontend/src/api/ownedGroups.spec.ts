@@ -1,13 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { get, post, patch } = vi.hoisted(() => ({
+const { get, post, patch, deleteRequest } = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
   patch: vi.fn(),
+  deleteRequest: vi.fn(),
 }));
 
 vi.mock("./client", () => ({
-  default: { get, post, patch },
+  default: { get, post, patch, delete: deleteRequest },
 }));
 
 import { ownedGroupsApi, redactOwnedGroupError } from "./ownedGroups";
@@ -17,6 +18,7 @@ describe("ownedGroupsApi Bot profile contract", () => {
     get.mockReset();
     post.mockReset();
     patch.mockReset();
+    deleteRequest.mockReset();
   });
 
   it("lists token-free Bot profile metadata", async () => {
@@ -110,6 +112,78 @@ describe("ownedGroupsApi Bot profile contract", () => {
     );
     expect(patch).toHaveBeenCalledWith("/owned-groups/bot-profiles/8", {
       enabled: false,
+    });
+  });
+
+  it("deletes only a confirmed local failed draft through the guarded endpoint", async () => {
+    deleteRequest.mockResolvedValue({ data: { deleted: true } });
+
+    await ownedGroupsApi.deleteFailedDraft(29);
+
+    expect(deleteRequest).toHaveBeenCalledWith("/owned-groups/29", {
+      params: { confirm_no_telegram_group: true },
+    });
+  });
+  it("queues a confirmed dissolution with an idempotency key rather than calling Telegram", async () => {
+    post.mockResolvedValue({
+      data: {
+        id: 29,
+        group_asset_id: 29,
+        operation_type: "dissolve",
+        status: "queued",
+        planned_count: 1,
+        selection_snapshot_hash: "selection",
+        config_snapshot_hash: "config",
+        idempotency_key: "dissolve-29-test",
+        created_at: "2026-09-15T00:00:00Z",
+      },
+    });
+
+    const result = await ownedGroupsApi.queueDissolution(
+      29,
+      { confirmation: "DISSOLVE 29" },
+      "dissolve-29-test",
+    );
+
+    expect(post).toHaveBeenCalledWith(
+      "/owned-groups/29/dissolution",
+      { confirmation: "DISSOLVE 29" },
+      { headers: { "Idempotency-Key": "dissolve-29-test" } },
+    );
+    expect(result).toMatchObject({
+      id: 29,
+      operation_type: "dissolve",
+      status: "queued",
+    });
+  });
+
+  it("submits an administrator dissolution verdict without contacting Telegram", async () => {
+    post.mockResolvedValue({
+      data: {
+        code: 0,
+        message: "已确认群组解散，资产归档",
+        data: {
+          id: 29,
+          status: "archived",
+          operation_id: 41,
+          operation_status: "completed",
+        },
+      },
+    });
+
+    const result = await ownedGroupsApi.resolveDissolution(29, {
+      outcome: "archived",
+      confirmation: "CONFIRM DISSOLVED 29",
+    });
+
+    expect(post).toHaveBeenCalledWith("/owned-groups/29/dissolution/resolution", {
+      outcome: "archived",
+      confirmation: "CONFIRM DISSOLVED 29",
+    });
+    expect(result.data).toMatchObject({
+      id: 29,
+      status: "archived",
+      operation_status: "completed",
     });
   });
 

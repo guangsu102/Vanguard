@@ -18,7 +18,12 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.account.models import AccountStatus, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountStatus,
+    AccountType,
+    SpamCheckAccountStatus,
+    TelegramAccount,
+)
 from app.core.account.session_files import resolve_telegram_session_file
 from app.core.config import settings
 from app.core.redis import RedisCache
@@ -316,7 +321,7 @@ async def require_owned_group_execution_enabled() -> None:
         )
 
 
-def _account_failure(
+def owned_group_account_failure(
     account: TelegramAccount | None,
     *,
     require_promoter: bool = True,
@@ -329,6 +334,26 @@ def _account_failure(
         return "account_type_not_promoter", {"account_type": account_type}
     if not bool(account.is_active):
         return "account_inactive", {}
+    account_status = _enum_value(account.status).strip().lower()
+    if account_status == AccountStatus.RESTRICTED.value:
+        return "account_restricted", {"status": account_status}
+    if account_status == AccountStatus.BANNED.value:
+        return "account_banned", {"status": account_status}
+    if account_status == AccountStatus.ERROR.value:
+        return "account_error", {"status": account_status}
+    spam_check_status = (
+        str(
+            getattr(account, "spam_check_status", SpamCheckAccountStatus.UNKNOWN.value)
+            or SpamCheckAccountStatus.UNKNOWN.value
+        )
+        .strip()
+        .lower()
+    )
+    if (
+        account_type == AccountType.PROMOTER.value
+        and spam_check_status == SpamCheckAccountStatus.RESTRICTED.value
+    ):
+        return "account_spam_restricted", {"spam_check_status": spam_check_status}
     risk_level = str(account.risk_level or "normal").strip().lower()
     if risk_level in {"frozen", "quarantined"}:
         return "account_risk_blocked", {"risk_level": risk_level}
@@ -423,7 +448,7 @@ async def precheck_owned_group_resources(
         for item in normalized
         if item["resource_type"] == ResourceType.BOT.value
     }
-    rollout_limit = int(_setting("OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS", 2))
+    rollout_limit = int(_setting("OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS", 2000))
     if len(user_ids) > rollout_limit:
         violations.append(
             {
@@ -436,7 +461,11 @@ async def precheck_owned_group_resources(
     account_ids = set(user_ids)
     if bot_profile_ids:
         profiles = (
-            await db.scalars(select(OwnedBotProfile).where(OwnedBotProfile.id.in_(bot_profile_ids)))
+            await db.scalars(
+                select(OwnedBotProfile)
+                .where(OwnedBotProfile.id.in_(bot_profile_ids))
+                .execution_options(populate_existing=True)
+            )
         ).all()
     else:
         profiles = []
@@ -445,7 +474,11 @@ async def precheck_owned_group_resources(
     accounts: dict[int, TelegramAccount] = {}
     if account_ids:
         account_rows = (
-            await db.scalars(select(TelegramAccount).where(TelegramAccount.id.in_(account_ids)))
+            await db.scalars(
+                select(TelegramAccount)
+                .where(TelegramAccount.id.in_(account_ids))
+                .execution_options(populate_existing=True)
+            )
         ).all()
         accounts = {int(account.id): account for account in account_rows}
 
@@ -453,7 +486,7 @@ async def precheck_owned_group_resources(
         resource_type = item["resource_type"]
         resource_id = item["resource_id"]
         if resource_type == ResourceType.USER.value:
-            failure = _account_failure(
+            failure = owned_group_account_failure(
                 accounts.get(resource_id),
                 require_runtime_ready=require_runtime_ready,
             )
@@ -504,7 +537,7 @@ async def precheck_owned_group_resources(
             # status like a promoter account.  Evaluate the shared account
             # guard once so a future guard change cannot produce two divergent
             # decisions for the same resource.
-            failure = _account_failure(
+            failure = owned_group_account_failure(
                 accounts[profile.account_id],
                 require_promoter=False,
                 require_runtime_ready=False,

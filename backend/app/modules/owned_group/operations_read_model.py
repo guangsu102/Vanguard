@@ -1150,9 +1150,12 @@ class OwnedGroupOperationsReadModel:
         elif not messaging.available:
             messaging_state = "unavailable"
             messaging_reasons.append("messaging_source_unavailable")
-        elif status != "ready" or snapshot.asset.get("core_group_id") is None:
+        elif status != "ready":
             messaging_state = "unavailable"
             messaging_reasons.append("asset_not_ready")
+        elif snapshot.asset.get("core_group_id") is None:
+            messaging_state = "unavailable"
+            messaging_reasons.append("core_group_mapping_missing")
         elif not messaging.summary.static_enabled:
             messaging_state = "disabled"
             messaging_reasons.append("messaging_feature_disabled")
@@ -1161,8 +1164,19 @@ class OwnedGroupOperationsReadModel:
             messaging_reasons.append("messaging_runtime_disabled")
         else:
             messaging_state = "ready"
-        if messaging.summary.dry_run:
-            messaging_reasons.append("messaging_dry_run")
+        if messaging.available:
+            if (
+                not messaging.summary.static_enabled
+                and "messaging_feature_disabled" not in messaging_reasons
+            ):
+                messaging_reasons.append("messaging_feature_disabled")
+            if (
+                not messaging.summary.runtime_enabled
+                and "messaging_runtime_disabled" not in messaging_reasons
+            ):
+                messaging_reasons.append("messaging_runtime_disabled")
+            if messaging.summary.dry_run:
+                messaging_reasons.append("messaging_dry_run")
 
         if archived:
             activities_state = "disabled"

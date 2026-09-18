@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from telethon import events as telethon_events
 
+from app.core.account.bot_credentials import resolve_guardian_bot_token
 from app.core.account.models import (
     AccountOperationConfig,
     AccountStatus,
@@ -244,7 +245,7 @@ class TelegramWorker:
                         .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
                         .where(TelegramAccount.account_type == AccountType.PROMOTER)
                         .where(TelegramAccount.is_active == True)
-                        .where(TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]))
+                        .where(TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]))
                         .where(AccountOperationConfig.enabled == True)
                     )
                 ).scalars().all()
@@ -353,7 +354,7 @@ class TelegramWorker:
                         .join(AccountOperationConfig, AccountOperationConfig.account_id == TelegramAccount.id)
                         .where(TelegramAccount.account_type == AccountType.PROMOTER)
                         .where(TelegramAccount.is_active == True)
-                        .where(TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]))
+                        .where(TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]))
                         .where(AccountOperationConfig.enabled == True)
                     )
                 ).scalars().all()
@@ -968,7 +969,7 @@ class TelegramWorker:
         )
 
         for profile in profiles:
-            client = TelegramClient(TelegramConfig(bot_token=profile.bot_token, timeout=min(self.heartbeat_interval, 30)))
+            client = TelegramClient(TelegramConfig(bot_token=resolve_guardian_bot_token(profile.bot_token), timeout=min(self.heartbeat_interval, 30)))
             try:
                 profile_group_sync_errors = 0
                 bot_user = await client.get_me()

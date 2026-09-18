@@ -8,6 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.account.evomi import ProxyInfo
 from app.core.account.models import AccountType, Proxy, ProxyMode
 
+# Anti-spam hygiene: keep the number of accounts sharing one static proxy IP
+# small. Datacenter IPs tolerate far fewer co-located accounts than
+# residential ones; 6 keeps per-IP blast radius contained.
+MAX_STATIC_PROXY_BINDINGS = 6
+
 
 @dataclass(frozen=True)
 class ResolvedProxy:

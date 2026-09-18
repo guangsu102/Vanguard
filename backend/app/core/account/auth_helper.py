@@ -43,6 +43,7 @@ class LoginSession:
     expires_at: datetime
     requires_2fa: bool = False
     device_profile: Optional[Dict[str, str]] = None
+    api_config_name: Optional[str] = None
 
     def is_expired(self) -> bool:
         """Check if session is expired."""
@@ -114,6 +115,7 @@ class TelegramAuthHelper:
         proxy: Optional[Dict[str, Any]] = None,
         proxy_required: Optional[bool] = None,
         device_profile: Optional[Dict[str, str]] = None,
+        api_config_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Send verification code to phone number.
@@ -175,6 +177,7 @@ class TelegramAuthHelper:
                 created_at=datetime.utcnow(),
                 expires_at=datetime.utcnow() + timedelta(minutes=5),
                 device_profile=profile,
+                api_config_name=api_config_name,
             )
             self._login_sessions[session_id] = login_session
 
@@ -263,6 +266,7 @@ class TelegramAuthHelper:
                 "username": username,
                 "session_string": session_string,
                 "device_profile": login_session.device_profile,
+                "api_config_name": login_session.api_config_name,
             }
 
         except SessionPasswordNeededError:
@@ -347,6 +351,7 @@ class TelegramAuthHelper:
                 "username": username,
                 "session_string": session_string,
                 "device_profile": login_session.device_profile,
+                "api_config_name": login_session.api_config_name,
             }
 
         except PasswordHashInvalidError:
@@ -368,6 +373,7 @@ class TelegramAuthHelper:
         proxy: Optional[Dict[str, Any]] = None,
         proxy_required: Optional[bool] = None,
         device_profile: Optional[Dict[str, str]] = None,
+        api_config_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Import existing session file.
@@ -456,6 +462,7 @@ class TelegramAuthHelper:
                 "phone": f"+{phone_from_session}" if phone_from_session else phone,
                 "session_string": session_string,
                 "device_profile": profile,
+                "api_config_name": api_config_name,
             }
 
         except Exception as e:

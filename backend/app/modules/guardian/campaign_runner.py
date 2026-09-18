@@ -22,6 +22,7 @@ from sqlalchemy import and_, desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.broadcasts import BroadcastRecord
+from app.core.account.bot_credentials import resolve_guardian_bot_token
 from app.core.campaign.models import (
     Campaign,
     CampaignDistributionMode,
@@ -1210,7 +1211,7 @@ class ManagedGroupCampaignRunner:
         profile = row.scalar_one_or_none()
         if profile is None:
             raise RuntimeError(f"Guardian bot profile not found for account_id={account_id}")
-        return await init_telegram_client(profile.bot_token)
+        return await init_telegram_client(resolve_guardian_bot_token(profile.bot_token))
 
     def _resolve_broadcast_message(self, campaign: Campaign) -> Optional[str]:
         reward_policy = self._parse_json_dict(campaign.reward_policy_json)

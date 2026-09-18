@@ -30,6 +30,15 @@ def test_owned_group_execution_defaults_off_and_kill_switch_is_available():
     assert configured.P0_SAFETY_GATE_ENABLED is True
     assert configured.P0_SAFETY_GATE_FAIL_CLOSED is False
     assert configured.OWNED_GROUP_KILL_SWITCH_ENABLED is False
+    assert configured.OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS == 2000
+
+
+def test_owned_group_operation_accepts_2000_accounts_and_rejects_2001():
+    configured = Settings(_env_file=None, OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS=2000)
+
+    assert configured.OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS == 2000
+    with pytest.raises(ValueError):
+        Settings(_env_file=None, OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS=2001)
 
 
 def test_production_owned_group_execution_requires_fail_closed_safety_gate():

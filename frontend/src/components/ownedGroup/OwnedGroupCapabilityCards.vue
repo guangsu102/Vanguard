@@ -38,6 +38,7 @@ const reasonLabels: Record<string, string> = {
   governance_stop_enabled: "Guardian 治理运行停止门禁已开启",
   member_observation_paused: "成员观察已暂停，历史数据仍可查看",
   asset_not_ready: "群资产尚未就绪",
+  core_group_mapping_missing: "尚未接入 Guardian 治理，群映射未建立",
   asset_needs_attention: "群资产需要人工处理",
   owned_group_execution_disabled: "自建群执行总开关已关闭",
   governance_gate_backend_unavailable: "Guardian 治理门禁服务不可用",

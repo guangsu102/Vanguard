@@ -9,7 +9,13 @@ import pytest
 from sqlalchemy import select
 
 import app.modules.acquisition.automation as acquisition_automation
-from app.core.account.models import AccountStatus, AccountType, TelegramAccount
+from app.core.account.models import (
+    AccountRiskLevel,
+    AccountStatus,
+    AccountType,
+    SpamCheckAccountStatus,
+    TelegramAccount,
+)
 from app.core.account.operation_lease import (
     AccountOperationLeaseBusy,
     AccountOperationLeaseUnavailable,
@@ -253,6 +259,181 @@ async def test_manual_policy_probe_final_owned_recheck_blocks_all_state(
     ) == []
 
 
+@pytest.mark.asyncio
+async def test_ad_account_risk_skip_reason_blocks_non_runnable_account_states(test_db):
+    now = datetime.utcnow()
+    accounts = {
+        "account_inactive": TelegramAccount(
+            identifier="ad-risk-inactive",
+            session_name="ad-risk-inactive",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=False,
+        ),
+        "account_error": TelegramAccount(
+            identifier="ad-risk-error",
+            session_name="ad-risk-error",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ERROR,
+            is_active=True,
+        ),
+        "account_banned": TelegramAccount(
+            identifier="ad-risk-banned",
+            session_name="ad-risk-banned",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.BANNED,
+            is_active=True,
+        ),
+        "account_restricted": TelegramAccount(
+            identifier="ad-risk-restricted",
+            session_name="ad-risk-restricted",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.RESTRICTED,
+            is_active=True,
+        ),
+        "account_spam_restricted": TelegramAccount(
+            identifier="ad-risk-spam-restricted",
+            session_name="ad-risk-spam-restricted",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            spam_check_status=SpamCheckAccountStatus.RESTRICTED.value,
+        ),
+        "manual_freeze": TelegramAccount(
+            identifier="ad-risk-frozen",
+            session_name="ad-risk-frozen",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            risk_level=AccountRiskLevel.FROZEN.value,
+            risk_reason="manual_freeze",
+        ),
+        "account_risk_quarantined": TelegramAccount(
+            identifier="ad-risk-quarantined",
+            session_name="ad-risk-quarantined",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            risk_level=AccountRiskLevel.QUARANTINED.value,
+        ),
+    }
+    test_db.add_all(accounts.values())
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    for expected_reason, account in accounts.items():
+        assert await service._ad_account_risk_skip_reason(account.id, now) == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_restricted_account_is_filtered_from_every_ad_probe_candidate_path(
+    test_db,
+    monkeypatch,
+):
+    now = datetime(2026, 9, 14, 8, 0)
+    account = TelegramAccount(
+        identifier="restricted-ad-probe-candidate",
+        session_name="restricted-ad-probe-candidate",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.RESTRICTED,
+        is_active=True,
+    )
+    direct_group = Group(
+        group_id=939994,
+        title="Restricted direct ad probe",
+        level=GroupLevel.A,
+        status="active",
+    )
+    warmup_group = Group(
+        group_id=939995,
+        title="Restricted warmup ad probe",
+        level=GroupLevel.A,
+        status="active",
+    )
+    test_db.add_all([account, direct_group, warmup_group])
+    await test_db.flush()
+    test_db.add_all(
+        [
+            GroupAccountMembership(
+                group_id=direct_group.id,
+                telegram_group_id=direct_group.group_id,
+                account_id=account.id,
+                status="joined",
+                join_method="manual",
+                warmup_status="writable_verified",
+                probe_status="success",
+                ad_status="active",
+                joined_at=now - timedelta(days=2),
+                first_ad_allowed_at=now - timedelta(days=1),
+                ad_eligible_after=now - timedelta(days=1),
+            ),
+            GroupAdProfile(
+                group_id=direct_group.id,
+                telegram_group_id=direct_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+            ),
+            GroupAccountMembership(
+                group_id=warmup_group.id,
+                telegram_group_id=warmup_group.group_id,
+                account_id=account.id,
+                status="joined",
+                join_method="manual",
+                warmup_status="probe_scheduled",
+                probe_status="scheduled",
+                ad_status="warming",
+                joined_at=now - timedelta(days=2),
+            ),
+            GroupAdProfile(
+                group_id=warmup_group.id,
+                telegram_group_id=warmup_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+            ),
+        ]
+    )
+    await test_db.commit()
+
+    capacity = {
+        **acquisition_automation.DEFAULT_AD_CAPACITY_SETTINGS,
+        "enabled": True,
+        "ad_policy_auto_probe_enabled": True,
+        "ad_policy_auto_probe_daily_limit_per_account": 10,
+        "window_start_hour": 0,
+        "window_end_hour": 0,
+    }
+    monkeypatch.setattr(acquisition_automation, "_now", lambda: now)
+    monkeypatch.setattr(
+        acquisition_automation,
+        "get_ad_capacity_settings",
+        AsyncMock(return_value=capacity),
+    )
+    monkeypatch.setattr(
+        acquisition_automation,
+        "get_group_ai_interaction_settings",
+        AsyncMock(return_value={"enabled": False, "allowProactiveWarmup": False}),
+    )
+    service = AcquisitionAutomationService(test_db)
+
+    warmup = await service._advance_disabled_group_warmup_to_write_probe(
+        now,
+        dry_run=True,
+    )
+    assert warmup["reason"] == "no_pending_write_probe"
+    assert warmup["processed"] == 0
+
+    automatic = await service.auto_probe_unknown_group_ad_policies(dry_run=True)
+    assert automatic["reason"] == "no_eligible_unknown_group"
+    assert automatic["processed"] == 0
+    assert all(
+        detail.get("action") != "would_send_group_ad_policy_probe"
+        for detail in automatic["details"]
+    )
+
+    with pytest.raises(RuntimeError, match="^no_probe_ready_membership$"):
+        await service._send_group_ad_policy_probe_locked(
+            direct_group.id,
+            account_id=account.id,
+        )
+
 def test_no_link_campaign_generates_profile_cta_creatives_only():
     service = AcquisitionAutomationService(None)
     campaign = SimpleNamespace(name="PipenAI soft ad")
@@ -469,7 +650,7 @@ async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(
         GroupAdRulesAuditResult(evidence=evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_model": "gpt-5.6-sol",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -478,7 +659,7 @@ async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(
 
     assert result.ad_allowed is True
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-    assert result.decision_source == "gpt-5.6-terra_two_pass"
+    assert result.decision_source == "gpt-5.6-sol_two_pass"
     assert len(result.ai_reviews) == 2
     assert service._ad_policy_llm_client.generate.await_count == 2
     assert result.reason == "group_history_supports_soft_ad_trial"
@@ -510,7 +691,7 @@ async def test_relevant_public_group_profile_can_enable_controlled_soft_ad_trial
         GroupAdRulesAuditResult(evidence=evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_model": "gpt-5.6-sol",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -519,7 +700,7 @@ async def test_relevant_public_group_profile_can_enable_controlled_soft_ad_trial
 
     assert result.ad_allowed is True
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-    assert result.decision_source == "gpt-5.6-terra_two_pass"
+    assert result.decision_source == "gpt-5.6-sol_two_pass"
     assert len(result.ai_reviews) == 2
     assert service._ad_policy_llm_client.generate.await_count == 2
 
@@ -562,7 +743,7 @@ async def test_soft_ad_trial_below_configured_confidence_fails_closed(test_db):
         GroupAdRulesAuditResult(evidence=evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_model": "gpt-5.6-sol",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -608,7 +789,7 @@ async def test_explicit_permission_must_cite_authoritative_group_rule(test_db):
         service._evaluate_group_ad_rules(evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_model": "gpt-5.6-sol",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -632,7 +813,7 @@ async def test_sync_group_policy_preserves_ai_soft_ad_trial_mode(test_db):
         policy_mode=GroupAdPolicyMode.SOFT_AD_TRIAL.value,
         reason="group_history_supports_soft_ad_trial",
         confidence=92,
-        decision_source="gpt-5.6-terra_two_pass",
+        decision_source="gpt-5.6-sol_two_pass",
     )
 
     profile = await service._sync_group_ad_policy_from_audit(
@@ -767,7 +948,7 @@ async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_
         service._evaluate_group_ad_rules(evidence),
         {
             "ad_policy_ai_enabled": True,
-            "ad_policy_ai_model": "gpt-5.6-terra",
+            "ad_policy_ai_model": "gpt-5.6-sol",
             "ad_policy_ai_timeout_seconds": 30,
             "ad_policy_ai_min_confidence": 95,
             "ad_policy_ai_require_second_pass": True,
@@ -777,7 +958,7 @@ async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_
     assert result.ad_allowed is None
     assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert result.reason == "group_rules_ai_consensus_failed"
-    assert result.decision_source == "gpt-5.6-terra_two_pass"
+    assert result.decision_source == "gpt-5.6-sol_two_pass"
     assert len(result.ai_reviews) == 2
     assert service._ad_policy_llm_client.generate.await_count == 2
 
@@ -785,7 +966,7 @@ async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_
 def test_ad_policy_evidence_hash_is_stable_until_retention_bucket_changes():
     capacity = {
         "ad_policy_ai_enabled": True,
-        "ad_policy_ai_model": "gpt-5.6-terra",
+        "ad_policy_ai_model": "gpt-5.6-sol",
         "ad_policy_ai_min_confidence": 95,
         "ad_policy_ai_require_second_pass": True,
     }
@@ -830,7 +1011,7 @@ async def test_group_rules_audit_reuses_matching_evidence_hash_without_llm(test_
     service = AcquisitionAutomationService(test_db)
     capacity = {
         "ad_policy_ai_enabled": True,
-        "ad_policy_ai_model": "gpt-5.6-terra",
+        "ad_policy_ai_model": "gpt-5.6-sol",
         "ad_policy_ai_timeout_seconds": 30,
         "ad_policy_ai_min_confidence": 95,
         "ad_policy_ai_require_second_pass": True,

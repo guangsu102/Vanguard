@@ -207,18 +207,36 @@ class FingerprintManager:
         "ios": ["Apple GPU"],
     }
 
+    # Telegram app version pools. Keep these close to the real current
+    # releases (checked 2026-09): Telegram Desktop 6.x, Telegram
+    # iOS/Android/macOS 12.x. A stale declared app version is itself an
+    # anti-spam signal, so revisit this pool regularly.
     TELEGRAM_APP_VERSIONS = {
-        "windows": ["5.0.1 x64", "5.1.3 x64", "5.2.2 x64"],
-        "macos": ["10.10.1", "10.11.2", "10.12.0"],
-        "android": ["10.14.5", "10.15.1", "10.15.2"],
-        "ios": ["10.14.5", "10.15.1", "10.15.2"],
+        "windows": ["6.11.2 x64", "6.11.0 x64", "6.10.1 x64"],
+        "macos": ["12.2.4", "12.1.1", "12.0.3"],
+        "android": ["12.12.2", "12.11.1", "12.10.1"],
+        "ios": ["12.2.4", "12.1.1", "12.0.3"],
     }
 
     TELEGRAM_DEVICE_MODELS = {
         "windows": ["PC 64bit", "Desktop", "Windows PC"],
         "macos": ["MacBook Pro", "MacBook Air", "iMac"],
-        "android": ["Pixel 8", "Samsung SM-G998B", "Xiaomi 13"],
-        "ios": ["iPhone 15", "iPhone 14 Pro", "iPhone 13"],
+        "android": [
+            "Pixel 10",
+            "Pixel 9",
+            "Samsung SM-S938B",
+            "Samsung SM-G998B",
+            "Xiaomi 14",
+            "Xiaomi 13",
+        ],
+        "ios": [
+            "iPhone 17 Pro",
+            "iPhone 17",
+            "iPhone 16",
+            "iPhone 15",
+            "iPhone 14 Pro",
+            "iPhone 13",
+        ],
     }
 
     def __init__(self):
@@ -298,6 +316,7 @@ class FingerprintManager:
 
         return {
             "fingerprint_id": fingerprint.fingerprint_id,
+            "os_type": fingerprint.os_type,
             "device_model": device_model or rng.choice(
                 self.TELEGRAM_DEVICE_MODELS.get(fingerprint.os_type, ["Desktop"])
             ),
@@ -379,9 +398,9 @@ class FingerprintManager:
         """Get OS version string."""
         versions = {
             "windows": "10.0",
-            "macos": "10.15.7",
-            "android": "14",
-            "ios": "17.4",
+            "macos": "15.6",
+            "android": "15",
+            "ios": "26.0",
         }
         return versions.get(os_type, "10.0")
 

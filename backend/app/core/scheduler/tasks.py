@@ -554,7 +554,7 @@ async def _health_check_accounts_async() -> dict[str, Any]:
         unhealthy = sum(
             1
             for account in runtime_accounts
-            if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            if account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}
         )
         return {
             "checked": len(runtime_accounts),
@@ -1081,6 +1081,39 @@ async def _send_trial_reminder_async(user_id: int, hours_before_expiry: int) -> 
 # =============================================================================
 # Periodic Tasks (Triggered by Celery Beat)
 # =============================================================================
+
+
+async def _account_app_version_roll_async(batch_size: int) -> dict[str, Any]:
+    from app.core.account.app_version_roll import roll_outdated_app_versions
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        return await roll_outdated_app_versions(db, batch_size=batch_size)
+
+    return await _run_with_db(handler)
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=300)
+def account_app_version_roll_task(self, batch_size: int | None = None):
+    """Roll a small batch of outdated declared app versions onto the current pool."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.APP_VERSION_ROLL_ENABLED:
+        return _skipped_result("account_app_version_roll", "app_version_roll_disabled")
+    normalized_batch = max(1, min(int(batch_size or settings.APP_VERSION_ROLL_BATCH_SIZE), 50))
+    logger.info("account_app_version_roll_started", batch_size=normalized_batch)
+    try:
+        result = _run_async(_account_app_version_roll_async(normalized_batch))
+        logger.info(
+            "account_app_version_roll_completed",
+            rolled_count=result.get("rolled_count"),
+            outdated_remaining=result.get("outdated_remaining"),
+            skipped_busy=result.get("skipped_busy"),
+        )
+        return result
+    except Exception as exc:
+        logger.error("account_app_version_roll_failed", error=str(exc))
+        raise self.retry(exc=exc)
 
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)

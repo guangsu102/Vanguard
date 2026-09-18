@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import TelegramAccount
-from app.core.ai.llm_client import LLMClient, LLMProvider
+from app.core.ai.llm_client import LLMClient, LLMClientError, LLMProvider
 from app.core.automation_settings import get_group_ai_interaction_settings
 from app.core.config import settings as app_settings
 from app.core.group.models import Group
@@ -1001,7 +1001,31 @@ class OwnedGroupMessageContentService:
             )
         except OwnedGroupMessagingError:
             raise
+        except LLMClientError as exc:
+            if exc.code in {
+                "AI_PROVIDER_COOLDOWN",
+                "AI_PROVIDER_TEMPORARY_FAILURE",
+            }:
+                raise OwnedGroupMessagingError(
+                    exc.code,
+                    str(exc),
+                    http_status=503,
+                    retryable=True,
+                ) from exc
+            raise OwnedGroupMessagingError(
+                "AI_GENERATION_FAILED",
+                "AI 内容生成失败",
+                http_status=422,
+                retryable=True,
+            ) from exc
         except Exception as exc:
+            if LLMClient.is_temporary_upstream_error(exc):
+                raise OwnedGroupMessagingError(
+                    "AI_PROVIDER_TEMPORARY_FAILURE",
+                    "AI provider is temporarily unavailable",
+                    http_status=503,
+                    retryable=True,
+                ) from exc
             raise OwnedGroupMessagingError(
                 "AI_GENERATION_FAILED",
                 "AI 内容生成失败",

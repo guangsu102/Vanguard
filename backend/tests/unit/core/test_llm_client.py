@@ -78,7 +78,7 @@ class TestModels:
         assert "fast" in models
         assert "balanced" in models
         assert "quality" in models
-        assert models["fast"] == "gpt-5.6-terra"
+        assert models["fast"] == "gpt-5.6-sol"
 
     def test_openai_model_tiers_use_runtime_settings(self, monkeypatch):
         """Test configurable OpenAI model tiers."""

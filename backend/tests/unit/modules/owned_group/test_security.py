@@ -17,6 +17,7 @@ from app.modules.owned_group.security import (
 def test_redact_sensitive_text_hides_tokens_and_private_invites_but_keeps_public_links():
     value = (
         "token=123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd "
+        "api=https://api.telegram.org/bot987654321:ZYXWVUTSRQPONMLKJIHGFEDCBAabcd/getMe "
         "invite=https://t.me/+AbCdEfGh12345678 "
         "public=https://t.me/my_public_group"
     )
@@ -24,6 +25,7 @@ def test_redact_sensitive_text_hides_tokens_and_private_invites_but_keeps_public
     assert REDACTED_TOKEN in redacted
     assert REDACTED_INVITE in redacted
     assert "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd" not in redacted
+    assert "ZYXWVUTSRQPONMLKJIHGFEDCBAabcd" not in redacted
     assert "+AbCdEfGh12345678" not in redacted
     assert "https://t.me/my_public_group" in redacted
 

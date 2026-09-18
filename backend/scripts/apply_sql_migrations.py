@@ -37,6 +37,10 @@ DEFAULT_MIGRATIONS = [
     "050_add_account_ai_persona.sql",
     "051_add_owned_group_message_persona_snapshot.sql",
     "052_add_owned_group_member_observations.sql",
+    "053_add_account_spam_checks.sql",
+    "054_add_managed_bot_provisions.sql",
+    "055_add_account_profile_updates.sql",
+    "056_add_api_config_platform.sql",
 ]
 
 

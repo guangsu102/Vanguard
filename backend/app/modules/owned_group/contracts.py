@@ -25,6 +25,7 @@ class AssetStatus(StrEnum):
     READY = "ready"
     CREATE_FAILED = "create_failed"
     NEEDS_ATTENTION = "needs_attention"
+    DISSOLVING = "dissolving"
     ARCHIVED = "archived"
 
 
@@ -93,14 +94,23 @@ _TRANSITIONS: dict[str, dict[str, set[str]]] = {
             AssetStatus.CREATE_FAILED.value,
             AssetStatus.NEEDS_ATTENTION.value,
         },
-        AssetStatus.READY.value: {AssetStatus.NEEDS_ATTENTION.value, AssetStatus.ARCHIVED.value},
+        AssetStatus.READY.value: {
+            AssetStatus.NEEDS_ATTENTION.value,
+            AssetStatus.DISSOLVING.value,
+            AssetStatus.ARCHIVED.value,
+        },
         AssetStatus.CREATE_FAILED.value: {
             AssetStatus.PRECHECKING.value,
             AssetStatus.ARCHIVED.value,
         },
         AssetStatus.NEEDS_ATTENTION.value: {
             AssetStatus.PRECHECKING.value,
+            AssetStatus.READY.value,
             AssetStatus.ARCHIVED.value,
+        },
+        AssetStatus.DISSOLVING.value: {
+            AssetStatus.ARCHIVED.value,
+            AssetStatus.NEEDS_ATTENTION.value,
         },
         AssetStatus.ARCHIVED.value: set(),
     },
@@ -139,11 +149,15 @@ _TRANSITIONS: dict[str, dict[str, set[str]]] = {
             OperationStatus.STOPPING.value,
             OperationStatus.STOPPED.value,
             OperationStatus.FAILED.value,
+            OperationStatus.COMPLETED.value,
         },
         OperationStatus.STOPPED.value: {OperationStatus.QUEUED.value},
         OperationStatus.COMPLETED.value: set(),
         OperationStatus.PARTIAL_COMPLETED.value: {OperationStatus.QUEUED.value},
-        OperationStatus.FAILED.value: {OperationStatus.QUEUED.value},
+        OperationStatus.FAILED.value: {
+            OperationStatus.QUEUED.value,
+            OperationStatus.COMPLETED.value,
+        },
     },
     "item": {
         ItemStatus.PENDING.value: {

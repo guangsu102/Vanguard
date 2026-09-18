@@ -804,7 +804,7 @@ class AdOnlyRecommendationService:
         if (
             target.account_type != AccountType.PROMOTER
             or not target.is_active
-            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}
             or target.risk_level
             not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}
         ):
@@ -1288,6 +1288,7 @@ class AdOnlyRecommendationService:
         if not target.is_active or target.status in {
             AccountStatus.ERROR,
             AccountStatus.BANNED,
+            AccountStatus.RESTRICTED,
         }:
             raise AdOnlyWorkflowError("target_account_unavailable")
         if target.risk_level not in {
@@ -1587,7 +1588,7 @@ class AdOnlyRecommendationService:
             raise AdOnlyWorkflowError("creative_not_enabled")
         if (
             not target.is_active
-            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}
             or target.risk_level
             not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}
         ):
@@ -1655,7 +1656,7 @@ class AdOnlyRecommendationService:
             raise AdOnlyWorkflowError("creative_not_enabled")
         if (
             not target.is_active
-            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED}
+            or target.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}
             or target.risk_level
             not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}
         ):
@@ -2363,7 +2364,7 @@ class AdOnlyRecommendationService:
             await self.db.execute(
                 select(GroupAdHandover)
                 .where(GroupAdHandover.id == handover_id)
-                .with_for_update()
+                .with_for_update(of=GroupAdHandover)
             )
         ).scalar_one_or_none()
         if handover is None:
@@ -2619,7 +2620,7 @@ class AdOnlyRecommendationService:
             await self.db.execute(
                 select(GroupAdHandover)
                 .where(GroupAdHandover.id == handover_id)
-                .with_for_update()
+                .with_for_update(of=GroupAdHandover)
             )
         ).scalar_one_or_none()
         if handover is None:
@@ -2724,7 +2725,7 @@ class AdOnlyRecommendationService:
             await self.db.execute(
                 select(GroupAdHandover)
                 .where(GroupAdHandover.id == handover_id)
-                .with_for_update()
+                .with_for_update(of=GroupAdHandover)
             )
         ).scalar_one_or_none()
         if handover is None:

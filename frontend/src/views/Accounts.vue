@@ -11,10 +11,11 @@ import AccountLoginDialog from '@/components/AccountLoginDialog.vue'
 import AccountOperationalStatusPanel from '@/components/AccountOperationalStatusPanel.vue'
 import AccountDeliveryBlockDrawer from '@/components/AccountDeliveryBlockDrawer.vue'
 import AccountPersonaDrawer from '@/components/accounts/AccountPersonaDrawer.vue'
+import AccountProfileUpdateDialog from '@/components/accounts/AccountProfileUpdateDialog.vue'
 import ClientListPagination from '@/components/ClientListPagination.vue'
 import { useAccountStore } from '@/stores/account'
 import { useAuthStore } from '@/stores/auth'
-import { proxiesApi, type Proxy } from '@/api/proxies'
+import { MAX_STATIC_PROXY_BINDINGS, proxiesApi, type Proxy } from '@/api/proxies'
 import {
   accountsApi,
   type Account,
@@ -25,6 +26,13 @@ import {
   type AccountRiskSummary,
   type AccountWarmupStage,
 } from '@/api/accounts'
+import {
+  accountSpamChecksApi,
+  createSpamCheckIdempotencyKey,
+  type SpamCheckOperation,
+  type SpamCheckOperationItem,
+  type SpamCheckOperationStatus,
+} from '@/api/accountSpamChecks'
 import type { AccountPersonaDetail } from '@/api/accountPersonas'
 import { automationApi, type AdDynamicStatus } from '@/api/automation'
 import { useRoute, useRouter } from 'vue-router'
@@ -69,6 +77,446 @@ const isAdmin = computed(() => authStore.userInfo?.role === 'admin')
 const todayUsagePagination = useClientPagination(todayUsageRows)
 const riskEventPagination = useClientPagination(riskEvents)
 const environmentEventPagination = useClientPagination(environmentEvents)
+const SPAM_CHECK_MAX_ACCOUNTS = 2000
+const SPAM_CHECK_PAGE_SIZE = 2000
+const SPAM_CHECK_POLL_INTERVAL_MS = 3000
+const spamCheckEligibleStatuses = new Set<Account['status']>(['online', 'idle', 'offline', 'restricted'])
+const spamCheckActiveStatuses = new Set<SpamCheckOperationStatus>(['queued', 'running', 'cancelling'])
+const spamCheckDialogVisible = ref(false)
+const profileUpdateDialogVisible = ref(false)
+const spamCheckLoadingAccounts = ref(false)
+const spamCheckOperationLoading = ref(false)
+const spamCheckSubmitting = ref(false)
+const spamCheckCancelling = ref(false)
+const spamCheckAccounts = ref<Account[]>([])
+const spamCheckSelectedIds = ref<number[]>([])
+const spamCheckSearch = ref('')
+const spamCheckLoadError = ref('')
+const spamCheckOperationError = ref('')
+const spamCheckOperation = ref<SpamCheckOperation | null>(null)
+let spamCheckPollTimer: number | null = null
+let spamCheckPollGeneration = 0
+let pendingSpamCheckFingerprint = ''
+let pendingSpamCheckIdempotencyKey = ''
+
+const isSpamCheckOperationActive = (status?: SpamCheckOperationStatus) =>
+  Boolean(status && spamCheckActiveStatuses.has(status))
+
+const spamCheckOperationActive = computed(() =>
+  isSpamCheckOperationActive(spamCheckOperation.value?.status),
+)
+
+const spamCheckEligibilityReason = (account: Account) => {
+  if (account.account_type !== 'promoter') return '不是推广账号'
+  if (!account.is_active) return '账号未启用'
+  if (!account.session_name?.trim()) return '缺少登录会话'
+  if (!spamCheckEligibleStatuses.has(account.status)) return '当前连接状态不可检测'
+  if (account.spam_check_status === 'queued' || account.spam_check_status === 'checking') {
+    return '检测任务处理中'
+  }
+  return ''
+}
+
+const spamCheckEligibleAccounts = computed(() =>
+  spamCheckAccounts.value.filter((account) => !spamCheckEligibilityReason(account)),
+)
+
+const spamCheckFilteredAccounts = computed(() => {
+  const query = spamCheckSearch.value.trim().toLowerCase()
+  if (!query) return spamCheckAccounts.value
+  return spamCheckAccounts.value.filter((account) =>
+    [
+      String(account.id),
+      account.display_name,
+      account.identifier,
+      account.phone,
+      account.session_name,
+    ].some((value) => value?.toLowerCase().includes(query)),
+  )
+})
+
+const spamCheckSelectedCount = computed(() => spamCheckSelectedIds.value.length)
+const spamCheckCanSubmit = computed(() =>
+  spamCheckSelectedCount.value >= 1
+  && spamCheckSelectedCount.value <= SPAM_CHECK_MAX_ACCOUNTS
+  && !spamCheckLoadingAccounts.value
+  && !spamCheckSubmitting.value
+  && !spamCheckOperationActive.value,
+)
+const spamCheckAccountMap = computed(
+  () => new Map(spamCheckAccounts.value.map((account) => [account.id, account])),
+)
+const spamCheckRecentItems = computed(() =>
+  [...(spamCheckOperation.value?.items || [])].slice(-100).reverse(),
+)
+const spamCheckProgressPercent = computed(() => {
+  const operation = spamCheckOperation.value
+  if (!operation) return 0
+  if (operation.status === 'succeeded') return 100
+  if (!operation.total_accounts) return 0
+  return Math.min(100, Math.round((operation.processed_accounts / operation.total_accounts) * 100))
+})
+const spamCheckRemainingAccounts = computed(() => {
+  const operation = spamCheckOperation.value
+  if (!operation) return 0
+  return Math.max(operation.total_accounts - operation.processed_accounts, 0)
+})
+const spamCheckProgressStatus = computed<'success' | 'warning' | 'exception' | undefined>(() => {
+  const status = spamCheckOperation.value?.status
+  if (status === 'succeeded') return 'success'
+  if (status === 'partial_failed') return 'warning'
+  if (status === 'failed') return 'exception'
+  return undefined
+})
+
+watch(spamCheckSelectedIds, (ids) => {
+  if (ids.length > SPAM_CHECK_MAX_ACCOUNTS) {
+    spamCheckSelectedIds.value = ids.slice(0, SPAM_CHECK_MAX_ACCOUNTS)
+    ElMessage.warning('一次最多选择 2000 个账号')
+    return
+  }
+  const fingerprint = ids.join(',')
+  if (pendingSpamCheckFingerprint && fingerprint !== pendingSpamCheckFingerprint) {
+    pendingSpamCheckFingerprint = ''
+    pendingSpamCheckIdempotencyKey = ''
+  }
+})
+
+const spamCheckAccountStatusText = (status: Account['status']) => {
+  const labels: Record<Account['status'], string> = {
+    offline: '离线',
+    online: '在线',
+    working: '工作中',
+    idle: '空闲',
+    restricted: '受限',
+    error: '异常',
+    banned: '封禁',
+  }
+  return labels[status] || status
+}
+
+const accountRestrictionSourceText = (account: Account) => {
+  const source = (account.restriction_source || '').toLowerCase()
+  if (source.includes('spam')) return 'SpamBot 限制'
+  if (source.includes('rpc') || source.includes('telegram')) return 'Telegram 操作限制'
+  return account.restriction_source || 'Telegram 操作限制'
+}
+
+const spamCheckResultText = (status: Account['spam_check_status']) => {
+  const labels: Record<Account['spam_check_status'], string> = {
+    unknown: '未检测',
+    queued: '排队中',
+    checking: '检测中',
+    clear: 'SpamBot 未检出限制',
+    restricted: '临时受限（非封号）',
+    flagged: '号码被风控关注（未封号）',
+    error: '检测失败',
+  }
+  return labels[status] || status
+}
+
+const spamCheckResultType = (status: Account['spam_check_status']) => {
+  if (status === 'clear') return 'success'
+  if (status === 'restricted' || status === 'error') return 'danger'
+  if (status === 'flagged' || status === 'queued' || status === 'checking') return 'warning'
+  return 'info'
+}
+
+const spamCheckOperationStatusText = (status: SpamCheckOperationStatus) => {
+  const labels: Record<SpamCheckOperationStatus, string> = {
+    queued: '排队中',
+    running: '执行中',
+    cancelling: '取消中',
+    succeeded: '已完成',
+    partial_failed: '部分失败',
+    failed: '失败',
+    cancelled: '已取消',
+  }
+  return labels[status] || status
+}
+
+const spamCheckOperationStatusType = (status: SpamCheckOperationStatus) => {
+  if (status === 'succeeded') return 'success'
+  if (status === 'partial_failed' || status === 'cancelling') return 'warning'
+  if (status === 'failed' || status === 'cancelled') return 'danger'
+  return 'info'
+}
+
+const spamCheckItemStatusText = (
+  item: { result?: SpamCheckOperationItem['result']; status?: SpamCheckOperationItem['status'] },
+) => {
+  if (item.result === 'clear') return 'SpamBot 未检出限制'
+  if (item.result === 'restricted') return '受限'
+  const labels: Partial<Record<SpamCheckOperationItem['status'], string>> = {
+    pending: '等待中',
+    in_progress: '检测中',
+    retry_wait: '等待重试',
+    succeeded: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  }
+  return (item.status && labels[item.status]) || item.status || '未知'
+}
+
+const spamCheckItemStatusType = (
+  item: { result?: SpamCheckOperationItem['result']; status?: SpamCheckOperationItem['status'] },
+) => {
+  if (item.result === 'clear') return 'success'
+  if (item.result === 'restricted' || item.status === 'failed' || item.status === 'cancelled') return 'danger'
+  if (item.status === 'retry_wait') return 'warning'
+  return 'info'
+}
+
+const spamCheckAccountLabel = (accountId: number | null) => {
+  if (accountId === null) return '账号已删除'
+  const account = spamCheckAccountMap.value.get(accountId)
+  return account?.display_name || account?.identifier || ('账号 #' + accountId)
+}
+
+const spamCheckErrorText = (error: unknown, fallback: string) => {
+  const responseData = (error as {
+    response?: { data?: { detail?: string | { message?: string }; message?: string } }
+  })?.response?.data
+  if (typeof responseData?.detail === 'string') return responseData.detail
+  if (responseData?.detail && typeof responseData.detail === 'object' && responseData.detail.message) {
+    return responseData.detail.message
+  }
+  if (responseData?.message) return responseData.message
+  return error instanceof Error && error.message ? error.message : fallback
+}
+
+const stopSpamCheckPolling = () => {
+  spamCheckPollGeneration += 1
+  if (spamCheckPollTimer !== null) window.clearTimeout(spamCheckPollTimer)
+  spamCheckPollTimer = null
+}
+
+const loadSpamCheckAccounts = async () => {
+  spamCheckLoadingAccounts.value = true
+  spamCheckLoadError.value = ''
+  try {
+    const collected = new Map<number, Account>()
+    const seenCursors = new Set<string>()
+    let cursor: string | undefined
+    while (true) {
+      const response = await accountsApi.list({
+        account_type: 'promoter',
+        limit: SPAM_CHECK_PAGE_SIZE,
+        ...(cursor ? { cursor } : {}),
+      })
+      response.list.forEach((account) => {
+        if (account.account_type === 'promoter') collected.set(account.id, account)
+      })
+      const nextCursor = response.nextCursor || undefined
+      if (!response.hasMore || !nextCursor) break
+      if (seenCursors.has(nextCursor)) throw new Error('账号分页游标重复，已停止加载')
+      seenCursors.add(nextCursor)
+      cursor = nextCursor
+    }
+    spamCheckAccounts.value = Array.from(collected.values())
+    const eligibleIds = new Set(spamCheckEligibleAccounts.value.map((account) => account.id))
+    spamCheckSelectedIds.value = spamCheckSelectedIds.value.filter((id) => eligibleIds.has(id))
+  } catch (error) {
+    spamCheckLoadError.value = spamCheckErrorText(error, '推广账号加载失败')
+  } finally {
+    spamCheckLoadingAccounts.value = false
+  }
+}
+
+const refreshSpamCheckAccountSnapshots = async () => {
+  await Promise.allSettled([
+    fetchData(),
+    loadSpamCheckAccounts(),
+  ])
+}
+
+const scheduleSpamCheckPoll = (operationId: number, generation: number) => {
+  spamCheckPollTimer = window.setTimeout(async () => {
+    try {
+      const refreshed = await accountSpamChecksApi.getOperation(operationId)
+      if (generation !== spamCheckPollGeneration) return
+      spamCheckOperation.value = refreshed
+      spamCheckOperationError.value = ''
+    } catch (error) {
+      if (generation !== spamCheckPollGeneration) return
+      spamCheckOperationError.value = spamCheckErrorText(error, 'SpamBot 检测进度刷新失败')
+    }
+    if (
+      generation === spamCheckPollGeneration
+      && spamCheckOperation.value?.id === operationId
+      && isSpamCheckOperationActive(spamCheckOperation.value.status)
+    ) {
+      scheduleSpamCheckPoll(operationId, generation)
+    } else if (generation === spamCheckPollGeneration) {
+      spamCheckPollTimer = null
+      await refreshSpamCheckAccountSnapshots()
+    }
+  }, SPAM_CHECK_POLL_INTERVAL_MS)
+}
+
+const startSpamCheckPolling = (operationId: number) => {
+  stopSpamCheckPolling()
+  const generation = spamCheckPollGeneration
+  scheduleSpamCheckPoll(operationId, generation)
+}
+
+const loadLatestSpamCheckOperation = async () => {
+  spamCheckOperationLoading.value = true
+  spamCheckOperationError.value = ''
+  try {
+    const latest = await accountSpamChecksApi.getLatestOperation()
+    spamCheckOperation.value = latest
+    if (latest && isSpamCheckOperationActive(latest.status)) startSpamCheckPolling(latest.id)
+    else stopSpamCheckPolling()
+  } catch (error) {
+    const status = (error as { response?: { status?: number } })?.response?.status
+    if (status === 404) {
+      spamCheckOperation.value = null
+      stopSpamCheckPolling()
+    } else {
+      spamCheckOperationError.value = spamCheckErrorText(error, '最近 SpamBot 检测任务加载失败')
+    }
+  } finally {
+    spamCheckOperationLoading.value = false
+  }
+}
+
+const openSpamCheckDialog = async () => {
+  spamCheckDialogVisible.value = true
+  await Promise.allSettled([
+    loadSpamCheckAccounts(),
+    loadLatestSpamCheckOperation(),
+  ])
+}
+
+const refreshSpamCheckOperation = async () => {
+  const operationId = spamCheckOperation.value?.id
+  if (!operationId) {
+    await loadLatestSpamCheckOperation()
+    return
+  }
+  stopSpamCheckPolling()
+  spamCheckOperationLoading.value = true
+  spamCheckOperationError.value = ''
+  try {
+    const refreshed = await accountSpamChecksApi.getOperation(operationId)
+    spamCheckOperation.value = refreshed
+    if (isSpamCheckOperationActive(refreshed.status)) startSpamCheckPolling(refreshed.id)
+    else await refreshSpamCheckAccountSnapshots()
+  } catch (error) {
+    spamCheckOperationError.value = spamCheckErrorText(error, 'SpamBot 检测进度刷新失败')
+  } finally {
+    spamCheckOperationLoading.value = false
+  }
+}
+
+const selectAllSpamCheckAccounts = () => {
+  const eligible = spamCheckEligibleAccounts.value
+  spamCheckSelectedIds.value = eligible
+    .slice(0, SPAM_CHECK_MAX_ACCOUNTS)
+    .map((account) => account.id)
+  if (eligible.length > SPAM_CHECK_MAX_ACCOUNTS) {
+    ElMessage.warning('可检测账号超过 2000 个，本次已选择前 2000 个')
+  }
+}
+
+const clearSpamCheckAccounts = () => {
+  spamCheckSelectedIds.value = []
+}
+
+const submitSpamCheckOperation = async () => {
+  const accountIds = [...spamCheckSelectedIds.value]
+  if (!accountIds.length) {
+    ElMessage.warning('请至少选择 1 个可检测账号')
+    return
+  }
+  if (accountIds.length > SPAM_CHECK_MAX_ACCOUNTS) {
+    ElMessage.warning('一次最多选择 2000 个账号')
+    return
+  }
+  const eligibleIds = new Set(spamCheckEligibleAccounts.value.map((account) => account.id))
+  if (accountIds.some((id) => !eligibleIds.has(id))) {
+    ElMessage.warning('选择中包含当前不可检测账号，请刷新账号后重新选择')
+    return
+  }
+  if (spamCheckOperationActive.value) {
+    ElMessage.warning('已有 SpamBot 检测任务正在执行')
+    return
+  }
+
+  try {
+    await ElMessageBox.confirm(
+      '将使用 ' + accountIds.length + ' 个真实 Telegram 账号向 @SpamBot 发起检测。'
+        + '这会产生真实 Telegram 消息和网络请求，不是演练。是否继续？',
+      '确认执行 SpamBot 检测',
+      {
+        type: 'warning',
+        confirmButtonText: '确认真实执行',
+        cancelButtonText: '取消',
+      },
+    )
+  } catch {
+    return
+  }
+
+  const fingerprint = accountIds.join(',')
+  if (!pendingSpamCheckIdempotencyKey || pendingSpamCheckFingerprint !== fingerprint) {
+    pendingSpamCheckFingerprint = fingerprint
+    pendingSpamCheckIdempotencyKey = createSpamCheckIdempotencyKey()
+  }
+  spamCheckSubmitting.value = true
+  spamCheckOperationError.value = ''
+  try {
+    const operation = await accountSpamChecksApi.createOperation(
+      { account_ids: accountIds },
+      pendingSpamCheckIdempotencyKey,
+    )
+    spamCheckOperation.value = operation
+    pendingSpamCheckFingerprint = ''
+    pendingSpamCheckIdempotencyKey = ''
+    if (isSpamCheckOperationActive(operation.status)) startSpamCheckPolling(operation.id)
+    ElMessage.success('SpamBot 检测任务已提交')
+  } catch (error) {
+    spamCheckOperationError.value = spamCheckErrorText(error, 'SpamBot 检测任务提交失败')
+  } finally {
+    spamCheckSubmitting.value = false
+  }
+}
+
+const cancelSpamCheckOperation = async () => {
+  const operation = spamCheckOperation.value
+  if (!operation || !isSpamCheckOperationActive(operation.status)) return
+  try {
+    await ElMessageBox.confirm(
+      '取消后，已经完成的检测结果会保留。是否继续？',
+      '取消 SpamBot 检测任务',
+      {
+        type: 'warning',
+        confirmButtonText: '确认取消',
+        cancelButtonText: '继续执行',
+      },
+    )
+  } catch {
+    return
+  }
+
+  spamCheckCancelling.value = true
+  spamCheckOperationError.value = ''
+  try {
+    const updated = await accountSpamChecksApi.cancelOperation(operation.id)
+    spamCheckOperation.value = updated
+    if (isSpamCheckOperationActive(updated.status)) startSpamCheckPolling(updated.id)
+    else {
+      stopSpamCheckPolling()
+      await refreshSpamCheckAccountSnapshots()
+    }
+    ElMessage.success('已提交取消请求')
+  } catch (error) {
+    spamCheckOperationError.value = spamCheckErrorText(error, 'SpamBot 检测任务取消失败')
+  } finally {
+    spamCheckCancelling.value = false
+  }
+}
 
 const resetSecurityPagination = () => {
   todayUsagePagination.reset()
@@ -162,6 +610,7 @@ const columns = [
   { prop: 'asset_tier', label: '资产等级', width: '110', slot: 'assetTier' },
   { prop: 'warmup_stage', label: '托管暖号', width: '130', slot: 'warmupStage' },
   { prop: 'status', label: '状态', width: '110', slot: 'status' },
+  { prop: 'spam_check_status', label: 'SpamBot 检测', minWidth: '190', slot: 'spamCheck' },
   { prop: 'delivery_status', label: '投放状态', width: '190', slot: 'deliveryStatus' },
   { prop: 'country_code', label: '国家/地区', width: '120', slot: 'country' },
   { prop: 'proxy_mode', label: '代理', width: '160', slot: 'proxy' },
@@ -319,14 +768,16 @@ const loadOperationalStatuses = async () => {
 
 const formatProxyOption = (proxy: Proxy) => {
   const bound = proxy.bindAccountCount || 0
-  return `${proxy.protocol}://${proxy.address}:${proxy.port} (${bound}/3)`
+  const capacity = proxy.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS
+  return `${proxy.protocol}://${proxy.address}:${proxy.port} (${bound}/${capacity})`
 }
 
 const isProxyFullForAccount = (proxy: Proxy) => {
   if (formData.static_proxy_id === proxy.id) {
     return false
   }
-  return (proxy.remainingBindSlots ?? Math.max(3 - (proxy.bindAccountCount || 0), 0)) <= 0
+  const capacity = proxy.maxBindAccounts ?? MAX_STATIC_PROXY_BINDINGS
+  return (proxy.remainingBindSlots ?? Math.max(capacity - (proxy.bindAccountCount || 0), 0)) <= 0
 }
 
 const assetTierText = (tier?: string) => assetTierOptions.find((item) => item.value === tier)?.label || '未标注'
@@ -630,7 +1081,11 @@ onMounted(() => {
   loadProxyOptions()
   loadOperationalStatuses()
 })
-onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
+onBeforeUnmount(() => {
+  clearAccountLocation()
+  personaRouteSequence += 1
+  stopSpamCheckPolling()
+})
 </script>
 
 <template>
@@ -645,6 +1100,14 @@ onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
         <el-button @click="goToGuardianBots">
           <el-icon><ChatDotRound /></el-icon>
           查看Bot账号
+        </el-button>
+        <el-button @click="openSpamCheckDialog">
+          <el-icon><CircleCheck /></el-icon>
+          SpamBot 封禁检测
+        </el-button>
+        <el-button v-if="isAdmin" @click="profileUpdateDialogVisible = true">
+          <el-icon><Edit /></el-icon>
+          批量设置广告简介
         </el-button>
         <el-button type="primary" @click="openAddDrawer">
           <el-icon><Plus /></el-icon>
@@ -753,6 +1216,27 @@ onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
           <el-tag :type="row.is_active ? 'success' : 'info'" effect="plain">
             {{ row.is_active ? '已启用' : '已停用' }}
           </el-tag>
+          <div v-if="row.status === 'restricted'" class="account-restriction-detail">
+            <strong>{{ accountRestrictionSourceText(row) }}</strong>
+            <span v-if="row.restriction_reason">{{ row.restriction_reason }}</span>
+            <small v-if="row.restriction_detected_at">{{ formatDate(row.restriction_detected_at) }}</small>
+          </div>
+        </div>
+      </template>
+
+      <template #spamCheck="{ row }">
+        <div class="spam-check-status-cell">
+          <el-tag :type="spamCheckResultType(row.spam_check_status)" effect="plain">
+            {{ spamCheckResultText(row.spam_check_status) }}
+          </el-tag>
+          <small v-if="row.spam_checked_at">{{ formatDate(row.spam_checked_at) }}</small>
+          <span
+            v-if="row.spam_check_summary"
+            class="spam-check-summary"
+            :title="row.spam_check_summary"
+          >
+            {{ row.spam_check_summary }}
+          </span>
         </div>
       </template>
 
@@ -874,6 +1358,228 @@ onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
       @success="handleLoginSuccess"
     />
 
+    <AccountProfileUpdateDialog
+      v-if="profileUpdateDialogVisible && isAdmin"
+      v-model:visible="profileUpdateDialogVisible"
+      @completed="fetchData"
+    />
+
+
+    <el-dialog
+      v-model="spamCheckDialogVisible"
+      title="SpamBot 封禁检测"
+      width="min(880px, 94vw)"
+      :close-on-click-modal="!spamCheckSubmitting"
+      :close-on-press-escape="!spamCheckSubmitting"
+    >
+      <div
+        v-loading="spamCheckLoadingAccounts || spamCheckOperationLoading"
+        class="spam-check-dialog-body"
+      >
+        <el-alert
+          title="这会执行真实 Telegram 操作"
+          description="每个选中账号会向 @SpamBot 发起真实检测。SpamBot 显示未受限，只代表它未检测到垃圾消息限制，不代表账号所有 Telegram 操作正常；RPC 等操作限制仍会独立保留并阻止建群。"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+
+        <el-alert
+          v-if="spamCheckLoadError"
+          :title="spamCheckLoadError"
+          type="error"
+          :closable="false"
+          show-icon
+        />
+
+        <section v-if="spamCheckOperation" class="spam-check-operation">
+          <div class="spam-check-section-heading">
+            <div>
+              <strong>最近任务 #{{ spamCheckOperation.id }}</strong>
+              <el-tag
+                :type="spamCheckOperationStatusType(spamCheckOperation.status)"
+                effect="plain"
+              >
+                {{ spamCheckOperationStatusText(spamCheckOperation.status) }}
+              </el-tag>
+            </div>
+            <el-button
+              link
+              type="primary"
+              :loading="spamCheckOperationLoading"
+              @click="refreshSpamCheckOperation"
+            >
+              刷新进度
+            </el-button>
+          </div>
+
+          <el-progress
+            :percentage="spamCheckProgressPercent"
+            :status="spamCheckProgressStatus"
+          />
+
+          <div class="spam-check-operation-metrics">
+            <div><span>总账号</span><strong>{{ spamCheckOperation.total_accounts }}</strong></div>
+            <div><span>已处理</span><strong>{{ spamCheckOperation.processed_accounts }}</strong></div>
+            <div><span>SpamBot 未限</span><strong>{{ spamCheckOperation.clear_accounts }}</strong></div>
+            <div><span>受限</span><strong>{{ spamCheckOperation.restricted_accounts }}</strong></div>
+            <div><span>失败</span><strong>{{ spamCheckOperation.failed_accounts }}</strong></div>
+            <div><span>已取消</span><strong>{{ spamCheckOperation.cancelled_accounts }}</strong></div>
+            <div><span>剩余</span><strong>{{ spamCheckRemainingAccounts }}</strong></div>
+          </div>
+
+          <el-alert
+            v-if="spamCheckOperation.last_error || spamCheckOperationError"
+            :title="spamCheckOperationError || spamCheckOperation.last_error || ''"
+            type="error"
+            :closable="false"
+            show-icon
+          />
+
+          <div v-if="spamCheckRecentItems.length" class="spam-check-items">
+            <div class="spam-check-items-title">
+              账号明细
+              <small>显示最近 {{ spamCheckRecentItems.length }} 条</small>
+            </div>
+            <el-table :data="spamCheckRecentItems" size="small" max-height="260">
+              <el-table-column label="账号" min-width="150">
+                <template #default="{ row }">
+                  {{ spamCheckAccountLabel(row.account_id) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="结果" width="100">
+                <template #default="{ row }">
+                  <el-tag :type="spamCheckItemStatusType(row)" effect="plain">
+                    {{ spamCheckItemStatusText(row) }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column prop="attempts" label="尝试" width="65" />
+              <el-table-column label="检测时间" width="155">
+                <template #default="{ row }">
+                  {{ formatDate(row.checked_at || row.finished_at) }}
+                </template>
+              </el-table-column>
+              <el-table-column label="回复摘要" min-width="210" show-overflow-tooltip>
+                <template #default="{ row }">
+                  {{ row.response_summary || row.reason_code || '-' }}
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+        </section>
+
+        <el-alert
+          v-else-if="spamCheckOperationError"
+          :title="spamCheckOperationError"
+          type="error"
+          :closable="false"
+          show-icon
+        />
+
+        <section class="spam-check-plan">
+          <div class="spam-check-section-heading">
+            <div>
+              <strong>选择推广账号</strong>
+              <small>
+                共 {{ spamCheckAccounts.length }} 个，当前可检测 {{ spamCheckEligibleAccounts.length }} 个
+              </small>
+            </div>
+            <el-button
+              link
+              type="primary"
+              :loading="spamCheckLoadingAccounts"
+              @click="loadSpamCheckAccounts"
+            >
+              刷新账号
+            </el-button>
+          </div>
+
+          <el-input
+            v-model="spamCheckSearch"
+            clearable
+            placeholder="搜索账号名称、手机号、会话或 ID"
+          />
+
+          <div class="spam-check-picker-toolbar">
+            <span>已选择 {{ spamCheckSelectedCount }} / {{ SPAM_CHECK_MAX_ACCOUNTS }}</span>
+            <div>
+              <el-button
+                link
+                type="primary"
+                :disabled="spamCheckOperationActive || !spamCheckEligibleAccounts.length"
+                @click="selectAllSpamCheckAccounts"
+              >
+                全选可检测账号
+              </el-button>
+              <el-button
+                link
+                :disabled="spamCheckOperationActive || !spamCheckSelectedCount"
+                @click="clearSpamCheckAccounts"
+              >
+                清空
+              </el-button>
+            </div>
+          </div>
+
+          <el-scrollbar max-height="300px" class="spam-check-scrollbar">
+            <el-checkbox-group
+              v-if="spamCheckFilteredAccounts.length"
+              v-model="spamCheckSelectedIds"
+              :max="SPAM_CHECK_MAX_ACCOUNTS"
+              class="spam-check-checkbox-group"
+            >
+              <div
+                v-for="account in spamCheckFilteredAccounts"
+                :key="account.id"
+                class="spam-check-account-row"
+                :class="{ 'is-disabled': Boolean(spamCheckEligibilityReason(account)) }"
+              >
+                <el-checkbox
+                  :label="account.id"
+                  :disabled="spamCheckOperationActive || Boolean(spamCheckEligibilityReason(account))"
+                  class="spam-check-checkbox"
+                >
+                  <span class="spam-check-account-name">
+                    {{ account.display_name || account.identifier || ('账号 #' + account.id) }}
+                  </span>
+                  <small>
+                    #{{ account.id }} · {{ account.phone || account.session_name }} ·
+                    {{ spamCheckAccountStatusText(account.status) }} ·
+                    {{ spamCheckResultText(account.spam_check_status) }}
+                    <template v-if="spamCheckEligibilityReason(account)">
+                      · {{ spamCheckEligibilityReason(account) }}
+                    </template>
+                  </small>
+                </el-checkbox>
+              </div>
+            </el-checkbox-group>
+            <el-empty v-else description="没有匹配的推广账号" :image-size="56" />
+          </el-scrollbar>
+        </section>
+      </div>
+
+      <template #footer>
+        <el-button @click="spamCheckDialogVisible = false">关闭</el-button>
+        <el-button
+          v-if="spamCheckOperationActive"
+          type="danger"
+          plain
+          :loading="spamCheckCancelling"
+          @click="cancelSpamCheckOperation"
+        >
+          取消任务
+        </el-button>
+        <el-button
+          type="primary"
+          :loading="spamCheckSubmitting"
+          :disabled="!spamCheckCanSubmit"
+          @click="submitSpamCheckOperation"
+        >
+          确认并检测
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-drawer
       v-model="securityDrawerVisible"
@@ -1147,6 +1853,178 @@ onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
   gap: 12px;
 }
 
+.spam-check-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.spam-check-operation,
+.spam-check-plan {
+  padding: 14px;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.spam-check-section-heading,
+.spam-check-picker-toolbar,
+.spam-check-items-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.spam-check-section-heading {
+  margin-bottom: 12px;
+
+  > div {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  small {
+    color: #909399;
+  }
+}
+
+.spam-check-operation-metrics {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+
+  > div {
+    display: flex;
+    min-height: 52px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: #f5f7fa;
+    flex-direction: column;
+    justify-content: center;
+    gap: 4px;
+  }
+
+  span {
+    color: #909399;
+    font-size: 12px;
+  }
+
+  strong {
+    color: #303133;
+    font-size: 18px;
+  }
+}
+
+.spam-check-picker-toolbar {
+  margin: 10px 0;
+  color: #606266;
+  font-size: 13px;
+}
+
+.spam-check-scrollbar {
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+}
+
+.spam-check-checkbox-group {
+  display: grid;
+  padding: 8px;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.spam-check-account-row {
+  min-width: 0;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+
+  &.is-disabled {
+    background: #f5f7fa;
+  }
+}
+
+.spam-check-checkbox {
+  width: 100%;
+  height: auto;
+  min-height: 56px;
+  margin: 0;
+  padding: 8px 10px;
+  white-space: normal;
+
+  :deep(.el-checkbox__label) {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  small {
+    overflow: hidden;
+    color: #909399;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.spam-check-account-name {
+  overflow: hidden;
+  color: #303133;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spam-check-items {
+  margin-top: 14px;
+}
+
+.spam-check-items-title {
+  margin-bottom: 8px;
+  font-weight: 600;
+
+  small {
+    color: #909399;
+    font-weight: 400;
+  }
+}
+
+.account-restriction-detail {
+  display: flex;
+  max-width: 150px;
+  flex-direction: column;
+  gap: 3px;
+  color: #f56c6c;
+  font-size: 12px;
+
+  span,
+  small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+.spam-check-status-cell {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
+
+  small,
+  .spam-check-summary {
+    max-width: 180px;
+    overflow: hidden;
+    color: #909399;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
 .delivery-status-cell,
 .persona-status-cell {
   display: flex;
@@ -1275,6 +2153,19 @@ onBeforeUnmount(() => { clearAccountLocation(); personaRouteSequence += 1 })
 @media (max-width: 760px) {
   .security-summary {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .spam-check-operation-metrics,
+  .spam-check-checkbox-group {
+    grid-template-columns: 1fr;
+  }
+
+  .spam-check-section-heading,
+  .spam-check-picker-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>

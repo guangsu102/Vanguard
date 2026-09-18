@@ -18,10 +18,12 @@ REDACTED = "[REDACTED]"
 REDACTED_TOKEN = "[REDACTED_TOKEN]"
 REDACTED_INVITE = "[REDACTED_INVITE_LINK]"
 
-# Telegram Bot API tokens are commonly rendered as ``123456789:AA...`` in
-# exception messages.  Keep the expression deliberately conservative so normal
-# numeric IDs and ordinary prose are not hidden.
-_BOT_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])\d{5,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_])")
+# Telegram Bot API tokens are commonly rendered as ``123456789:AA...`` or as
+# the ``bot<token>`` segment of a Bot API URL.  Keep the expression deliberately
+# conservative so normal numeric IDs and ordinary prose are not hidden.
+_BOT_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:bot)?\d{5,12}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_])"
+)
 
 # Only private invite forms are secret.  A public username/link is intentionally
 # retained for normal operational context; ``+hash`` and ``joinchat`` links are

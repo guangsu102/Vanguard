@@ -21,6 +21,7 @@ from app.core.account.models import (
 
 @pytest.mark.asyncio
 async def test_static_proxy_capacity_enforces_configured_limit(test_db):
+    assert MAX_STATIC_PROXY_BINDINGS == 6
     proxy = Proxy(
         proxy_type=ProxyType.RESIDENTIAL,
         host="127.0.0.1",
@@ -32,7 +33,7 @@ async def test_static_proxy_capacity_enforces_configured_limit(test_db):
     test_db.add(proxy)
     await test_db.flush()
 
-    for idx in range(MAX_STATIC_PROXY_BINDINGS):
+    for idx in range(MAX_STATIC_PROXY_BINDINGS - 1):
         test_db.add(
             TelegramAccount(
                 phone=f"+1555000000{idx}",
@@ -48,6 +49,25 @@ async def test_static_proxy_capacity_enforces_configured_limit(test_db):
         )
     await test_db.commit()
 
+    # The sixth binding is still available.
+    await _ensure_static_proxy_capacity(test_db, proxy.id)
+    final_idx = MAX_STATIC_PROXY_BINDINGS - 1
+    test_db.add(
+        TelegramAccount(
+            phone=f"+1555000000{final_idx}",
+            identifier=f"+1555000000{final_idx}",
+            account_type=AccountType.PROMOTER,
+            api_config_name="default",
+            country_code="US",
+            session_name=f"capacity_session_{final_idx}",
+            proxy_mode=ProxyMode.STATIC,
+            static_proxy_id=proxy.id,
+            status=AccountStatus.OFFLINE,
+        )
+    )
+    await test_db.commit()
+
+    # A seventh binding must be rejected.
     with pytest.raises(HTTPException) as exc:
         await _ensure_static_proxy_capacity(test_db, proxy.id)
 

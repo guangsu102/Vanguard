@@ -10,6 +10,7 @@ Features:
 - Rate limiting
 """
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -18,6 +19,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Literal, Optional
@@ -184,10 +186,19 @@ class LLMClient:
     # gate; max_tokens is the reserved response budget.
     PERSONA_CONTEXT_TOKEN_LIMIT = 8192
 
+    # The SDK owns retries and Retry-After backoff. Bound the full call as well
+    # so repeated SDK timeouts cannot occupy a keyword worker for many minutes.
+    OPENAI_REQUEST_TIMEOUT_SECONDS = 45.0
+    OPENAI_TOTAL_TIMEOUT_SECONDS = 90.0
+    OPENAI_MAX_RETRIES = 2
+    UPSTREAM_COOLDOWN_SECONDS = 30
+    RATE_LIMIT_COOLDOWN_SECONDS = 60
+    MAX_UPSTREAM_COOLDOWN_SECONDS = 300
+
     # Model configurations
     MODELS = {
         LLMProvider.OPENAI: {
-            "fast": "gpt-5.6-terra",
+            "fast": "gpt-5.6-sol",
             "balanced": "gpt-4o",
             "quality": "gpt-4-turbo",
         },
@@ -685,6 +696,20 @@ class LLMClient:
             return normalized
         return f"{normalized}/v1"
 
+    @staticmethod
+    def is_temporary_upstream_error(exc: Exception) -> bool:
+        """Return whether an OpenAI-compatible failure is safe to retry later."""
+
+        if getattr(exc, "status_code", None) in {429, 502, 503, 504}:
+            return True
+        if isinstance(exc, TimeoutError):
+            return True
+        try:
+            from openai import APIConnectionError
+        except ImportError:
+            return False
+        return isinstance(exc, APIConnectionError)
+
     async def generate(
         self,
         prompt: str,
@@ -762,19 +787,32 @@ class LLMClient:
     ) -> str:
         """Call OpenAI API."""
         try:
-            from openai import AsyncOpenAI
+            from openai import AsyncOpenAI, Timeout
 
-            client_kwargs: dict[str, Any] = {"api_key": self.api_key}
+            cooldown_key = self._upstream_cooldown_key(model)
+            await self._check_upstream_cooldown(cooldown_key)
+            client_kwargs: dict[str, Any] = {
+                "api_key": self.api_key,
+                "timeout": Timeout(self.OPENAI_REQUEST_TIMEOUT_SECONDS, connect=5.0),
+                "max_retries": self.OPENAI_MAX_RETRIES,
+            }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
             client = AsyncOpenAI(**client_kwargs)
             try:
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                async with asyncio.timeout(self.OPENAI_TOTAL_TIMEOUT_SECONDS):
+                    response = await client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+            except Exception as exc:
+                # Caller cancellation (for example the group audit's 45s
+                # deadline) is not an upstream outage and must propagate.
+                if self.is_temporary_upstream_error(exc):
+                    await self._record_upstream_cooldown(cooldown_key, exc)
+                raise
             finally:
                 close_result = client.close()
                 if inspect.isawaitable(close_result):
@@ -785,6 +823,81 @@ class LLMClient:
         except ImportError:
             self.logger.warning("openai_not_installed")
             return await self._call_fallback("openai")
+
+    def _upstream_cooldown_key(self, model: str) -> str:
+        """Share backoff across workers without exposing endpoint or credentials."""
+        material = json.dumps(
+            [
+                self.provider.value,
+                self.base_url or "https://api.openai.com/v1",
+                model,
+                hashlib.sha256((self.api_key or "").encode()).hexdigest(),
+            ],
+            separators=(",", ":"),
+        )
+        return "llm:upstream-cooldown:" + hashlib.sha256(material.encode()).hexdigest()
+
+    async def _check_upstream_cooldown(self, key: str) -> None:
+        try:
+            active = await self.cache.get(key)
+        except Exception as exc:
+            self.logger.warning("llm_cooldown_read_failed", error_type=type(exc).__name__)
+            return
+        if active:
+            raise LLMClientError("AI_PROVIDER_COOLDOWN", "AI provider is temporarily cooling down")
+
+    def _upstream_cooldown_seconds(self, exc: Exception) -> int:
+        seconds = (
+            self.RATE_LIMIT_COOLDOWN_SECONDS
+            if getattr(exc, "status_code", None) == 429
+            else self.UPSTREAM_COOLDOWN_SECONDS
+        )
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {})
+        for header, multiplier in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+            raw_value = headers.get(header)
+            if raw_value is None:
+                continue
+            try:
+                retry_after = float(raw_value) * multiplier
+            except (TypeError, ValueError):
+                if header != "retry-after":
+                    continue
+                try:
+                    retry_after = parsedate_to_datetime(raw_value).timestamp() - time.time()
+                except (TypeError, ValueError, OverflowError, OSError):
+                    continue
+            if math.isfinite(retry_after) and retry_after > 0:
+                seconds = max(seconds, math.ceil(min(retry_after, self.MAX_UPSTREAM_COOLDOWN_SECONDS)))
+                break
+        return min(seconds, self.MAX_UPSTREAM_COOLDOWN_SECONDS)
+
+    async def _record_upstream_cooldown(self, key: str, exc: Exception) -> None:
+        seconds = self._upstream_cooldown_seconds(exc)
+        try:
+            # Concurrent account workers may see different Retry-After values.
+            # Extend the shared deadline atomically; never shorten a longer one.
+            redis_client = self.cache.client
+            stored = False
+            if redis_client is not None:
+                await redis_client.eval(
+                    "if redis.call('TTL', KEYS[1]) < tonumber(ARGV[1]) then "
+                    "redis.call('SET', KEYS[1], '1', 'EX', ARGV[1]) end; return 1",
+                    1,
+                    key,
+                    seconds,
+                )
+                stored = True
+        except Exception as cache_exc:
+            self.logger.warning("llm_cooldown_write_failed", error_type=type(cache_exc).__name__)
+            stored = False
+        self.logger.warning(
+            "llm_upstream_unavailable",
+            error_type=type(exc).__name__,
+            status_code=getattr(exc, "status_code", None),
+            cooldown_seconds=seconds,
+            cooldown_shared=bool(stored),
+        )
 
     @staticmethod
     def _extract_openai_content(response: Any) -> str:

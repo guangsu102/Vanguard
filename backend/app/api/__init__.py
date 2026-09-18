@@ -3,6 +3,8 @@ API Package Initialization
 """
 
 from app.api.account_personas import router as account_personas
+from app.api.account_spam import router as account_spam
+from app.api.account_profile_updates import router as account_profile_updates
 from app.api.accounts import router as accounts
 from app.api.acquisition import router as acquisition
 from app.api.ad_only_recommendations import router as ad_only_recommendations
@@ -15,6 +17,7 @@ from app.api.group_search_keywords import router as group_search_keywords
 from app.api.groups import router as groups
 from app.api.guardian_bots import router as guardian_bots
 from app.api.keywords import router as keywords
+from app.api.managed_bot_provisions import router as managed_bot_provisions
 from app.api.managed_groups import router as managed_groups
 from app.api.moderation import router as moderation
 from app.api.moderation_sensitive_keywords import router as moderation_sensitive_keywords
@@ -43,6 +46,8 @@ from app.api.xboard import router as xboard
 __all__ = [
     "auth",
     "accounts",
+    "account_spam",
+    "account_profile_updates",
     "proxies",
     "groups",
     "keywords",
@@ -62,6 +67,7 @@ __all__ = [
     "group_governance",
     "group_search_keywords",
     "guardian_bots",
+    "managed_bot_provisions",
     "managed_groups",
     "moderation_sensitive_keywords",
     "workers",

@@ -190,7 +190,9 @@ class GroupFailoverService:
                 GroupAccountMembership.status == "joined",
                 Group.status == "active",
                 or_(
-                    TelegramAccount.status == AccountStatus.BANNED,
+                    TelegramAccount.status.in_(
+                        [AccountStatus.BANNED, AccountStatus.RESTRICTED]
+                    ),
                     TelegramAccount.risk_reason == "account_banned",
                 ),
             )
@@ -283,7 +285,7 @@ class GroupFailoverService:
                 GroupAccountMembership.account_id != source_account_id,
                 TelegramAccount.is_active,
                 TelegramAccount.account_type == AccountType.PROMOTER,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
                 TelegramAccount.risk_level.in_(
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
@@ -466,7 +468,7 @@ class GroupFailoverService:
                 target_account_filter,
                 TelegramAccount.account_type == AccountType.PROMOTER,
                 TelegramAccount.is_active,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
                 TelegramAccount.risk_level.in_(
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
@@ -509,7 +511,7 @@ class GroupFailoverService:
             return False
         if account.account_type != AccountType.PROMOTER:
             return False
-        if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+        if account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
             return False
         if account.risk_level not in {AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value}:
             return False

@@ -666,7 +666,11 @@ class OwnedGroupMessageExecutionService:
                     await self.prompt_context_store.discard(int(current.id))
                     return current
         except OwnedGroupMessagingError as exc:
-            if exc.code == "PROMPT_CONTEXT_UNAVAILABLE":
+            if exc.code in {
+                "PROMPT_CONTEXT_UNAVAILABLE",
+                "AI_PROVIDER_COOLDOWN",
+                "AI_PROVIDER_TEMPORARY_FAILURE",
+            }:
                 return await self._defer_generation_error_if_owned(
                     execution_id,
                     lease_id,

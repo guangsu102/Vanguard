@@ -12,6 +12,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.keyword.engine import KeywordEngine
+from app.core.user.tracker import UserTracker
 from app.modules.guardian.anti_spam.competitor_block import CompetitorBlocker
 from app.modules.guardian.anti_spam.spam_detector import SpamDetector
 from app.modules.guardian.broadcast.broadcaster import GuardianBroadcaster
@@ -43,6 +44,7 @@ class GuardianContext:
     broadcaster: GuardianBroadcaster
     coupon_distributor: CouponDistributor
     campaign_runner: ManagedGroupCampaignRunner
+    user_tracker: UserTracker
 
 
 class GuardianBot:
@@ -92,6 +94,7 @@ class GuardianBot:
             broadcaster=GuardianBroadcaster(db, telegram_client),
             coupon_distributor=CouponDistributor(db, xboard_client),
             campaign_runner=ManagedGroupCampaignRunner(db, xboard_client),
+            user_tracker=UserTracker(db),
         )
         
         self.logger = logger.bind(module="guardian_bot")
@@ -245,9 +248,14 @@ class GuardianBot:
         action = evaluation.recommended_action
         
         policy_group_id = core_group_id if core_group_id is not None else chat_id
+        tracked_user = await self._context.user_tracker.get_or_create_user(
+            telegram_id=user_id,
+            username=username,
+        )
+        internal_user_id = tracked_user.id
 
         punishment = await self._context.punishment_manager.calculate_punishment(
-            user_id=user_id,
+            user_id=internal_user_id,
             group_id=policy_group_id,
             level=evaluation.severity,
             is_repeat=len(evaluation.matched_rules) > 1
@@ -259,7 +267,7 @@ class GuardianBot:
         duration = punishment.duration
         
         await self._context.punishment_manager.record_violation(
-            user_id=user_id,
+            user_id=internal_user_id,
             group_id=policy_group_id,
             rule_id=matched_rule.rule_id if matched_rule else None,
             rule_type=rule_type,
@@ -269,7 +277,7 @@ class GuardianBot:
         )
         
         warning_count = await self._context.punishment_manager.get_warning_count(
-            user_id, policy_group_id
+            internal_user_id, policy_group_id
         )
         
         await self._context.action_executor.execute(

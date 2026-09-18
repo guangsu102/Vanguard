@@ -373,6 +373,38 @@ async def test_non_ready_asset_makes_governance_and_activities_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_ready_asset_without_core_group_reports_mapping_missing(
+    test_db,
+    monkeypatch,
+):
+    asset, *_ = await _seed(test_db)
+    asset.core_group_id = None
+    asset.managed_binding_id = None
+    asset.guardian_bot_account_id = None
+    asset.governance_status = "disabled"
+    await test_db.commit()
+    monkeypatch.setattr(
+        "app.modules.owned_group.operations_read_model.is_owned_group_governance_enabled",
+        lambda: True,
+    )
+
+    operations = await _service(test_db).get_operations_center(asset.id, role="admin")
+
+    assert operations.sections.messaging.state == "unavailable"
+    assert "core_group_mapping_missing" in (
+        operations.sections.messaging.blocking_reasons
+    )
+    assert "asset_not_ready" not in operations.sections.messaging.blocking_reasons
+    assert "messaging_feature_disabled" in (
+        operations.sections.messaging.blocking_reasons
+    )
+    assert "messaging_runtime_disabled" in (
+        operations.sections.messaging.blocking_reasons
+    )
+    assert "messaging_dry_run" in operations.sections.messaging.blocking_reasons
+
+
+@pytest.mark.asyncio
 async def test_binding_loads_owned_bot_profile_by_account_without_owned_membership(
     test_db,
     monkeypatch,

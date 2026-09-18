@@ -293,17 +293,17 @@ class TestOSVersion:
     def test_macos_version(self, manager):
         """Test macOS version string."""
         version = manager._get_os_version("macos")
-        assert version == "10.15.7"
+        assert version == "15.6"
 
     def test_android_version(self, manager):
         """Test Android version string."""
         version = manager._get_os_version("android")
-        assert version == "14"
+        assert version == "15"
 
     def test_ios_version(self, manager):
         """Test iOS version string."""
         version = manager._get_os_version("ios")
-        assert version == "17.4"
+        assert version == "26.0"
 
     def test_unknown_os_version(self, manager):
         """Test unknown OS version defaults to Windows."""

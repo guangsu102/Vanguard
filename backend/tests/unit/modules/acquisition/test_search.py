@@ -1164,9 +1164,9 @@ class TestAutoJoinStateHandling:
         service._auto_join_dynamic_daily_limit = AsyncMock(return_value=1)
         service.group_finder.search_by_keyword = AsyncMock(
             return_value=[
-                DiscoveredGroup(91001, "Group 1", "group_1", 0, False),
-                DiscoveredGroup(91002, "Group 2", "group_2", 500, False),
-                DiscoveredGroup(91003, "Group 3", "group_3", 800, False),
+                DiscoveredGroup(91001, "群组一", "group_1", 0, False),
+                DiscoveredGroup(91002, "群组二", "group_2", 500, False),
+                DiscoveredGroup(91003, "群组三", "group_3", 800, False),
             ]
         )
         service._attempt_join_queued_group = AsyncMock(
@@ -3140,6 +3140,13 @@ class TestAdDeliveryFailureHandling:
             status=AccountStatus.BANNED,
             is_active=True,
         )
+        restricted = TelegramAccount(
+            identifier="ad-binding-restricted",
+            session_name="ad_binding_restricted",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.RESTRICTED,
+            is_active=True,
+        )
         errored = TelegramAccount(
             identifier="ad-binding-error",
             session_name="ad_binding_error",
@@ -3152,7 +3159,7 @@ class TestAdDeliveryFailureHandling:
             enabled=True,
             status="active",
         )
-        test_db.add_all([eligible, inactive, banned, errored, campaign])
+        test_db.add_all([eligible, inactive, banned, restricted, errored, campaign])
         await test_db.flush()
         bindings = [
             AccountAdBinding(
@@ -3160,7 +3167,7 @@ class TestAdDeliveryFailureHandling:
                 ad_campaign_id=campaign.id,
                 enabled=True,
             )
-            for account in (eligible, inactive, banned, errored)
+            for account in (eligible, inactive, banned, restricted, errored)
         ]
         test_db.add_all(bindings)
         await test_db.commit()
@@ -3271,3 +3278,197 @@ async def test_account_ad_warmup_days_uses_warmup_policy_with_seven_day_floor(mo
     )
 
     assert await service._account_ad_warmup_days(1) == 7
+
+
+class TestDiscoveryCjkPrefilter:
+    def _service(self):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        service._search_filter_settings = AsyncMock(
+            return_value=acquisition_automation.SearchFilterSettings()
+        )
+        service._record_group_search_result = AsyncMock()
+        service._is_ad_group_control_blocked = AsyncMock(return_value=False)
+        service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
+        service._set_discovered_group_status = AsyncMock()
+        service._record_join_attempt = AsyncMock()
+        return service
+
+    @staticmethod
+    def _discovered(title: str) -> DiscoveredGroup:
+        return DiscoveredGroup(
+            group_id=9001,
+            title=title,
+            username="paypalhub",
+            member_count=100,
+            is_private=False,
+            source_keyword="kw",
+        )
+
+    @staticmethod
+    def _db_group(title: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            id=1,
+            group_id=9001,
+            title=title,
+            username="paypalhub",
+            status="active",
+            source_keyword="kw",
+        )
+
+    @pytest.mark.asyncio
+    async def test_title_without_cjk_is_rejected_before_queueing(self):
+        service = self._service()
+        service._ensure_group = AsyncMock(return_value=self._db_group("PayPal Money Hub"))
+
+        result = await service._persist_search_results_for_queue(
+            2, "kw", [self._discovered("PayPal Money Hub")]
+        )
+
+        assert result["rejected"] == 1
+        assert result["queued"] == 0
+        service._set_discovered_group_status.assert_awaited_once()
+        service._record_join_attempt.assert_awaited_once()
+        assert service._record_join_attempt.await_args.kwargs["reason"] == "title_no_cjk"
+
+    @pytest.mark.asyncio
+    async def test_cjk_title_is_queued(self):
+        service = self._service()
+        service._ensure_group = AsyncMock(return_value=self._db_group("外贸收款交流群"))
+
+        result = await service._persist_search_results_for_queue(
+            2, "kw", [self._discovered("外贸收款交流群")]
+        )
+
+        assert result["queued"] == 1
+        assert result["rejected"] == 0
+        service._record_join_attempt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cjk_filter_can_be_disabled(self):
+        service = self._service()
+        service._search_filter_settings = AsyncMock(
+            return_value=acquisition_automation.SearchFilterSettings(cjk_title_required=False)
+        )
+        service._ensure_group = AsyncMock(return_value=self._db_group("PayPal Money Hub"))
+
+        result = await service._persist_search_results_for_queue(
+            2, "kw", [self._discovered("PayPal Money Hub")]
+        )
+
+        assert result["queued"] == 1
+        assert result["rejected"] == 0
+
+
+class TestJoinQuotaCooldownPeek:
+    @pytest.mark.asyncio
+    async def test_active_cooldown_pushes_next_join_after(self, test_db):
+        account = TelegramAccount(
+            identifier="quota-peek-a",
+            session_name="quota-peek-a",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        test_db.add(account)
+        await test_db.flush()
+        config = AccountOperationConfig(
+            account_id=account.id,
+            enabled=True,
+            auto_join_enabled=True,
+        )
+        test_db.add(config)
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db, account_pool=MagicMock())
+        service.risk_guard.peek_join_cooldown = AsyncMock(return_value=3600)
+
+        reason = await service._check_join_quota(config)
+
+        assert reason == "join_risk_cooldown"
+        assert config.next_join_after is not None
+        peek_call = service.risk_guard.peek_join_cooldown.await_args
+        assert peek_call.args[0] == account.id
+
+    @pytest.mark.asyncio
+    async def test_without_cooldown_quota_check_continues(self, test_db):
+        account = TelegramAccount(
+            identifier="quota-peek-b",
+            session_name="quota-peek-b",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        test_db.add(account)
+        await test_db.flush()
+        config = AccountOperationConfig(
+            account_id=account.id,
+            enabled=True,
+            auto_join_enabled=True,
+        )
+        test_db.add(config)
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db, account_pool=MagicMock())
+        service.risk_guard.peek_join_cooldown = AsyncMock(return_value=0)
+
+        reason = await service._check_join_quota(config)
+
+        assert reason != "join_risk_cooldown"
+        service.risk_guard.peek_join_cooldown.assert_awaited_once()
+
+
+class TestAuditRejectKeywordFeedback:
+    @pytest.mark.asyncio
+    async def test_reject_after_audit_penalizes_source_keyword(self, test_db):
+        group = Group(
+            group_id=97001,
+            title="测试群",
+            username="feedback_group",
+            status="rejected",
+            source_keyword="反馈关键词",
+        )
+        keyword = GroupSearchKeyword(
+            text="反馈关键词",
+            normalized_text="反馈关键词",
+            keyword_type=KeywordType.DEMAND.value,
+            status=SearchKeywordStatus.APPROVED,
+            source=SearchKeywordSource.MANUAL,
+            enabled=True,
+            use_count=1,
+        )
+        test_db.add_all([group, keyword])
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db, account_pool=MagicMock())
+        service.group_manager = SimpleNamespace(
+            update_group=AsyncMock(),
+            update_scores=AsyncMock(),
+        )
+
+        result = await service._reject_group_after_failed_audit(group, "non_chinese_chat")
+
+        assert result is True
+        service.group_manager.update_group.assert_awaited_once_with(group.id, status="rejected")
+        assert service.group_manager.update_scores.await_args.kwargs["history_score"] == -40
+        await test_db.refresh(keyword)
+        assert keyword.status == SearchKeywordStatus.DISCARDED.value
+        assert keyword.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_membership_ban_does_not_reject_group(self, test_db):
+        group = Group(
+            group_id=97002,
+            title="被封群",
+            username="banned_group",
+            status="active",
+            source_keyword="反馈关键词二",
+        )
+        test_db.add(group)
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(db=test_db, account_pool=MagicMock())
+
+        result = await service._reject_group_after_failed_audit(group, "group_membership_banned")
+
+        assert result is False
+        assert group.status == "active"

@@ -347,7 +347,9 @@ async def _load_account(
         .execution_options(populate_existing=True)
     )
     if for_update:
-        query = query.with_for_update()
+        # api_config is a lazy="joined" relationship, so the SELECT carries a
+        # LEFT OUTER JOIN that PostgreSQL refuses to lock without OF.
+        query = query.with_for_update(of=TelegramAccount)
     account = await db.scalar(query)
     if account is None:
         raise AccountPersonaError(
@@ -361,7 +363,7 @@ async def _load_account(
         AccountOperationConfig.account_id == int(account_id)
     )
     if for_update:
-        config_query = config_query.with_for_update()
+        config_query = config_query.with_for_update(of=AccountOperationConfig)
     operation_config = await db.scalar(config_query)
     set_committed_value(account, "operation_config", operation_config)
     return account
@@ -476,7 +478,7 @@ def _account_runtime_blockers(
         reasons.append("ACCOUNT_INACTIVE")
     if not _has_usable_user_session(account):
         reasons.append("ACCOUNT_SESSION_MISSING")
-    if _enum_value(account.status) in {AccountStatus.ERROR.value, AccountStatus.BANNED.value}:
+    if _enum_value(account.status) in {AccountStatus.ERROR.value, AccountStatus.BANNED.value, AccountStatus.RESTRICTED.value}:
         reasons.append("ACCOUNT_STATUS_BLOCKED")
     if _enum_value(account.risk_level) not in {
         AccountRiskLevel.NORMAL.value,

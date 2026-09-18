@@ -32,8 +32,15 @@ from app.core.account.models import (
     AccountType,
     AccountWarmupStage,
     ProxyMode,
+    SpamCheckAccountStatus,
     TelegramAccount,
     TelegramAPIConfig,
+)
+from app.core.account.api_config_pool import (
+    MAX_ACCOUNTS_PER_API_CONFIG,
+    api_config_assignment_report,
+    link_account_api_config,
+    pick_api_config_for_platform,
 )
 from app.core.account.operation_lease import (
     AccountOperationLeaseHandle,
@@ -43,7 +50,11 @@ from app.core.account.operation_lease import (
 from app.core.account.persona import PersonaV1, hash_persona
 from app.core.account.pool import get_account_pool, invalidate_account_in_all_pools
 from app.core.account.proxy_policy_events import publish_account_proxy_policy_changed
-from app.core.account.proxy_resolver import normalize_proxy_mode, resolve_auth_proxy
+from app.core.account.proxy_resolver import (
+    MAX_STATIC_PROXY_BINDINGS,
+    normalize_proxy_mode,
+    resolve_auth_proxy,
+)
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.session_crypto import encrypt_session_string
 from app.core.account.telegram_execution import TelegramExecutionService
@@ -52,12 +63,11 @@ from app.core.database import get_db
 from app.core.group.membership_sync import sync_account_joined_groups
 from app.core.network.fingerprint import FingerprintManager
 from app.core.security import require_admin
+from app.modules.account_spam.service import enqueue_automatic_spam_check
+from app.modules.owned_group.models import OwnedGroupAsset
 
 router = APIRouter()
 auth_helper = TelegramAuthHelper()
-# Keep static proxy capacity aligned with the proxy inventory API: one proxy
-# may be bound to up to ten accounts.
-MAX_STATIC_PROXY_BINDINGS = 10
 logger = structlog.get_logger()
 
 
@@ -138,7 +148,7 @@ async def _apply_onboarding_operation_mode(
             select(TelegramAccount)
             .options(lazyload(TelegramAccount.operation_config))
             .where(TelegramAccount.id == account.id)
-            .with_for_update()
+            .with_for_update(of=TelegramAccount)
         )
     ).scalar_one_or_none()
     if locked_account is None:
@@ -148,7 +158,7 @@ async def _apply_onboarding_operation_mode(
             select(AccountOperationConfig)
             .options(lazyload(AccountOperationConfig.account))
             .where(AccountOperationConfig.account_id == account.id)
-            .with_for_update()
+            .with_for_update(of=AccountOperationConfig)
         )
     ).scalar_one_or_none()
     if config is None:
@@ -257,6 +267,7 @@ class AccountResponse(BaseModel):
     profile_bio_synced_at: Optional[str] = None
     account_type: str
     operation_mode: str = AccountOperationMode.GROWTH.value
+    owned_group_created_count: int | None = None
     persona_configured: bool = False
     persona_name: Optional[str] = None
     persona_revision: int = 0
@@ -271,6 +282,18 @@ class AccountResponse(BaseModel):
     warmup_hold_until: Optional[str] = None
     warmup_note: Optional[str] = None
     status: str
+    spam_check_status: str = SpamCheckAccountStatus.UNKNOWN.value
+    spam_checked_at: Optional[str] = None
+    spam_check_summary: Optional[str] = None
+    spam_restriction_confirmed_at: Optional[str] = None
+    restriction_source: Optional[str] = None
+    restriction_reason: Optional[str] = None
+    restriction_detected_at: Optional[str] = None
+    risk_score: float = 0.0
+    risk_level: str = "normal"
+    risk_pause_until: Optional[str] = None
+    risk_recovery_until: Optional[str] = None
+    risk_reason: Optional[str] = None
     country_code: str
     country_name: Optional[str] = None
     api_config_name: str
@@ -361,6 +384,11 @@ class APIConfigCreate(BaseModel):
     api_id: str = Field(..., description="Telegram API ID")
     api_hash: str = Field(..., description="Telegram API Hash")
     description: Optional[str] = Field(None, max_length=200)
+    platform: str = Field(
+        default="any",
+        pattern="^(windows|macos|android|ios|any)$",
+        description="Device platform this api_id was registered for",
+    )
 
 
 class APIConfigResponse(BaseModel):
@@ -370,6 +398,7 @@ class APIConfigResponse(BaseModel):
     api_id: str
     api_hash: str
     description: Optional[str] = None
+    platform: str = "any"
     account_count: int
     created_at: str
     updated_at: str
@@ -446,7 +475,11 @@ async def _reload_account_for_response(
     return result.scalar_one_or_none() or account
 
 
-def _account_to_response(account: TelegramAccount) -> AccountResponse:
+def _account_to_response(
+    account: TelegramAccount,
+    *,
+    owned_group_created_count: int | None = None,
+) -> AccountResponse:
     """Convert TelegramAccount model to response."""
     persona_summary = _account_persona_summary(account)
     return AccountResponse(
@@ -462,6 +495,7 @@ def _account_to_response(account: TelegramAccount) -> AccountResponse:
             if account.__dict__.get("operation_config") is not None
             else AccountOperationMode.GROWTH.value
         ),
+        owned_group_created_count=owned_group_created_count,
         **persona_summary,
         asset_tier=account.asset_tier or AccountAssetTier.UNKNOWN.value,
         registered_at=account.registered_at.isoformat() if account.registered_at else None,
@@ -473,6 +507,30 @@ def _account_to_response(account: TelegramAccount) -> AccountResponse:
         warmup_hold_until=account.warmup_hold_until.isoformat() if account.warmup_hold_until else None,
         warmup_note=account.warmup_note,
         status=account.status.value,
+        spam_check_status=account.spam_check_status,
+        spam_checked_at=account.spam_checked_at.isoformat() if account.spam_checked_at else None,
+        spam_check_summary=account.spam_check_summary,
+        spam_restriction_confirmed_at=(
+            account.spam_restriction_confirmed_at.isoformat()
+            if account.spam_restriction_confirmed_at
+            else None
+        ),
+        restriction_source=account.restriction_source,
+        restriction_reason=account.restriction_reason,
+        restriction_detected_at=(
+            account.restriction_detected_at.isoformat()
+            if account.restriction_detected_at
+            else None
+        ),
+        risk_score=float(account.risk_score or 0.0),
+        risk_level=str(account.risk_level or "normal"),
+        risk_pause_until=account.risk_pause_until.isoformat() if account.risk_pause_until else None,
+        risk_recovery_until=(
+            account.risk_recovery_until.isoformat()
+            if account.risk_recovery_until
+            else None
+        ),
+        risk_reason=account.risk_reason,
         country_code=account.country_code,
         country_name=account.country_name,
         api_config_name=account.api_config_name,
@@ -795,8 +853,33 @@ async def list_accounts(
     # Get next cursor
     next_cursor = str(accounts[-1].id) if accounts and has_more else None
 
+    owned_group_created_counts: dict[int, int] = {}
+    if accounts:
+        owner_account_ids = [account.id for account in accounts]
+        owned_group_counts_result = await db.execute(
+            select(
+                OwnedGroupAsset.owner_account_id,
+                func.count(OwnedGroupAsset.id),
+            )
+            .where(
+                OwnedGroupAsset.owner_account_id.in_(owner_account_ids),
+                OwnedGroupAsset.telegram_chat_id.is_not(None),
+            )
+            .group_by(OwnedGroupAsset.owner_account_id)
+        )
+        owned_group_created_counts = {
+            int(owner_account_id): int(created_count)
+            for owner_account_id, created_count in owned_group_counts_result.all()
+        }
+
     return AccountListResponse(
-        data=[_account_to_response(a) for a in accounts],
+        data=[
+            _account_to_response(
+                account,
+                owned_group_created_count=owned_group_created_counts.get(account.id, 0),
+            )
+            for account in accounts
+        ],
         total=total,
         next_cursor=next_cursor,
         has_more=has_more,
@@ -1508,29 +1591,47 @@ async def batch_delete_accounts(
 # =============================================================================
 
 @router.get("/configs")
-async def list_api_configs(
-    db: AsyncSession = Depends(get_db),
-) -> dict:
-    """List all API configurations."""
+async def list_api_configs(db: AsyncSession = Depends(get_db)) -> dict:
+    """List all API configurations with live account distribution."""
+    report = await api_config_assignment_report(db)
+    config_by_key = {(entry["name"], entry["api_id"]): entry for entry in report["configs"]}
     manager = AccountManager(db)
     configs = await manager.list_api_configs()
-
-    return {
-        "code": 0,
-        "message": "success",
-        "data": [
+    now_iso = datetime.utcnow().isoformat()
+    data = []
+    for c in configs:
+        live = config_by_key.get((c.name, c.api_id), {})
+        data.append(
             {
                 "id": c.id,
                 "name": c.name,
                 "api_id": c.api_id,
                 "api_hash": c.api_hash,
                 "description": c.description,
-                "account_count": c.account_count,
+                "platform": getattr(c, "platform", None) or "any",
+                "account_count": live.get("account_count", 0),
+                "explicit_account_count": live.get("explicit_account_count", 0),
+                "env_fallback_count": live.get("env_fallback_count", 0),
+                "under_cap": live.get(
+                    "under_cap",
+                    live.get("account_count", 0) < MAX_ACCOUNTS_PER_API_CONFIG,
+                ),
                 "created_at": c.created_at.isoformat() if c.created_at else "",
-                "updated_at": c.updated_at.isoformat() if c.updated_at else "",
+                "updated_at": c.updated_at.isoformat() if c.updated_at else now_iso,
             }
-            for c in configs
-        ]
+        )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": data,
+        "summary": {
+            "max_accounts_per_config": report["max_accounts_per_config"],
+            "accounts_total": report["accounts_total"],
+            "accounts_bound": report["accounts_bound"],
+            "accounts_unbound": report["accounts_unbound"],
+            "accounts_env_fallback": report["accounts_env_fallback"],
+            "accounts_with_session": report["accounts_with_session"],
+        },
     }
 
 
@@ -1548,6 +1649,7 @@ async def create_api_config(
             api_id=config.api_id,
             api_hash=config.api_hash,
             description=config.description,
+            platform=config.platform,
         )
         return APIConfigResponse(
             id=created.id,
@@ -1555,12 +1657,88 @@ async def create_api_config(
             api_id=created.api_id,
             api_hash=created.api_hash,
             description=created.description,
+            platform=created.platform,
             account_count=created.account_count,
             created_at=created.created_at.isoformat(),
             updated_at=created.updated_at.isoformat(),
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/configs/assign")
+async def assign_api_configs(db: AsyncSession = Depends(get_db)) -> dict:
+    """Assign platform-matched API configs to promoter accounts.
+
+    Accounts WITHOUT an existing session are rebound immediately (they will
+    authenticate fresh under the new config). Accounts that already hold a
+    session are only reported as ``needs_relogin``: switching the api_id on a
+    live auth key is an anti-abuse signal, so rebinding those happens through
+    their next re-login. Guardian bot accounts are out of scope.
+    """
+    accounts = (
+        (
+            await db.execute(
+                select(TelegramAccount)
+                .where(TelegramAccount.account_type == AccountType.PROMOTER)
+                .order_by(TelegramAccount.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assigned: list[dict] = []
+    needs_relogin: list[dict] = []
+    failed: list[dict] = []
+    for account in accounts:
+        profile = _build_telegram_device_profile(
+            phone=account.phone,
+            identifier=account.identifier,
+            session_name=account.session_name,
+            account_id=account.id,
+            existing=account,
+        )
+        os_type = profile.get("os_type", "any")
+        # Only accounts without an existing auth key can be rebound safely.
+        has_session = bool(account.session_string)
+        try:
+            config = await pick_api_config_for_platform(db, os_type=os_type)
+        except Exception as exc:
+            failed.append({"account_id": account.id, "error": str(exc)[:200]})
+            continue
+        if config is None:
+            failed.append({"account_id": account.id, "error": "no_api_config_available"})
+            continue
+        entry = {
+            "account_id": account.id,
+            "os_type": os_type,
+            "api_config_name": config.name,
+        }
+        if has_session and account.api_config_id is None:
+            # Existing auth keys keep their original api_id until re-login.
+            needs_relogin.append(entry)
+            continue
+        if account.api_config_id == config.id:
+            continue
+        link_account_api_config(account, config)
+        assigned.append(entry)
+    await db.commit()
+    report = await api_config_assignment_report(db)
+    return {
+        "code": 0,
+        "message": "API config assignment completed",
+        "data": {
+            "assigned": assigned,
+            "needs_relogin": needs_relogin,
+            "failed": failed,
+            "summary": {
+                "max_accounts_per_config": report["max_accounts_per_config"],
+                "accounts_bound": report["accounts_bound"],
+                "accounts_unbound": report["accounts_unbound"],
+                "accounts_with_session": report["accounts_with_session"],
+            },
+        },
+    }
 
 
 @router.delete("/configs/{config_name}")
@@ -1730,11 +1908,6 @@ async def send_verification_code(
     """
     manager = AccountManager(db)
 
-    # Get API config
-    api_config = await _get_api_config_or_default(manager, request.api_config_name)
-    if not api_config:
-        raise HTTPException(status_code=404, detail=f"API config '{request.api_config_name}' not found")
-
     try:
         try:
             proxy_mode = normalize_proxy_mode(request.proxy_mode)
@@ -1751,6 +1924,21 @@ async def send_verification_code(
         if proxy_mode == ProxyMode.STATIC:
             await _ensure_static_proxy_capacity(db, request.static_proxy_id)
         device_profile = _build_telegram_device_profile(phone=request.phone)
+        # The api_id must match the device platform it was registered for and
+        # stay under the per-config account cap; the chosen config is carried
+        # through the login session so complete-login links the same one.
+        api_config = await pick_api_config_for_platform(
+            db,
+            os_type=device_profile.get("os_type", "any"),
+            requested_name=request.api_config_name,
+        )
+        if api_config is None:
+            api_config = await _get_api_config_or_default(manager, request.api_config_name)
+        if not api_config:
+            raise HTTPException(
+                status_code=404,
+                detail=f"API config '{request.api_config_name}' not found",
+            )
         result = await auth_helper.send_code(
             phone=request.phone,
             api_id=api_config.api_id,
@@ -1760,9 +1948,11 @@ async def send_verification_code(
             proxy=proxy,
             proxy_required=False,
             device_profile=device_profile,
+            api_config_name=api_config.name,
         )
         result["proxy_mode"] = proxy_mode.value
         result["device_profile"] = device_profile
+        result["api_config_name"] = api_config.name
         result["static_proxy_id"] = request.static_proxy_id if proxy_mode == ProxyMode.STATIC else None
 
         return SendCodeResponse(
@@ -1888,6 +2078,19 @@ async def complete_account_login(
     session_string = account_data.session_string
     auth_lease: AccountAuthLease | None = None
 
+    # Prefer the config chosen at send-code (carried by the client); fall back
+    # to a platform-matched pick so the account never ends up name-only.
+    login_api_config = await _get_api_config_or_default(manager, account_data.api_config_name)
+    if login_api_config is None:
+        login_api_config = await pick_api_config_for_platform(
+            db,
+            os_type=_build_telegram_device_profile(
+                phone=account_data.phone,
+                identifier=account_data.identifier,
+                session_name=account_data.session_name,
+            ).get("os_type", "any"),
+        )
+
     try:
         # Check if account already exists
         existing = await db.execute(
@@ -1919,7 +2122,10 @@ async def complete_account_login(
             )
             account.country_code = account_data.country_code
             account.country_name = account_data.country_name
-            account.api_config_name = account_data.api_config_name
+            if login_api_config is not None:
+                link_account_api_config(account, login_api_config)
+            else:
+                account.api_config_name = account_data.api_config_name
             account.identifier = (account_data.identifier or account_data.phone or account.identifier)
             account.display_name = account_data.display_name
             if account_data.profile_bio is not None:
@@ -1985,13 +2191,17 @@ async def complete_account_login(
                 warmup_note=(account_data.warmup_note or "").strip()[:255] or None,
                 account_type=AccountType(account_data.account_type),
                 operation_mode=AccountOperationMode(account_data.operation_mode),
-                api_config_name=account_data.api_config_name,
+                api_config_name=(
+                    login_api_config.name if login_api_config else account_data.api_config_name
+                ),
                 country_code=account_data.country_code,
                 country_name=account_data.country_name,
                 session_name=account_data.session_name,
                 proxy_mode=proxy_mode,
                 static_proxy_id=account_data.static_proxy_id if proxy_mode == ProxyMode.STATIC else None,
             )
+            if login_api_config is not None:
+                link_account_api_config(account, login_api_config)
             account.session_string = encrypt_session_string(session_string)
             _apply_device_profile(
                 account,
@@ -2012,6 +2222,16 @@ async def complete_account_login(
             await _propagate_account_proxy_policy_change(account)
         await AccountEnvironmentGuard(db).record_event(account, "login", details={"source": "complete_login"})
         await _sync_promoter_joined_groups(account, db)
+        if not account_already_existed:
+            try:
+                await enqueue_automatic_spam_check(db, account_id=account.id)
+            except Exception as exc:
+                await db.rollback()
+                logger.warning(
+                    "automatic_spam_check_enqueue_failed",
+                    account_id=account.id,
+                    error_type=type(exc).__name__,
+                )
         account = await _reload_account_for_response(db, account)
         return _account_to_response(account)
 
@@ -2047,11 +2267,6 @@ async def import_session_file(
     Upload a .session file to import an already logged-in account.
     """
     manager = AccountManager(db)
-
-    # Get API config
-    api_config = await _get_api_config_or_default(manager, api_config_name)
-    if not api_config:
-        raise HTTPException(status_code=404, detail=f"API config '{api_config_name}' not found")
 
     # Validate file extension
     if not session_file.filename.endswith(".session"):
@@ -2093,6 +2308,15 @@ async def import_session_file(
             shutil.copyfileobj(session_file.file, f)
 
         device_profile = _build_telegram_device_profile(phone=phone, existing=existing)
+        api_config = await pick_api_config_for_platform(
+            db,
+            os_type=device_profile.get("os_type", "any"),
+            requested_name=api_config_name,
+        )
+        if api_config is None:
+            api_config = await _get_api_config_or_default(manager, api_config_name)
+        if not api_config:
+            raise HTTPException(status_code=404, detail=f"API config '{api_config_name}' not found")
 
         # Import session
         result = await auth_helper.import_session(
@@ -2105,6 +2329,7 @@ async def import_session_file(
             proxy=telethon_proxy,
             proxy_required=False,
             device_profile=device_profile,
+            api_config_name=api_config.name,
         )
 
         # Create or update account in database
@@ -2113,7 +2338,7 @@ async def import_session_file(
             # Update existing account
             existing.country_code = country_code
             existing.country_name = country_name
-            existing.api_config_name = api_config_name
+            link_account_api_config(existing, api_config)
             if profile_bio is not None:
                 existing.profile_bio = profile_bio.strip()[:70]
                 existing.profile_bio_synced_at = None
@@ -2142,12 +2367,13 @@ async def import_session_file(
                 account_type=AccountType.PROMOTER,
                 operation_mode=AccountOperationMode(operation_mode),
                 asset_tier=normalized_asset_tier,
-                api_config_name=api_config_name,
+                api_config_name=api_config.name,
                 country_code=country_code,
                 country_name=country_name,
                 proxy_mode=resolved_proxy_mode,
                 static_proxy_id=static_proxy_id if resolved_proxy_mode == ProxyMode.STATIC else None,
             )
+            link_account_api_config(account, api_config)
             _apply_device_profile(account, result.get("device_profile") or device_profile)
             account.session_string = encrypt_session_string(result["session_string"])
             account.status = AccountStatus.ONLINE
@@ -2159,6 +2385,16 @@ async def import_session_file(
             await _propagate_account_proxy_policy_change(account)
         await AccountEnvironmentGuard(db).record_event(account, "import", details={"source": "import_session"})
         await _sync_promoter_joined_groups(account, db)
+        if not account_already_existed:
+            try:
+                await enqueue_automatic_spam_check(db, account_id=account.id)
+            except Exception as exc:
+                await db.rollback()
+                logger.warning(
+                    "automatic_spam_check_enqueue_failed",
+                    account_id=account.id,
+                    error_type=type(exc).__name__,
+                )
         return ImportSessionResponse(
             code=0,
             message="Session imported successfully",

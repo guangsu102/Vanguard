@@ -10,7 +10,6 @@ from pathlib import Path
 import paramiko
 import socks
 
-
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = "/opt/vanguard"
 SSH_HOST = "168.110.23.229"
@@ -155,7 +154,7 @@ def main() -> int:
 
         run(
             client,
-            f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --build backend frontend",
+            f"cd {shlex.quote(REMOTE_ROOT)} && docker compose --env-file .env.production -f docker-compose.production.yml up -d --build backend frontend",
             timeout=1200,
         )
 

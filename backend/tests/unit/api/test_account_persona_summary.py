@@ -16,6 +16,7 @@ from app.core.account.models import (
 )
 from app.core.account.persona import hash_persona
 from app.core.database import get_db
+from app.modules.owned_group.models import OwnedGroupAsset
 
 
 def _persona(name: str) -> dict[str, object]:
@@ -131,6 +132,36 @@ async def test_account_list_returns_safe_persona_summaries_without_n_plus_one(te
         revision=5,
         persona_hash="f" * 64,
     )
+    test_db.add_all(
+        [
+            OwnedGroupAsset(
+                internal_name="persona-summary-created-1",
+                telegram_chat_id=-100000000001,
+                title="已创建群 1",
+                visibility="private",
+                owner_account_id=valid.id,
+                invite_mode="direct_invite",
+                status="ready",
+            ),
+            OwnedGroupAsset(
+                internal_name="persona-summary-created-2",
+                telegram_chat_id=-100000000002,
+                title="已创建群 2",
+                visibility="private",
+                owner_account_id=valid.id,
+                invite_mode="direct_invite",
+                status="needs_attention",
+            ),
+            OwnedGroupAsset(
+                internal_name="persona-summary-local-draft",
+                title="本地草稿",
+                visibility="private",
+                owner_account_id=valid.id,
+                invite_mode="direct_invite",
+                status="draft",
+            ),
+        ]
+    )
     await test_db.commit()
 
     statements: list[str] = []
@@ -166,6 +197,8 @@ async def test_account_list_returns_safe_persona_summaries_without_n_plus_one(te
     assert by_id[neutral.id]["persona_name"] is None
     assert by_id[neutral.id]["persona_revision"] == 0
     assert by_id[neutral.id]["persona_applicable"] is True
+    assert by_id[valid.id]["owned_group_created_count"] == 2
+    assert by_id[neutral.id]["owned_group_created_count"] == 0
     assert by_id[ad_only.id]["persona_applicable"] is False
     assert by_id[missing_config.id]["persona_applicable"] is False
     assert by_id[guardian.id]["persona_applicable"] is False
@@ -180,11 +213,13 @@ async def test_account_list_returns_safe_persona_summaries_without_n_plus_one(te
     assert "do-not-leak" not in response.text
     assert "hash-must-not-leak" not in response.text
 
-    # One count query plus one data query; Persona and operation config are not
-    # lazily selected once per account.
-    assert len(statements) == 2
+    # One total count query, one account query, and one bulk owned-group count;
+    # Persona, operation config, and owned-group counts are not selected once
+    # per account.
+    assert len(statements) == 3
     assert "ai_persona" in statements[1]
     assert "telegram_account_operation_config" in statements[1]
+    assert "owned_group_assets" in statements[2].lower()
 
 
 @pytest.mark.asyncio

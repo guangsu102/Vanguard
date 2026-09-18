@@ -13,6 +13,8 @@ from fastapi.responses import JSONResponse
 
 from app.api import (
     account_personas,
+    account_spam,
+    account_profile_updates,
     accounts,
     acquisition,
     ad_only_recommendations,
@@ -25,6 +27,7 @@ from app.api import (
     groups,
     guardian_bots,
     keywords,
+    managed_bot_provisions,
     managed_groups,
     moderation,
     moderation_sensitive_keywords,
@@ -141,6 +144,8 @@ async def health_check() -> dict:
 # Include API routers
 app.include_router(auth, prefix="/api", tags=["Authentication"])
 app.include_router(accounts, prefix="/api/accounts", tags=["Accounts"], dependencies=[Depends(get_current_user)])
+app.include_router(account_spam, prefix="/api/accounts", tags=["Account Spam Check"], dependencies=[Depends(get_current_user)])
+app.include_router(account_profile_updates, prefix="/api/accounts", tags=["Account Profile Updates"], dependencies=[Depends(get_current_user)])
 app.include_router(proxies, prefix="/api/proxies", tags=["Proxies"], dependencies=[Depends(get_current_user)])
 app.include_router(groups, prefix="/api/groups", tags=["Groups"], dependencies=[Depends(get_current_user)])
 app.include_router(keywords, prefix="/api/keywords", tags=["Keywords"], dependencies=[Depends(get_current_user)])
@@ -160,6 +165,7 @@ app.include_router(automation, prefix="/api/automation", tags=["Automation"], de
 app.include_router(ad_only_recommendations, prefix="/api/automation", tags=["Ad-only Handover"], dependencies=[Depends(get_current_user)])
 app.include_router(group_search_keywords, prefix="/api/group-search-keywords", tags=["Group Search Keywords"], dependencies=[Depends(get_current_user)])
 app.include_router(guardian_bots, prefix="/api/guardian-bots", tags=["Guardian Bots"], dependencies=[Depends(get_current_user)])
+app.include_router(managed_bot_provisions, prefix="/api/guardian-bots", tags=["Managed Bot Provisions"])
 app.include_router(managed_groups, prefix="/api/managed-groups", tags=["Managed Groups"], dependencies=[Depends(get_current_user)])
 app.include_router(group_governance, prefix="/api/group-governance", tags=["Group Governance"], dependencies=[Depends(get_current_user)])
 app.include_router(moderation_sensitive_keywords, prefix="/api/moderation-sensitive-keywords", tags=["Moderation Sensitive Keywords"], dependencies=[Depends(get_current_user)])

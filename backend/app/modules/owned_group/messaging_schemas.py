@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -463,6 +463,14 @@ class ExecutionGenerationPolicySnapshot(StrictSchema):
     default_template_id: int | None = None
 
 
+BusinessSnapshotTopic = Annotated[str, Field(min_length=1, max_length=100)]
+
+
+class ExecutionBusinessSnapshotV1(StrictSchema):
+    allowed_topics: list[BusinessSnapshotTopic] = Field(default_factory=list, max_length=20)
+    group_title: str = Field(max_length=255)
+
+
 class ExecutionPromptContextSummary(StrictSchema):
     keyword_requires_review: bool | None = None
     request_fingerprint: str | None = None
@@ -470,6 +478,7 @@ class ExecutionPromptContextSummary(StrictSchema):
     strategy: str | None = None
     topic: str | None = None
     generation_policy_snapshot: ExecutionGenerationPolicySnapshot | None = None
+    business_snapshot_v1: ExecutionBusinessSnapshotV1 | None = None
     instruction_present: bool = False
     matched_keyword_present: bool = False
     recent_context_message_count: int = 0

@@ -52,9 +52,11 @@ def _assert_account_then_config_locks(statements) -> None:
     config_sql = _postgres_sql(statements[1])
     assert "FROM telegram_account" in account_sql
     assert "telegram_account_operation_config" not in account_sql
-    assert account_sql.rstrip().endswith("FOR UPDATE")
+    assert account_sql.rstrip().endswith("FOR UPDATE OF telegram_account")
     assert "FROM telegram_account_operation_config" in config_sql
-    assert config_sql.rstrip().endswith("FOR UPDATE")
+    assert config_sql.rstrip().endswith(
+        "FOR UPDATE OF telegram_account_operation_config"
+    )
 
 
 @pytest.mark.asyncio
@@ -145,9 +147,11 @@ async def test_batch_locks_all_accounts_then_configs_in_ascending_order():
     ]
     assert "ORDER BY telegram_account.id ASC" in account_sql
     assert "telegram_account.id IN (2, 5, 9)" in account_sql
-    assert account_sql.rstrip().endswith("FOR UPDATE")
+    assert account_sql.rstrip().endswith("FOR UPDATE OF telegram_account")
     assert "ORDER BY telegram_account_operation_config.account_id ASC" in config_sql
     assert "telegram_account_operation_config.account_id IN (2, 5, 9)" in config_sql
-    assert config_sql.rstrip().endswith("FOR UPDATE")
+    assert config_sql.rstrip().endswith(
+        "FOR UPDATE OF telegram_account_operation_config"
+    )
     db.add.assert_called_once()
     db.flush.assert_awaited_once()

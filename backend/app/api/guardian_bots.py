@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.account.bot_credentials import encrypt_guardian_bot_token
 from app.core.account.manager import AccountManager
 from app.core.account.models import (
     AccountStatus,
@@ -19,7 +20,7 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.database import get_db
-
+from app.core.security import require_admin
 
 router = APIRouter()
 
@@ -154,7 +155,11 @@ async def list_guardian_bots(
 
 
 @router.post("", response_model=GuardianBotResponse, status_code=status.HTTP_201_CREATED)
-async def create_guardian_bot(request: GuardianBotCreate, db: AsyncSession = Depends(get_db)) -> GuardianBotResponse:
+async def create_guardian_bot(
+    request: GuardianBotCreate,
+    _current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> GuardianBotResponse:
     manager = AccountManager(db)
     identifier = request.identifier.strip()
     if not identifier:
@@ -173,9 +178,13 @@ async def create_guardian_bot(request: GuardianBotCreate, db: AsyncSession = Dep
     account.status = AccountStatus.IDLE
     account.is_active = request.enabled
 
+    encrypted_token = encrypt_guardian_bot_token(request.bot_token.strip())
+    if not encrypted_token:
+        raise HTTPException(status_code=503, detail="bot token encryption unavailable")
+
     profile = GuardianBotProfile(
         account_id=account.id,
-        bot_token=request.bot_token,
+        bot_token=encrypted_token,
         bot_username=request.bot_username,
         bot_user_id=request.bot_user_id,
         enabled=request.enabled,
@@ -199,6 +208,7 @@ async def get_guardian_bot(profile_id: int, db: AsyncSession = Depends(get_db)) 
 async def update_guardian_bot(
     profile_id: int,
     request: GuardianBotUpdate,
+    _current_user: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> GuardianBotResponse:
     profile = await db.get(GuardianBotProfile, profile_id)
@@ -228,6 +238,12 @@ async def update_guardian_bot(
         import json
 
         profile.permissions_snapshot = json.dumps(data.pop("permissions_snapshot"), ensure_ascii=False)
+
+    if "bot_token" in data:
+        encrypted_token = encrypt_guardian_bot_token(str(data.pop("bot_token")).strip())
+        if not encrypted_token:
+            raise HTTPException(status_code=503, detail="bot token encryption unavailable")
+        profile.bot_token = encrypted_token
 
     for field, value in data.items():
         setattr(profile, field, value)

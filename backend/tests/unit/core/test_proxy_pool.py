@@ -13,12 +13,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.account.models import Proxy, ProxyType, TelegramAccount
+from app.core.account.proxy_resolver import MAX_STATIC_PROXY_BINDINGS
 from app.core.network import proxy_pool as proxy_pool_module
-from app.core.network.proxy_pool import ProxyPool, ProxyConfig, ProxyHealth
-from app.core.account.models import ProxyType, TelegramAccount
+from app.core.network.proxy_pool import ProxyConfig, ProxyHealth, ProxyPool
 
 
 class TestProxyConfig:
@@ -143,9 +143,90 @@ class TestProxyHealthCheck:
 
         assert result[proxy.id]["success"] is False
         assert result[proxy.id]["status"] == 503
-        assert proxy.is_active is False
+        assert proxy.is_active is True
+        assert pool._health[proxy.id].is_active is True
         assert proxy.consecutive_failures == 1
         assert proxy.success_rate == pytest.approx(0.8)
+
+    @pytest.mark.asyncio
+    async def test_repeated_failures_become_error_and_success_recovers(self, test_db, monkeypatch):
+        pool = ProxyPool(test_db)
+        proxy = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "1.1.1.2",
+            8080,
+            "US",
+        )
+        response_status = {"value": 503}
+        monkeypatch.setattr(
+            proxy_pool_module.aiohttp,
+            "ClientSession",
+            lambda *args, **kwargs: _FakeSession(response_status["value"]),
+        )
+
+        for _ in range(3):
+            await pool.health_check(proxy.id)
+        await test_db.refresh(proxy)
+
+        assert proxy.is_active is True
+        assert proxy.consecutive_failures == 3
+        assert pool._health[proxy.id].is_active is False
+
+        response_status["value"] = 200
+        result = await pool.health_check(proxy.id)
+        await test_db.refresh(proxy)
+
+        assert result[proxy.id]["success"] is True
+        assert proxy.is_active is True
+        assert proxy.consecutive_failures == 0
+        assert pool._health[proxy.id].is_active is True
+        assert (await pool.get_available_proxy()).proxy_id == proxy.id
+
+    @pytest.mark.asyncio
+    async def test_sync_marks_repeatedly_failing_enabled_proxy_unhealthy(self, test_db):
+        proxy = Proxy(
+            proxy_type=ProxyType.DATACENTER,
+            host="1.1.1.3",
+            port=8080,
+            protocol="http",
+            country="US",
+            is_active=True,
+            success_rate=1.0,
+            consecutive_failures=3,
+        )
+        test_db.add(proxy)
+        await test_db.commit()
+        await test_db.refresh(proxy)
+
+        pool = ProxyPool(test_db)
+        await pool.sync_from_db()
+
+        assert pool._proxies[proxy.id].is_enabled is True
+        assert pool._health[proxy.id].is_active is False
+        assert await pool.get_available_proxy() is None
+
+    @pytest.mark.asyncio
+    async def test_sync_keeps_manually_disabled_proxy_out_of_selection(self, test_db):
+        proxy = Proxy(
+            proxy_type=ProxyType.DATACENTER,
+            host="1.1.1.4",
+            port=8080,
+            protocol="http",
+            country="US",
+            is_active=False,
+            success_rate=1.0,
+            consecutive_failures=0,
+        )
+        test_db.add(proxy)
+        await test_db.commit()
+        await test_db.refresh(proxy)
+
+        pool = ProxyPool(test_db)
+        await pool.sync_from_db()
+
+        assert pool._proxies[proxy.id].is_enabled is False
+        assert pool._health[proxy.id].is_active is True
+        assert await pool.get_available_proxy() is None
 
     @pytest.mark.asyncio
     async def test_health_check_all_excludes_inactive_proxies(self, test_db):
@@ -339,6 +420,25 @@ class TestProxyBinding:
         assert bound.proxy_id == proxy.id
 
     @pytest.mark.asyncio
+    async def test_allows_max_bindings_and_rejects_one_more(self, pool, test_db):
+        proxy = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "192.168.1.2",
+            8080,
+            "US",
+        )
+
+        assert MAX_STATIC_PROXY_BINDINGS == 6
+        for account_id in range(1, MAX_STATIC_PROXY_BINDINGS + 1):
+            await pool.bind_to_account(account_id=account_id, proxy_id=proxy.id)
+
+        with pytest.raises(ValueError, match="already has 6 bound accounts"):
+            await pool.bind_to_account(
+                account_id=MAX_STATIC_PROXY_BINDINGS + 1,
+                proxy_id=proxy.id,
+            )
+
+    @pytest.mark.asyncio
     async def test_unbind_account(self, pool, test_db):
         """Test unbinding proxy from account."""
         proxy = await pool.add_proxy(
@@ -403,14 +503,34 @@ class TestAvailableProxy:
         assert proxy.proxy_type == ProxyType.DATACENTER
 
     @pytest.mark.asyncio
-    async def test_bound_proxy_not_available(self, pool, test_db):
-        """Test that bound proxies are not returned."""
+    async def test_selection_prefers_less_loaded_proxy(self, pool, test_db):
+        """Prefer a less-loaded proxy while allowing reuse below capacity."""
         proxy = await pool.get_available_proxy()
         await pool.bind_to_account(account_id=999, proxy_id=proxy.proxy_id)
 
-        # Get another available proxy - should be different
+        # With equal health, selection spreads accounts across less-loaded proxies.
         proxy2 = await pool.get_available_proxy()
         assert proxy2.proxy_id != proxy.proxy_id
+
+    @pytest.mark.asyncio
+    async def test_single_proxy_remains_available_until_twentieth_binding(self, test_db):
+        pool = ProxyPool(test_db)
+        proxy = await pool.add_proxy(
+            ProxyType.DATACENTER,
+            "4.4.4.4",
+            8080,
+            "US",
+        )
+
+        for account_id in range(1, MAX_STATIC_PROXY_BINDINGS):
+            await pool.bind_to_account(account_id=account_id, proxy_id=proxy.id)
+
+        assert (await pool.get_available_proxy()).proxy_id == proxy.id
+        await pool.bind_to_account(
+            account_id=MAX_STATIC_PROXY_BINDINGS,
+            proxy_id=proxy.id,
+        )
+        assert await pool.get_available_proxy() is None
 
     @pytest.mark.asyncio
     async def test_country_matching(self, pool, test_db):
@@ -466,8 +586,8 @@ class TestProxyFailure:
         assert pool._health[proxy.id].consecutive_failures == 1
 
     @pytest.mark.asyncio
-    async def test_proxy_disabled_after_3_failures(self, pool, test_db):
-        """Test proxy is disabled after 3 consecutive failures."""
+    async def test_proxy_marked_unhealthy_after_3_failures_without_manual_disable(self, pool, test_db):
+        """Repeated failures affect health without changing the manual switch."""
         proxy = await pool.add_proxy(
             ProxyType.DATACENTER, "1.1.1.1", 8080, "US"
         )
@@ -476,6 +596,7 @@ class TestProxyFailure:
             await pool.on_proxy_failure(proxy.id)
 
         assert pool._health[proxy.id].is_active is False
+        assert proxy.is_active is True
 
 
 class TestHealthChecker:

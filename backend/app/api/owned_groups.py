@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
@@ -21,10 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.account.models import AccountType, TelegramAccount
 from app.core.database import get_db
 from app.core.p0_safety_gate import (
+    owned_group_account_failure,
     precheck_owned_group_resources,
     require_owned_group_module_enabled,
 )
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_admin
 from app.modules.owned_group.contracts import (
     DEFAULT_OPERATION_CONFIG,
     AssetStatus,
@@ -32,15 +33,24 @@ from app.modules.owned_group.contracts import (
     OperationStatus,
     ReasonCode,
     ResourceType,
+    assert_transition,
     build_config_snapshot,
     build_selection_snapshot,
+)
+from app.modules.owned_group.messaging_contracts import TERMINAL_EXECUTION_STATUSES
+from app.modules.owned_group.messaging_models import (
+    GroupAccountMessageExecution,
+    GroupAccountMessagePolicy,
 )
 from app.modules.owned_group.models import (
     OwnedGroupAsset,
     OwnedGroupOperation,
     OwnedGroupOperationItem,
 )
-from app.modules.owned_group.models_extra import OwnedGroupAdminAssignment
+from app.modules.owned_group.models_extra import (
+    OwnedGroupAdminAssignment,
+    OwnedGroupAuditEvent,
+)
 from app.modules.owned_group.security import redact_sensitive_text, redact_sensitive_value
 
 router = APIRouter()
@@ -173,7 +183,7 @@ class OwnedGroupResourceSelection(BaseModel):
 
 
 class OwnedGroupOperationCreate(BaseModel):
-    resources: list[OwnedGroupResourceSelection] = Field(..., min_length=1, max_length=200)
+    resources: list[OwnedGroupResourceSelection] = Field(..., min_length=1, max_length=2000)
     batch_size: int = Field(default=DEFAULT_OPERATION_CONFIG["batch_size"], ge=1, le=200)
     batch_interval_seconds: int = Field(
         default=DEFAULT_OPERATION_CONFIG["batch_interval_seconds"], ge=1, le=86400
@@ -181,6 +191,20 @@ class OwnedGroupOperationCreate(BaseModel):
     max_parallelism: int = Field(default=1, ge=1, le=1)
     max_attempts: int = Field(default=2, ge=1, le=5)
     schedule_at: datetime | None = None
+
+class OwnedGroupDissolutionCreate(BaseModel):
+    """Double-confirmation payload for an irreversible remote Telegram action."""
+
+    confirmation: str = Field(..., min_length=10, max_length=64)
+
+    @field_validator("confirmation")
+    @classmethod
+    def normalize_confirmation(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("confirmation must not be blank")
+        return normalized
+
 
 
 class OwnedGroupAssetResponse(BaseModel):
@@ -207,6 +231,9 @@ class OwnedGroupAssetResponse(BaseModel):
     governance_last_error_message: str | None = None
     created_at: datetime
     updated_at: datetime
+    # True only when the asset is needs_attention because its latest dissolve
+    # operation ended without a verified remote outcome (unknown/failed).
+    pending_dissolution_review: bool = False
 
 
 class OwnedGroupAssetListResponse(BaseModel):
@@ -219,6 +246,7 @@ class OwnedGroupAssetListResponse(BaseModel):
 class OwnedGroupOperationResponse(BaseModel):
     id: int
     group_asset_id: int
+    operation_type: str
     status: str
     planned_count: int
     selection_snapshot_hash: str
@@ -297,7 +325,11 @@ class OwnedGroupPrecheckResponse(BaseModel):
     owner_auto_included: bool
 
 
-def _asset_response(asset: OwnedGroupAsset) -> OwnedGroupAssetResponse:
+def _asset_response(
+    asset: OwnedGroupAsset,
+    *,
+    pending_dissolution_review: bool = False,
+) -> OwnedGroupAssetResponse:
     public_link = None
     if asset.status == AssetStatus.READY.value and asset.visibility == "public":
         candidate = str(asset.public_link or "").strip()
@@ -334,6 +366,7 @@ def _asset_response(asset: OwnedGroupAsset) -> OwnedGroupAssetResponse:
         ),
         created_at=asset.created_at,
         updated_at=asset.updated_at,
+        pending_dissolution_review=pending_dissolution_review,
     )
 
 
@@ -341,6 +374,7 @@ def _operation_response(operation: OwnedGroupOperation) -> OwnedGroupOperationRe
     return OwnedGroupOperationResponse(
         id=operation.id,
         group_asset_id=operation.group_asset_id,
+        operation_type=operation.operation_type,
         status=operation.status,
         planned_count=operation.planned_count,
         selection_snapshot_hash=operation.selection_snapshot_hash,
@@ -511,10 +545,10 @@ def _build_selection_with_owner(
         (item["resource_type"], item["resource_id"]) == owner_key for item in selection
     )
     if owner_auto_included:
-        if len(selection) >= 200:
+        if len(selection) >= 2000:
             raise HTTPException(
                 status_code=422,
-                detail="At most 200 resources, including the group owner, may be planned",
+                detail="At most 2000 resources, including the group owner, may be planned",
             )
         selection.append({"resource_type": owner_key[0], "resource_id": owner_key[1]})
         selection, selection_hash = build_selection_snapshot(selection)
@@ -626,9 +660,23 @@ async def list_owned_group_assets(
         query = query.where(OwnedGroupAsset.visibility == visibility)
         count_query = count_query.where(OwnedGroupAsset.visibility == visibility)
     rows = await db.execute(query)
+    assets = rows.scalars().all()
     total = int((await db.execute(count_query)).scalar() or 0)
+    review_ids = await _pending_dissolution_review_asset_ids(
+        db, [asset.id for asset in assets]
+    )
     return OwnedGroupAssetListResponse(
-        data=[_asset_response(asset) for asset in rows.scalars().all()], total=total
+        data=[
+            _asset_response(
+                asset,
+                pending_dissolution_review=(
+                    asset.status == AssetStatus.NEEDS_ATTENTION.value
+                    and asset.id in review_ids
+                ),
+            )
+            for asset in assets
+        ],
+        total=total,
     )
 
 
@@ -733,6 +781,17 @@ async def create_owned_group_draft(
         )
     if not owner.is_active:
         raise HTTPException(status_code=400, detail="owner account is inactive")
+    owner_failure = owned_group_account_failure(owner)
+    if owner_failure:
+        reason, details = owner_failure
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "reason": reason,
+                "message": "群主账号当前不可用于自建群编排",
+                "details": details,
+            },
+        )
 
     asset = OwnedGroupAsset(
         internal_name=request.internal_name.strip(),
@@ -760,7 +819,599 @@ async def get_owned_group_asset(
     asset = await db.get(OwnedGroupAsset, asset_id)
     if not asset:
         raise HTTPException(status_code=404, detail="Owned group asset not found")
-    return _asset_response(asset)
+    review_ids = await _pending_dissolution_review_asset_ids(db, [asset.id])
+    return _asset_response(
+        asset,
+        pending_dissolution_review=(
+            asset.status == AssetStatus.NEEDS_ATTENTION.value
+            and asset.id in review_ids
+        ),
+    )
+
+
+_NONTERMINAL_DELETE_BLOCKING_OPERATION_STATUSES = {
+    OperationStatus.DRAFT.value,
+    OperationStatus.QUEUED.value,
+    OperationStatus.RUNNING.value,
+    OperationStatus.PAUSED.value,
+    OperationStatus.STOPPING.value,
+    OperationStatus.UNKNOWN.value,
+}
+
+_DISSOLVE_OPERATION_TYPE = "dissolve"
+
+# A dissolution whose remote outcome was never verified (unknown) or was
+# explicitly refused (failed) leaves the asset fenced in needs_attention until
+# an administrator reviews the real Telegram state.
+_DISSOLUTION_REVIEW_OPERATION_STATUSES = {
+    OperationStatus.UNKNOWN.value,
+    OperationStatus.FAILED.value,
+}
+
+
+async def _pending_dissolution_review_asset_ids(
+    db: AsyncSession, asset_ids: list[int]
+) -> set[int]:
+    """Return asset ids whose latest dissolve operation awaits manual review.
+
+    Only the latest dissolve operation per asset decides the flag: a failed
+    historical attempt followed by a completed retry must not keep the asset
+    flagged forever.
+    """
+
+    if not asset_ids:
+        return set()
+    latest_ids = (
+        select(func.max(OwnedGroupOperation.id).label("op_id"))
+        .where(
+            OwnedGroupOperation.group_asset_id.in_(asset_ids),
+            OwnedGroupOperation.operation_type == _DISSOLVE_OPERATION_TYPE,
+        )
+        .group_by(OwnedGroupOperation.group_asset_id)
+        .subquery()
+    )
+    rows = await db.execute(
+        select(OwnedGroupOperation.group_asset_id).where(
+            OwnedGroupOperation.id.in_(select(latest_ids.c.op_id)),
+            OwnedGroupOperation.status.in_(
+                sorted(_DISSOLUTION_REVIEW_OPERATION_STATUSES)
+            ),
+        )
+    )
+    return {int(row) for row in rows.scalars().all()}
+
+
+def _owned_group_delete_conflict(reason: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"reason": reason, "message": message, "retryable": False},
+    )
+
+
+@router.delete("/{asset_id:int}")
+async def delete_failed_owned_group_draft(
+    asset_id: int,
+    confirm_no_telegram_group: bool = Query(default=False),
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Delete a failed local-only draft after strict side-effect checks.
+
+    This endpoint never calls Telegram. The explicit query confirmation records
+    the administrator's assertion that no Telegram group exists for the draft.
+    """
+
+    require_owned_group_module_enabled()
+    if not confirm_no_telegram_group:
+        raise _owned_group_delete_conflict(
+            "delete_confirmation_required",
+            "必须确认 Telegram 中不存在对应群组",
+        )
+
+    asset = (
+        (
+            await db.execute(
+                select(OwnedGroupAsset)
+                .where(OwnedGroupAsset.id == asset_id)
+                .with_for_update(of=OwnedGroupAsset)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Owned group asset not found")
+    if str(asset.status) != AssetStatus.NEEDS_ATTENTION.value:
+        raise _owned_group_delete_conflict(
+            "asset_status_not_deletable",
+            "仅可删除 needs_attention 状态的失败草稿",
+        )
+
+    linked_fields = {
+        "telegram_chat_id": asset.telegram_chat_id,
+        "core_group_id": asset.core_group_id,
+        "managed_binding_id": asset.managed_binding_id,
+        "guardian_bot_account_id": asset.guardian_bot_account_id,
+    }
+    if any(value is not None for value in linked_fields.values()):
+        raise _owned_group_delete_conflict(
+            "asset_has_telegram_or_governance_binding",
+            "资产已存在 Telegram 或治理绑定，不能作为本地草稿删除",
+        )
+    if str(asset.governance_status or "disabled") != "disabled":
+        raise _owned_group_delete_conflict(
+            "asset_governance_not_disabled",
+            "资产治理状态未停用，不能删除",
+        )
+
+    blocking_operation_id = await db.scalar(
+        select(OwnedGroupOperation.id)
+        .where(
+            OwnedGroupOperation.group_asset_id == asset_id,
+            OwnedGroupOperation.status.in_(sorted(_NONTERMINAL_DELETE_BLOCKING_OPERATION_STATUSES)),
+        )
+        .order_by(OwnedGroupOperation.id)
+        .limit(1)
+        .with_for_update(of=OwnedGroupOperation)
+    )
+    if blocking_operation_id is not None:
+        raise _owned_group_delete_conflict(
+            "asset_operation_not_terminal",
+            "资产仍存在未结束的编排任务",
+        )
+
+    policy_id = await db.scalar(
+        select(GroupAccountMessagePolicy.id)
+        .where(GroupAccountMessagePolicy.owned_group_asset_id == asset_id)
+        .limit(1)
+    )
+    execution_id = await db.scalar(
+        select(GroupAccountMessageExecution.id)
+        .where(GroupAccountMessageExecution.owned_group_asset_id == asset_id)
+        .limit(1)
+    )
+    if policy_id is not None or execution_id is not None:
+        raise _owned_group_delete_conflict(
+            "asset_has_message_configuration",
+            "资产已接入群内消息功能，不能删除",
+        )
+
+    operation_ids = list(
+        (
+            await db.scalars(
+                select(OwnedGroupOperation.id).where(OwnedGroupOperation.group_asset_id == asset_id)
+            )
+        ).all()
+    )
+    audit_events = (
+        (
+            await db.scalars(
+                select(OwnedGroupAuditEvent)
+                .where(OwnedGroupAuditEvent.group_asset_id == asset_id)
+                .with_for_update(of=OwnedGroupAuditEvent)
+            )
+        )
+        .unique()
+        .all()
+    )
+    for event in audit_events:
+        event.group_asset_id = None
+        if event.operation_id in operation_ids:
+            event.operation_id = None
+            event.operation_item_id = None
+
+    db.add(
+        OwnedGroupAuditEvent(
+            event_type="asset_failed_draft_deleted",
+            group_asset_id=None,
+            resource_type="owned_group_asset",
+            resource_id=asset_id,
+            actor_id=int(current_user["id"]),
+            before_state=json.dumps(
+                {
+                    "id": asset_id,
+                    "status": str(asset.status),
+                    "internal_name": asset.internal_name,
+                    "operation_count": len(operation_ids),
+                    "confirmation": "no_telegram_group",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            after_state=json.dumps({"deleted": True}, sort_keys=True),
+            result="success",
+            reason_code="failed_local_draft_deleted",
+        )
+    )
+    try:
+        await db.delete(asset)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise _owned_group_delete_conflict(
+            "asset_delete_dependency_conflict",
+            "资产仍被其他记录引用，删除已取消",
+        ) from exc
+
+    return {
+        "code": 0,
+        "message": "失败草稿已删除",
+        "data": {"id": asset_id},
+    }
+@router.post(
+    "/{asset_id:int}/dissolution",
+    response_model=OwnedGroupOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def queue_owned_group_dissolution(
+    asset_id: int,
+    request: OwnedGroupDissolutionCreate,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128),
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> OwnedGroupOperationResponse:
+    """Queue one administrator-confirmed Telegram group dissolution.
+
+    This endpoint never contacts Telegram. The dedicated single-file worker owns
+    the remote call after persisting the intent and fencing the asset state.
+    """
+
+    require_owned_group_module_enabled()
+    if request.confirmation.upper() != f"DISSOLVE {asset_id}":
+        raise _owned_group_delete_conflict(
+            "dissolution_confirmation_invalid",
+            f"请输入确认短语 DISSOLVE {asset_id}",
+        )
+
+    asset = (
+        (
+            await db.execute(
+                select(OwnedGroupAsset)
+                .where(OwnedGroupAsset.id == asset_id)
+                .with_for_update(of=OwnedGroupAsset)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Owned group asset not found")
+
+    selection, selection_hash = build_selection_snapshot([])
+    config, config_hash = build_config_snapshot(
+        {
+            "operation": _DISSOLVE_OPERATION_TYPE,
+            "asset_id": int(asset.id),
+            "telegram_chat_id": int(asset.telegram_chat_id or 0),
+            "batch_size": 1,
+            "batch_interval_seconds": 60,
+            "max_parallelism": 1,
+            "max_attempts": 1,
+        }
+    )
+    existing = await db.scalar(
+        select(OwnedGroupOperation).where(OwnedGroupOperation.idempotency_key == idempotency_key)
+    )
+    if existing is not None:
+        if (
+            existing.group_asset_id != asset.id
+            or existing.operation_type != _DISSOLVE_OPERATION_TYPE
+        ):
+            raise _owned_group_delete_conflict(
+                "idempotency_key_conflict",
+                "Idempotency-Key 已用于另一项群组操作",
+            )
+        if not _idempotency_payload_matches(
+            existing,
+            selection_hash=selection_hash,
+            config_hash=config_hash,
+            schedule_at=None,
+        ):
+            raise _idempotency_payload_mismatch(existing)
+        return _operation_response(existing)
+
+    if asset.status != AssetStatus.READY.value:
+        raise _owned_group_delete_conflict(
+            "asset_not_ready_for_dissolution",
+            "仅 ready 状态且已创建 Telegram 群的资产可以解散",
+        )
+    if not asset.telegram_chat_id:
+        raise _owned_group_delete_conflict(
+            "telegram_group_missing",
+            "该资产没有可核验的 Telegram 群 ID，不能发起解散",
+        )
+    if str(asset.governance_status or "disabled") != "disabled":
+        raise _owned_group_delete_conflict(
+            "governance_must_be_disabled",
+            "请先停用 Guardian 治理后再解散群",
+        )
+
+    blocking_operation_id = await db.scalar(
+        select(OwnedGroupOperation.id)
+        .where(
+            OwnedGroupOperation.group_asset_id == asset.id,
+            OwnedGroupOperation.status.in_(sorted(_NONTERMINAL_DELETE_BLOCKING_OPERATION_STATUSES)),
+        )
+        .order_by(OwnedGroupOperation.id)
+        .limit(1)
+        .with_for_update(of=OwnedGroupOperation)
+    )
+    if blocking_operation_id is not None:
+        raise _owned_group_delete_conflict(
+            "owned_group_operation_active",
+            "请先完成、停止并核验所有进行中的成员编排任务",
+        )
+
+    active_policy_id = await db.scalar(
+        select(GroupAccountMessagePolicy.id)
+        .where(
+            GroupAccountMessagePolicy.owned_group_asset_id == asset.id,
+            GroupAccountMessagePolicy.enabled.is_(True),
+        )
+        .limit(1)
+        .with_for_update(of=GroupAccountMessagePolicy)
+    )
+    if active_policy_id is not None:
+        raise _owned_group_delete_conflict(
+            "message_policy_must_be_disabled",
+            "请先停用群内消息策略后再解散群",
+        )
+    active_execution_id = await db.scalar(
+        select(GroupAccountMessageExecution.id)
+        .where(
+            GroupAccountMessageExecution.owned_group_asset_id == asset.id,
+            GroupAccountMessageExecution.status.not_in(TERMINAL_EXECUTION_STATUSES),
+        )
+        .limit(1)
+        .with_for_update(of=GroupAccountMessageExecution)
+    )
+    if active_execution_id is not None:
+        raise _owned_group_delete_conflict(
+            "message_execution_active",
+            "请先处理或取消全部未结束的群内消息任务",
+        )
+
+    assert_transition("asset", asset.status, AssetStatus.DISSOLVING.value)
+    asset.status = AssetStatus.DISSOLVING.value
+    operation = OwnedGroupOperation(
+        group_asset_id=asset.id,
+        operation_type=_DISSOLVE_OPERATION_TYPE,
+        status=OperationStatus.QUEUED.value,
+        selection_snapshot=_snapshot_json(selection),
+        selection_snapshot_hash=selection_hash,
+        config_snapshot=_snapshot_json(config),
+        config_snapshot_hash=config_hash,
+        idempotency_key=idempotency_key,
+        planned_count=1,
+        created_by=int(current_user["id"]),
+    )
+    db.add(operation)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        if not _is_idempotency_conflict(exc):
+            raise
+        # The database unique key is the final arbiter if two administrators
+        # submit the same key concurrently. Return the durable first intent;
+        # never queue a second irreversible remote request.
+        await db.rollback()
+        concurrent = await db.scalar(
+            select(OwnedGroupOperation).where(
+                OwnedGroupOperation.idempotency_key == idempotency_key
+            )
+        )
+        if concurrent is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency-Key is already being processed",
+            ) from exc
+        if (
+            concurrent.group_asset_id != asset_id
+            or concurrent.operation_type != _DISSOLVE_OPERATION_TYPE
+        ):
+            raise _owned_group_delete_conflict(
+                "idempotency_key_conflict",
+                "Idempotency-Key 已用于另一项群组操作",
+            ) from exc
+        if not _idempotency_payload_matches(
+            concurrent,
+            selection_hash=selection_hash,
+            config_hash=config_hash,
+            schedule_at=None,
+        ):
+            raise _idempotency_payload_mismatch(concurrent) from exc
+        return _operation_response(concurrent)
+    db.add(
+        OwnedGroupAuditEvent(
+            event_type="owned_group_dissolution_queued",
+            group_asset_id=asset.id,
+            operation_id=operation.id,
+            actor_id=int(current_user["id"]),
+            before_state=AssetStatus.READY.value,
+            after_state=AssetStatus.DISSOLVING.value,
+            result="queued",
+            reason_code="administrator_confirmed",
+        )
+    )
+    return _operation_response(operation)
+
+
+class OwnedGroupDissolutionResolutionCreate(BaseModel):
+    """Administrator verdict after reviewing an uncertain Telegram dissolution."""
+
+    outcome: Literal["archived", "still_exists"]
+    confirmation: str = Field(..., min_length=10, max_length=64)
+
+    @field_validator("confirmation")
+    @classmethod
+    def normalize_confirmation(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("confirmation must not be blank")
+        return normalized
+
+
+@router.post("/{asset_id:int}/dissolution/resolution")
+async def resolve_owned_group_dissolution(
+    asset_id: int,
+    request: OwnedGroupDissolutionResolutionCreate,
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Resolve a dissolution that ended without a verified remote outcome.
+
+    The administrator checks the real Telegram state out of band, then either:
+    - ``archived``: the group is gone -> archive the asset locally and close
+      the dissolve operation as completed;
+    - ``still_exists``: the group survived -> restore the asset to ready and
+      close the dissolve operation as failed so a new dissolution may be queued.
+
+    This endpoint never contacts Telegram. The typed confirmation phrase
+    prevents a stray click from finalizing an irreversible bookkeeping verdict.
+    """
+
+    require_owned_group_module_enabled()
+    expected_phrase = (
+        f"CONFIRM DISSOLVED {asset_id}"
+        if request.outcome == "archived"
+        else f"CONFIRM EXISTS {asset_id}"
+    )
+    if request.confirmation.upper() != expected_phrase:
+        raise _owned_group_delete_conflict(
+            "dissolution_resolution_confirmation_invalid",
+            f"请输入确认短语 {expected_phrase}",
+        )
+
+    asset = (
+        (
+            await db.execute(
+                select(OwnedGroupAsset)
+                .where(OwnedGroupAsset.id == asset_id)
+                .with_for_update(of=OwnedGroupAsset)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Owned group asset not found")
+
+    latest_operation = (
+        (
+            await db.execute(
+                select(OwnedGroupOperation)
+                .where(
+                    OwnedGroupOperation.group_asset_id == asset_id,
+                    OwnedGroupOperation.operation_type == _DISSOLVE_OPERATION_TYPE,
+                )
+                .order_by(desc(OwnedGroupOperation.id))
+                .limit(1)
+                .with_for_update(of=OwnedGroupOperation)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if latest_operation is None:
+        raise _owned_group_delete_conflict(
+            "dissolution_operation_missing",
+            "该资产没有解散任务，无需人工核验",
+        )
+
+    target_asset_status = (
+        AssetStatus.ARCHIVED.value
+        if request.outcome == "archived"
+        else AssetStatus.READY.value
+    )
+    target_operation_status = (
+        OperationStatus.COMPLETED.value
+        if request.outcome == "archived"
+        else OperationStatus.FAILED.value
+    )
+    reason_code = (
+        "administrator_confirmed_dissolved"
+        if request.outcome == "archived"
+        else "administrator_confirmed_group_still_exists"
+    )
+
+    def _resolution_response() -> dict[str, Any]:
+        return {
+            "code": 0,
+            "message": (
+                "已确认群组解散，资产归档"
+                if request.outcome == "archived"
+                else "已确认群仍存在，资产恢复为可用"
+            ),
+            "data": {
+                "id": asset.id,
+                "status": str(asset.status),
+                "operation_id": latest_operation.id,
+                "operation_status": str(latest_operation.status),
+            },
+        }
+
+    if latest_operation.status in _DISSOLUTION_REVIEW_OPERATION_STATUSES:
+        prior_resolution = await db.scalar(
+            select(OwnedGroupAuditEvent.id)
+            .where(
+                OwnedGroupAuditEvent.event_type
+                == "owned_group_dissolution_manually_resolved",
+                OwnedGroupAuditEvent.operation_id == latest_operation.id,
+                OwnedGroupAuditEvent.reason_code == reason_code,
+            )
+            .limit(1)
+        )
+        if prior_resolution is not None and str(asset.status) == target_asset_status:
+            # Idempotent replay of the same administrator verdict.
+            return _resolution_response()
+    if str(asset.status) != AssetStatus.NEEDS_ATTENTION.value:
+        raise _owned_group_delete_conflict(
+            "asset_not_awaiting_dissolution_review",
+            "仅解散结果不确定（needs_attention）的资产需要人工核验",
+        )
+    if latest_operation.status not in _DISSOLUTION_REVIEW_OPERATION_STATUSES:
+        raise _owned_group_delete_conflict(
+            "dissolution_operation_not_reviewable",
+            "解散任务尚未结束或已有结论，无法人工核验",
+        )
+
+    now = datetime.utcnow()
+    assert_transition("asset", asset.status, target_asset_status)
+    previous_asset_status = str(asset.status)
+    asset.status = target_asset_status
+    asset.updated_at = now
+    if request.outcome == "archived":
+        asset.archived_at = now
+        asset.member_count = 0
+    if str(latest_operation.status) != target_operation_status:
+        assert_transition("operation", latest_operation.status, target_operation_status)
+        latest_operation.status = target_operation_status
+    latest_operation.updated_at = now
+    if request.outcome == "archived":
+        latest_operation.completed_count = 1
+        latest_operation.failed_count = 0
+    else:
+        latest_operation.failed_count = 1
+        latest_operation.last_error = "administrator_confirmed_group_still_exists"
+    if latest_operation.finished_at is None:
+        latest_operation.finished_at = now
+
+    db.add(
+        OwnedGroupAuditEvent(
+            event_type="owned_group_dissolution_manually_resolved",
+            group_asset_id=asset.id,
+            operation_id=latest_operation.id,
+            actor_id=int(current_user["id"]),
+            before_state=previous_asset_status,
+            after_state=str(asset.status),
+            result="success",
+            reason_code=reason_code,
+        )
+    )
+    await db.flush()
+    return _resolution_response()
+
+
 
 
 @router.post(

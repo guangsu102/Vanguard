@@ -4,6 +4,8 @@ export type ProxyProtocol = 'http' | 'https' | 'socks5'
 export type ProxyStatus = 'active' | 'inactive' | 'error'
 export type ProxyType = 'residential' | 'datacenter' | 'mobile'
 
+export const MAX_STATIC_PROXY_BINDINGS = 20
+
 export interface Proxy {
   id: number
   address: string
@@ -25,6 +27,7 @@ export interface Proxy {
     identifier: string
     status: string
   }>
+  maxBindAccounts: number
   remainingBindSlots: number
   lastCheckedAt?: string
   createdAt: string
@@ -57,6 +60,10 @@ export interface ProxyFormData {
   country_name?: string
 }
 
+export type ProxyUpdateData = Partial<ProxyFormData> & {
+  status?: 'active' | 'inactive'
+}
+
 export const proxiesApi = {
   list: (params?: ProxyListParams) => {
     return apiClient.get<{ data: ProxyListResponse }>('/proxies', { params })
@@ -70,7 +77,7 @@ export const proxiesApi = {
     return apiClient.get<{ data: Proxy }>(`/proxies/${id}`)
   },
 
-  update: (id: number, data: Partial<ProxyFormData>) => {
+  update: (id: number, data: ProxyUpdateData) => {
     return apiClient.put<{ data: Proxy }>(`/proxies/${id}`, data)
   },
 

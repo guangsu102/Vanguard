@@ -37,6 +37,7 @@ from app.core.account.models import (
     AccountRiskLevel,
     AccountStatus,
     AccountType,
+    SpamCheckAccountStatus,
     TelegramAccount,
 )
 from app.core.account.operation_lease import (
@@ -76,6 +77,7 @@ from app.modules.acquisition.auto_reply.speaker import Speaker
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
 from app.modules.acquisition.config import AcquisitionConfig
 from app.modules.acquisition.dynamic_frequency import AccountDynamicFrequencyService
+from app.modules.acquisition.join_reconciliation import reconcile_joined_auto_join_attempts
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AcquisitionMessage,
@@ -534,6 +536,7 @@ class SearchFilterSettings:
 
     title_blacklist_enabled: bool = True
     title_blacklist: list[str] = field(default_factory=list)
+    cjk_title_required: bool = True
 
 
 @dataclass
@@ -714,7 +717,7 @@ class AcquisitionAutomationService:
                 TelegramAccount.risk_level.in_(
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
                 ~owned_group_asset_exists,
             )
             .order_by(desc(Group.level_score), GroupAccountMembership.updated_at.asc())
@@ -1165,7 +1168,7 @@ class AcquisitionAutomationService:
             == AccountOperationMode.AD_ONLY.value
             or account is None
             or not account.is_active
-            or account.status in [AccountStatus.ERROR, AccountStatus.BANNED]
+            or account.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
             or account.account_type != AccountType.PROMOTER
         ):
             result = AutomationRunResult(skipped=1)
@@ -1780,7 +1783,7 @@ class AcquisitionAutomationService:
             account = config.account
             if not account or not account.is_active:
                 continue
-            if account.status in [AccountStatus.ERROR, AccountStatus.BANNED]:
+            if account.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
                 continue
             if account.account_type != AccountType.PROMOTER:
                 continue
@@ -1794,6 +1797,17 @@ class AcquisitionAutomationService:
 
     async def _check_join_quota(self, config: AccountOperationConfig) -> Optional[str]:
         now = _now()
+        cooldown_remaining = await self.risk_guard.peek_join_cooldown(config.account_id)
+        if cooldown_remaining > 0:
+            # The risk guard would refuse the JOIN anyway; push the account's
+            # next slot past the cooldown so later ticks skip it cheaply via
+            # the join_interval gate instead of burning a candidate group on a
+            # guaranteed refusal.
+            config.next_join_after = max(
+                config.next_join_after or now,
+                now + timedelta(seconds=cooldown_remaining + 30),
+            )
+            return "join_risk_cooldown"
         today = _day_start(now)
         join_daily_limit = await self._auto_join_dynamic_daily_limit(config, now)
         if join_daily_limit <= 0:
@@ -2392,6 +2406,12 @@ class AcquisitionAutomationService:
     async def _sync_pending_auto_join_memberships(self) -> dict[str, Any]:
         settings_config = await self._join_verification_settings()
         result: dict[str, Any] = {"checked": 0, "updated": 0, "details": []}
+        completed = await reconcile_joined_auto_join_attempts(
+            self.db, limit=settings_config.pending_sync_limit
+        )
+        result["checked"] += completed["checked"]
+        result["updated"] += completed["updated"]
+        result["details"].extend(completed["details"])
         reconciled = await self._reconcile_failed_auto_join_groups(
             limit=settings_config.pending_sync_limit
         )
@@ -2475,6 +2495,11 @@ class AcquisitionAutomationService:
                 note=self._format_join_audit_note(audit, leave_error=leave_error),
             )
             if audit.passed:
+                # Record the confirmed approval before any separate ad-policy
+                # action can intentionally leave the newly joined group.
+                await reconcile_joined_auto_join_attempts(
+                    self.db, account_id=membership.account_id, group_id=group.id, limit=1
+                )
                 await self._sync_group_ad_policy_from_audit(group, audit)
                 if audit.ad_allowed is False:
                     await self._apply_join_audit_ad_rule_decision(group, updated_membership, audit)
@@ -2742,6 +2767,7 @@ class AcquisitionAutomationService:
         title_filtered_ids: Optional[set[int]] = None,
     ) -> dict[str, int]:
         title_filtered_ids = title_filtered_ids or set()
+        filter_settings = await self._search_filter_settings()
         saved = 0
         queued = 0
         rejected = 0
@@ -2765,6 +2791,25 @@ class AcquisitionAutomationService:
 
             if group.group_id in title_filtered_ids:
                 await self._set_discovered_group_status(db_group, "rejected")
+                rejected += 1
+                continue
+
+            if (
+                filter_settings.cjk_title_required
+                and not self._title_has_cjk(group.title)
+            ):
+                # A title with no CJK at all almost always fails the Chinese
+                # evidence audit after joining; reject at discovery instead of
+                # spending a join-budget slot and a 2h cooldown on it.
+                await self._set_discovered_group_status(db_group, "rejected")
+                await self._record_join_attempt(
+                    account_id,
+                    group,
+                    DeliveryStatus.SKIPPED,
+                    db_group=db_group,
+                    source_keyword=keyword,
+                    reason="title_no_cjk",
+                )
                 rejected += 1
                 continue
 
@@ -2864,7 +2909,17 @@ class AcquisitionAutomationService:
         return SearchFilterSettings(
             title_blacklist_enabled=bool(config.get("title_blacklist_enabled", True)),
             title_blacklist=normalized_terms,
+            cjk_title_required=bool(config.get("cjk_title_required", True)),
         )
+
+    @staticmethod
+    def _title_has_cjk(title: Optional[str]) -> bool:
+        """True when the title carries at least one CJK ideograph."""
+        for char in str(title or ""):
+            code = ord(char)
+            if 0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF or 0xF900 <= code <= 0xFAFF:
+                return True
+        return False
 
     def _title_blacklist_match(
         self, title: str, settings_config: SearchFilterSettings
@@ -4009,7 +4064,7 @@ class AcquisitionAutomationService:
         payload = {
             "version": AD_POLICY_EVIDENCE_HASH_VERSION,
             "ai_enabled": bool(capacity.get("ad_policy_ai_enabled", True)),
-            "model": str(capacity.get("ad_policy_ai_model") or "gpt-5.6-terra"),
+            "model": str(capacity.get("ad_policy_ai_model") or "gpt-5.6-sol"),
             "min_confidence": int(capacity.get("ad_policy_ai_min_confidence") or 95),
             "require_second_pass": bool(capacity.get("ad_policy_ai_require_second_pass", True)),
             "evidence": canonical_evidence,
@@ -4297,7 +4352,7 @@ class AcquisitionAutomationService:
             local_result.decision_source = "strict_gate"
             return local_result
 
-        model = str(capacity.get("ad_policy_ai_model") or "gpt-5.6-terra")[:100]
+        model = str(capacity.get("ad_policy_ai_model") or "gpt-5.6-sol")[:100]
         timeout_seconds = int(capacity.get("ad_policy_ai_timeout_seconds") or 45)
         min_confidence = int(capacity.get("ad_policy_ai_min_confidence") or 95)
         try:
@@ -5193,11 +5248,14 @@ class AcquisitionAutomationService:
             return False
         try:
             await self.group_manager.update_group(group.id, status="rejected")
+            # Negative history_score marks this group as a wasted join slot so
+            # later discovery passes can discount the same chat immediately
+            # instead of re-learning it through another paid join attempt.
             await self.group_manager.update_scores(
                 group.id,
                 rule_score=0,
                 admin_score=0,
-                history_score=0,
+                history_score=-40,
                 activity_score=0,
             )
         except Exception as exc:
@@ -5205,7 +5263,53 @@ class AcquisitionAutomationService:
                 "group_reject_after_audit_failed", group_id=group.id, error=str(exc)
             )
             return False
+        await self._penalize_keyword_after_audit_reject(group, reason)
         return True
+
+    async def _penalize_keyword_after_audit_reject(
+        self,
+        group: Group,
+        reason: Optional[str],
+    ) -> None:
+        """Feed a post-join audit rejection back into its source keyword.
+
+        A keyword whose joins keep failing the audit is burning join slots;
+        record a zero-candidate feedback so the discard counters converge and
+        the keyword exits rotation faster than search-only learning allows.
+        """
+        keyword_text = (group.source_keyword or "").strip()
+        if not keyword_text:
+            return
+        try:
+            normalized = normalize_keyword_text(keyword_text)
+            row = (
+                await self.db.execute(
+                    select(GroupSearchKeyword).where(
+                        GroupSearchKeyword.normalized_text == normalized,
+                        GroupSearchKeyword.status == SearchKeywordStatus.APPROVED,
+                    )
+                )
+            ).scalars().first()
+            if row is None:
+                return
+            await self._record_search_keyword_feedback(
+                row,
+                found_count=0,
+                candidate_count=0,
+            )
+            self.logger.info(
+                "keyword_penalized_after_audit_reject",
+                keyword=keyword_text,
+                reason=reason,
+                use_count=row.use_count,
+                discarded=row.status == SearchKeywordStatus.DISCARDED.value,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "keyword_penalize_after_audit_reject_failed",
+                keyword=keyword_text,
+                error=str(exc),
+            )
 
     def _format_join_audit_note(
         self,
@@ -5216,7 +5320,34 @@ class AcquisitionAutomationService:
         payload = audit.details()
         if leave_error:
             payload["leave_error"] = leave_error
-        return json.dumps(payload, ensure_ascii=False)[:4000]
+        note = json.dumps(payload, ensure_ascii=False)
+        if len(note) <= 4000:
+            return note
+        # Keep the decision machine-readable even when AI evidence is large.
+        # Cutting the serialized JSON used to make successful approvals unreadable.
+        payload["details_truncated"] = True
+        summary_keys = {
+            "reason", "action", "attempted", "success", "should_retry_audit",
+            "should_leave", "post_action_status", "ad_allowed", "policy_mode",
+            "decision_source", "confidence",
+        }
+        for name in ("verification_details", "ad_rule_details"):
+            details = payload.get(name) or {}
+            payload[name] = {
+                key: value[:200] if isinstance(value, str) else value
+                for key, value in details.items()
+                if key in summary_keys and isinstance(value, (str, bool, int, float, type(None)))
+            }
+            payload[name]["truncated"] = True
+        for key, value in payload.items():
+            if isinstance(value, str):
+                payload[key] = value[:300]
+        note = json.dumps(payload, ensure_ascii=False)
+        if len(note) > 4000:
+            payload["verification_details"] = {"truncated": True}
+            payload["ad_rule_details"] = {"truncated": True}
+            note = json.dumps(payload, ensure_ascii=False)
+        return note
 
     async def _record_join_attempt(
         self,
@@ -6212,7 +6343,7 @@ class AcquisitionAutomationService:
             .where(
                 AccountAdBinding.enabled == True,
                 TelegramAccount.is_active == True,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
             )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )
@@ -6247,7 +6378,7 @@ class AcquisitionAutomationService:
                 AccountAdBinding.account_id == account_id,
                 AccountAdBinding.id.in_(binding_ids),
                 TelegramAccount.is_active == True,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED]),
+                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
             )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )
@@ -7570,7 +7701,7 @@ class AcquisitionAutomationService:
         for membership in memberships:
             account = membership.account
             account_status = str(getattr(account.status, "value", account.status) or "")
-            if account_status in {"banned", "error", "disabled"}:
+            if account_status in {"banned", "error", "restricted", "disabled"}:
                 continue
             if membership.ad_status == MEMBERSHIP_AD_STATUS_BLOCKED:
                 continue
@@ -8572,7 +8703,7 @@ class AcquisitionAutomationService:
         accounts_by_id: dict[int, TelegramAccount] = {}
         for profile, group, membership, account in rows.all():
             account_status = str(getattr(account.status, "value", account.status) or "").lower()
-            if account_status in {"banned", "error", "disabled"}:
+            if account_status in {"banned", "error", "restricted", "disabled"}:
                 continue
             account_id = int(membership.account_id)
             candidates.append(
@@ -8790,7 +8921,7 @@ class AcquisitionAutomationService:
             if group.id in seen_group_ids:
                 continue
             account_status = str(getattr(account.status, "value", account.status) or "")
-            if account_status in {"banned", "error", "disabled"}:
+            if account_status in {"banned", "error", "restricted", "disabled"}:
                 continue
             if membership.ad_status == MEMBERSHIP_AD_STATUS_BLOCKED:
                 continue
@@ -9524,6 +9655,24 @@ class AcquisitionAutomationService:
         account = row.scalar_one_or_none()
         if account is None:
             return "account_missing"
+        if not account.is_active:
+            return "account_inactive"
+
+        account_status = str(getattr(account.status, "value", account.status) or "").lower()
+        status_reason = {
+            AccountStatus.ERROR.value: "account_error",
+            AccountStatus.BANNED.value: "account_banned",
+            AccountStatus.RESTRICTED.value: "account_restricted",
+        }.get(account_status)
+        if status_reason:
+            return status_reason
+
+        spam_check_status = str(account.spam_check_status or "").lower()
+        if spam_check_status == SpamCheckAccountStatus.RESTRICTED.value:
+            return "account_spam_restricted"
+
+        if account.risk_level == AccountRiskLevel.FROZEN.value:
+            return account.risk_reason or "account_risk_frozen"
         if account.risk_level == AccountRiskLevel.QUARANTINED.value:
             return "account_risk_quarantined"
         if account.risk_pause_until and account.risk_pause_until > now:

@@ -53,6 +53,7 @@ SKIP_DIR_NAMES = {
     ".codex-ssh",
     ".git",
     ".pytest_cache",
+    ".venv",
     "__pycache__",
     "dist",
     "htmlcov",
@@ -154,7 +155,8 @@ def connect() -> paramiko.SSHClient:
     sock.connect((SSH_HOST, SSH_PORT))
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
     key = paramiko.RSAKey.from_private_key_file(str(ssh_key))
     client.connect(
         SSH_HOST,
@@ -260,7 +262,7 @@ def remote_prepare_command(remote_archive: str, timestamp: str) -> str:
         # Stop only the Vanguard Compose project before moving its bind-mount
         # directory. This leaves the independent Sub2API containers untouched.
         f"if [ -f {remote_root}/docker-compose.production.yml ]; then "
-        f"cd {remote_root} && docker compose -f docker-compose.production.yml down --remove-orphans || true; fi; "
+        f"cd {remote_root} && docker compose --env-file .env.production -f docker-compose.production.yml down --remove-orphans || true; fi; "
         f"docker rm -f {containers} >/dev/null 2>&1 || true; "
         f"if [ -d {remote_root} ]; then mv {remote_root} {backup_root}; fi; "
         f"mkdir -p {remote_root}; "
@@ -274,32 +276,21 @@ def remote_prepare_command(remote_archive: str, timestamp: str) -> str:
         f"mkdir -p {remote_root}/data/logs {remote_root}/data/uploads {remote_root}/sessions; "
         f"chown -R 1000:1000 {remote_root}/data/logs {remote_root}/data/uploads {remote_root}/sessions || true; "
         f"cd {remote_root}; "
-        "docker compose -f docker-compose.production.yml config --services"
+        "docker compose --env-file .env.production -f docker-compose.production.yml config --services"
     )
 
-
-def apply_migrations_command() -> str:
-    # Keep the deployment path on the same curated chain used by the runner.
-    # Older 010-020 names are Alembic-only in this checkout and must not be
-    # passed as raw SQL files (the previous command failed before 044 ran).
-    return (
-        "docker exec -i vanguard-backend "
-        "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py"
-    )
 
 
 def apply_migrations_compose_command() -> str:
-    """Run the same curated migration chain from a one-off backend container.
+    """Run the curated migration chain before long-lived app containers.
 
-    Specialized deploy modes do not start the long-lived backend before their
-    migration step, so they cannot use ``docker exec``.  Keeping this command
-    on the runner's default list prevents references to old Alembic-only/raw SQL
-    filenames that are not present in the release archive.
+    A one-off backend container keeps schema changes ahead of application
+    startup and uses the runner's default migration list.
     """
 
     return (
         f"cd {shlex.quote(REMOTE_ROOT)} && "
-        "docker compose -f docker-compose.production.yml run --rm backend "
+        "docker compose --env-file .env.production -f docker-compose.production.yml run --rm backend "
         "env PYTHONPATH=/app python /app/scripts/apply_sql_migrations.py"
     )
 
@@ -967,7 +958,7 @@ def main() -> int:
             run(client, "docker logs --tail 120 vanguard-telegram-guardian-worker", timeout=180, allow_fail=True)
             run(client, f"curl -v --max-time 10 {HEALTH_URL}", timeout=120, allow_fail=True)
             run(client, env_check_command(), timeout=180, allow_fail=True)
-            run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml ps", timeout=120, allow_fail=True)
+            run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose --env-file .env.production -f docker-compose.production.yml ps", timeout=120, allow_fail=True)
             run(client, f"rm -f {shlex.quote(REMOTE_ARCHIVE_ROOT)}/.codex-vanguard-full-deploy-*.tar.gz", timeout=120, allow_fail=True)
             return 0
         finally:
@@ -1053,7 +1044,7 @@ def main() -> int:
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"(docker compose -f docker-compose.production.yml build {services} "
+                    f"(docker compose --env-file .env.production -f docker-compose.production.yml build {services} "
                     f"> {shlex.quote(build_log)} 2>&1; "
                     "code=$?; "
                     f"tail -n 200 {shlex.quote(build_log)}; "
@@ -1065,7 +1056,7 @@ def main() -> int:
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml up -d --force-recreate {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}"
                 ),
                 timeout=900,
             )
@@ -1160,7 +1151,7 @@ def main() -> int:
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml build {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml build {services}"
                 ),
                 timeout=2400,
             )
@@ -1168,7 +1159,7 @@ def main() -> int:
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml up -d --force-recreate {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}"
                 ),
                 timeout=900,
             )
@@ -1293,7 +1284,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    "docker compose -f docker-compose.production.yml exec -T postgres "
+                    "docker compose --env-file .env.production -f docker-compose.production.yml exec -T postgres "
                     f"sh -lc {shlex.quote(settings_psql)} "
                     f"> {shlex.quote(backup_dir + '/probe-settings.before')}; "
                     f"sha256sum {shlex.quote(backup_dir + '/probe-settings.before')}"
@@ -1319,7 +1310,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"(docker compose -f docker-compose.production.yml build {services} "
+                    f"(docker compose --env-file .env.production -f docker-compose.production.yml build {services} "
                     f"> {shlex.quote(build_log)} 2>&1; code=$?; "
                     f"tail -n 240 {shlex.quote(build_log)}; exit $code)"
                 ),
@@ -1330,7 +1321,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml up -d --force-recreate {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}"
                 ),
                 timeout=1200,
             )
@@ -1355,7 +1346,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    "docker compose -f docker-compose.production.yml exec -T postgres "
+                    "docker compose --env-file .env.production -f docker-compose.production.yml exec -T postgres "
                     f"sh -lc {shlex.quote(migration_psql)}"
                 ),
                 timeout=180,
@@ -1374,7 +1365,7 @@ asyncio.run(main())
                 "vanguard-backend | grep -E '^(OWNED_GROUP_EXECUTION_ENABLED|P0_SAFETY_GATE_ENABLED|P0_SAFETY_GATE_FAIL_CLOSED|OWNED_GROUP_KILL_SWITCH_ENABLED)=' | sort",
                 timeout=120,
             )
-            run(client, f"curl -fsS https://vanguard.pipenai.xyz/health", timeout=120)
+            run(client, "curl -fsS https://vanguard.pipenai.xyz/health", timeout=120)
             run(
                 client,
                 "grep -nE 'server_name|proxy_pass' /etc/nginx/conf.d/vanguard.conf",
@@ -1465,7 +1456,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml build {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml build {services}"
                 ),
                 timeout=2400,
             )
@@ -1474,7 +1465,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    f"docker compose -f docker-compose.production.yml up -d --force-recreate {services}"
+                    f"docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}"
                 ),
                 timeout=900,
             )
@@ -1520,7 +1511,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    "docker compose -f docker-compose.production.yml build celery-worker celery-beat"
+                    "docker compose --env-file .env.production -f docker-compose.production.yml build celery-worker celery-beat"
                 ),
                 timeout=2400,
             )
@@ -1528,7 +1519,7 @@ asyncio.run(main())
                 client,
                 (
                     f"cd {shlex.quote(REMOTE_ROOT)} && "
-                    "docker compose -f docker-compose.production.yml up -d --force-recreate celery-worker celery-beat"
+                    "docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate celery-worker celery-beat"
                 ),
                 timeout=900,
             )
@@ -1558,29 +1549,28 @@ asyncio.run(main())
         build_services = f"{services} db-init admin-init" if args.bootstrap else services
         run(
             client,
-            f"cd {compose_root} && docker compose -f docker-compose.production.yml build {build_services}",
+            f"cd {compose_root} && docker compose --env-file .env.production -f docker-compose.production.yml build {build_services}",
             timeout=3600,
         )
         run(
             client,
-            f"cd {compose_root} && docker compose -f docker-compose.production.yml up -d postgres redis",
+            f"cd {compose_root} && docker compose --env-file .env.production -f docker-compose.production.yml up -d postgres redis",
             timeout=600,
         )
         if args.bootstrap:
             run(
                 client,
-                f"cd {compose_root} && docker compose -f docker-compose.production.yml --profile bootstrap run --rm db-init",
+                f"cd {compose_root} && docker compose --env-file .env.production -f docker-compose.production.yml --profile bootstrap run --rm db-init",
                 timeout=1200,
             )
             run(
                 client,
-                f"cd {compose_root} && docker compose -f docker-compose.production.yml --profile bootstrap run --rm --no-deps admin-init",
+                f"cd {compose_root} && docker compose --env-file .env.production -f docker-compose.production.yml --profile bootstrap run --rm --no-deps admin-init",
                 timeout=600,
             )
-        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --force-recreate backend", timeout=1200)
-        if not args.bootstrap:
-            run(client, apply_migrations_command(), timeout=600)
-        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose -f docker-compose.production.yml up -d --force-recreate {services}", timeout=1200)
+        else:
+            run(client, apply_migrations_compose_command(), timeout=1200)
+        run(client, f"cd {shlex.quote(REMOTE_ROOT)} && docker compose --env-file .env.production -f docker-compose.production.yml up -d --force-recreate {services}", timeout=1200)
 
         wait_for_health(client)
         run(client, env_check_command(), timeout=180, allow_fail=True)

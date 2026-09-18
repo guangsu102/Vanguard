@@ -1,11 +1,16 @@
 import time
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from app.core.account.evomi import ProxyInfo
 from app.core.account.models import AccountStatus, AccountType, ProxyMode
-from app.core.account.pool import AccountPool, invalidate_account_in_all_pools
+from app.core.account.pool import (
+    AccountPool,
+    StaticProxyUnavailableError,
+    invalidate_account_in_all_pools,
+)
 from app.core.account.proxy_policy_events import ProxyPolicyState
 from app.core.account.proxy_resolver import ResolvedProxy
 
@@ -268,7 +273,18 @@ async def test_add_account_from_db_refreshes_existing_static_proxy_policy(monkey
         "app.core.account.pool.get_account_proxy_policy_state",
         load_policy,
     )
-    pool = AccountPool()
+    resolver_calls = []
+
+    async def resolve_static(proxy_id: int) -> ResolvedProxy:
+        resolver_calls.append(proxy_id)
+        return ResolvedProxy(
+            protocol="socks5",
+            host="resolved.proxy.test",
+            port=1080,
+            proxy_id=proxy_id,
+        )
+
+    pool = AccountPool(static_proxy_resolver=resolve_static)
     account = await pool.add_account(
         account_id=14,
         phone="+10000000014",
@@ -314,7 +330,155 @@ async def test_add_account_from_db_refreshes_existing_static_proxy_policy(monkey
     assert account.client is None
     assert account.proxy_mode == ProxyMode.STATIC
     assert account.static_proxy_id == 88
+    assert account.static_proxy is not None
+    assert account.static_proxy.host == "resolved.proxy.test"
     assert account.proxy_policy_version == 4
+    assert resolver_calls == [88]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_is_active", "consecutive_failures"),
+    [(False, 0), (True, 3)],
+)
+async def test_add_account_from_db_rejects_unavailable_static_proxy(
+    monkeypatch,
+    proxy_is_active,
+    consecutive_failures,
+):
+    authoritative_proxy = SimpleNamespace(
+        id=89,
+        protocol="socks5",
+        host="authoritative.proxy.test",
+        port=1080,
+        username="user",
+        password="pass",
+        is_active=proxy_is_active,
+        consecutive_failures=consecutive_failures,
+    )
+
+    class FakeDb:
+        async def get(self, _model, proxy_id):
+            assert proxy_id == 89
+            return authoritative_proxy
+
+    @asynccontextmanager
+    async def fake_get_db_session():
+        yield FakeDb()
+
+    monkeypatch.setattr("app.core.database.get_db_session", fake_get_db_session)
+    pool = AccountPool()
+    db_account = SimpleNamespace(
+        id=15,
+        phone="+10000000015",
+        session_name="unavailable_static_session",
+        country_code="US",
+        api_config=SimpleNamespace(api_id="12345", api_hash="hash"),
+        api_config_name="default",
+        fingerprint_id=None,
+        session_string="session",
+        account_type=AccountType.PROMOTER,
+        proxy_mode=ProxyMode.STATIC,
+        static_proxy_id=89,
+        static_proxy=SimpleNamespace(
+            id=89,
+            protocol="socks5",
+            host="stale-healthy.proxy.test",
+            port=1080,
+            username="user",
+            password="pass",
+            is_active=True,
+            consecutive_failures=0,
+        ),
+        device_model=None,
+        system_version=None,
+        app_version=None,
+        status=AccountStatus.ONLINE,
+    )
+
+    with pytest.raises(StaticProxyUnavailableError, match="Static proxy 89 is unavailable"):
+        await pool.add_account_from_db(db_account)
+
+    assert pool.size == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("proxy_is_active", "consecutive_failures"),
+    [(False, 0), (True, 3)],
+)
+async def test_sync_from_db_evicts_account_with_unavailable_static_proxy(
+    monkeypatch,
+    proxy_is_active,
+    consecutive_failures,
+):
+    authoritative_proxy = SimpleNamespace(
+        id=90,
+        protocol="socks5",
+        host="authoritative.proxy.test",
+        port=1080,
+        username="user",
+        password="pass",
+        is_active=proxy_is_active,
+        consecutive_failures=consecutive_failures,
+    )
+
+    class FakeDb:
+        async def get(self, _model, proxy_id):
+            assert proxy_id == 90
+            return authoritative_proxy
+
+    @asynccontextmanager
+    async def fake_get_db_session():
+        yield FakeDb()
+
+    monkeypatch.setattr("app.core.database.get_db_session", fake_get_db_session)
+    pool = AccountPool()
+    existing = await pool.add_account(
+        account_id=16,
+        phone="+10000000016",
+        session_name="reload_unavailable_static_session",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+        proxy_mode=ProxyMode.DYNAMIC,
+    )
+    client = FakeClient()
+    existing.client = client
+    db_account = SimpleNamespace(
+        id=16,
+        phone="+10000000016",
+        session_name="reload_unavailable_static_session",
+        country_code="US",
+        api_config=SimpleNamespace(api_id="12345", api_hash="hash"),
+        api_config_name="default",
+        fingerprint_id=None,
+        session_string="session",
+        account_type=AccountType.PROMOTER,
+        proxy_mode=ProxyMode.STATIC,
+        static_proxy_id=90,
+        static_proxy=SimpleNamespace(
+            id=90,
+            protocol="socks5",
+            host="stale-healthy.proxy.test",
+            port=1080,
+            username="user",
+            password="pass",
+            is_active=True,
+            consecutive_failures=0,
+        ),
+        device_model=None,
+        system_version=None,
+        app_version=None,
+        status=AccountStatus.ONLINE,
+    )
+
+    synced = await pool.sync_from_db([db_account])
+
+    assert synced == 0
+    assert client.disconnected is True
+    assert await pool.get_account_by_id(16) is None
 
 
 @pytest.mark.asyncio

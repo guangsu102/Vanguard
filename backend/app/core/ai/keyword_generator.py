@@ -699,7 +699,13 @@ class KeywordGenerator:
             return keywords[:count]
 
         except Exception as e:
-            self.logger.error("keyword_generation_error", error=str(e))
+            self.logger.error(
+                "keyword_generation_error",
+                category=category,
+                error_type=type(e).__name__,
+                error_code=getattr(e, "code", None),
+                status_code=getattr(e, "status_code", None),
+            )
             return self._generate_fallback(category, count, avoid_set)
 
     def _generate_fallback(

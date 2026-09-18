@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { proxiesApi, type Proxy, type ProxyListParams, type ProxyFormData } from '@/api/proxies'
+import {
+  proxiesApi,
+  type Proxy,
+  type ProxyListParams,
+  type ProxyFormData,
+  type ProxyUpdateData,
+} from '@/api/proxies'
 import { DEFAULT_PAGE_SIZE, normalizeListPayload, normalizePageSize } from '@/utils/pagination'
 
 export const useProxyStore = defineStore('proxy', () => {
@@ -44,7 +50,7 @@ export const useProxyStore = defineStore('proxy', () => {
     }
   }
 
-  const update = async (id: number, data: Partial<ProxyFormData>) => {
+  const update = async (id: number, data: ProxyUpdateData) => {
     loading.value = true
     try {
       const res = await proxiesApi.update(id, data)
@@ -56,6 +62,10 @@ export const useProxyStore = defineStore('proxy', () => {
     } finally {
       loading.value = false
     }
+  }
+
+  const setEnabled = async (id: number, enabled: boolean) => {
+    return update(id, { status: enabled ? 'active' : 'inactive' })
   }
 
   const remove = async (id: number) => {
@@ -76,12 +86,18 @@ export const useProxyStore = defineStore('proxy', () => {
   }
 
   const testLatency = async (id: number) => {
-    const res = await proxiesApi.test(id)
-    const proxy = list.value.find((item) => item.id === id)
-    if (proxy) {
-      proxy.latency = res.data.data.latency
+    try {
+      const res = await proxiesApi.test(id)
+      const proxy = list.value.find((item) => item.id === id)
+      if (proxy) {
+        proxy.latency = res.data.data.latency
+      }
+      return res.data.data
+    } finally {
+      // Both success and failure update health counters on the backend. Reload
+      // so the row immediately reflects active/error while keeping manual stop.
+      await fetchList().catch(() => undefined)
     }
-    return res.data.data
   }
 
   const refreshStatus = async () => {
@@ -113,6 +129,7 @@ export const useProxyStore = defineStore('proxy', () => {
     fetchList,
     create,
     update,
+    setEnabled,
     remove,
     getById,
     testLatency,

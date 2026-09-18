@@ -10,6 +10,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 
 from app.api.resource_search import ResourceSearchCreateRequest, _utc_iso
 from app.celery import celery_app
@@ -61,6 +62,13 @@ def test_resource_search_sql_migration_is_registered_and_parseable():
         hardening_path.read_text(encoding="utf-8")
     )
     assert any("ADD COLUMN IF NOT EXISTS heartbeat_at" in item for item in hardening_statements)
+
+
+def test_resource_search_account_lock_targets_only_account_table_in_postgresql():
+    statement = resource_search_api._locked_resource_search_accounts_query([1])
+    compiled = str(statement.compile(dialect=postgresql.dialect()))
+
+    assert "FOR UPDATE OF telegram_account" in compiled
 
 
 async def _create_account(test_db, identifier: str) -> TelegramAccount:

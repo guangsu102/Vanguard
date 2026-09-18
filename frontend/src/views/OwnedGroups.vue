@@ -10,7 +10,7 @@ import {
 import { ElMessage, ElMessageBox } from "element-plus";
 import dayjs from "dayjs";
 import { useRoute, useRouter } from "vue-router";
-import { accountsApi, type Account } from "@/api/accounts";
+import { accountsApi, type Account, type AccountType } from "@/api/accounts";
 import { getApiErrorMessage } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 import { useOwnedGroupStore } from "@/stores/ownedGroup";
@@ -53,6 +53,9 @@ const inviteLinkAction = ref<string | null>(null);
 const inviteLinksError = ref("");
 const precheckResult = ref<OwnedGroupPrecheckResult | null>(null);
 const creating = ref(false);
+const deletingDraftId = ref<number | null>(null);
+const dissolvingId = ref<number | null>(null);
+const resolvingDissolutionId = ref<number | null>(null);
 const prechecking = ref(false);
 const submitting = ref(false);
 const controlling = ref(false);
@@ -71,6 +74,27 @@ const botForm = reactive({
   bot_token: "",
 });
 let pollTimer: ReturnType<typeof setInterval> | undefined;
+const MAX_PLANNED_RESOURCES = 2000;
+const expandedResourceKeys = ref<string[]>([]);
+
+const loadAccountsByType = async (
+  accountType: AccountType,
+): Promise<Account[]> => {
+  const collected = new Map<number, Account>();
+  let cursor: string | undefined;
+  while (true) {
+    const response = await accountsApi.list({
+      limit: MAX_PLANNED_RESOURCES,
+      account_type: accountType,
+      ...(cursor ? { cursor } : {}),
+    });
+    response.list.forEach((account) => collected.set(account.id, account));
+    const nextCursor = response.nextCursor || undefined;
+    if (!response.hasMore || !nextCursor || nextCursor === cursor) break;
+    cursor = nextCursor;
+  }
+  return Array.from(collected.values());
+};
 
 const ADMIN_PERMISSION_OPTIONS = [
   { key: "invite_users", label: "邀请成员" },
@@ -125,12 +149,113 @@ const draft = reactive({
   invite_mode: "direct_invite" as const,
 });
 
-const ownerOptions = computed(() =>
-  accounts.value.filter(
-    (account) => account.account_type === "promoter" && account.is_active,
-  ),
+const ACCOUNT_STATUS_LABELS: Record<string, string> = {
+  offline: "离线",
+  online: "在线",
+  working: "工作中",
+  idle: "空闲",
+  restricted: "受限",
+  error: "错误",
+  banned: "封禁",
+};
+
+const SPAM_STATUS_LABELS: Record<string, string> = {
+  unknown: "未检测",
+  queued: "排队中",
+  checking: "检测中",
+  clear: "正常",
+  restricted: "受限（非封号）",
+  flagged: "号码风控（未封号）",
+  error: "检测异常",
+};
+
+const RISK_LEVEL_LABELS: Record<string, string> = {
+  normal: "正常",
+  watch: "观察",
+  limited: "限流",
+  frozen: "冻结",
+  quarantined: "隔离",
+};
+
+const hasFutureAccountHold = (value?: string) => {
+  if (!value) return false;
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
+    ? value
+    : value + "Z";
+  const deadline = dayjs(normalized);
+  return deadline.isValid() && deadline.isAfter(dayjs());
+};
+
+const accountEligibilityReason = (account: Account): string => {
+  if (!account.is_active) return "系统已停用";
+  if (account.status === "restricted") return "Telegram 账号受限";
+  if (account.status === "banned") return "Telegram 账号已封禁";
+  if (account.status === "error") return "账号连接错误";
+  if (account.spam_check_status === "restricted") return "SpamBot 已确认受限";
+  if (["frozen", "quarantined"].includes(account.risk_level || "normal")) {
+    return "账号风控已阻断";
+  }
+  if (
+    account.risk_level === "limited" ||
+    hasFutureAccountHold(account.risk_pause_until) ||
+    hasFutureAccountHold(account.risk_recovery_until)
+  ) {
+    return "账号处于风控暂停期";
+  }
+  if (!["online", "idle"].includes(account.status)) {
+    return "账号当前未就绪";
+  }
+  return "";
+};
+
+const accountOptionLabel = (account: Account): string => {
+  const phone = account.phone || account.identifier || "账号 #" + account.id;
+  const displayName =
+    account.display_name && account.display_name !== phone
+      ? "（" + account.display_name + "）"
+      : "";
+  const runtime = account.is_active
+    ? ACCOUNT_STATUS_LABELS[account.status] || account.status
+    : "系统停用";
+  const spam =
+    SPAM_STATUS_LABELS[account.spam_check_status || "unknown"] ||
+    account.spam_check_status ||
+    "未检测";
+  const riskPaused =
+    hasFutureAccountHold(account.risk_pause_until) ||
+    hasFutureAccountHold(account.risk_recovery_until);
+  const risk = riskPaused
+    ? "暂停"
+    : RISK_LEVEL_LABELS[account.risk_level || "normal"] ||
+      account.risk_level ||
+      "正常";
+  return (
+    phone +
+    displayName +
+    " · " +
+    runtime +
+    " · SpamBot" +
+    spam +
+    " · 风控" +
+    risk
+  );
+};
+
+const ownedGroupOwnerOptionLabel = (account: Account): string =>
+  "账号类型 " +
+  (account.operation_mode || "growth") +
+  " · 已创建 " +
+  (account.owned_group_created_count ?? 0) +
+  " 个群 · " +
+  accountOptionLabel(account);
+
+const promoterOptions = computed(() =>
+  accounts.value.filter((account) => account.account_type === "promoter"),
 );
-const resourceOptions = computed(() => ownerOptions.value);
+const ownerOptions = computed(() =>
+  promoterOptions.value.filter((account) => !accountEligibilityReason(account)),
+);
+const resourceOptions = computed(() => promoterOptions.value);
 const botProfiles = computed(() => store.botProfiles);
 const botProfileOptions = computed(() =>
   botProfiles.value.filter((profile) => profile.enabled),
@@ -139,6 +264,23 @@ const selectedAsset = computed(
   () =>
     store.list.find((asset) => asset.id === selectedId.value) || store.current,
 );
+const ownerResourceKey = computed(() =>
+  selectedAsset.value ? `user:${selectedAsset.value.owner_account_id}` : "",
+);
+const ownerExplicitlySelected = computed(
+  () =>
+    Boolean(ownerResourceKey.value) &&
+    selectedResources.value.includes(ownerResourceKey.value),
+);
+const implicitOwnerCount = computed(() =>
+  selectedAsset.value && !ownerExplicitlySelected.value ? 1 : 0,
+);
+const finalPlannedResourceCount = computed(
+  () => selectedResources.value.length + implicitOwnerCount.value,
+);
+const plannedResourceLimitExceeded = computed(
+  () => finalPlannedResourceCount.value > MAX_PLANNED_RESOURCES,
+);
 const isAdmin = computed(() => authStore.userInfo?.role === "admin");
 const canOperateGovernance = computed(() =>
   ["admin", "operator"].includes(authStore.userInfo?.role || ""),
@@ -146,7 +288,7 @@ const canOperateGovernance = computed(() =>
 const selectedAssetId = computed(() => selectedAsset.value?.id);
 const governance = computed(() => {
   const assetId = selectedAssetId.value;
-  return assetId ? store.governanceByAssetId[assetId] ?? null : null;
+  return assetId ? (store.governanceByAssetId[assetId] ?? null) : null;
 });
 const governanceStatus = computed<OwnedGroupGovernanceState>(
   () =>
@@ -156,15 +298,11 @@ const governanceStatus = computed<OwnedGroupGovernanceState>(
 );
 const governanceLoading = computed(() => {
   const assetId = selectedAssetId.value;
-  return assetId
-    ? Boolean(store.governanceLoadingByAssetId[assetId])
-    : false;
+  return assetId ? Boolean(store.governanceLoadingByAssetId[assetId]) : false;
 });
 const governanceCandidates = computed(() => {
   const assetId = selectedAssetId.value;
-  return assetId
-    ? store.governanceCandidatesByAssetId[assetId] ?? []
-    : [];
+  return assetId ? (store.governanceCandidatesByAssetId[assetId] ?? []) : [];
 });
 const governanceCandidatesLoading = computed(() => {
   const assetId = selectedAssetId.value;
@@ -175,8 +313,7 @@ const governanceCandidatesLoading = computed(() => {
 const selectedGovernanceCandidate = computed(() =>
   governanceCandidates.value.find(
     (candidate) =>
-      candidate.guardian_bot_account_id ===
-      selectedGuardianBotAccountId.value,
+      candidate.guardian_bot_account_id === selectedGuardianBotAccountId.value,
   ),
 );
 const currentGovernanceCandidate = computed(() =>
@@ -188,8 +325,7 @@ const currentGovernanceCandidate = computed(() =>
 );
 const currentGuardianBotAccount = computed(() =>
   botAccounts.value.find(
-    (account) =>
-      account.id === governance.value?.guardian_bot_account_id,
+    (account) => account.id === governance.value?.guardian_bot_account_id,
   ),
 );
 const governanceBotLabel = computed(
@@ -221,8 +357,7 @@ const governanceFailure = computed<GovernanceFailure | null>(() => {
   ) {
     return {
       reason: asset.governance_last_error_code || "governance_failed",
-      message:
-        asset.governance_last_error_message || "Guardian 治理状态异常",
+      message: asset.governance_last_error_message || "Guardian 治理状态异常",
       retryable: false,
       missing_permissions: [],
       correlation_id: null,
@@ -285,7 +420,7 @@ const selectedResourceEntries = computed(() =>
             ? botProfileLabel(profile)
             : `Bot #${resourceId}`
           : account
-            ? `${account.display_name || account.identifier} · ${account.status}`
+            ? accountOptionLabel(account)
             : `用户 #${resourceId}`,
     };
   }),
@@ -294,25 +429,46 @@ const operation = computed(() => store.operation);
 const operationActive = computed(() =>
   ["queued", "running", "stopping"].includes(operation.value?.status || ""),
 );
+const isDissolutionOperation = computed(
+  () => operation.value?.operation_type === "dissolve",
+);
+const operationDissolutionNeedsReview = computed(
+  () =>
+    isAdmin.value &&
+    isDissolutionOperation.value &&
+    ["unknown", "failed"].includes(operation.value?.status || "") &&
+    selectedAsset.value?.status === "needs_attention" &&
+    selectedAsset.value?.pending_dissolution_review === true,
+);
 const assetActive = computed(() =>
-  ["prechecking", "creating"].includes(selectedAsset.value?.status || ""),
+  ["prechecking", "creating", "dissolving"].includes(selectedAsset.value?.status || ""),
 );
-const operationCanPause = computed(() =>
-  ["queued", "running"].includes(operation.value?.status || ""),
+const operationCanPause = computed(
+  () =>
+    !isDissolutionOperation.value &&
+    ["queued", "running"].includes(operation.value?.status || ""),
 );
-const operationCanResume = computed(() => operation.value?.status === "paused");
-const operationCanStop = computed(() =>
-  ["queued", "running", "paused", "unknown"].includes(
-    operation.value?.status || "",
-  ),
+const operationCanResume = computed(
+  () => !isDissolutionOperation.value && operation.value?.status === "paused",
 );
-const operationCanRetry = computed(() =>
-  ["stopped", "partial_completed", "failed"].includes(
-    operation.value?.status || "",
-  ),
+const operationCanStop = computed(
+  () =>
+    !isDissolutionOperation.value &&
+    ["queued", "running", "paused", "unknown"].includes(
+      operation.value?.status || "",
+    ),
 );
-const operationNeedsReconcile = computed(() =>
-  ["unknown", "stopping"].includes(operation.value?.status || ""),
+const operationCanRetry = computed(
+  () =>
+    !isDissolutionOperation.value &&
+    ["stopped", "partial_completed", "failed"].includes(
+      operation.value?.status || "",
+    ),
+);
+const operationNeedsReconcile = computed(
+  () =>
+    !isDissolutionOperation.value &&
+    ["unknown", "stopping"].includes(operation.value?.status || ""),
 );
 const assetNeedsReconcile = computed(() =>
   ["needs_attention", "create_failed"].includes(
@@ -361,9 +517,84 @@ const setAdminRequired = (key: string, value: boolean) => {
       config.admin_permissions[permission] = false;
     });
     config.admin_title = "";
+    expandedResourceKeys.value = expandedResourceKeys.value.filter(
+      (expandedKey) => expandedKey !== key,
+    );
   }
 };
 
+const isResourceConfigExpanded = (key: string) =>
+  expandedResourceKeys.value.includes(key);
+
+const toggleResourceConfig = (key: string) => {
+  expandedResourceKeys.value = isResourceConfigExpanded(key)
+    ? expandedResourceKeys.value.filter((expandedKey) => expandedKey !== key)
+    : [...expandedResourceKeys.value, key];
+};
+
+const isResourceOptionDisabled = (key: string, otherwiseDisabled = false) => {
+  if (otherwiseDisabled) return true;
+  if (selectedResources.value.includes(key)) return false;
+  // At 1,999 non-owner selections, the implicit owner already makes 2,000.
+  // Keep the owner selectable: making it explicit replaces the implicit row
+  // and therefore does not increase the final plan size.
+  if (key === ownerResourceKey.value && !ownerExplicitlySelected.value) {
+    return false;
+  }
+  return finalPlannedResourceCount.value >= MAX_PLANNED_RESOURCES;
+};
+
+const validatePlannedResourceLimit = (): boolean => {
+  if (!plannedResourceLimitExceeded.value) return true;
+  ElMessage.warning(
+    `最终计划数（含群主）不能超过 ${MAX_PLANNED_RESOURCES}；当前为 ${finalPlannedResourceCount.value}。请移除至少一个非群主资源，或显式选择群主替代自动计数。`,
+  );
+  return false;
+};
+
+const validateAccountEligibility = (
+  accountId: number,
+  contextLabel: string,
+): boolean => {
+  const account = accounts.value.find((item) => item.id === accountId);
+  if (!account) {
+    ElMessage.warning(contextLabel + "账号不存在或未加载，请刷新后重试");
+    return false;
+  }
+  const reason = accountEligibilityReason(account);
+  if (!reason) return true;
+  ElMessage.warning(
+    contextLabel +
+      "账号 " +
+      (account.phone || account.identifier || "#" + account.id) +
+      " 不可用：" +
+      reason,
+  );
+  return false;
+};
+
+const validatePlannedAccountEligibility = (): boolean => {
+  if (!selectedAsset.value) return false;
+  const accountIds = new Set<number>([selectedAsset.value.owner_account_id]);
+  selectedResources.value.forEach((key) => {
+    const [resourceType, rawId] = key.split(":");
+    const accountId = Number(rawId);
+    if (
+      resourceType === "user" &&
+      Number.isInteger(accountId) &&
+      accountId > 0
+    ) {
+      accountIds.add(accountId);
+    }
+  });
+  for (const accountId of accountIds) {
+    if (!validateAccountEligibility(accountId, "计划成员")) {
+      precheckResult.value = null;
+      return false;
+    }
+  }
+  return true;
+};
 const setAdminPermission = (
   key: string,
   permission: string,
@@ -459,9 +690,7 @@ const governancePermissionLabel = (permission: string) =>
 const formatGovernanceTime = (value?: string | null) =>
   value ? dayjs(value).format("YYYY-MM-DD HH:mm:ss") : "-";
 
-const governanceCandidateLabel = (
-  candidate: OwnedGroupGovernanceCandidate,
-) => {
+const governanceCandidateLabel = (candidate: OwnedGroupGovernanceCandidate) => {
   const name =
     candidate.display_name ||
     candidate.username ||
@@ -472,11 +701,7 @@ const governanceCandidateLabel = (
       : "@" + candidate.username
     : "无用户名";
   return (
-    name +
-    " · " +
-    username +
-    " · account #" +
-    candidate.guardian_bot_account_id
+    name + " · " + username + " · account #" + candidate.guardian_bot_account_id
   );
 };
 
@@ -655,10 +880,7 @@ const openGovernanceDialog = async () => {
     const candidates = await store.fetchGovernanceCandidates(
       selectedAsset.value.id,
     );
-    if (
-      !selectedGuardianBotAccountId.value &&
-      candidates.length === 1
-    ) {
+    if (!selectedGuardianBotAccountId.value && candidates.length === 1) {
       selectedGuardianBotAccountId.value =
         candidates[0].guardian_bot_account_id;
     }
@@ -686,8 +908,7 @@ const bindGovernance = async () => {
     actionMessage.value =
       result.governance_status === "managed"
         ? "Guardian 治理接入成功"
-        : "Guardian 治理请求已提交，当前状态：" +
-          result.governance_status;
+        : "Guardian 治理请求已提交，当前状态：" + result.governance_status;
     if (result.governance_status === "managed") {
       ElMessage.success("Guardian 治理接入成功");
     } else {
@@ -720,8 +941,7 @@ const reconcileGovernance = async () => {
     actionMessage.value =
       result.governance_status === "managed"
         ? "Guardian 治理检测通过"
-        : "Guardian 治理检测完成，当前状态：" +
-          result.governance_status;
+        : "Guardian 治理检测完成，当前状态：" + result.governance_status;
     if (result.governance_status === "managed") {
       ElMessage.success("Guardian 治理检测通过");
     } else {
@@ -739,8 +959,7 @@ const reconcileGovernance = async () => {
 const openGovernancePolicies = () => {
   const asset = selectedAsset.value;
   const status = governance.value;
-  const telegramChatId =
-    status?.telegram_chat_id ?? asset?.telegram_chat_id;
+  const telegramChatId = status?.telegram_chat_id ?? asset?.telegram_chat_id;
   const guardianBotAccountId =
     status?.guardian_bot_account_id ?? asset?.guardian_bot_account_id;
   if (
@@ -774,6 +993,171 @@ const ownedGroupMessagingDisabledReason = (asset: OwnedGroupAsset) => {
 
 const asOwnedGroupAsset = (value: unknown) => value as OwnedGroupAsset;
 
+const canDeleteFailedDraft = (asset: OwnedGroupAsset) =>
+  isAdmin.value &&
+  asset.status === "needs_attention" &&
+  asset.telegram_chat_id == null &&
+  asset.core_group_id == null &&
+  asset.managed_binding_id == null &&
+  asset.guardian_bot_account_id == null &&
+  asset.governance_status === "disabled";
+
+const deleteFailedDraft = async (asset: OwnedGroupAsset) => {
+  if (!canDeleteFailedDraft(asset)) return;
+  try {
+    await ElMessageBox.confirm(
+      "请先确认已核实 Telegram 中没有创建该群。此操作只删除 Vanguard 本地失败草稿，不会调用 Telegram，也无法用于删除真实群。是否继续？",
+      "删除失败草稿",
+      {
+        type: "warning",
+        confirmButtonText: "已核实未建群，删除草稿",
+        cancelButtonText: "取消",
+      },
+    );
+  } catch {
+    return;
+  }
+
+  deletingDraftId.value = asset.id;
+  try {
+    await store.deleteFailedDraft(asset.id);
+    if (selectedId.value === asset.id) {
+      selectedId.value = null;
+      selectedResources.value = [];
+      expandedResourceKeys.value = [];
+      Object.keys(resourceConfigs).forEach(
+        (key) => delete resourceConfigs[key],
+      );
+      precheckResult.value = null;
+      actionMessage.value = "";
+      stopPolling();
+    }
+    ElMessage.success("本地失败草稿已删除");
+  } catch (error) {
+    showError(error, "删除失败草稿失败");
+  } finally {
+    deletingDraftId.value = null;
+  };
+};
+const canDissolveGroup = (asset: OwnedGroupAsset) =>
+  isAdmin.value &&
+  asset.status === "ready" &&
+  Number.isSafeInteger(asset.telegram_chat_id) &&
+  asset.telegram_chat_id !== 0;
+
+const queueDissolution = async (asset: OwnedGroupAsset) => {
+  if (!canDissolveGroup(asset)) return;
+  const confirmation = "DISSOLVE " + asset.id;
+  let confirmedValue: string;
+  try {
+    const prompt = await ElMessageBox.prompt(
+      "此操作会先将资产置为解散中，再由后台单线程任务发起 Telegram 解散。解散后群和历史内容无法恢复；如果远端结果不确定，系统会转人工核验，不会自动重试。",
+      "解散 Telegram 群",
+      {
+        type: "error",
+        confirmButtonText: "确认排队解散",
+        cancelButtonText: "取消",
+        inputPlaceholder: confirmation,
+        inputValidator: (value) =>
+          value?.trim().toUpperCase() === confirmation ||
+          "请输入确认短语 " + confirmation,
+      },
+    );
+    confirmedValue = prompt.value.trim().toUpperCase();
+  } catch {
+    return;
+  }
+
+  dissolvingId.value = asset.id;
+  errorMessage.value = "";
+  try {
+    await store.queueDissolution(asset.id, confirmedValue);
+    if (selectedId.value !== asset.id) {
+      selectedId.value = asset.id;
+      selectedResources.value = [];
+      expandedResourceKeys.value = [];
+      Object.keys(resourceConfigs).forEach(
+        (key) => delete resourceConfigs[key],
+      );
+      precheckResult.value = null;
+    }
+    actionMessage.value =
+      "群 #" + asset.id + " 的解散任务已入队，正在等待单线程执行";
+    startPolling();
+    ElMessage.success("解散群任务已入队");
+  } catch (error) {
+    showError(error, "解散群排队失败");
+  } finally {
+    dissolvingId.value = null;
+  }
+};
+
+const canResolveDissolution = (asset: OwnedGroupAsset) =>
+  isAdmin.value &&
+  asset.status === "needs_attention" &&
+  asset.pending_dissolution_review === true;
+
+const resolveDissolution = async (asset: OwnedGroupAsset) => {
+  if (!canResolveDissolution(asset)) return;
+  const archivedPhrase = "CONFIRM DISSOLVED " + asset.id;
+  const existsPhrase = "CONFIRM EXISTS " + asset.id;
+  let promptValue: string;
+  try {
+    const prompt = await ElMessageBox.prompt(
+      "请先在 Telegram 中核实该群的真实状态，再输入对应确认短语：输入 " +
+        archivedPhrase +
+        " 表示群已解散（资产归档，不可恢复）；输入 " +
+        existsPhrase +
+        " 表示群仍存在（资产恢复为可用，可重新发起解散）。",
+      "人工核验解散结果",
+      {
+        type: "warning",
+        confirmButtonText: "提交核验结论",
+        cancelButtonText: "取消",
+        inputPlaceholder: archivedPhrase + " 或 " + existsPhrase,
+        inputValidator: (value) => {
+          const normalized = value?.trim().toUpperCase() ?? "";
+          if (normalized === archivedPhrase || normalized === existsPhrase) {
+            return true;
+          }
+          return (
+            "请输入 " + archivedPhrase + " 或 " + existsPhrase
+          );
+        },
+      },
+    );
+    promptValue = prompt.value.trim().toUpperCase();
+  } catch {
+    return;
+  }
+
+  const outcome =
+    promptValue === archivedPhrase ? "archived" : "still_exists";
+  resolvingDissolutionId.value = asset.id;
+  errorMessage.value = "";
+  try {
+    await store.resolveDissolution(asset.id, outcome, promptValue);
+    if (selectedId.value !== asset.id) {
+      selectedId.value = asset.id;
+      selectedResources.value = [];
+      expandedResourceKeys.value = [];
+      Object.keys(resourceConfigs).forEach(
+        (key) => delete resourceConfigs[key],
+      );
+      precheckResult.value = null;
+    }
+    actionMessage.value =
+      outcome === "archived"
+        ? "已确认群组解散，资产 #" + asset.id + " 归档"
+        : "已确认群仍存在，资产 #" + asset.id + " 恢复为可用";
+    ElMessage.success(actionMessage.value);
+  } catch (error) {
+    showError(error, "人工核验提交失败");
+  } finally {
+    resolvingDissolutionId.value = null;
+  }
+};
+
 const openOperationsCenter = (asset: OwnedGroupAsset) => {
   if (!Number.isSafeInteger(asset.id) || asset.id <= 0) return;
   router.push(`/owned-groups/${asset.id}/operations`);
@@ -799,13 +1183,9 @@ const viewGovernanceFailure = () => {
     "Reason: " + failure.reason,
     failure.missing_permissions?.length
       ? "缺失权限：" +
-        failure.missing_permissions
-          .map(governancePermissionLabel)
-          .join("、")
+        failure.missing_permissions.map(governancePermissionLabel).join("、")
       : "",
-    failure.correlation_id
-      ? "Correlation ID: " + failure.correlation_id
-      : "",
+    failure.correlation_id ? "Correlation ID: " + failure.correlation_id : "",
   ].filter(Boolean);
   ElMessageBox.alert(lines.join("\n"), "Guardian 治理失败原因", {
     confirmButtonText: "知道了",
@@ -878,16 +1258,12 @@ const load = async () => {
   try {
     await Promise.all([
       store.fetchList(),
-      accountsApi
-        .list({ limit: 200, account_type: "promoter" })
-        .then((response) => {
-          accounts.value = response.list;
-        }),
-      accountsApi
-        .list({ limit: 200, account_type: "guardian_bot" })
-        .then((response) => {
-          botAccounts.value = response.list;
-        }),
+      loadAccountsByType("promoter").then((response) => {
+        accounts.value = response;
+      }),
+      loadAccountsByType("guardian_bot").then((response) => {
+        botAccounts.value = response;
+      }),
     ]);
     botProfileError.value = "";
     try {
@@ -927,6 +1303,7 @@ const registerBotProfile = async () => {
     ElMessage.warning("请选择归属用户和 Bot 账号");
     return;
   }
+  if (!validateAccountEligibility(botForm.owner_account_id, "归属用户")) return;
   registeringBot.value = true;
   botProfileError.value = "";
   try {
@@ -989,6 +1366,7 @@ const createDraft = async () => {
     !draft.owner_account_id
   )
     return ElMessage.warning("请填写内部名称、群标题并选择群主账号");
+  if (!validateAccountEligibility(draft.owner_account_id, "群主")) return;
   if (
     draft.visibility === "public" &&
     !/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(draft.telegram_username.trim())
@@ -1010,6 +1388,7 @@ const createDraft = async () => {
     selectedId.value = asset.id;
     store.select(asset);
     selectedResources.value = [];
+    expandedResourceKeys.value = [];
     Object.keys(resourceConfigs).forEach((key) => delete resourceConfigs[key]);
     reconcileChatId.value = "";
     reconcileUsername.value = "";
@@ -1095,6 +1474,12 @@ const reconcileAsset = async () => {
 
 const precheck = async () => {
   if (!selectedAsset.value) return ElMessage.warning("请先选择一个资产");
+  if (operationActive.value)
+    return ElMessage.warning(
+      "当前成员编排仍在执行，请完成或停止后再提交下一批",
+    );
+  if (!validatePlannedResourceLimit()) return;
+  if (!validatePlannedAccountEligibility()) return;
   const resources = buildResourceSelections();
   if (!resources.length)
     return ElMessage.warning(
@@ -1130,6 +1515,12 @@ const precheck = async () => {
 
 const submit = async () => {
   if (!selectedAsset.value) return ElMessage.warning("请先选择一个资产");
+  if (operationActive.value)
+    return ElMessage.warning(
+      "当前成员编排仍在执行，请完成或停止后再提交下一批",
+    );
+  if (!validatePlannedResourceLimit()) return;
+  if (!validatePlannedAccountEligibility()) return;
   const resources = buildResourceSelections();
   if (!resources.length) return ElMessage.warning("请选择至少一个计划成员");
   if (!validateResourceAdminConfigs()) return;
@@ -1144,6 +1535,12 @@ const submit = async () => {
     if (result) {
       actionMessage.value =
         "操作 #" + result.id + " 已提交，状态：" + result.status;
+      selectedResources.value = [];
+      expandedResourceKeys.value = [];
+      Object.keys(resourceConfigs).forEach(
+        (key) => delete resourceConfigs[key],
+      );
+      precheckResult.value = null;
       startPolling();
     }
     ElMessage.success("操作已提交");
@@ -1186,6 +1583,7 @@ const selectAsset = (asset: OwnedGroupAsset) => {
   selectedId.value = asset.id;
   store.select(asset);
   selectedResources.value = [];
+  expandedResourceKeys.value = [];
   Object.keys(resourceConfigs).forEach((key) => delete resourceConfigs[key]);
   inviteLinksLoadedFor.value = null;
   inviteLinksError.value = "";
@@ -1202,7 +1600,7 @@ const statusType = (status: OwnedGroupOperationStatus | string) => {
   if (["completed", "member_verified", "admin_verified"].includes(status))
     return "success";
   if (["failed", "unknown", "create_failed"].includes(status)) return "danger";
-  if (["paused", "stopping", "needs_attention"].includes(status))
+  if (["paused", "stopping", "needs_attention", "dissolving"].includes(status))
     return "warning";
   return "info";
 };
@@ -1217,6 +1615,9 @@ watch(
     Object.keys(resourceConfigs).forEach((key) => {
       if (!selected.has(key)) delete resourceConfigs[key];
     });
+    expandedResourceKeys.value = expandedResourceKeys.value.filter((key) =>
+      selected.has(key),
+    );
     precheckResult.value = null;
   },
   { deep: true },
@@ -1292,14 +1693,11 @@ onBeforeUnmount(() => {
               style="width: 100%"
             >
               <el-option
-                v-for="account in ownerOptions"
+                v-for="account in promoterOptions"
                 :key="account.id"
-                :label="
-                  (account.display_name || account.identifier) +
-                  ' · ' +
-                  account.status
-                "
+                :label="ownedGroupOwnerOptionLabel(account)"
                 :value="account.id"
+                :disabled="Boolean(accountEligibilityReason(account))"
               />
             </el-select>
           </el-form-item>
@@ -1340,22 +1738,67 @@ onBeforeUnmount(() => {
               }}</el-tag></template
             ></el-table-column
           ><el-table-column prop="visibility" label="可见性" width="80" />
-          <el-table-column label="群运营" width="210" fixed="right">
+          <el-table-column label="群运营" width="300" fixed="right">
             <template #default="{ row }">
-              <el-button text type="primary" @click.stop="openOperationsCenter(asOwnedGroupAsset(row))">运营中心</el-button>
+              <el-button
+                text
+                type="primary"
+                @click.stop="openOperationsCenter(asOwnedGroupAsset(row))"
+                >运营中心</el-button
+              >
               <el-tooltip
-                :disabled="!ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))"
-                :content="ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))"
+                :disabled="
+                  !ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))
+                "
+                :content="
+                  ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row))
+                "
               >
                 <span>
                   <el-button
                     text
                     type="primary"
-                    :disabled="Boolean(ownedGroupMessagingDisabledReason(asOwnedGroupAsset(row)))"
-                    @click.stop="openOwnedGroupMessaging(asOwnedGroupAsset(row))"
-                  >群内消息</el-button>
+                    :disabled="
+                      Boolean(
+                        ownedGroupMessagingDisabledReason(
+                          asOwnedGroupAsset(row),
+                        ),
+                      )
+                    "
+                    @click.stop="
+                      openOwnedGroupMessaging(asOwnedGroupAsset(row))
+                    "
+                    >群内消息</el-button
+                  >
                 </span>
               </el-tooltip>
+              <el-button
+                v-if="canDissolveGroup(asOwnedGroupAsset(row))"
+                text
+                type="danger"
+                :loading="dissolvingId === row.id"
+                @click.stop="queueDissolution(asOwnedGroupAsset(row))"
+              >
+                解散群
+              </el-button>
+              <el-button
+                v-if="canResolveDissolution(asOwnedGroupAsset(row))"
+                text
+                type="warning"
+                :loading="resolvingDissolutionId === row.id"
+                @click.stop="resolveDissolution(asOwnedGroupAsset(row))"
+              >
+                人工核验
+              </el-button>
+              <el-button
+                v-if="canDeleteFailedDraft(asOwnedGroupAsset(row))"
+                text
+                type="danger"
+                :loading="deletingDraftId === row.id"
+                @click.stop="deleteFailedDraft(asOwnedGroupAsset(row))"
+              >
+                删除草稿
+              </el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -1364,7 +1807,12 @@ onBeforeUnmount(() => {
             <strong>当前：</strong>{{ selectedAsset.title }}（#{{
               selectedAsset.id
             }}）
-            <el-button type="primary" plain @click="openOperationsCenter(selectedAsset)">运营中心</el-button>
+            <el-button
+              type="primary"
+              plain
+              @click="openOperationsCenter(selectedAsset)"
+              >运营中心</el-button
+            >
           </p>
           <el-card shadow="never" class="governance-card">
             <template #header>
@@ -1409,9 +1857,7 @@ onBeforeUnmount(() => {
                 </el-descriptions-item>
                 <el-descriptions-item label="最近检测时间">
                   {{
-                    formatGovernanceTime(
-                      governance?.governance_last_checked_at,
-                    )
+                    formatGovernanceTime(governance?.governance_last_checked_at)
                   }}
                 </el-descriptions-item>
                 <el-descriptions-item label="绑定状态">
@@ -1489,7 +1935,9 @@ onBeforeUnmount(() => {
               <div class="governance-actions">
                 <template v-if="!assetReadyForGovernance">
                   <el-button type="primary" disabled>接入治理</el-button>
-                  <small class="poll-hint">{{ governanceDisabledReason }}</small>
+                  <small class="poll-hint">{{
+                    governanceDisabledReason
+                  }}</small>
                 </template>
                 <template v-else-if="governanceStatus === 'disabled'">
                   <el-button
@@ -1499,10 +1947,7 @@ onBeforeUnmount(() => {
                   >
                     接入治理
                   </el-button>
-                  <small
-                    v-if="governanceDisabledReason"
-                    class="poll-hint"
-                  >
+                  <small v-if="governanceDisabledReason" class="poll-hint">
                     {{ governanceDisabledReason }}
                   </small>
                 </template>
@@ -1542,11 +1987,7 @@ onBeforeUnmount(() => {
                   </el-button>
                 </template>
                 <template v-else>
-                  <el-button
-                    type="danger"
-                    plain
-                    @click="viewGovernanceFailure"
-                  >
+                  <el-button type="danger" plain @click="viewGovernanceFailure">
                     查看失败原因
                   </el-button>
                   <el-button
@@ -1596,7 +2037,7 @@ onBeforeUnmount(() => {
           </div>
           <el-button
             :loading="prechecking"
-            :disabled="selectedAsset.status === 'archived'"
+            :disabled="selectedAsset.status === 'archived' || operationActive"
             @click="precheck"
             >资源预检查并排队</el-button
           >
@@ -1604,6 +2045,7 @@ onBeforeUnmount(() => {
             <el-select
               v-model="selectedResources"
               multiple
+              :multiple-limit="MAX_PLANNED_RESOURCES"
               filterable
               collapse-tags
               placeholder="选择用户账号或已验证 Bot"
@@ -1613,12 +2055,14 @@ onBeforeUnmount(() => {
                 <el-option
                   v-for="account in resourceOptions"
                   :key="resourceKey('user', account.id)"
-                  :label="
-                    (account.display_name || account.identifier) +
-                    ' · ' +
-                    account.status
-                  "
+                  :label="accountOptionLabel(account)"
                   :value="resourceKey('user', account.id)"
+                  :disabled="
+                    isResourceOptionDisabled(
+                      resourceKey('user', account.id),
+                      Boolean(accountEligibilityReason(account)),
+                    )
+                  "
                 />
               </el-option-group>
               <el-option-group
@@ -1631,12 +2075,30 @@ onBeforeUnmount(() => {
                   :label="botProfileLabel(profile)"
                   :value="resourceKey('bot', profile.id)"
                   :disabled="
-                    profile.status !== 'verified' && profile.status !== 'active'
+                    isResourceOptionDisabled(
+                      resourceKey('bot', profile.id),
+                      profile.status !== 'verified' &&
+                        profile.status !== 'active',
+                    )
                   "
                 />
               </el-option-group>
             </el-select>
           </el-form-item>
+          <div
+            class="planned-resource-count"
+            :class="{ 'is-over-limit': plannedResourceLimitExceeded }"
+            data-testid="planned-resource-count"
+          >
+            <strong>
+              最终计划数（含群主） {{ finalPlannedResourceCount }}/{{
+                MAX_PLANNED_RESOURCES
+              }}
+            </strong>
+            <small v-if="implicitOwnerCount">
+              群主未显式选择，系统会自动计入 1 个名额。
+            </small>
+          </div>
           <div
             v-if="selectedResourceEntries.length"
             class="resource-admin-list"
@@ -1657,8 +2119,26 @@ onBeforeUnmount(() => {
                   active-text="设为管理员"
                   @change="setAdminRequired(entry.key, Boolean($event))"
                 />
+                <el-button
+                  v-if="!entry.is_owner && entry.config.admin_required"
+                  text
+                  size="small"
+                  @click="toggleResourceConfig(entry.key)"
+                >
+                  {{
+                    isResourceConfigExpanded(entry.key)
+                      ? "收起权限"
+                      : "配置权限"
+                  }}
+                </el-button>
               </div>
-              <template v-if="!entry.is_owner && entry.config.admin_required">
+              <template
+                v-if="
+                  !entry.is_owner &&
+                  entry.config.admin_required &&
+                  isResourceConfigExpanded(entry.key)
+                "
+              >
                 <el-input
                   v-model="entry.config.admin_title"
                   maxlength="16"
@@ -1717,7 +2197,7 @@ onBeforeUnmount(() => {
           <el-button
             type="primary"
             :loading="submitting"
-            :disabled="selectedAsset.status !== 'ready'"
+            :disabled="selectedAsset.status !== 'ready' || operationActive"
             @click="submit"
             >提交成员操作</el-button
           >
@@ -1795,9 +2275,32 @@ onBeforeUnmount(() => {
                 >执行对账</el-button
               >
             </el-button-group>
-            <small v-if="operationActive" class="poll-hint"
-              >执行中，页面每 3 秒自动刷新；可随时暂停或停止。</small
+            <small v-if="operationActive" class="poll-hint">
+              {{
+                isDissolutionOperation
+                  ? "解散任务执行中，页面每 3 秒自动刷新；远端结果不确定时将转人工核验，不会自动重试。"
+                  : "执行中，页面每 3 秒自动刷新；可随时暂停或停止。"
+              }}
+            </small>
+            <div
+              v-if="operationDissolutionNeedsReview"
+              class="poll-hint"
+              style="margin-top: 8px"
             >
+              <el-alert
+                type="warning"
+                :closable="false"
+                show-icon
+                title="解散结果未确认：请在 Telegram 中核实该群状态后，点击人工确认提交结论。"
+              />
+              <el-button
+                type="warning"
+                size="small"
+                :loading="resolvingDissolutionId === selectedAsset.id"
+                @click="resolveDissolution(asOwnedGroupAsset(selectedAsset))"
+                >人工确认解散结果</el-button
+              >
+            </div>
           </div>
           <div v-if="selectedAsset.status === 'ready'" class="invite-panel">
             <div class="invite-header">
@@ -1990,9 +2493,7 @@ onBeforeUnmount(() => {
             >
               <div class="governance-candidate-option">
                 <strong>{{
-                  candidate.display_name ||
-                  candidate.username ||
-                  "Guardian Bot"
+                  candidate.display_name || candidate.username || "Guardian Bot"
                 }}</strong>
                 <span>{{
                   candidate.username
@@ -2001,9 +2502,7 @@ onBeforeUnmount(() => {
                       : "@" + candidate.username
                     : "无用户名"
                 }}</span>
-                <span
-                  >account #{{ candidate.guardian_bot_account_id }}</span
-                >
+                <span>account #{{ candidate.guardian_bot_account_id }}</span>
                 <el-tag size="small" effect="plain">
                   Owned: {{ candidate.owned_profile_status }}
                 </el-tag>
@@ -2038,9 +2537,7 @@ onBeforeUnmount(() => {
         "
       />
       <el-alert
-        v-if="
-          !governanceCandidatesLoading && !governanceCandidates.length
-        "
+        v-if="!governanceCandidatesLoading && !governanceCandidates.length"
         type="info"
         :closable="false"
         title="没有符合当前群主归属及双 Profile 条件的 Guardian Bot。"
@@ -2066,8 +2563,7 @@ onBeforeUnmount(() => {
           type="primary"
           :loading="governanceLoading"
           :disabled="
-            !selectedGuardianBotAccountId ||
-            governanceCandidatesLoading
+            !selectedGuardianBotAccountId || governanceCandidatesLoading
           "
           @click="bindGovernance"
         >
@@ -2098,14 +2594,11 @@ onBeforeUnmount(() => {
             style="width: 100%"
           >
             <el-option
-              v-for="account in ownerOptions"
+              v-for="account in promoterOptions"
               :key="account.id"
-              :label="
-                (account.display_name || account.identifier) +
-                ' · ' +
-                account.status
-              "
+              :label="accountOptionLabel(account)"
               :value="account.id"
+              :disabled="Boolean(accountEligibilityReason(account))"
             />
           </el-select>
         </el-form-item>
@@ -2119,11 +2612,7 @@ onBeforeUnmount(() => {
             <el-option
               v-for="account in botAccounts.filter((item) => item.is_active)"
               :key="account.id"
-              :label="
-                (account.display_name || account.identifier) +
-                ' · ' +
-                account.status
-              "
+              :label="accountOptionLabel(account)"
               :value="account.id"
             />
           </el-select>
@@ -2207,6 +2696,15 @@ onBeforeUnmount(() => {
   padding: 10px;
   background: var(--el-fill-color-lighter);
   border-radius: 6px;
+}
+.planned-resource-count {
+  display: grid;
+  gap: 3px;
+  margin: -8px 0 12px 110px;
+  color: var(--el-text-color-secondary);
+}
+.planned-resource-count.is-over-limit {
+  color: var(--el-color-danger);
 }
 .resource-admin-header,
 .invite-header,
@@ -2326,6 +2824,9 @@ onBeforeUnmount(() => {
   .permission-grid,
   .invite-row {
     grid-template-columns: 1fr;
+  }
+  .planned-resource-count {
+    margin-left: 0;
   }
   .governance-capabilities {
     grid-template-columns: repeat(2, minmax(0, 1fr));

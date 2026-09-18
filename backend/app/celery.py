@@ -31,6 +31,9 @@ celery_app = Celery(
     include=[
         "app.core.scheduler.tasks",
         "app.modules.qq.tasks",
+        "app.modules.account_spam.tasks",
+        "app.modules.account_profile_update.tasks",
+        "app.modules.managed_bot_provision.tasks",
         "app.modules.owned_group.tasks",
         "app.modules.owned_group.messaging_tasks",
         "app.modules.owned_group.messaging_retention_tasks",
@@ -48,6 +51,8 @@ TASK_CONCURRENCY = {
     "bulk_import": 2,
     "automation": 3,
     "resource_search": 1,
+    "account_spam": 1,
+    "account_profile_update": 1,
     "qq_commands": 2,
     "owned_group": 1,
 }
@@ -106,20 +111,25 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/5"),
         "options": {"queue": "health_check", "rate_limit": "10/m"},
     },
+    "account-app-version-roll-daily": {
+        "task": "app.core.scheduler.tasks.account_app_version_roll_task",
+        "schedule": crontab(hour=4, minute=23),  # Daily low-traffic window
+        "options": {"queue": "health_check"},
+    },
     "sync-group-metrics-every-10min": {
         "task": "app.core.scheduler.tasks.sync_group_metrics",
         "schedule": crontab(minute="*/10"),
         "options": {"queue": "default"},
     },
-    "check-proxy-status-every-15min": {
-        "task": "app.core.scheduler.tasks.check_proxy_status",
-        "schedule": crontab(minute="*/15"),
-        "options": {"queue": "proxy_validation"},
-    },
     "auto-join-groups-dispatcher-every-5min": {
         "task": "app.core.scheduler.tasks.auto_join_groups_task",
         "schedule": crontab(minute="*/5"),
-        "kwargs": {"scheduled": True, "keywords_per_account": 10, "max_groups_per_keyword": 20},
+        "kwargs": {
+            "scheduled": True,
+            "max_accounts": 26,
+            "keywords_per_account": 30,
+            "max_groups_per_keyword": 50,
+        },
         "options": {"queue": "automation", "rate_limit": "12/h"},
     },
     "recover-orphaned-groups-every-5min": {
@@ -230,6 +240,24 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=30),
         "options": {"queue": "qq_commands"},
     },
+    "account-spam-worker-every-30s": {
+        "task": "app.modules.account_spam.tasks.account_spam_check_tick",
+        "schedule": 30.0,
+        "kwargs": {"limit": 10, "stale_after_seconds": 300},
+        "options": {"queue": "account_spam"},
+    },
+    "account-profile-update-worker-every-10s": {
+        "task": "app.modules.account_profile_update.tasks.account_profile_update_tick",
+        "schedule": 10.0,
+        "kwargs": {"stale_after_seconds": 300},
+        "options": {"queue": "account_profile_update"},
+    },
+    "managed-bot-provision-worker-every-15s": {
+        "task": "app.modules.managed_bot_provision.tasks.managed_bot_provision_tick",
+        "schedule": 15.0,
+        "kwargs": {"limit": 5, "stale_after_seconds": 300},
+        "options": {"queue": "owned_group"},
+    },
     "owned-group-worker-every-30s": {
         "task": "app.modules.owned_group.tasks.owned_group_worker_tick",
         "schedule": 30.0,
@@ -280,6 +308,13 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.reconcile_resource_searches_task": {"queue": "default"},
     "app.core.scheduler.tasks.cleanup_resource_search_history_task": {"queue": "default"},
     "app.modules.qq.tasks.execute_qq_command": {"queue": "qq_commands"},
+    "app.modules.account_spam.tasks.account_spam_check_tick": {"queue": "account_spam"},
+    "app.modules.account_profile_update.tasks.account_profile_update_tick": {
+        "queue": "account_profile_update"
+    },
+    "app.modules.managed_bot_provision.tasks.managed_bot_provision_tick": {
+        "queue": "owned_group"
+    },
     "app.modules.qq.tasks.cleanup_qq_messages": {"queue": "qq_commands"},
     "app.modules.owned_group.tasks.owned_group_worker_tick": {"queue": "owned_group"},
     "app.modules.owned_group.messaging_tasks.dispatch_owned_group_messages": {
@@ -333,6 +368,14 @@ celery_app.conf.task_queues = {
     "qq_commands": {
         "exchange": "qq_commands",
         "routing_key": "qq_commands",
+    },
+    "account_spam": {
+        "exchange": "account_spam",
+        "routing_key": "account_spam",
+    },
+    "account_profile_update": {
+        "exchange": "account_profile_update",
+        "routing_key": "account_profile_update",
     },
     "owned_group": {
         "exchange": "owned_group",

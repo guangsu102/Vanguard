@@ -15,7 +15,7 @@ describe("OwnedGroupCapabilityCards", () => {
 
   it("renders known backend blockers as Chinese explanations", () => {
     const blockers = [
-      "asset_not_ready", "asset_needs_attention", "owned_group_execution_disabled",
+      "asset_not_ready", "core_group_mapping_missing", "asset_needs_attention", "owned_group_execution_disabled",
       "governance_gate_backend_unavailable", "guardian_degraded", "governance_feature_disabled",
       "messaging_source_unavailable", "messaging_feature_disabled",
     ];

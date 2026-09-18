@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
+import { ElMessageBox } from 'element-plus'
+import { accountsApi, type Account } from '@/api/accounts'
+import type { SpamCheckOperation } from '@/api/accountSpamChecks'
 import Accounts from './Accounts.vue'
 
 interface AccountsViewModel {
@@ -11,6 +14,14 @@ interface AccountsViewModel {
   handleEnable: (account: { id: number }) => Promise<void>
   openDeliveryBlockDrawer: (account: { id: number; identifier: string }) => void
   selectedDeliveryStatus: { account_id: number } | null
+  spamCheckAccounts: Account[]
+  spamCheckEligibleAccounts: Account[]
+  spamCheckSelectedIds: number[]
+  spamCheckOperation: SpamCheckOperation | null
+  openSpamCheckDialog: () => Promise<void>
+  submitSpamCheckOperation: () => Promise<void>
+  spamCheckResultText: (status: Account['spam_check_status']) => string
+  accountRestrictionSourceText: (account: Account) => string
 }
 
 const {
@@ -25,6 +36,11 @@ const {
   updatePersonaSummary,
   push,
   getAdDynamicStatus,
+  createSpamCheckOperation,
+  getLatestSpamCheckOperation,
+  getSpamCheckOperation,
+  cancelSpamCheckOperation,
+  createSpamCheckKey,
 } = vi.hoisted(() => ({
   fetchList: vi.fn().mockResolvedValue([]),
   update: vi.fn().mockResolvedValue({}),
@@ -36,6 +52,11 @@ const {
   setAccountTypeFilter: vi.fn(),
   updatePersonaSummary: vi.fn(),
   push: vi.fn(),
+  createSpamCheckOperation: vi.fn(),
+  getLatestSpamCheckOperation: vi.fn(),
+  getSpamCheckOperation: vi.fn(),
+  cancelSpamCheckOperation: vi.fn(),
+  createSpamCheckKey: vi.fn(() => 'spam-check-key'),
   getAdDynamicStatus: vi.fn().mockResolvedValue({
     data: {
       data: [
@@ -84,7 +105,22 @@ vi.mock('@/api/proxies', () => ({
 vi.mock('@/api/automation', () => ({
   automationApi: {
     getAdDynamicStatus,
+  createSpamCheckOperation,
+  getLatestSpamCheckOperation,
+  getSpamCheckOperation,
+  cancelSpamCheckOperation,
+  createSpamCheckKey,
   },
+}))
+
+vi.mock('@/api/accountSpamChecks', () => ({
+  accountSpamChecksApi: {
+    createOperation: createSpamCheckOperation,
+    getLatestOperation: getLatestSpamCheckOperation,
+    getOperation: getSpamCheckOperation,
+    cancelOperation: cancelSpamCheckOperation,
+  },
+  createSpamCheckIdempotencyKey: createSpamCheckKey,
 }))
 
 vi.mock('@/stores/account', () => ({
@@ -98,6 +134,7 @@ vi.mock('@/stores/account', () => ({
         phone: '13800000000',
         session_name: 'alice-session',
         status: 'online',
+        spam_check_status: 'clear',
         is_active: true,
         country_code: 'US',
         country_name: 'United States',
@@ -115,6 +152,7 @@ vi.mock('@/stores/account', () => ({
         phone: '19900000000',
         session_name: 'guardian-session',
         status: 'online',
+        spam_check_status: 'clear',
         is_active: true,
         country_code: 'US',
         api_config_name: 'default',
@@ -175,6 +213,54 @@ const globalStubs = {
   'el-tabs': { template: '<div><slot /></div>' },
   'el-tab-pane': { template: '<div><slot /></div>' },
   'el-empty': { template: '<div />' },
+  'el-dialog': { template: '<div><slot /><slot name="footer" /></div>' },
+  'el-input': { template: '<input />' },
+  'el-scrollbar': { template: '<div><slot /></div>' },
+  'el-checkbox-group': { template: '<div><slot /></div>' },
+  'el-checkbox': { template: '<label><slot /></label>' },
+  'el-progress': { template: '<div />' },
+}
+
+const listAccounts = vi.spyOn(accountsApi, 'list')
+const confirmAction = vi.spyOn(ElMessageBox, 'confirm')
+
+const makeAccount = (id: number, overrides: Partial<Account> = {}): Account => ({
+  id,
+  identifier: 'promoter-' + id,
+  display_name: 'Promoter ' + id,
+  phone: '1550000' + id,
+  account_type: 'promoter',
+  operation_mode: 'growth',
+  asset_tier: 'unknown',
+  warmup_stage: 'normal',
+  status: 'online',
+  spam_check_status: 'unknown',
+  risk_score: 0,
+  risk_level: 'normal',
+  country_code: 'US',
+  api_config_name: 'default',
+  session_name: 'session-' + id,
+  proxy_mode: 'dynamic',
+  is_active: true,
+  connection_count: 0,
+  error_count: 0,
+  created_at: '2026-09-13T00:00:00Z',
+  updated_at: '2026-09-13T00:00:00Z',
+  ...overrides,
+})
+
+const runningSpamOperation: SpamCheckOperation = {
+  id: 51,
+  status: 'running',
+  total_accounts: 2,
+  processed_accounts: 0,
+  clear_accounts: 0,
+  restricted_accounts: 0,
+  failed_accounts: 0,
+  cancelled_accounts: 0,
+  last_error: null,
+  created_at: '2026-09-13T01:00:00Z',
+  items: [],
 }
 
 const globalConfig = {
@@ -192,6 +278,18 @@ describe('Accounts view', () => {
     disable.mockClear()
     push.mockClear()
     getAdDynamicStatus.mockClear()
+    createSpamCheckOperation.mockReset()
+    getLatestSpamCheckOperation.mockReset().mockResolvedValue(null)
+    getSpamCheckOperation.mockReset()
+    cancelSpamCheckOperation.mockReset()
+    createSpamCheckKey.mockClear()
+    listAccounts.mockReset().mockResolvedValue({
+      list: [makeAccount(11)],
+      total: 1,
+      nextCursor: null,
+      hasMore: false,
+    })
+    confirmAction.mockReset().mockResolvedValue('confirm' as never)
   })
 
   it('renders page and account row', () => {
@@ -241,5 +339,89 @@ describe('Accounts view', () => {
 
     expect(enable).toHaveBeenCalledWith(1)
     expect(disable).toHaveBeenCalledWith(1)
+  })
+  it('loads all promoter pages and only exposes detectable accounts', async () => {
+    listAccounts
+      .mockResolvedValueOnce({
+        list: [
+          makeAccount(11),
+          makeAccount(12, { status: 'working' }),
+        ],
+        total: 3,
+        nextCursor: 'next-page',
+        hasMore: true,
+      })
+      .mockResolvedValueOnce({
+        list: [makeAccount(13, { status: 'offline' })],
+        total: 3,
+        nextCursor: null,
+        hasMore: false,
+      })
+
+    const wrapper = mount(Accounts, { global: globalConfig })
+    const vm = wrapper.vm as unknown as AccountsViewModel
+    await vm.openSpamCheckDialog()
+
+    expect(listAccounts).toHaveBeenNthCalledWith(1, {
+      account_type: 'promoter',
+      limit: 2000,
+    })
+    expect(listAccounts).toHaveBeenNthCalledWith(2, {
+      account_type: 'promoter',
+      limit: 2000,
+      cursor: 'next-page',
+    })
+    expect(vm.spamCheckAccounts.map((account) => account.id)).toEqual([11, 12, 13])
+    expect(vm.spamCheckEligibleAccounts.map((account) => account.id)).toEqual([11, 13])
+    wrapper.unmount()
+  })
+
+  it('submits selected accounts only after confirming a real SpamBot action', async () => {
+    createSpamCheckOperation.mockResolvedValue(runningSpamOperation)
+    const wrapper = mount(Accounts, { global: globalConfig })
+    const vm = wrapper.vm as unknown as AccountsViewModel
+    await vm.openSpamCheckDialog()
+    vm.spamCheckSelectedIds = [11]
+
+    await vm.submitSpamCheckOperation()
+
+    expect(confirmAction).toHaveBeenCalledWith(
+      expect.stringContaining('真实 Telegram'),
+      '确认执行 SpamBot 检测',
+      expect.objectContaining({ confirmButtonText: '确认真实执行' }),
+    )
+    expect(createSpamCheckOperation).toHaveBeenCalledWith(
+      { account_ids: [11] },
+      'spam-check-key',
+    )
+    wrapper.unmount()
+  })
+
+  it('polls after three seconds and separates SpamBot clear from an RPC restriction', async () => {
+    vi.useFakeTimers()
+    getLatestSpamCheckOperation.mockResolvedValue(runningSpamOperation)
+    getSpamCheckOperation.mockResolvedValue({
+      ...runningSpamOperation,
+      status: 'succeeded',
+      processed_accounts: 2,
+      clear_accounts: 1,
+      restricted_accounts: 1,
+    })
+    const wrapper = mount(Accounts, { global: globalConfig })
+    const vm = wrapper.vm as unknown as AccountsViewModel
+
+    await vm.openSpamCheckDialog()
+    await vi.advanceTimersByTimeAsync(3000)
+
+    expect(getSpamCheckOperation).toHaveBeenCalledWith(51)
+    expect(vm.spamCheckOperation?.status).toBe('succeeded')
+    expect(vm.spamCheckResultText('clear')).toContain('SpamBot')
+    expect(vm.accountRestrictionSourceText(makeAccount(14, {
+      status: 'restricted',
+      restriction_source: 'telegram_rpc',
+    }))).toBe('Telegram 操作限制')
+
+    wrapper.unmount()
+    vi.useRealTimers()
   })
 })

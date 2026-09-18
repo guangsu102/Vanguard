@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.config import settings
-from app.core.p0_safety_gate import SafetyGateDecision
+from app.core.p0_safety_gate import SafetyGateDecision, SafetyGateState
 from app.modules.owned_group.models import (
     OwnedGroupAsset,
     OwnedGroupOperation,
@@ -18,7 +18,11 @@ from app.modules.owned_group.models_extra import (
     OwnedGroupAdminAssignment,
     OwnedGroupMembership,
 )
-from app.modules.owned_group.worker import ItemExecutionResult, run_owned_group_operation
+from app.modules.owned_group.worker import (
+    ItemExecutionResult,
+    run_owned_group_operation,
+    run_owned_group_worker_tick,
+)
 
 
 class ResultAdapter:
@@ -165,6 +169,10 @@ async def test_worker_sanitizes_adapter_error_and_honors_retry_delay(test_db):
     assert item.status == "failed_transient"
     assert item.next_retry_at is not None
     assert item.next_retry_at >= before + timedelta(seconds=299)
+    assert operation.schedule_at is not None
+    # The configured/default batch interval is longer than this FloodWait, so
+    # the operation itself must not be reclaimed before the next batch window.
+    assert operation.schedule_at >= before + timedelta(seconds=599)
     assert "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd" not in (item.error_message or "")
     assert "PrivateHash123456" not in (item.error_message or "")
 
@@ -188,6 +196,68 @@ async def test_worker_honors_flood_wait_longer_than_one_day(test_db):
     # The server-provided FloodWait is authoritative; it must not be truncated
     # to the old one-day application cap.
     assert item.next_retry_at >= before + timedelta(seconds=172799)
+    assert operation.schedule_at is not None
+    assert operation.schedule_at >= before + timedelta(seconds=172799)
+
+
+@pytest.mark.asyncio
+async def test_worker_tick_runs_only_one_batch_before_interval(test_db, monkeypatch):
+    _asset, operation, _item, _owner, _member = await _seed(test_db)
+    operation.config_snapshot = json.dumps(
+        {"batch_size": 1, "batch_interval_seconds": 600, "max_attempts": 2}
+    )
+    second_member = TelegramAccount(
+        identifier="owned-persist-member-two",
+        session_name="owned-persist-member-two",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        session_string="member-two-session",
+        is_active=True,
+    )
+    test_db.add(second_member)
+    await test_db.flush()
+    test_db.add(
+        OwnedGroupOperationItem(
+            operation_id=operation.id,
+            resource_type="user",
+            resource_id=second_member.id,
+            status="pending",
+            admin_required=False,
+        )
+    )
+    await test_db.flush()
+
+    async def open_gate():
+        return SafetyGateState(global_stop=False, backend_available=True)
+
+    monkeypatch.setattr("app.modules.owned_group.worker.get_safety_gate_state", open_gate)
+    monkeypatch.setattr(
+        "app.modules.owned_group.worker.is_owned_group_module_enabled", lambda: True
+    )
+    adapter = ResultAdapter(ItemExecutionResult(success=True))
+    before = datetime.utcnow()
+
+    result = await run_owned_group_worker_tick(
+        test_db,
+        limit=10,
+        adapter=adapter,
+    )
+
+    assert result["status"] == "ok"
+    assert len(result["operations"]) == 1
+    assert adapter.calls == 1
+    assert operation.status == "queued"
+    assert operation.schedule_at is not None
+    assert operation.schedule_at >= before + timedelta(seconds=599)
+    pending_items = (
+        await test_db.scalars(
+            select(OwnedGroupOperationItem).where(
+                OwnedGroupOperationItem.operation_id == operation.id,
+                OwnedGroupOperationItem.status == "pending",
+            )
+        )
+    ).all()
+    assert len(pending_items) == 1
 
 
 @pytest.mark.asyncio

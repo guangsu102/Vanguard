@@ -71,10 +71,10 @@ class Settings(BaseSettings):
         description="Static emergency stop for all owned-group execution",
     )
     OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS: int = Field(
-        default=2,
+        default=2000,
         ge=1,
-        le=5,
-        description="Maximum promoter accounts in one owned-group rollout (1-5)",
+        le=2000,
+        description="Maximum promoter accounts in one owned-group operation (1-2000)",
     )
 
     @field_validator("JWT_SECRET")
@@ -109,6 +109,14 @@ class Settings(BaseSettings):
     BOT_TOKEN: str | None = Field(default=None, description="Telegram bot token")
     TELEGRAM_SESSION_DIR: str = Field(default="./sessions", description="Telegram session files directory")
     TELEGRAM_SESSION_ENCRYPTION_KEY: str | None = Field(default=None, description="Encryption key for Telegram StringSession values")
+    APP_VERSION_ROLL_ENABLED: bool = Field(
+        default=True,
+        description="Daily roll of outdated declared Telegram app versions onto the current pool",
+    )
+    APP_VERSION_ROLL_BATCH_SIZE: int = Field(
+        default=3,
+        description="Max accounts whose app_version is rolled per day",
+    )
 
     # QQ through NapCatQQ OneBot 11
     QQ_ONEBOT_ENABLED: bool = Field(default=False, description="Enable NapCatQQ OneBot 11")
@@ -205,7 +213,7 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str | None = Field(default=None, description="OpenAI-compatible API base URL")
     ANTHROPIC_API_KEY: str | None = Field(default=None, description="Anthropic API Key")
     LLM_PROVIDER: str = Field(default="openai", description="LLM provider: openai/anthropic/local")
-    LLM_MODEL: str = Field(default="gpt-5.6-terra", description="Default LLM model")
+    LLM_MODEL: str = Field(default="gpt-5.6-sol", description="Default LLM model")
     LLM_FAST_MODEL: str = Field(default="", description="Low-latency LLM model; falls back to LLM_MODEL when empty")
 
     # CORS

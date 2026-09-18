@@ -50,6 +50,7 @@ class ParsedTelegramGroupLink:
 
 
 _TELEGRAM_LINK_HOSTS = {"t.me", "telegram.me"}
+_OFFICIAL_SPAMBOT_ID = 178220800
 logger = structlog.get_logger()
 _RESERVED_PUBLIC_PATHS = {
     "addstickers",
@@ -131,6 +132,24 @@ def _is_valid_public_username(value: str) -> bool:
         and value[0].isalpha()
         and all(char.isascii() and (char.isalnum() or char == "_") for char in value)
     )
+
+
+def _normalize_managed_bot_username(value: str) -> str:
+    username = str(value or "").strip().removeprefix("@")
+    if (
+        not 5 <= len(username) <= 32
+        or not username.casefold().endswith("bot")
+        or not all(char.isascii() and (char.isalnum() or char == "_") for char in username)
+    ):
+        raise TelegramExecutionError("invalid managed bot username")
+    return username
+
+
+def _normalize_managed_bot_name(value: str) -> str:
+    name = str(value or "").strip()
+    if not 1 <= len(name) <= 64:
+        raise TelegramExecutionError("invalid managed bot name")
+    return name
 
 
 def _validate_invite_hash(value: str) -> str:
@@ -222,9 +241,7 @@ class TelegramExecutionService:
                 raise TelegramSendReservationReleasePendingError(
                     "owned-group risk reservation release is pending"
                 ) from exc
-            raise TelegramSendPreflightError(
-                "owned-group risk preflight unavailable"
-            ) from exc
+            raise TelegramSendPreflightError("owned-group risk preflight unavailable") from exc
         if not decision.allowed:
             raise TelegramExecutionError(f"risk_guard_blocked:{decision.reason}")
 
@@ -243,11 +260,19 @@ class TelegramExecutionService:
                     details=details,
                 )
             except Exception as audit_exc:
-                if action != AccountRiskAction.OWNED_GROUP_MESSAGE:
+                if action not in {
+                    AccountRiskAction.OWNED_GROUP_MESSAGE,
+                    AccountRiskAction.MANAGED_BOT_CREATE,
+                }:
                     raise
                 await self._rollback_owned_risk_audit()
+                event = (
+                    "managed_bot_risk_failure_record_failed"
+                    if action == AccountRiskAction.MANAGED_BOT_CREATE
+                    else "owned_group_risk_failure_record_failed"
+                )
                 self.logger.error(
-                    "owned_group_risk_failure_record_failed",
+                    event,
                     error_type=type(audit_exc).__name__,
                     error=safe_exception_message(audit_exc, max_length=500),
                 )
@@ -262,11 +287,19 @@ class TelegramExecutionService:
                     details=details,
                 )
             except Exception as audit_exc:
-                if action != AccountRiskAction.OWNED_GROUP_MESSAGE:
+                if action not in {
+                    AccountRiskAction.OWNED_GROUP_MESSAGE,
+                    AccountRiskAction.MANAGED_BOT_CREATE,
+                }:
                     raise
                 await self._rollback_owned_risk_audit()
+                event = (
+                    "managed_bot_risk_success_record_failed"
+                    if action == AccountRiskAction.MANAGED_BOT_CREATE
+                    else "owned_group_risk_success_record_failed"
+                )
                 self.logger.error(
-                    "owned_group_risk_success_record_failed",
+                    event,
                     error_type=type(audit_exc).__name__,
                     error=safe_exception_message(audit_exc, max_length=500),
                 )
@@ -402,9 +435,7 @@ class TelegramExecutionService:
             raise TelegramSendPreflightError("telegram client unavailable")
 
         attempt_token = str(send_attempt_id or uuid.uuid4().hex)
-        risk_reservation_id = AccountRiskGuard.owned_group_reservation_id(
-            attempt_token
-        )
+        risk_reservation_id = AccountRiskGuard.owned_group_reservation_id(attempt_token)
         details = {
             "source": "owned_group_message",
             "execution_id": execution_id,
@@ -469,9 +500,7 @@ class TelegramExecutionService:
                 None,
             )
             if message_id is None:
-                raise TelegramSendOutcomeUnknownError(
-                    "Telegram send returned without a message id"
-                )
+                raise TelegramSendOutcomeUnknownError("Telegram send returned without a message id")
         return int(message_id)
 
     async def send_ad(
@@ -508,6 +537,191 @@ class TelegramExecutionService:
             else:
                 result = await client.send_message(target, content)
         return getattr(result, "id", getattr(result, "message_id", None))
+
+    async def check_managed_bot_username(
+        self,
+        account: Any,
+        username: str,
+    ) -> bool:
+        """Check a managed Bot username through an authenticated user session."""
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        normalized_username = _normalize_managed_bot_username(username)
+        from telethon.tl.functions.bots import CheckUsernameRequest
+
+        try:
+            result = await client(CheckUsernameRequest(username=normalized_username))
+        except Exception as exc:
+            raise TelegramExecutionError(
+                f"managed_bot_username_check_failed:{type(exc).__name__}"
+            ) from None
+        return bool(result)
+
+    async def create_managed_bot(
+        self,
+        account: Any,
+        *,
+        name: str,
+        username: str,
+        manager_bot: Any,
+        source: str = "managed_bot_provision",
+        risk_reservation_id: str | None = None,
+        on_create_attempted: Callable[[], Awaitable[None]] | None = None,
+    ) -> Any:
+        """Create one Telegram managed Bot using an authenticated user session."""
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        normalized_name = _normalize_managed_bot_name(name)
+        normalized_username = _normalize_managed_bot_username(username)
+        try:
+            manager_entity = await client.get_entity(manager_bot)
+        except Exception as exc:
+            raise TelegramExecutionError(
+                f"managed_bot_manager_resolve_failed:{type(exc).__name__}"
+            ) from None
+        manager_id = int(getattr(manager_entity, "id", 0) or 0)
+        if (
+            manager_id <= 0
+            or getattr(manager_entity, "bot", None) is not True
+            or getattr(manager_entity, "bot_can_manage_bots", None) is not True
+        ):
+            raise TelegramExecutionError("managed_bot_manager_permission_missing")
+        try:
+            manager_input = await client.get_input_entity(manager_entity)
+        except Exception as exc:
+            raise TelegramExecutionError(
+                f"managed_bot_manager_input_failed:{type(exc).__name__}"
+            ) from None
+
+        if not await self.check_managed_bot_username(account, normalized_username):
+            raise TelegramExecutionError("managed_bot_username_unavailable")
+
+        from telethon.tl.functions.bots import CreateBotRequest
+
+        async with self._risk_operation(
+            account,
+            AccountRiskAction.MANAGED_BOT_CREATE,
+            target_type="manager_bot",
+            target_id=manager_id,
+            details={
+                "source": source,
+                "risk_reservation_id": risk_reservation_id,
+            },
+        ):
+            if on_create_attempted is not None:
+                await on_create_attempted()
+            try:
+                created = await client(
+                    CreateBotRequest(
+                        name=normalized_name,
+                        username=normalized_username,
+                        manager_id=manager_input,
+                    )
+                )
+            except Exception as exc:
+                raise TelegramExecutionError(
+                    f"managed_bot_create_failed:{type(exc).__name__}"
+                ) from None
+            created_id = int(getattr(created, "id", 0) or 0)
+            created_username = str(getattr(created, "username", "") or "")
+            if (
+                created_id <= 0
+                or getattr(created, "bot", None) is not True
+                or created_username.casefold() != normalized_username.casefold()
+            ):
+                raise TelegramExecutionError("managed_bot_identity_mismatch")
+        return created
+
+    async def check_spambot_status(
+        self,
+        account: Any,
+        *,
+        wait_seconds: int = 20,
+        source: str = "account_spam_check",
+    ) -> str:
+        """Ask Telegram's official @SpamBot and return its reply for classification."""
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        try:
+            entity = await client.get_entity("SpamBot")
+        except Exception as exc:
+            raise TelegramExecutionError(f"spambot_resolve_failed:{type(exc).__name__}") from exc
+        username = str(getattr(entity, "username", "") or "").casefold()
+        entity_id = getattr(entity, "id", None)
+        if (
+            username != "spambot"
+            or getattr(entity, "bot", None) is not True
+            or entity_id is None
+            or int(entity_id) != _OFFICIAL_SPAMBOT_ID
+        ):
+            raise TelegramExecutionError("official_spambot_identity_mismatch")
+
+        async with self._risk_operation(
+            account,
+            AccountRiskAction.SPAM_CHECK,
+            target_type="official_bot",
+            target_id=int(entity_id),
+            details={"source": source},
+        ):
+            try:
+                sent = await client.send_message(entity, "/start")
+                sent_id = int(getattr(sent, "id", 0) or 0)
+                sent_at = getattr(sent, "date", None)
+                if sent_id <= 0 or sent_at is None:
+                    raise TelegramExecutionError("spambot_request_identity_missing")
+                deadline = asyncio.get_running_loop().time() + max(2, min(int(wait_seconds), 60))
+                while True:
+                    messages = await client.get_messages(entity, limit=10)
+                    if messages is None:
+                        candidates = []
+                    elif isinstance(messages, (list, tuple)):
+                        candidates = list(messages)
+                    else:
+                        try:
+                            candidates = list(messages)
+                        except TypeError:
+                            candidates = [messages]
+                    for message in candidates:
+                        message_id = int(getattr(message, "id", 0) or 0)
+                        sender_id = getattr(message, "sender_id", None)
+                        if sender_id is None:
+                            sender_id = getattr(
+                                getattr(message, "from_id", None),
+                                "user_id",
+                                None,
+                            )
+                        message_at = getattr(message, "date", None)
+                        if (
+                            message_id <= sent_id
+                            or message_at is None
+                            or message_at < sent_at
+                            or bool(getattr(message, "out", False))
+                            or sender_id is None
+                            or int(sender_id) != _OFFICIAL_SPAMBOT_ID
+                        ):
+                            continue
+                        text = str(
+                            getattr(message, "raw_text", None)
+                            or getattr(message, "message", None)
+                            or ""
+                        ).strip()
+                        if text:
+                            return text
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TelegramExecutionError("spambot_response_timeout")
+                    await asyncio.sleep(2)
+            except TelegramExecutionError:
+                raise
+            except Exception as exc:
+                raise TelegramExecutionError(
+                    f"spambot_request_failed:{type(exc).__name__}"
+                ) from exc
 
     async def update_profile_bio(
         self,

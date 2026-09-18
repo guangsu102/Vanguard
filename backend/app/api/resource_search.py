@@ -126,6 +126,17 @@ def _operation_mode(account: TelegramAccount) -> str:
     )
 
 
+def _locked_resource_search_accounts_query(account_ids: list[int]):
+    """Lock only selected account rows while validating a new search run."""
+    return (
+        select(TelegramAccount)
+        .options(selectinload(TelegramAccount.operation_config))
+        .where(TelegramAccount.id.in_(account_ids))
+        .order_by(TelegramAccount.id)
+        .with_for_update(of=TelegramAccount)
+    )
+
+
 def _serialize_account_task(task: ResourceSearchAccountTask) -> dict:
     return {
         "id": task.id,
@@ -254,13 +265,7 @@ async def create_resource_search_run(
     current_user: dict = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    rows = await db.execute(
-        select(TelegramAccount)
-        .options(selectinload(TelegramAccount.operation_config))
-        .where(TelegramAccount.id.in_(request.account_ids))
-        .order_by(TelegramAccount.id)
-        .with_for_update()
-    )
+    rows = await db.execute(_locked_resource_search_accounts_query(request.account_ids))
     accounts = rows.scalars().unique().all()
     account_by_id = {account.id: account for account in accounts}
     invalid_accounts = []

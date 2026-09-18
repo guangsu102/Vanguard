@@ -168,7 +168,7 @@ class AccountDynamicFrequencyService:
     def account_risk_limit_multiplier(account: TelegramAccount | None, now: datetime) -> float:
         if account is None:
             return 1.0
-        if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+        if account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
             return 0.0
         if account.risk_pause_until and account.risk_pause_until > now:
             return 0.0
@@ -562,7 +562,7 @@ class AccountDynamicFrequencyService:
         else:
             if not account.is_active:
                 adjust("account_inactive", -70.0)
-            if account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+            if account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
                 adjust(f"account_status_{account.status.value}", -80.0)
             if account.risk_pause_until and account.risk_pause_until > now:
                 adjust(account.risk_reason or "account_risk_paused", -100.0)
@@ -662,7 +662,7 @@ class AccountDynamicFrequencyService:
     ) -> str:
         if account is None or not config_enabled:
             return "cooldown"
-        if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED}:
+        if not account.is_active or account.status in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
             return "cooldown"
         if account.risk_pause_until and account.risk_pause_until > now:
             return "cooldown"

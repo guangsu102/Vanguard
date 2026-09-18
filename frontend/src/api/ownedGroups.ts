@@ -10,6 +10,7 @@ export type OwnedGroupAssetStatus =
   | "ready"
   | "create_failed"
   | "needs_attention"
+  | "dissolving"
   | "archived";
 export type OwnedGroupResourceType = "user" | "bot";
 export type OwnedBotProfileStatus =
@@ -125,6 +126,8 @@ export interface OwnedGroupAsset {
   member_count: number;
   created_at: string;
   updated_at: string;
+  /** True when the latest dissolve operation ended unknown/failed and awaits an administrator verdict. */
+  pending_dissolution_review?: boolean;
 }
 export interface OwnedGroupDraftInput {
   internal_name: string;
@@ -149,6 +152,24 @@ export interface OwnedGroupOperationInput {
   max_parallelism?: number;
   max_attempts?: number;
   schedule_at?: string;
+}
+export interface OwnedGroupDissolutionInput {
+  confirmation: string;
+}
+export type OwnedGroupDissolutionResolutionOutcome = "archived" | "still_exists";
+export interface OwnedGroupDissolutionResolutionInput {
+  outcome: OwnedGroupDissolutionResolutionOutcome;
+  confirmation: string;
+}
+export interface OwnedGroupDissolutionResolutionResponse {
+  code: number;
+  message: string;
+  data: {
+    id: number;
+    status: string;
+    operation_id: number;
+    operation_status: string;
+  };
 }
 
 /**
@@ -195,6 +216,7 @@ export interface OwnedGroupPrecheckResult {
 export interface OwnedGroupOperation {
   id: number;
   group_asset_id: number;
+  operation_type: string;
   status: string;
   planned_count: number;
   selection_snapshot_hash: string;
@@ -212,6 +234,7 @@ export interface OwnedGroupControlResponse {
 }
 export interface OwnedGroupOperationDetail extends OwnedGroupControlResponse {
   group_asset_id: number;
+  operation_type: string;
   status: OwnedGroupOperationStatus;
   planned_count: number;
   completed_count: number;
@@ -581,6 +604,41 @@ export const ownedGroupsApi = {
   }) => apiClient.get<OwnedGroupListResponse>("/owned-groups", { params }),
   getById: async (id: number): Promise<OwnedGroupAsset> =>
     unwrap((await apiClient.get(`/owned-groups/${id}`)).data),
+  deleteFailedDraft: async (id: number): Promise<void> => {
+    await apiClient.delete("/owned-groups/" + id, {
+      params: { confirm_no_telegram_group: true },
+    });
+  },
+  /**
+   * Persist a separately confirmed Telegram group-dissolution intent. The API
+   * only queues work; the backend worker performs the remote operation later.
+   */
+  queueDissolution: async (
+    id: number,
+    data: OwnedGroupDissolutionInput,
+    idempotencyKey: string,
+  ): Promise<OwnedGroupOperation> =>
+    unwrap(
+      (
+        await apiClient.post("/owned-groups/" + id + "/dissolution", data, {
+          headers: { "Idempotency-Key": idempotencyKey },
+        })
+      ).data,
+    ),
+  /**
+   * Record the administrator's out-of-band verdict for a dissolution whose
+   * remote outcome was never verified. The API never contacts Telegram.
+   */
+  resolveDissolution: async (
+    id: number,
+    data: OwnedGroupDissolutionResolutionInput,
+  ): Promise<OwnedGroupDissolutionResolutionResponse> =>
+    (
+      await apiClient.post(
+        "/owned-groups/" + id + "/dissolution/resolution",
+        data,
+      )
+    ).data,
   getGovernance: async (
     assetId: number,
   ): Promise<OwnedGroupGovernanceStatus> =>

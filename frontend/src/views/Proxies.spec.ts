@@ -5,6 +5,7 @@ import Proxies from './Proxies.vue'
 const fetchList = vi.fn().mockResolvedValue([])
 const create = vi.fn().mockResolvedValue({})
 const update = vi.fn().mockResolvedValue({})
+const setEnabled = vi.fn().mockResolvedValue({})
 const remove = vi.fn().mockResolvedValue({})
 const testLatency = vi.fn().mockResolvedValue({ latency: 20 })
 const refreshStatus = vi.fn().mockResolvedValue({})
@@ -21,6 +22,10 @@ vi.mock('@/stores/proxy', () => ({
         protocol: 'http',
         latency: 45,
         status: 'active',
+        bindAccountCount: 4,
+        bindAccounts: [],
+        maxBindAccounts: 20,
+        remainingBindSlots: 16,
         bindAccountPhone: '10086',
         lastCheckedAt: '2026-05-24T10:00:00Z',
         createdAt: '2026-05-20T10:00:00Z',
@@ -32,6 +37,7 @@ vi.mock('@/stores/proxy', () => ({
     fetchList,
     create,
     update,
+    setEnabled,
     remove,
     testLatency,
     refreshStatus,
@@ -43,7 +49,7 @@ vi.mock('@/stores/proxy', () => ({
 vi.mock('@/components/TableCard.vue', () => ({
   default: {
     props: ['data'],
-    template: '<div><slot /><div v-for="row in data" :key="row.id">{{ row.address }}:{{ row.port }}</div></div>',
+    template: '<div><slot /><div v-for="row in data" :key="row.id">{{ row.address }}:{{ row.port }}<slot name="bindAccount" :row="row" /></div></div>',
   },
 }))
 vi.mock('@/components/SearchBar.vue', () => ({ default: { template: '<div />' } }))
@@ -55,12 +61,14 @@ const stubs = {
   'el-icon': { template: '<span><slot /></span>' },
   'el-tag': { template: '<span><slot /></span>' },
   'el-progress': { template: '<div />' },
+  'el-alert': { props: ['title'], template: '<div>{{ title }}</div>' },
 }
 
 describe('Proxies view', () => {
   beforeEach(() => {
     fetchList.mockClear()
     update.mockClear()
+    setEnabled.mockClear()
     refreshStatus.mockClear()
     testLatency.mockClear()
   })
@@ -69,6 +77,7 @@ describe('Proxies view', () => {
     const wrapper = mount(Proxies, { global: { stubs } })
     expect(wrapper.text()).toContain('代理管理')
     expect(wrapper.text()).toContain('127.0.0.1')
+    expect(wrapper.text()).toContain('4/20')
   })
 
   it('loads proxies on mount', () => {
@@ -85,6 +94,19 @@ describe('Proxies view', () => {
 
     expect(refreshStatus).toHaveBeenCalledTimes(1)
     expect(testLatency).toHaveBeenCalledWith(1)
+  })
+
+  it('manually enables, recovers, and disables proxies', async () => {
+    const wrapper = mount(Proxies, { global: { stubs } })
+    const vm = wrapper.vm as any
+
+    await vm.handleManualStatus({ id: 4, status: 'inactive' })
+    await vm.handleManualStatus({ id: 5, status: 'error' })
+    await vm.handleManualStatus({ id: 6, status: 'active' })
+
+    expect(setEnabled).toHaveBeenNthCalledWith(1, 4, true)
+    expect(setEnabled).toHaveBeenNthCalledWith(2, 5, true)
+    expect(setEnabled).toHaveBeenNthCalledWith(3, 6, false)
   })
 
   it('opens add drawer and resets form data', () => {
