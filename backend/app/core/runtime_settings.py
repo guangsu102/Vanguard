@@ -421,7 +421,9 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "ad_policy_ai_model": "gpt-5.6-sol",
     "ad_policy_ai_timeout_seconds": 45,
     "ad_policy_ai_min_confidence": 95,
-    "ad_policy_ai_require_second_pass": True,
+    # Two-pass doubles latency (sol is ~40s per pass on the 2k-token floor).
+    # Single pass with high confidence requirement stays conservative enough.
+    "ad_policy_ai_require_second_pass": False,
     "ad_policy_auto_probe_enabled": True,
     "ad_policy_auto_probe_daily_limit_per_account": 10,
     "ad_policy_auto_probe_interval_hours": 24,

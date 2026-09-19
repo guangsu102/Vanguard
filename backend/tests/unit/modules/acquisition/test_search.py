@@ -3472,3 +3472,266 @@ class TestAuditRejectKeywordFeedback:
 
         assert result is False
         assert group.status == "active"
+
+
+class TestCaptchaSubtyping:
+    def _service(self):
+        return AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+
+    def _decision(self, service, prompt: str):
+        return service._local_join_verification_decision(
+            [SimpleNamespace(text=prompt, raw_text=prompt)],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
+        )
+
+    def test_math_challenge_is_solved_locally(self):
+        service = self._service()
+        decision = self._decision(service, "入群验证码：23+19=？ 请输入答案")
+        assert decision.challenge_type == "math"
+        assert decision.action == "send_answer"
+        assert decision.answer == "42"
+
+    def test_math_subtraction_with_fullwidth_marks(self):
+        service = self._service()
+        decision = self._decision(service, "请计算 36 － 9 ＝ ?")
+        assert decision.challenge_type == "math"
+        assert decision.answer == "27"
+
+    def test_math_multiplication(self):
+        service = self._service()
+        decision = self._decision(service, "验证：7 × 6 = ?")
+        assert decision.answer == "42"
+
+    def test_division_with_remainder_falls_back_to_manual(self):
+        service = self._service()
+        decision = self._decision(service, "验证码：7 ÷ 3 = ?")
+        assert decision.challenge_type == "captcha"
+        assert decision.action == "manual"
+
+    def test_tme_link_routes_to_second_hop(self):
+        service = self._service()
+        decision = self._decision(
+            service, "请点击 https://t.me/somecaptcha_bot 完成验证"
+        )
+        assert decision.challenge_type == "second_hop_bot"
+        assert decision.bot_username == "somecaptcha_bot"
+
+    def test_webpage_captcha_stays_manual(self):
+        service = self._service()
+        decision = self._decision(
+            service, "请点击 https://captcha.example.org/verify 完成验证"
+        )
+        assert decision.challenge_type == "captcha"
+        assert decision.action == "manual"
+
+    def test_plain_captcha_wording_stays_manual(self):
+        service = self._service()
+        decision = self._decision(service, "请完成图形验证码")
+        assert decision.challenge_type == "captcha"
+        assert decision.action == "manual"
+
+    def test_button_whitelist_expanded_variants(self):
+        service = self._service()
+        for text in ("同意并加入", "我已阅读并同意群规", "完成验证", "通过验证", "加入群聊", "Join"):
+            assert service._is_safe_verification_button(text), text
+        assert not service._is_safe_verification_button("举报此消息")
+
+
+class SecondHopBot:
+    """Scripted Telegram bot used to exercise the second-hop flow."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.sent = []
+
+    async def get_entity(self, username):
+        return SimpleNamespace(id=555, bot=True, username=username)
+
+    async def send_message(self, entity, text):
+        self.sent.append(text)
+
+    async def get_messages(self, entity, limit=10):
+        batch = self.script.pop(0) if self.script else []
+        return [
+            SimpleNamespace(id=100 + i, message=text, buttons=None)
+            for i, text in enumerate(batch)
+        ]
+
+
+class TestSecondHopBotVerification:
+    def _decision(self, username="verify_helper"):
+        return acquisition_automation.JoinVerificationDecision(
+            challenge_type="second_hop_bot",
+            action="second_hop",
+            confidence=0.7,
+            bot_username=username,
+        )
+
+    def _service(self, bot):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        return service, bot
+
+    @pytest.mark.asyncio
+    async def test_math_challenge_in_bot_solved_and_verified(self):
+        bot = SecondHopBot(
+            [
+                ["验证机器人", "请输入 12+30=?"],
+                ["回答正确，验证通过，welcome to the group"],
+            ]
+        )
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is True
+        assert result.reason == "second_hop_bot_verified"
+        assert result.should_retry_audit is True
+        assert result.should_leave is False
+        assert bot.sent == ["/start", "42"]
+
+    @pytest.mark.asyncio
+    async def test_button_challenge_clicked_then_verified(self):
+        bot = SecondHopBot(
+            [
+                [SimpleNamespace(id=10, message="请点击按钮", buttons=MagicMock())],
+                ["验证通过"],
+            ]
+        )
+        service, bot = self._service(bot)
+        service._extract_message_buttons = lambda messages: (
+            [{"text": "同意加入", "message_id": 10}] if messages else []
+        )
+        service._click_verification_button = AsyncMock(return_value=True)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is True
+        assert result.reason == "second_hop_bot_verified"
+        service._click_verification_button.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rejection_signal_leaves_group(self):
+        bot = SecondHopBot([["回答错误，验证失败"]])
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is False
+        assert result.reason == "second_hop_bot_rejected"
+        assert result.should_leave is True
+
+    @pytest.mark.asyncio
+    async def test_external_link_inside_bot_aborts(self):
+        bot = SecondHopBot([["请打开 https://example.com/verify"]])
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is False
+        assert result.reason == "second_hop_external_link_in_bot"
+
+    @pytest.mark.asyncio
+    async def test_non_bot_target_stays_pending(self):
+        bot = SecondHopBot([])
+        bot.get_entity = AsyncMock(return_value=SimpleNamespace(id=5, bot=False))
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.reason == "verification_manual_required"
+        assert result.should_leave is False
+
+    @pytest.mark.asyncio
+    async def test_approval_wording_waits_instead_of_leaving(self):
+        bot = SecondHopBot([["您的入群申请已提交，请等待管理员审批"]])
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is True
+        assert result.action == "wait"
+        assert result.reason == "verification_waiting"
+        assert result.should_leave is False
+
+    @pytest.mark.asyncio
+    async def test_no_resolution_reports_failure(self):
+        bot = SecondHopBot([["请发送你的年龄"]])
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is False
+        assert result.reason == "second_hop_no_resolution"
+        assert result.should_leave is True
+
+
+class TestSecondHopLinkExtraction:
+    def test_bot_link_routes_to_second_hop(self):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        decision = service._local_join_verification_decision(
+            [SimpleNamespace(text="请加 @ t.me/verify_helper_bot 请输入验证码", raw_text="t.me/verify_helper_bot")],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
+        )
+        assert decision.action == "second_hop"
+        assert decision.bot_username == "verify_helper_bot"
+
+    def test_joinchat_invite_stays_manual(self):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        decision = service._local_join_verification_decision(
+            [SimpleNamespace(text="t.me/joinchat/AbCdEf12345 请输入验证码", raw_text="t.me/joinchat/AbCdEf12345 请输入验证码")],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
+        )
+        assert decision.action == "manual"
+
+    def test_webpage_link_stays_manual(self):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        decision = service._local_join_verification_decision(
+            [SimpleNamespace(text="https://verify.example.com/captcha 完成验证", raw_text="https://verify.example.com/captcha 完成验证")],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
+        )
+        assert decision.action == "manual"
+
+    def test_second_hop_can_be_disabled(self):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        decision = service._local_join_verification_decision(
+            [SimpleNamespace(text="t.me/verify_helper_bot 请输入验证码", raw_text="t.me/verify_helper_bot 请输入验证码")],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(
+                ai_enabled=False, allow_second_hop_bots=False
+            ),
+        )
+        assert decision.action == "manual"
+
+
+class TestCaptchaWeakSignalGuard:
+    def _decision(self, prompt: str):
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+        return service._local_join_verification_decision(
+            [SimpleNamespace(text=prompt, raw_text=prompt)],
+            can_send_messages=False,
+            permission_reason="default_send_restricted",
+            settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
+        )
+
+    def test_ad_copy_with_calculation_word_is_not_captcha(self):
+        decision = self._decision(
+            "空投比例根据代币市值、总发行量、持币地址等多种数据精密计算，确保公平。数字资产快照期间请勿转账。"
+        )
+        assert decision.challenge_type != "captcha"
+
+    def test_weak_word_with_instruction_is_captcha(self):
+        decision = self._decision("入群验证：请输入计算结果 5+3=?")
+        assert decision.challenge_type == "math"
+
+    def test_strong_signal_alone_is_captcha(self):
+        decision = self._decision("请完成图形验证码")
+        assert decision.challenge_type == "captcha"

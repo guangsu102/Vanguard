@@ -309,8 +309,37 @@ AD_POLICY_AI_MODES = frozenset(
         GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
     }
 )
+# Strong, unambiguous captcha signals. Weak words like 计算/数字/字母 only
+# count when paired with an instruction context, because group ads about
+# "精密计算" / "数字资产" otherwise keep groups stuck in manual verification.
 CAPTCHA_SIGNAL_RE = re.compile(
-    r"(验证码|驗證碼|图形码|圖片驗證|图片验证|captcha|算术|計算|计算|数字|字母|请输入|請輸入)",
+    r"(验证码|驗證碼|图形码|圖片驗證|图片验证|captcha)",
+    re.IGNORECASE,
+)
+CAPTCHA_WEAK_SIGNAL_RE = re.compile(r"(算术|計算|计算|数字|字母)", re.IGNORECASE)
+CAPTCHA_INSTRUCTION_RE = re.compile(
+    r"(请输入|請輸入|请回答|請回答|发送.{0,6}给管理|输入.{0,8}(完成|验证|答案)|回复.{0,8}(完成|验证|答案))",
+    re.IGNORECASE,
+)
+# Deterministic arithmetic challenges ("3+5=?", "12 － 4 ＝ ？", "3 × 5 = ?").
+# Solved locally without any AI dependency.
+MATH_QUESTION_RE = re.compile(r"(\d{1,4})\s*([+\-－＋×x*÷/])\s*(\d{1,4})\s*[=＝]\s*[?？？]?")
+# Verification that hands off to an external page cannot be automated, but a
+# t.me/telegram.me hand-off to a verification bot can: the account messages
+# that bot directly (second hop) and replays the same button/math/question
+# handling used inside the group.
+CAPTCHA_EXTERNAL_LINK_RE = re.compile(r"(https?://|t\.me/|telegram\.me/)", re.IGNORECASE)
+SECOND_HOP_BOT_LINK_RE = re.compile(
+    r"(?:t\.me|telegram\.me)/(?!joinchat(?:/|$)|\+)([A-Za-z0-9_]{4,32})",
+    re.IGNORECASE,
+)
+SECOND_HOP_SUCCESS_RE = re.compile(
+    r"(验证通过|驗證通過|已通过|已通過|验证成功|驗證成功|通过验证|通過驗證|你已加入|已获得发言|已獲得發言|"
+    r"welcome(?:\s+to)?|you(?:'| a)re verified|successfully verified)",
+    re.IGNORECASE,
+)
+SECOND_HOP_FAILURE_RE = re.compile(
+    r"(验证失败|驗證失敗|回答错误|回答錯誤|答案错误|答案錯誤| incorrect|wrong answer|banned|被踢)",
     re.IGNORECASE,
 )
 APPROVAL_PENDING_RE = re.compile(
@@ -318,7 +347,7 @@ APPROVAL_PENDING_RE = re.compile(
     re.IGNORECASE,
 )
 SAFE_BUTTON_RE = re.compile(
-    r"(同意|已阅读|已閱讀|开始|開始|验证|驗證|继续|繼續|我不是|加入|确认|確認|accept|agree|start|verify|continue|human)",
+    r"(同意|已阅读|已閱讀|开始|開始|验证|驗證|继续|繼續|我不是|我是人|加入|入群|完成|通过|通過|确认|確認|accept|agree|start|verify|continue|join|pass|human)",
     re.IGNORECASE,
 )
 UNSAFE_ANSWER_RE = re.compile(
@@ -527,6 +556,7 @@ class JoinVerificationSettings:
     unknown_challenge_action: str = "leave"
     allow_button_clicks: bool = True
     allow_text_answers: bool = True
+    allow_second_hop_bots: bool = True
     answer_profile: str = "中文用户，主要为了学习交流、找资料、行业沟通。"
 
 
@@ -551,6 +581,7 @@ class JoinVerificationDecision:
     answer: Optional[str] = None
     reason: str = ""
     target_message_id: Optional[int] = None
+    bot_username: Optional[str] = None
 
     def details(self) -> dict[str, Any]:
         return {
@@ -583,6 +614,7 @@ class JoinVerificationActionResult:
     button_text: Optional[str] = None
     answer: Optional[str] = None
     target_message_id: Optional[int] = None
+    bot_username: Optional[str] = None
     post_action_rechecks: list[dict[str, Any]] = field(default_factory=list)
     post_action_final_can_send: Optional[bool] = None
     post_action_final_permission_reason: Optional[str] = None
@@ -694,8 +726,7 @@ class AcquisitionAutomationService:
                 OwnedGroupAsset.archived_at.is_(None),
                 or_(
                     OwnedGroupAsset.core_group_id == Group.id,
-                    OwnedGroupAsset.telegram_chat_id
-                    == GroupAccountMembership.telegram_group_id,
+                    OwnedGroupAsset.telegram_chat_id == GroupAccountMembership.telegram_group_id,
                 ),
             )
             .exists()
@@ -717,7 +748,9 @@ class AcquisitionAutomationService:
                 TelegramAccount.risk_level.in_(
                     [AccountRiskLevel.NORMAL.value, AccountRiskLevel.WATCH.value]
                 ),
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
+                TelegramAccount.status.notin_(
+                    [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
+                ),
                 ~owned_group_asset_exists,
             )
             .order_by(desc(Group.level_score), GroupAccountMembership.updated_at.asc())
@@ -836,9 +869,7 @@ class AcquisitionAutomationService:
                 )
                 continue
 
-            async with telegram_chat_advisory_lock(
-                self.db, membership.telegram_group_id
-            ):
+            async with telegram_chat_advisory_lock(self.db, membership.telegram_group_id):
                 if await self._is_owned_group_ad_domain_excluded(
                     membership.group_id, membership.telegram_group_id
                 ):
@@ -1168,7 +1199,8 @@ class AcquisitionAutomationService:
             == AccountOperationMode.AD_ONLY.value
             or account is None
             or not account.is_active
-            or account.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
+            or account.status
+            in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
             or account.account_type != AccountType.PROMOTER
         ):
             result = AutomationRunResult(skipped=1)
@@ -1783,7 +1815,11 @@ class AcquisitionAutomationService:
             account = config.account
             if not account or not account.is_active:
                 continue
-            if account.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
+            if account.status in [
+                AccountStatus.ERROR,
+                AccountStatus.BANNED,
+                AccountStatus.RESTRICTED,
+            ]:
                 continue
             if account.account_type != AccountType.PROMOTER:
                 continue
@@ -2794,10 +2830,7 @@ class AcquisitionAutomationService:
                 rejected += 1
                 continue
 
-            if (
-                filter_settings.cjk_title_required
-                and not self._title_has_cjk(group.title)
-            ):
+            if filter_settings.cjk_title_required and not self._title_has_cjk(group.title):
                 # A title with no CJK at all almost always fails the Chinese
                 # evidence audit after joining; reject at discovery instead of
                 # spending a join-budget slot and a 2h cooldown on it.
@@ -3131,6 +3164,7 @@ class AcquisitionAutomationService:
             unknown_challenge_action=str(config.get("unknown_challenge_action", "leave")),
             allow_button_clicks=bool(config.get("allow_button_clicks", True)),
             allow_text_answers=bool(config.get("allow_text_answers", True)),
+            allow_second_hop_bots=bool(config.get("allow_second_hop_bots", True)),
             answer_profile=str(
                 config.get("answer_profile") or "中文用户，主要为了学习交流、找资料、行业沟通。"
             )[:500],
@@ -3279,6 +3313,162 @@ class AcquisitionAutomationService:
         )
         return self._with_join_verification_decision(result, decision)
 
+    SECOND_HOP_BUDGET_SECONDS = 90.0
+    SECOND_HOP_MESSAGE_LIMIT = 10
+    SECOND_HOP_MAX_ROUNDS = 3
+
+    async def _run_second_hop_bot_verification(
+        self,
+        client: Any,
+        decision: JoinVerificationDecision,
+    ) -> JoinVerificationActionResult:
+        """Complete a verification that hands off to a Telegram bot.
+
+        Guardrails: the link target must be an actual bot, only one hop is
+        followed (an external link inside the bot chat aborts), the whole
+        exchange runs inside a fixed time budget, and any unexpected reply
+        shape abandons the attempt instead of guessing.
+        """
+        bot_username = (decision.bot_username or "").strip()
+        if not bot_username:
+            return JoinVerificationActionResult(
+                attempted=True,
+                success=False,
+                action="second_hop",
+                reason="second_hop_missing_bot",
+                should_leave=True,
+            )
+
+        started = asyncio.get_running_loop().time()
+
+        def remaining_budget() -> float:
+            return max(
+                0.5,
+                self.SECOND_HOP_BUDGET_SECONDS - (asyncio.get_running_loop().time() - started),
+            )
+
+        def success_reason(text: str) -> Optional[str]:
+            if SECOND_HOP_SUCCESS_RE.search(text):
+                return "second_hop_bot_verified"
+            if SECOND_HOP_FAILURE_RE.search(text):
+                return "second_hop_bot_rejected"
+            return None
+
+        try:
+            bot_entity = await asyncio.wait_for(
+                client.get_entity(bot_username), timeout=remaining_budget()
+            )
+            if getattr(bot_entity, "bot", None) is not True:
+                # Likely an informational channel link rather than a verifier;
+                # keep the membership pending instead of blacklisting the group.
+                return JoinVerificationActionResult(
+                    attempted=True,
+                    success=False,
+                    action="manual",
+                    reason="verification_manual_required",
+                    should_leave=False,
+                )
+            await client.send_message(bot_entity, "/start")
+            for _ in range(self.SECOND_HOP_MAX_ROUNDS):
+                wait_seconds = min(self.SECOND_HOP_MESSAGE_LIMIT, remaining_budget())
+                await asyncio.sleep(min(4.0, max(1.0, wait_seconds / 3)))
+                if remaining_budget() <= 1.0:
+                    break
+                bot_messages = await asyncio.wait_for(
+                    client.get_messages(bot_entity, limit=self.SECOND_HOP_MESSAGE_LIMIT),
+                    timeout=remaining_budget(),
+                )
+                bot_messages = [m for m in (bot_messages or []) if self._extract_message_text(m)]
+                for message in bot_messages:
+                    text = self._extract_message_text(message) or ""
+                    if APPROVAL_PENDING_RE.search(text):
+                        return JoinVerificationActionResult(
+                            attempted=True,
+                            success=True,
+                            action="wait",
+                            reason="verification_waiting",
+                            should_leave=False,
+                        )
+                    verdict = success_reason(text)
+                    if verdict:
+                        return JoinVerificationActionResult(
+                            attempted=True,
+                            success=verdict == "second_hop_bot_verified",
+                            action="second_hop",
+                            reason=verdict,
+                            should_retry_audit=verdict == "second_hop_bot_verified",
+                            should_leave=verdict != "second_hop_bot_verified",
+                        )
+                    if CAPTCHA_EXTERNAL_LINK_RE.search(text):
+                        return JoinVerificationActionResult(
+                            attempted=True,
+                            success=False,
+                            action="second_hop",
+                            reason="second_hop_external_link_in_bot",
+                            should_leave=True,
+                        )
+                button_texts = [
+                    item["text"]
+                    for item in self._extract_message_buttons(bot_messages)
+                    if self._is_safe_verification_button(item["text"])
+                ]
+                if button_texts and remaining_budget() > 2.0:
+                    clicked = await asyncio.wait_for(
+                        self._click_verification_button(bot_messages, button_texts[0], None),
+                        timeout=remaining_budget(),
+                    )
+                    if clicked:
+                        continue
+                combined_text = chr(10).join(
+                    filter(None, (self._extract_message_text(m) for m in bot_messages))
+                )
+                math_answer = self._solve_math_verification(combined_text)
+                if math_answer:
+                    await asyncio.wait_for(
+                        client.send_message(bot_entity, math_answer),
+                        timeout=remaining_budget(),
+                    )
+                    continue
+                for pattern in (
+                    "加群目的",
+                    "入群目的",
+                    "你是做什么",
+                    "来自哪里",
+                    "why do you join",
+                ):
+                    if pattern in combined_text:
+                        await asyncio.wait_for(
+                            client.send_message(
+                                bot_entity, self._default_join_verification_answer("")
+                            ),
+                            timeout=remaining_budget(),
+                        )
+                        break
+            return JoinVerificationActionResult(
+                attempted=True,
+                success=False,
+                action="second_hop",
+                reason="second_hop_no_resolution",
+                should_leave=True,
+            )
+        except TimeoutError:
+            return JoinVerificationActionResult(
+                attempted=True,
+                success=False,
+                action="second_hop",
+                reason="second_hop_timeout",
+                should_leave=True,
+            )
+        except Exception as exc:
+            return JoinVerificationActionResult(
+                attempted=True,
+                success=False,
+                action="second_hop",
+                reason="second_hop_failed",
+                error=str(exc)[:300],
+                should_leave=True,
+            )
+
     def _with_join_verification_decision(
         self,
         result: JoinVerificationActionResult,
@@ -3291,6 +3481,7 @@ class AcquisitionAutomationService:
         result.button_text = decision.button_text
         result.answer = decision.answer
         result.target_message_id = decision.target_message_id
+        result.bot_username = decision.bot_username
         return result
 
     async def _ask_join_verification_ai_safely(
@@ -3311,8 +3502,10 @@ class AcquisitionAutomationService:
                 ),
                 timeout=settings_config.ai_timeout_seconds,
             )
+            await self._record_llm_health(success=True)
             return decision, None
         except TimeoutError:
+            await self._record_llm_health(success=False, error="verification AI timeout")
             return None, JoinVerificationActionResult(
                 attempted=True,
                 success=False,
@@ -3355,7 +3548,46 @@ class AcquisitionAutomationService:
                     reason="safe verification button detected",
                 )
 
-        if CAPTCHA_SIGNAL_RE.search(prompt_text):
+        # Arithmetic challenges are unambiguous — solve them before any other
+        # classification, whether or not generic captcha wording is present.
+        math_answer = self._solve_math_verification(prompt_text)
+        if math_answer is not None:
+            return JoinVerificationDecision(
+                challenge_type="math",
+                action="send_answer",
+                confidence=0.95,
+                answer=math_answer,
+                reason="deterministic math challenge solved locally",
+            )
+
+        bot_match = SECOND_HOP_BOT_LINK_RE.search(prompt_text)
+        if bot_match and settings_config.allow_second_hop_bots:
+            return JoinVerificationDecision(
+                challenge_type="second_hop_bot",
+                action="second_hop",
+                confidence=0.7,
+                bot_username=bot_match.group(1),
+                reason="verification handed to a telegram bot; second hop attempt",
+            )
+
+        captcha_match = CAPTCHA_SIGNAL_RE.search(prompt_text) or (
+            CAPTCHA_WEAK_SIGNAL_RE.search(prompt_text)
+            and CAPTCHA_INSTRUCTION_RE.search(prompt_text)
+        )
+        if captcha_match:
+            self.logger.info(
+                "captcha_signal_detected",
+                trigger_word=captcha_match.group(0),
+                context=prompt_text[max(0, captcha_match.start() - 80) : captcha_match.end() + 80],
+                prompt_length=len(prompt_text),
+            )
+            if CAPTCHA_EXTERNAL_LINK_RE.search(prompt_text):
+                return JoinVerificationDecision(
+                    challenge_type="captcha",
+                    action="manual",
+                    confidence=0.9,
+                    reason="external verification link requires manual handling",
+                )
             return JoinVerificationDecision(
                 challenge_type="captcha",
                 action="manual",
@@ -3476,6 +3708,9 @@ class AcquisitionAutomationService:
                 reason="captcha_manual_required",
                 should_leave=False,
             )
+
+        if decision.action == "second_hop":
+            return await self._run_second_hop_bot_verification(client, decision)
 
         if decision.action == "click_button":
             if not settings_config.allow_button_clicks or not decision.button_text:
@@ -3695,6 +3930,39 @@ class AcquisitionAutomationService:
     def _is_safe_verification_button(self, text: str) -> bool:
         compact = text.strip()
         return bool(compact and len(compact) <= 24 and SAFE_BUTTON_RE.search(compact))
+
+    @staticmethod
+    def _solve_math_verification(prompt_text: str) -> Optional[str]:
+        """Solve a simple arithmetic challenge; None when none is present.
+
+        Division keeps integer semantics for clean problems only (no
+        remainders), which is what group verifications actually ask.
+        """
+        match = MATH_QUESTION_RE.search(prompt_text or "")
+        if not match:
+            return None
+        try:
+            left = int(match.group(1))
+            op = match.group(2)
+            right = int(match.group(3))
+        except ValueError:
+            return None
+        if op in {"+", "＋"}:
+            value = left + right
+        elif op in {"-", "－"}:
+            value = left - right
+        elif op in {"×", "x", "*"}:
+            value = left * right
+        elif op in {"÷", "/"}:
+            if right == 0 or left % right != 0:
+                return None
+            value = left // right
+        else:
+            return None
+        answer = str(value)
+        if not answer.strip() or len(answer) > 6:
+            return None
+        return answer
 
     def _is_safe_verification_answer(self, answer: str) -> bool:
         compact = answer.strip()
@@ -4399,6 +4667,7 @@ class AcquisitionAutomationService:
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
+            await self._record_llm_health(success=False, error=str(exc)[:160])
             local_result.ad_allowed = None
             local_result.policy_mode = GroupAdPolicyMode.UNKNOWN.value
             local_result.reason = "group_rules_ai_unavailable"
@@ -4424,8 +4693,7 @@ class AcquisitionAutomationService:
         else:
             required_evidence_indexes = authoritative_indexes | trial_context_indexes
         cited_relevant_evidence = bool(required_evidence_indexes) and all(
-            bool(set(review["evidence_indexes"]) & required_evidence_indexes)
-            for review in reviews
+            bool(set(review["evidence_indexes"]) & required_evidence_indexes) for review in reviews
         )
         required_confidence = min_confidence
         if not consensus or not cited_relevant_evidence or confidence < required_confidence:
@@ -5244,6 +5512,11 @@ class AcquisitionAutomationService:
             "button_click_timeout",
             "answer_send_timeout",
             "captcha_manual_required",
+            "second_hop_bot_rejected",
+            "second_hop_no_resolution",
+            "second_hop_timeout",
+            "second_hop_failed",
+            "second_hop_external_link_in_bot",
         }:
             return False
         try:
@@ -5266,6 +5539,58 @@ class AcquisitionAutomationService:
         await self._penalize_keyword_after_audit_reject(group, reason)
         return True
 
+    LLM_HEALTH_FAILURE_THRESHOLD = 5
+    LLM_HEALTH_ALERT_SUPPRESS_SECONDS = 6 * 3600
+
+    async def _record_llm_health(
+        self,
+        *,
+        success: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        """Count consecutive LLM failures in Redis and alert once per window.
+
+        Keeps the acquisition module aware of upstream AI outages (the
+        gpt-5.6-terra 404 incident silently degraded ad-policy decisions for
+        a day); alerting at the fifth failure keeps noise low.
+        """
+        try:
+            from app.core.redis import RedisCache
+
+            client = RedisCache()
+            if client.client is None:
+                return
+            counter_key = "llm_health:acquisition:consecutive_failures"
+            suppress_key = "llm_health:acquisition:alert_suppressed"
+            if success:
+                await client.delete(counter_key)
+                return
+            failures = await client.incr(counter_key)
+            await client.expire(counter_key, 3600)
+            if int(failures or 0) < self.LLM_HEALTH_FAILURE_THRESHOLD:
+                return
+            if await client.get(suppress_key):
+                return
+            await client.set(
+                suppress_key,
+                "1",
+                ttl=self.LLM_HEALTH_ALERT_SUPPRESS_SECONDS,
+            )
+            from app.core.scheduler.alerts import AlertSeverity, TaskAlertManager
+
+            TaskAlertManager().send_task_alert(
+                task_name="acquisition_llm_health",
+                error=(error or "LLM upstream unavailable")[:200],
+                severity=AlertSeverity.WARNING,
+                details=(
+                    f"LLM 连续失败 {failures} 次（1 小时窗口）。"
+                    "群广告规则与入群验证 AI 已降级为 fail-closed，"
+                    "请检查 OPENAI_BASE_URL 上游与模型名。"
+                ),
+            )
+        except Exception as exc:
+            self.logger.debug("llm_health_record_failed", error=str(exc))
+
     async def _penalize_keyword_after_audit_reject(
         self,
         group: Group,
@@ -5283,13 +5608,17 @@ class AcquisitionAutomationService:
         try:
             normalized = normalize_keyword_text(keyword_text)
             row = (
-                await self.db.execute(
-                    select(GroupSearchKeyword).where(
-                        GroupSearchKeyword.normalized_text == normalized,
-                        GroupSearchKeyword.status == SearchKeywordStatus.APPROVED,
+                (
+                    await self.db.execute(
+                        select(GroupSearchKeyword).where(
+                            GroupSearchKeyword.normalized_text == normalized,
+                            GroupSearchKeyword.status == SearchKeywordStatus.APPROVED,
+                        )
                     )
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
             if row is None:
                 return
             await self._record_search_keyword_feedback(
@@ -5327,9 +5656,17 @@ class AcquisitionAutomationService:
         # Cutting the serialized JSON used to make successful approvals unreadable.
         payload["details_truncated"] = True
         summary_keys = {
-            "reason", "action", "attempted", "success", "should_retry_audit",
-            "should_leave", "post_action_status", "ad_allowed", "policy_mode",
-            "decision_source", "confidence",
+            "reason",
+            "action",
+            "attempted",
+            "success",
+            "should_retry_audit",
+            "should_leave",
+            "post_action_status",
+            "ad_allowed",
+            "policy_mode",
+            "decision_source",
+            "confidence",
         }
         for name in ("verification_details", "ad_rule_details"):
             details = payload.get(name) or {}
@@ -5715,9 +6052,7 @@ class AcquisitionAutomationService:
                 schedule_id: Optional[int] = None
                 schedule_token: Optional[str] = None
                 try:
-                    async with telegram_chat_advisory_lock(
-                        self.db, membership.telegram_group_id
-                    ):
+                    async with telegram_chat_advisory_lock(self.db, membership.telegram_group_id):
                         # The API and candidate query are only the first guard.
                         # Re-resolve ownership while holding the same chat lock
                         # used by OwnedGroupAsset claims, and keep it until the
@@ -5737,13 +6072,15 @@ class AcquisitionAutomationService:
                             )
                             continue
 
-                        schedule_id, schedule_token, schedule_reason = (
-                            await self._claim_ad_schedule_state(
-                                campaign=campaign,
-                                account_id=binding.account_id,
-                                membership=membership,
-                                lease_seconds=int(execution["job_lease_seconds"]),
-                            )
+                        (
+                            schedule_id,
+                            schedule_token,
+                            schedule_reason,
+                        ) = await self._claim_ad_schedule_state(
+                            campaign=campaign,
+                            account_id=binding.account_id,
+                            membership=membership,
+                            lease_seconds=int(execution["job_lease_seconds"]),
                         )
                         if schedule_token is None:
                             result.skipped += 1
@@ -5777,13 +6114,14 @@ class AcquisitionAutomationService:
                             return result
 
                         if delivery_policy == AdDeliveryPolicy.GROWTH.value:
-                            delivery_log, quota_reason = (
-                                await self._claim_growth_campaign_daily_quota(
-                                    campaign=campaign,
-                                    account_id=binding.account_id,
-                                    group=group,
-                                    creative=creative,
-                                )
+                            (
+                                delivery_log,
+                                quota_reason,
+                            ) = await self._claim_growth_campaign_daily_quota(
+                                campaign=campaign,
+                                account_id=binding.account_id,
+                                group=group,
+                                creative=creative,
                             )
                             if delivery_log is None:
                                 await self._release_ad_delivery_budget(
@@ -6343,7 +6681,9 @@ class AcquisitionAutomationService:
             .where(
                 AccountAdBinding.enabled == True,
                 TelegramAccount.is_active == True,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
+                TelegramAccount.status.notin_(
+                    [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
+                ),
             )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )
@@ -6378,7 +6718,9 @@ class AcquisitionAutomationService:
                 AccountAdBinding.account_id == account_id,
                 AccountAdBinding.id.in_(binding_ids),
                 TelegramAccount.is_active == True,
-                TelegramAccount.status.notin_([AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]),
+                TelegramAccount.status.notin_(
+                    [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]
+                ),
             )
             .order_by(AccountAdBinding.priority.desc(), AccountAdBinding.id)
         )
@@ -7104,8 +7446,7 @@ class AcquisitionAutomationService:
                 OwnedGroupAsset.archived_at.is_(None),
                 or_(
                     OwnedGroupAsset.core_group_id == Group.id,
-                    OwnedGroupAsset.telegram_chat_id
-                    == GroupAccountMembership.telegram_group_id,
+                    OwnedGroupAsset.telegram_chat_id == GroupAccountMembership.telegram_group_id,
                 ),
             )
             .exists()
@@ -7274,9 +7615,7 @@ class AcquisitionAutomationService:
         group = membership.group
         if group is None:
             return "group_missing"
-        async with telegram_chat_advisory_lock(
-            self.db, membership.telegram_group_id
-        ):
+        async with telegram_chat_advisory_lock(self.db, membership.telegram_group_id):
             if await self._is_owned_group_ad_domain_excluded(
                 membership.group_id, membership.telegram_group_id
             ):
@@ -7450,9 +7789,7 @@ class AcquisitionAutomationService:
         if group is None:
             return "group_missing"
 
-        async with telegram_chat_advisory_lock(
-            self.db, membership.telegram_group_id
-        ):
+        async with telegram_chat_advisory_lock(self.db, membership.telegram_group_id):
             if await self._is_owned_group_ad_domain_excluded(
                 membership.group_id, membership.telegram_group_id
             ):
@@ -7600,9 +7937,7 @@ class AcquisitionAutomationService:
         core_group_id = int(identity[0])
         telegram_group_id = int(identity[1])
         async with telegram_chat_advisory_lock(self.db, telegram_group_id):
-            if await self._is_owned_group_ad_domain_excluded(
-                core_group_id, telegram_group_id
-            ):
+            if await self._is_owned_group_ad_domain_excluded(core_group_id, telegram_group_id):
                 raise RuntimeError(OWNED_GROUP_AD_DOMAIN_EXCLUDED)
             return await self._send_group_ad_policy_probe_locked(
                 group_id,
@@ -8845,7 +9180,9 @@ class AcquisitionAutomationService:
         if window_reason:
             return {**result.as_dict(), "reason": window_reason}
 
-        per_account_limit = int(capacity.get("ad_policy_auto_probe_daily_limit_per_account", 0) or 0)
+        per_account_limit = int(
+            capacity.get("ad_policy_auto_probe_daily_limit_per_account", 0) or 0
+        )
         if per_account_limit <= 0:
             return {**result.as_dict(), "reason": "ad_policy_auto_probe_limit_zero"}
 
@@ -9422,9 +9759,7 @@ class AcquisitionAutomationService:
         if group is None:
             return "group_missing"
 
-        if await self._is_owned_group_ad_domain_excluded(
-            group.id, membership.telegram_group_id
-        ):
+        if await self._is_owned_group_ad_domain_excluded(group.id, membership.telegram_group_id):
             return OWNED_GROUP_AD_DOMAIN_EXCLUDED
 
         op_config = await self._get_account_operation_config(binding.account_id)
@@ -10220,9 +10555,7 @@ class AcquisitionAutomationService:
         previous_mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
         profile.ad_policy_mode = GroupAdPolicyMode.FORBIDDEN.value
         profile.ad_policy_confidence = 100
-        profile.ad_policy_source = str(
-            profile.ad_policy_source or "ad_probe_group_control"
-        )[:80]
+        profile.ad_policy_source = str(profile.ad_policy_source or "ad_probe_group_control")[:80]
         profile.ad_policy_verified_at = now
         profile.ad_policy_expires_at = None
         profile.ad_tier = GroupAdTier.BLOCKED.value
@@ -10543,9 +10876,7 @@ class AcquisitionAutomationService:
         if log.group is not None:
             capacity = await get_ad_capacity_settings(self.db)
             leave_on_deleted_ad = bool(capacity.get("leave_on_deleted_ad", True))
-            block_group_on_probe_failure = bool(
-                capacity.get("block_group_on_probe_failure", True)
-            )
+            block_group_on_probe_failure = bool(capacity.get("block_group_on_probe_failure", True))
             profile = await self._get_or_create_group_ad_profile(log.group)
             unknown_policy_probe = profile.ad_policy_mode == GroupAdPolicyMode.UNKNOWN_PROBE.value
             profile.deleted_count = int(profile.deleted_count or 0) + 1
