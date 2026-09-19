@@ -1632,6 +1632,16 @@ class AccountRiskGuard:
         details = details or {}
         if details.get("source") in CONTENT_DEDUP_EXEMPT_SOURCES:
             return RiskDecision(True)
+        if (
+            action == AccountRiskAction.AD_DELIVERY
+            # Literal to avoid a core->modules import; matches
+            # AdDeliveryPolicy.AD_ONLY.value.
+            and str(details.get("delivery_policy") or "growth") == "ad_only"
+        ):
+            # Dedicated (ad_only) accounts repeat operator-curated creatives on
+            # an explicit per-group cadence; growth deliveries keep duplicate
+            # protection.
+            return RiskDecision(True)
         content = details.get("content") or details.get("text") or details.get("caption")
         if not content:
             return RiskDecision(True)

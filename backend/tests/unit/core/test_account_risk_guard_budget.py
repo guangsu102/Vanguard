@@ -13,7 +13,7 @@ class FakeRedisClient:
         self.values = {}
 
     async def exists(self, key):
-        return 0
+        return 1 if key in self.values else 0
 
     async def incrby(self, key, amount):
         self.values[key] = int(self.values.get(key, 0)) + amount
@@ -137,3 +137,80 @@ async def test_owned_group_join_allows_restricted_account_that_join_blocks(test_
         target_id=account.id,
     )
     assert allowed_profile.allowed is True
+
+
+@pytest.mark.asyncio
+async def test_ad_only_delivery_repeats_content_while_growth_is_deduped(test_db):
+    account = TelegramAccount(
+        phone="+15559990052",
+        identifier="+15559990052",
+        account_type=AccountType.PROMOTER,
+        api_config_name="default",
+        country_code="US",
+        session_name="ad_only_dedup_session",
+        status=AccountStatus.ONLINE,
+        created_at=datetime.utcnow() - timedelta(days=20),
+        managed_started_at=datetime.utcnow() - timedelta(days=20),
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    wrapper = SimpleNamespace(account_id=account.id, country_code="US")
+    content = "GPT不降智低至0.09x、纯血国模0.2x 缓存命中99%"
+
+    first = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        target_type="group",
+        target_id=-100123,
+        details={
+            "source": "ad_delivery",
+            "delivery_policy": "ad_only",
+            "content": content,
+        },
+    )
+    assert first.allowed is True
+
+    # The dedicated account repeats the operator-curated creative on its
+    # configured cadence: content dedup must not block the repeat.
+    repeat = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        target_type="group",
+        target_id=-100123,
+        details={
+            "source": "ad_delivery",
+            "delivery_policy": "ad_only",
+            "content": content,
+        },
+    )
+    assert repeat.allowed is True
+
+    growth_first = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        target_type="group",
+        target_id=-100456,
+        details={
+            "source": "ad_delivery",
+            "delivery_policy": "growth",
+            "content": content,
+        },
+    )
+    assert growth_first.allowed is True
+
+    growth_repeat = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.AD_DELIVERY,
+        target_type="group",
+        target_id=-100456,
+        details={
+            "source": "ad_delivery",
+            "delivery_policy": "growth",
+            "content": content,
+        },
+    )
+    assert growth_repeat.allowed is False
+    assert growth_repeat.reason in {"content_repeat_account", "content_repeat_target"}
