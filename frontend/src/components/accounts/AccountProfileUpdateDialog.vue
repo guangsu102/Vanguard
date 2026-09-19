@@ -22,7 +22,12 @@ const emit = defineEmits<{
 const PROFILE_UPDATE_MAX_ACCOUNTS = 2000
 const PROFILE_UPDATE_PAGE_SIZE = 2000
 const PROFILE_UPDATE_POLL_INTERVAL_MS = 3000
-const profileUpdateEligibleStatuses = new Set<Account['status']>(['online', 'idle', 'offline'])
+const profileUpdateEligibleStatuses = new Set<Account['status']>([
+  'online',
+  'idle',
+  'offline',
+  'restricted',
+])
 const profileUpdateActiveStatuses = new Set<AccountProfileUpdateOperationStatus>([
   'queued',
   'running',
@@ -69,7 +74,6 @@ const profileUpdateActiveAccountIds = computed(() => {
 
 const profileUpdateEligibilityReason = (account: Account) => {
   if (account.account_type !== 'promoter') return '不是推广账号'
-  if (account.operation_mode !== 'ad_only') return '不是广告专用账号'
   if (!account.is_active) return '账号未启用'
   if (!account.session_name?.trim()) return '缺少登录会话'
   if (!profileUpdateEligibleStatuses.has(account.status)) return '当前连接状态不可更新'
@@ -385,7 +389,7 @@ const submitProfileUpdateOperation = async () => {
 
   try {
     await ElMessageBox.confirm(
-      '将把 ' + accountIds.length + ' 个 ad_only 广告账号的简介写入持久化队列。'
+      '将把 ' + accountIds.length + ' 个账号的简介写入持久化队列。'
         + '服务器会全局单线程、逐个执行真实 Telegram 更新，不会由浏览器并发发起。是否继续？',
       '确认排队批量设置简介',
       {
@@ -469,7 +473,7 @@ onBeforeUnmount(stopProfileUpdatePolling)
 <template>
   <el-dialog
     v-model="dialogVisible"
-    title="批量设置广告账号简介"
+    title="批量设置账号简介"
     width="min(900px, 94vw)"
     :close-on-click-modal="!profileUpdateSubmitting"
     :close-on-press-escape="!profileUpdateSubmitting"
@@ -480,7 +484,7 @@ onBeforeUnmount(stopProfileUpdatePolling)
     >
       <el-alert
         title="全局单线程队列：不会批量并发调用 Telegram"
-        description="提交只会创建持久化任务。服务端全局每次最多处理一个 ad_only 广告账号，并在执行时再次核验会话、账号职责和简介是否被人工改动。"
+        description="提交只会创建持久化任务。服务端全局每次最多处理一个账号，并在执行时再次核验会话和简介是否被人工改动。"
         type="info"
         :closable="false"
         show-icon
@@ -575,7 +579,7 @@ onBeforeUnmount(stopProfileUpdatePolling)
       <section class="profile-update-plan">
         <div class="profile-update-section-heading">
           <div>
-            <strong>选择 ad_only 广告账号</strong>
+            <strong>选择推广账号</strong>
             <small>
               共 {{ profileUpdateAccounts.length }} 个推广账号，当前可排队 {{ profileUpdateEligibleAccounts.length }} 个
             </small>
@@ -649,7 +653,8 @@ onBeforeUnmount(stopProfileUpdatePolling)
                 </span>
                 <small>
                   #{{ account.id }} · {{ account.phone || account.session_name }} ·
-                  {{ profileUpdateAccountStatusText(account.status) }} · ad_only
+                  {{ profileUpdateAccountStatusText(account.status) }} ·
+                  {{ account.operation_mode }}
                   <template v-if="profileUpdateEligibilityReason(account)">
                     · {{ profileUpdateEligibilityReason(account) }}
                   </template>

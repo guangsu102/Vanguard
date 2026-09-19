@@ -83,8 +83,42 @@ class ManagedBotProvisionLeaseLost(RuntimeError):
 
 _LEASE_SECONDS = 300
 _EXTERNAL_CALL_TIMEOUT_SECONDS = 120
+_BOTFATHER_CONVERSATION_TIMEOUT_SECONDS = 180
 _CAPABILITY_PROBE_TIMEOUT_SECONDS = 15
 _CAPABILITY_PROBE_CONCURRENCY = 8
+
+
+def _classify_botfather_create_error(exc: BaseException) -> ManagedBotProvisionFailure:
+    """Map @BotFather conversation failures to provision failure codes."""
+
+    message = str(exc)
+    if "botfather_username_taken" in message:
+        return ManagedBotProvisionFailure("USERNAME_OCCUPIED")
+    if "botfather_username_invalid" in message:
+        return ManagedBotProvisionFailure("USERNAME_INVALID")
+    if "botfather_create_rejected" in message:
+        return ManagedBotProvisionFailure("BOT_CREATE_REJECTED")
+    if "botfather_flow_unexpected" in message or "botfather_conversation_failed" in message:
+        # The conversation may have progressed part-way (the username may
+        # already have been submitted); the create_attempted_at fencing keeps
+        # a retry from double-creating.
+        return ManagedBotProvisionFailure(
+            "TELEGRAM_TEMPORARILY_UNAVAILABLE",
+            retryable=True,
+            retry_after_seconds=60,
+            uncertain_create_outcome=True,
+        )
+    if "risk_guard_blocked" in message:
+        return ManagedBotProvisionFailure(
+            "ACCOUNT_RISK_BLOCKED",
+            retryable=True,
+            retry_after_seconds=3600,
+        )
+    return ManagedBotProvisionFailure(
+        "TELEGRAM_TEMPORARILY_UNAVAILABLE",
+        retryable=True,
+        retry_after_seconds=60,
+    )
 
 
 def _reserved_username_filter(username: str) -> Any:
@@ -368,13 +402,18 @@ async def list_manager_capabilities(db: AsyncSession) -> dict[str, Any]:
         blockers.append("unsupported")
     if not owner_rows:
         blockers.append("owner_account_unavailable")
-    if not any(item["can_manage_bots"] for item in manager_rows):
-        blockers.append("manager_permission_missing")
+    can_manage_any = any(item["can_manage_bots"] for item in manager_rows)
+    if can_manage_any:
+        creation_strategy = "managed_bot"
+    else:
+        # No manager bot holds Telegram's bot-management right: provisioning
+        # falls back to the @BotFather conversation, which only needs an
+        # eligible owner session.
+        creation_strategy = "botfather_conversation"
     return {
         "supported": supported,
-        "available": supported
-        and bool(owner_rows)
-        and any(item["can_manage_bots"] for item in manager_rows),
+        "available": supported and bool(owner_rows),
+        "creation_strategy": creation_strategy,
         "owner_accounts": owner_rows,
         "manager_bot_profiles": manager_rows,
         "blockers": blockers,
@@ -673,7 +712,17 @@ class ManagedBotProvisionService:
     async def _manager_client(
         self,
         profile: GuardianBotProfile,
-    ) -> tuple[TelegramClient, Any]:
+        *,
+        allow_missing_manage_right: bool = False,
+    ) -> tuple[TelegramClient, Any, bool]:
+        """Open the manager Bot API client.
+
+        Returns ``(client, identity, can_manage_bots)``.  With
+        ``allow_missing_manage_right`` a manager that lacks the right is
+        reported as ``can_manage_bots=False`` instead of failing, so callers
+        can fall back to the @BotFather conversation strategy.
+        """
+
         token = resolve_guardian_bot_token(profile.bot_token)
         if not token:
             raise ManagedBotProvisionFailure("MANAGER_INVALID")
@@ -694,7 +743,11 @@ class ManagedBotProvisionService:
         except BaseException:
             await client.close()
             raise
-        if not identity.is_bot or not identity.can_manage_bots:
+        if not identity.is_bot:
+            await client.close()
+            raise ManagedBotProvisionFailure("MANAGER_INVALID")
+        can_manage = bool(identity.can_manage_bots)
+        if not can_manage and not allow_missing_manage_right:
             await client.close()
             raise ManagedBotProvisionFailure("MANAGER_PERMISSION_MISSING")
         if profile.bot_user_id and int(profile.bot_user_id) != int(identity.user_id):
@@ -703,7 +756,7 @@ class ManagedBotProvisionService:
         profile.bot_user_id = int(identity.user_id)
         profile.bot_username = identity.username or profile.bot_username
         await self.db.commit()
-        return client, identity
+        return client, identity, can_manage
 
     async def _recover_existing(
         self,
@@ -792,10 +845,29 @@ class ManagedBotProvisionService:
                 raise ManagedBotProvisionFailure("MANAGER_INVALID")
 
             await self._set_step(row, lease_id, ManagedBotProvisionStep.PREFLIGHT)
-            manager_client, _manager_identity = await self._manager_client(manager)
+            manager_client, _manager_identity, manager_can_manage = (
+                await self._manager_client(manager, allow_missing_manage_right=True)
+            )
+            if not manager_can_manage:
+                # Telegram never granted this bot the right to manage other
+                # bots: fall back to the @BotFather conversation strategy,
+                # which only needs the owner's user session and returns the
+                # token directly from BotFather's confirmation message.
+                await manager_client.close()
+                manager_client = None
 
             recovered = None
+            botfather_token: str | None = None
             if row.bot_user_id is not None:
+                if not manager_can_manage:
+                    # A BotFather creation was already verified (bot_user_id
+                    # recorded) but its token is not recoverable without a
+                    # manager right: the operator must resolve it via
+                    # @BotFather /mybots.
+                    raise ManagedBotProvisionFailure(
+                        "MANAGED_BOT_TOKEN_UNAVAILABLE",
+                        uncertain_create_outcome=True,
+                    )
                 await self._set_step(
                     row,
                     lease_id,
@@ -828,8 +900,27 @@ class ManagedBotProvisionService:
                         lease_id,
                         ManagedBotProvisionStep.FETCH_TOKEN,
                     )
-                    recovered = await self._recover_existing(row, wrapper, manager_client)
-            if recovered is None:
+                    if manager_can_manage:
+                        recovered = await self._recover_existing(
+                            row, wrapper, manager_client
+                        )
+                    else:
+                        # The username was already submitted once: never resend
+                        # it.  Recover the token from the BotFather chat where
+                        # the confirmation message would have been delivered.
+                        botfather_token = await asyncio.wait_for(
+                            self.telegram_execution.read_botfather_provisioned_token(
+                                wrapper,
+                                username=row.username,
+                            ),
+                            timeout=_BOTFATHER_CONVERSATION_TIMEOUT_SECONDS,
+                        )
+                        if botfather_token is None:
+                            raise ManagedBotProvisionFailure(
+                                "TELEGRAM_CREATE_OUTCOME_UNKNOWN",
+                                uncertain_create_outcome=True,
+                            )
+            if manager_can_manage and recovered is None:
                 await self._set_step(
                     row,
                     lease_id,
@@ -894,7 +985,7 @@ class ManagedBotProvisionService:
                         retry_after_seconds=60,
                         uncertain_create_outcome=True,
                     ) from None
-            else:
+            elif manager_can_manage:
                 entity, token = recovered
                 await self._record_external_created(
                     row,
@@ -906,6 +997,33 @@ class ManagedBotProvisionService:
                     lease_id,
                     ManagedBotProvisionStep.FETCH_TOKEN,
                 )
+            else:
+                if botfather_token is None:
+                    await self._set_step(
+                        row,
+                        lease_id,
+                        ManagedBotProvisionStep.CREATE_BOT,
+                    )
+
+                    async def mark_botfather_username_submitted() -> None:
+                        await self._mark_create_attempted(row, lease_id)
+
+                    try:
+                        botfather_token = await asyncio.wait_for(
+                            self.telegram_execution.create_bot_via_botfather(
+                                wrapper,
+                                name=row.display_name,
+                                username=row.username,
+                                on_username_submitted=mark_botfather_username_submitted,
+                            ),
+                            timeout=_BOTFATHER_CONVERSATION_TIMEOUT_SECONDS,
+                        )
+                    except Exception as exc:
+                        raise _classify_botfather_create_error(exc) from None
+                # The bot's Telegram user id is only known after the VERIFY
+                # getMe below; record it there.
+                entity = None
+                token = botfather_token
 
             await self._set_step(
                 row,
@@ -928,12 +1046,21 @@ class ManagedBotProvisionService:
                 await child_client.close()
             if (
                 not identity.is_bot
-                or int(identity.user_id) != int(entity.id)
+                or (entity is not None and int(identity.user_id) != int(entity.id))
+                or (entity is None and row.bot_user_id is not None and int(identity.user_id) != int(row.bot_user_id))
                 or str(identity.username or "").casefold() != row.username.casefold()
             ):
                 raise ManagedBotProvisionFailure(
                     "MANAGED_BOT_IDENTITY_MISMATCH",
                     uncertain_create_outcome=True,
+                )
+            if entity is None:
+                # BotFather strategy: the Telegram user id only became known
+                # through this verification getMe.
+                await self._record_external_created(
+                    row,
+                    lease_id,
+                    bot_user_id=int(identity.user_id),
                 )
 
             await self._set_step(

@@ -21,7 +21,7 @@ from app.core.account.models import (
 from app.core.account.telegram_execution import TelegramExecutionError
 from app.modules.account_profile_update.service import (
     AccountProfileUpdateService,
-    account_is_ad_only_eligible,
+    account_is_profile_update_eligible,
     create_profile_update_operation,
     operation_snapshot,
 )
@@ -247,7 +247,7 @@ async def test_risk_block_retries_then_cancellation_stops_pending_item(test_db):
     assert operation.status == AccountProfileUpdateOperationStatus.CANCELLED.value
 
 
-def test_only_ad_only_promoters_are_eligible():
+def test_all_active_promoters_with_a_session_are_eligible():
     promoter = SimpleNamespace(
         account_type=AccountType.PROMOTER,
         status=AccountStatus.ONLINE,
@@ -261,5 +261,14 @@ def test_only_ad_only_promoters_are_eligible():
     growth = SimpleNamespace(
         **{**promoter.__dict__, "operation_config": SimpleNamespace(operation_mode="growth")}
     )
-    assert account_is_ad_only_eligible(promoter) is True
-    assert account_is_ad_only_eligible(growth) is False
+    assert account_is_profile_update_eligible(promoter) is True
+    # Operation mode no longer gates profile updates: growth accounts qualify too.
+    assert account_is_profile_update_eligible(growth) is True
+    restricted = SimpleNamespace(
+        **{**promoter.__dict__, "status": AccountStatus.RESTRICTED}
+    )
+    assert account_is_profile_update_eligible(restricted) is True
+    inactive = SimpleNamespace(**{**promoter.__dict__, "is_active": False})
+    assert account_is_profile_update_eligible(inactive) is False
+    missing_session = SimpleNamespace(**{**promoter.__dict__, "session_string": None})
+    assert account_is_profile_update_eligible(missing_session) is False

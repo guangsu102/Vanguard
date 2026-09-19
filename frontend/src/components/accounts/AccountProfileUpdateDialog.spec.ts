@@ -136,6 +136,7 @@ describe('AccountProfileUpdateDialog', () => {
         makeAccount(2, { operation_mode: 'growth' }),
         makeAccount(3, { is_active: false }),
         makeAccount(4, { status: 'working' }),
+        makeAccount(5, { status: 'restricted' }),
       ],
       total: 4,
       nextCursor: null,
@@ -143,16 +144,17 @@ describe('AccountProfileUpdateDialog', () => {
     })
   })
 
-  it('only exposes active ad_only promoter accounts with a usable session', async () => {
+  it('exposes every active promoter account with a usable session regardless of mode', async () => {
     const wrapper = mountDialog()
     await flushPromises()
 
     const vm = wrapper.vm as unknown as DialogViewModel
     expect(api.listAccounts).toHaveBeenCalledWith({ account_type: 'promoter', limit: 2000 })
-    expect(vm.profileUpdateEligibleAccounts.map((account) => account.id)).toEqual([1])
-    expect(vm.profileUpdateEligibilityReason(vm.profileUpdateAccounts[1]!)).toBe('不是广告专用账号')
+    expect(vm.profileUpdateEligibleAccounts.map((account) => account.id)).toEqual([1, 2, 5])
+    expect(vm.profileUpdateEligibilityReason(vm.profileUpdateAccounts[1]!)).toBe('')
     expect(vm.profileUpdateEligibilityReason(vm.profileUpdateAccounts[2]!)).toBe('账号未启用')
     expect(vm.profileUpdateEligibilityReason(vm.profileUpdateAccounts[3]!)).toBe('当前连接状态不可更新')
+    expect(vm.profileUpdateEligibilityReason(vm.profileUpdateAccounts[4]!)).toBe('')
 
     wrapper.unmount()
   })

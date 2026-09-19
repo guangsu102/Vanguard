@@ -1107,7 +1107,7 @@ onBeforeUnmount(() => {
         </el-button>
         <el-button v-if="isAdmin" @click="profileUpdateDialogVisible = true">
           <el-icon><Edit /></el-icon>
-          批量设置广告简介
+          批量设置账号简介
         </el-button>
         <el-button type="primary" @click="openAddDrawer">
           <el-icon><Plus /></el-icon>

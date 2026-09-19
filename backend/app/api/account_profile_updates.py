@@ -22,7 +22,7 @@ from app.core.security import require_admin
 from app.modules.account_profile_update.service import (
     ACTIVE_OPERATION_STATUSES,
     TERMINAL_OPERATION_STATUSES,
-    account_is_ad_only_eligible,
+    account_is_profile_update_eligible,
     create_profile_update_operation,
     normalize_account_ids,
     normalize_profile_bio,
@@ -185,15 +185,15 @@ async def create_account_profile_update_operation(
     invalid_ids = [
         account_id
         for account_id in request.account_ids
-        if not account_is_ad_only_eligible(accounts_by_id[account_id])
+        if not account_is_profile_update_eligible(accounts_by_id[account_id])
     ]
     if invalid_ids:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
-                "code": "account_not_ad_only_eligible",
+                "code": "account_not_eligible",
                 "account_ids": invalid_ids,
-                "message": "仅支持具备有效会话的 promoter + ad_only 广告账号",
+                "message": "仅支持具备有效会话且状态允许的 promoter 账号",
             },
         )
 

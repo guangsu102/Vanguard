@@ -16,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.account.models import (
-    AccountOperationMode,
     AccountProfileUpdateItem,
     AccountProfileUpdateItemStatus,
     AccountProfileUpdateOperation,
@@ -53,6 +52,9 @@ ELIGIBLE_ACCOUNT_STATUSES = {
     AccountStatus.ONLINE,
     AccountStatus.IDLE,
     AccountStatus.OFFLINE,
+    # SpamBot-restricted accounts can still edit their own profile: the
+    # Telegram limit covers messaging/invites, not profile writes.
+    AccountStatus.RESTRICTED,
 }
 _QUEUE_LEASE_ID = 1
 _QUEUE_LEASE_SECONDS = 900
@@ -105,19 +107,14 @@ def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value) or "")
 
 
-def account_is_ad_only_eligible(account: TelegramAccount | None) -> bool:
+def account_is_profile_update_eligible(account: TelegramAccount | None) -> bool:
     if account is None or not account.is_active:
         return False
     if _enum_value(account.account_type) != AccountType.PROMOTER.value:
         return False
     if _enum_value(account.status) not in {status.value for status in ELIGIBLE_ACCOUNT_STATUSES}:
         return False
-    config = account.operation_config
-    return bool(
-        config is not None
-        and config.operation_mode == AccountOperationMode.AD_ONLY.value
-        and session_is_available(account)
-    )
+    return session_is_available(account)
 
 
 def safe_worker_error(exc: BaseException) -> str:
@@ -154,6 +151,7 @@ def _error_is_permanent(exc: BaseException) -> bool:
         marker in raw
         for marker in (
             "account_no_longer_ad_only_eligible",
+            "account_not_eligible",
             "account_missing",
             "session",
             "authkey",
@@ -169,8 +167,8 @@ def _preflight_reason(
 ) -> str | None:
     if account is None:
         return "account_missing"
-    if not account_is_ad_only_eligible(account):
-        return "account_no_longer_ad_only_eligible"
+    if not account_is_profile_update_eligible(account):
+        return "account_not_eligible"
     current_hash = profile_bio_hash(account.profile_bio)
     if current_hash != item.baseline_bio_hash:
         if current_hash == item.desired_bio_hash and account.profile_bio_synced_at is not None:
@@ -207,8 +205,8 @@ async def create_profile_update_operation(
     account_by_id = {account.id: account for account in accounts}
     if set(account_by_id) != set(values):
         raise ValueError("account_not_found")
-    if any(not account_is_ad_only_eligible(account_by_id[item]) for item in values):
-        raise ValueError("account_not_ad_only_eligible")
+    if any(not account_is_profile_update_eligible(account_by_id[item]) for item in values):
+        raise ValueError("account_not_eligible")
 
     operation = AccountProfileUpdateOperation(
         idempotency_key=idempotency_key,
@@ -459,6 +457,7 @@ class AccountProfileUpdateService:
                 purpose="account_profile_update",
                 require_session=True,
                 raise_on_lease_failure=True,
+                allow_restricted=True,
             )
             if wrapper is None:
                 raise TelegramExecutionError("account operation lease unavailable")
@@ -628,7 +627,7 @@ class AccountProfileUpdateService:
             return
         item.status = AccountProfileUpdateItemStatus.FAILED.value
         item.reason_code = (
-            "account_no_longer_ad_only_eligible"
+            "account_not_eligible"
             if force_permanent or _error_is_permanent(exc)
             else "profile_update_failed"
         )

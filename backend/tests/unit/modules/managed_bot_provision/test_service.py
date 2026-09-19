@@ -101,6 +101,7 @@ def _install_fake_bot_api(
     *,
     username: str,
     managed_token_error: TelegramAPIError | None = None,
+    manager_can_manage: bool = True,
 ):
     class FakeTelegramClient:
         constructed_tokens: list[str] = []
@@ -119,7 +120,7 @@ def _install_fake_bot_api(
                     first_name="Manager",
                     full_name="Manager",
                     is_bot=True,
-                    can_manage_bots=True,
+                    can_manage_bots=manager_can_manage,
                 )
             assert self.token == CHILD_TOKEN
             return SimpleNamespace(
@@ -678,3 +679,67 @@ async def test_reserved_or_externally_created_operation_keeps_username_conflict(
         )
 
     assert await test_db.scalar(select(func.count(ManagedBotProvision.id))) == 1
+
+
+class BotFatherStrategyExecution:
+    """Stands in for the @BotFather conversation strategy on the owner session."""
+
+    def __init__(self, username: str, token: str = CHILD_TOKEN):
+        self.username = username
+        self.token = token
+        self.botfather_calls: list[dict] = []
+
+    async def check_managed_bot_username(self, wrapper, username: str) -> bool:
+        raise AssertionError("BotFather strategy must not pre-check usernames via MTProto")
+
+    async def create_bot_via_botfather(
+        self, wrapper, *, name: str, username: str, on_username_submitted=None, source="managed_bot_provision"
+    ):
+        assert wrapper is not None
+        self.botfather_calls.append({"name": name, "username": username})
+        if on_username_submitted is not None:
+            await on_username_submitted()
+        return self.token
+
+
+@pytest.mark.asyncio
+async def test_botfather_strategy_creates_bot_when_manager_lacks_manage_right(
+    test_db,
+    monkeypatch,
+):
+    username = "botfather_created_bot"
+    owner, manager = await _seed_owner_and_manager(test_db, suffix="2001")
+    bot_api = _install_fake_bot_api(
+        monkeypatch, username=username, manager_can_manage=False
+    )
+    execution = BotFatherStrategyExecution(username=username)
+    pool = FakeAccountPool()
+
+    operation, _ = await _create_operation(
+        test_db,
+        owner,
+        manager,
+        username=username,
+        key="idem-key-2001",
+    )
+    await ManagedBotProvisionService(
+        test_db,
+        account_pool=pool,
+        telegram_execution=execution,
+    ).run_tick(limit=1)
+
+    await test_db.refresh(operation)
+    assert operation.status == ManagedBotProvisionStatus.SUCCEEDED.value
+    assert operation.current_step == ManagedBotProvisionStep.COMPLETE.value
+    assert operation.bot_user_id == BOT_USER_ID
+    assert execution.botfather_calls[0]["username"] == username
+    assert bot_api.managed_token_requests == []
+
+    guardian = await test_db.get(GuardianBotProfile, operation.guardian_bot_profile_id)
+    owned = await test_db.get(OwnedBotProfile, operation.owned_bot_profile_id)
+    assert guardian is not None and owned is not None
+    assert resolve_guardian_bot_token(guardian.bot_token) == CHILD_TOKEN
+    assert decrypt_ephemeral_secret(owned.token_ciphertext) == CHILD_TOKEN
+    assert owned.status == "verified"
+    assert owned.owner_account_id == owner.id
+    assert pool.released == 1
