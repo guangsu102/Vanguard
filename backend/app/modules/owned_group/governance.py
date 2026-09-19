@@ -1154,6 +1154,70 @@ async def bind_governance(
     )
 
 
+async def unbind_governance(
+    db: AsyncSession,
+    asset_id: int,
+    actor: dict[str, Any] | None,
+    correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """Detach Guardian governance so irreversible steps (e.g. dissolution) unblock.
+
+    This is a local bookkeeping operation only: it never contacts Telegram and
+    never demotes the bot in the group.  The managed binding row is marked
+    inactive so guardian views stop treating the group as governed.
+    """
+
+    correlation = new_correlation_id(asset_id, correlation_id)
+    asset = await _locked_asset(db, asset_id)
+    _validate_ready_asset(asset)
+    current_status = str(asset.governance_status or "disabled")
+    if current_status == "pending":
+        raise GovernanceServiceError(
+            "governance_state_changed",
+            "治理操作正在执行，请等待完成或重新检测后再停用",
+            status_code=409,
+            retryable=True,
+            correlation_id=correlation,
+        )
+    if current_status == "disabled" and asset.guardian_bot_account_id is None:
+        raise GovernanceServiceError(
+            "governance_not_bound",
+            "自建群尚未接入 Guardian 治理",
+            status_code=409,
+            correlation_id=correlation,
+        )
+
+    before = _audit_state(asset)
+    binding = (
+        await db.get(ManagedGroupBinding, asset.managed_binding_id)
+        if asset.managed_binding_id is not None
+        else None
+    )
+    if binding is not None and _value(binding.binding_status) == "active":
+        binding.binding_status = ManagedGroupBindingStatus.INACTIVE
+    asset.managed_binding_id = None
+    asset.guardian_bot_account_id = None
+    asset.governance_status = "disabled"
+    asset.governance_pending_at = None
+    asset.governance_enabled_at = None
+    asset.governance_last_error_code = None
+    asset.governance_last_error_message = None
+    asset.updated_at = _now()
+    _add_audit(
+        db,
+        event_type="owned_group_governance_unbound",
+        asset=asset,
+        actor=actor,
+        before_state=before,
+        after_state=_audit_state(asset),
+        result="success",
+        reason_code="operator_unbind",
+        correlation_id=correlation,
+    )
+    await db.commit()
+    return await get_governance_status(db, asset_id, correlation_id=correlation)
+
+
 async def reconcile_governance(
     db: AsyncSession,
     asset_id: int,

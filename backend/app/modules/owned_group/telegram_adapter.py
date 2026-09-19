@@ -315,6 +315,17 @@ def classify_telegram_error(
             message=safe_message,
         )
     if isinstance(exc, TelegramExecutionError) and "risk_guard_blocked" in str(exc):
+        reason = str(exc)
+        if "cooldown" in reason or "daily_budget" in reason:
+            # A budget throttle is time-based, not a policy rejection: the
+            # item must wait for the window instead of being given up on.
+            return TelegramErrorClassification(
+                status=ItemStatus.FAILED_TRANSIENT.value,
+                reason_code="risk_guard_throttled",
+                transient=True,
+                retry_after_seconds=30,
+                message="Telegram operation throttled by account risk guard",
+            )
         return TelegramErrorClassification(
             status=ItemStatus.FAILED_PERMANENT.value,
             reason_code="risk_guard_blocked",
@@ -636,7 +647,13 @@ class TelethonOwnedGroupTelegramAdapter:
             return None
         return await self.db.get(TelegramAccount, int(account_id))
 
-    async def _acquire(self, account: TelegramAccount | None, *, purpose: str) -> Any:
+    async def _acquire(
+        self,
+        account: TelegramAccount | None,
+        *,
+        purpose: str,
+        allow_restricted: bool = False,
+    ) -> Any:
         if account is None:
             raise AdapterConfigurationError("account_not_found")
         try:
@@ -647,6 +664,7 @@ class TelethonOwnedGroupTelegramAdapter:
                 purpose=purpose,
                 require_session=True,
                 raise_on_lease_failure=True,
+                allow_restricted=allow_restricted,
             )
         except (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable):
             raise
@@ -1214,7 +1232,7 @@ class TelethonOwnedGroupTelegramAdapter:
         )
         async with self._risk_operation(
             wrapper,
-            AccountRiskAction.JOIN,
+            AccountRiskAction.OWNED_GROUP_JOIN,
             target_type="group",
             target_id=_telegram_peer_id(entity),
             details={"source": "owned_group_invite_revoke"},
@@ -1251,7 +1269,7 @@ class TelethonOwnedGroupTelegramAdapter:
         )
         async with self._risk_operation(
             wrapper,
-            AccountRiskAction.JOIN,
+            AccountRiskAction.OWNED_GROUP_JOIN,
             target_type="group",
             target_id=_telegram_peer_id(entity),
             details={"source": "owned_group_invite_regenerate"},
@@ -1613,7 +1631,7 @@ class TelethonOwnedGroupTelegramAdapter:
                 request_needed = asset.invite_mode == "manual_approval"
                 async with self._risk_operation(
                     wrapper,
-                    AccountRiskAction.JOIN,
+                    AccountRiskAction.OWNED_GROUP_JOIN,
                     target_type="group",
                     target_id=chat_id,
                     details={"source": "owned_group_invite_link"},
@@ -1810,7 +1828,7 @@ class TelethonOwnedGroupTelegramAdapter:
         try:
             async with self._risk_operation(
                 risk_account,
-                AccountRiskAction.JOIN,
+                AccountRiskAction.OWNED_GROUP_JOIN,
                 target_type="group",
                 target_id=_telegram_peer_id(entity),
                 details={"source": "owned_group_direct_invite"},
@@ -1883,7 +1901,15 @@ class TelethonOwnedGroupTelegramAdapter:
             owner_client = self._client(owner_wrapper)
             entity = await self._group_entity(owner_client, asset)
             if target_profile is None:
-                target_wrapper = await self._acquire(target_account, purpose="owned_group_target")
+                # Restricted targets are explicitly planned members: their
+                # session is only used for identity resolution (and, in link
+                # mode, the target's own join), so the pool's default ban on
+                # RESTRICTED accounts must not reject them here.
+                target_wrapper = await self._acquire(
+                    target_account,
+                    purpose="owned_group_target",
+                    allow_restricted=True,
+                )
             # Bot profiles are verified through Bot API getMe and are invited by
             # the owner Telethon session; they must not consume a linked
             # GuardianBot AccountPool/Telethon lease.
@@ -1928,6 +1954,7 @@ class TelethonOwnedGroupTelegramAdapter:
                             target_wrapper,
                             link,
                             source="owned_group_self_join",
+                            action=AccountRiskAction.OWNED_GROUP_JOIN,
                         )
                     except TelegramJoinRequestPendingError as exc:
                         return ItemExecutionResult(
@@ -2054,7 +2081,9 @@ class TelethonOwnedGroupTelegramAdapter:
             entity = await self._group_entity(owner_client, asset)
             if _profile is None:
                 target_wrapper = await self._acquire(
-                    target_account, purpose="owned_group_reconcile_target"
+                    target_account,
+                    purpose="owned_group_reconcile_target",
+                    allow_restricted=True,
                 )
             # Bot reconciliation is owner-side read-only verification plus
             # profile.getMe; no linked bot AccountPool lease is acquired.

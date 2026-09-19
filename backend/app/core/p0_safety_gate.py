@@ -326,6 +326,7 @@ def owned_group_account_failure(
     *,
     require_promoter: bool = True,
     require_runtime_ready: bool = True,
+    allow_unready_membership: bool = False,
 ) -> tuple[str, dict[str, Any]] | None:
     if account is None:
         return "account_not_found", {}
@@ -334,6 +335,15 @@ def owned_group_account_failure(
         return "account_type_not_promoter", {"account_type": account_type}
     if not bool(account.is_active):
         return "account_inactive", {}
+    risk_level = str(account.risk_level or "normal").strip().lower()
+    if risk_level in {"frozen", "quarantined"}:
+        return "account_risk_blocked", {"risk_level": risk_level}
+    if allow_unready_membership:
+        # Planned group members may be restricted, banned, or simply offline:
+        # the per-item execution result records the concrete Telegram failure
+        # instead of blocking the whole batch in precheck.  Hard system states
+        # (inactive, frozen, quarantined) stay blocked above.
+        return None
     account_status = _enum_value(account.status).strip().lower()
     if account_status == AccountStatus.RESTRICTED.value:
         return "account_restricted", {"status": account_status}
@@ -354,9 +364,6 @@ def owned_group_account_failure(
         and spam_check_status == SpamCheckAccountStatus.RESTRICTED.value
     ):
         return "account_spam_restricted", {"spam_check_status": spam_check_status}
-    risk_level = str(account.risk_level or "normal").strip().lower()
-    if risk_level in {"frozen", "quarantined"}:
-        return "account_risk_blocked", {"risk_level": risk_level}
     if (
         risk_level == "limited"
         or _is_future(account.risk_pause_until)
@@ -486,9 +493,12 @@ async def precheck_owned_group_resources(
         resource_type = item["resource_type"]
         resource_id = item["resource_id"]
         if resource_type == ResourceType.USER.value:
+            # The owner must stay fully eligible; planned members may be
+            # restricted/banned/offline and fail per item at execution time.
             failure = owned_group_account_failure(
                 accounts.get(resource_id),
                 require_runtime_ready=require_runtime_ready,
+                allow_unready_membership=resource_id != int(owner_account_id),
             )
             if failure:
                 reason, details = failure

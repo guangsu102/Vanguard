@@ -160,3 +160,74 @@ async def test_stale_creating_asset_is_quarantined(test_db):
 
     assert result == {"assets": 1}
     assert asset.status == "needs_attention"
+
+
+async def _seed_stale_asset(test_db, *, status: str, identifier: str) -> OwnedGroupAsset:
+    owner = TelegramAccount(
+        identifier=identifier,
+        session_name=identifier,
+        account_type=AccountType.PROMOTER,
+        is_active=True,
+    )
+    test_db.add(owner)
+    await test_db.flush()
+    asset = OwnedGroupAsset(
+        internal_name=identifier,
+        title="Owned Recovery Stale",
+        visibility="private",
+        owner_account_id=owner.id,
+        invite_mode="direct_invite",
+        status=status,
+        updated_at=datetime.utcnow() - timedelta(hours=1),
+    )
+    test_db.add(asset)
+    await test_db.flush()
+    return asset
+
+
+@pytest.mark.asyncio
+async def test_stale_prechecking_asset_is_quarantined_and_requeueable(test_db):
+    from sqlalchemy import select
+
+    from app.modules.owned_group.models_extra import OwnedGroupAuditEvent
+    from app.modules.owned_group.worker import enqueue_asset_precheck
+
+    asset = await _seed_stale_asset(
+        test_db, status="prechecking", identifier="owned-recovery-stale-precheck"
+    )
+
+    result = await reconcile_stale_owned_group_assets(test_db, stale_after_seconds=60)
+
+    assert result == {"assets": 1}
+    assert asset.status == "needs_attention"
+    reason = await test_db.scalar(
+        select(OwnedGroupAuditEvent.reason_code)
+        .where(OwnedGroupAuditEvent.group_asset_id == asset.id)
+        .order_by(OwnedGroupAuditEvent.id.desc())
+        .limit(1)
+    )
+    assert reason == "precheck_heartbeat_stale"
+
+    # No remote write was possible from PRECHECKING, so the plain precheck
+    # queue path must accept the quarantined asset again.
+    requeued = await enqueue_asset_precheck(test_db, asset.id)
+    assert requeued.status == "prechecking"
+
+
+@pytest.mark.asyncio
+async def test_stale_creating_asset_keeps_strict_quarantine(test_db):
+    from app.modules.owned_group.worker import enqueue_asset_precheck
+
+    asset = await _seed_stale_asset(
+        test_db, status="creating", identifier="owned-recovery-stale-creating"
+    )
+
+    result = await reconcile_stale_owned_group_assets(test_db, stale_after_seconds=60)
+
+    assert result == {"assets": 1}
+    assert asset.status == "needs_attention"
+
+    # A CREATING asset may have created the group remotely; a plain retry
+    # stays blocked and requires explicit Telegram reconciliation.
+    with pytest.raises(ValueError):
+        await enqueue_asset_precheck(test_db, asset.id)

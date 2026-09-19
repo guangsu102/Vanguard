@@ -52,6 +52,7 @@ class AccountRiskAction(str, Enum):
     MODERATION = "moderation"
     AD_DELIVERY = "ad_delivery"
     OWNED_GROUP_MESSAGE = "owned_group_message"
+    OWNED_GROUP_JOIN = "owned_group_join"
     PROFILE_UPDATE = "profile_update"
     REACTION = "reaction"
     FORWARD = "forward"
@@ -92,6 +93,14 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     # Owned-group messaging owns its business quotas and cooldowns. This risk
     # action only participates in the shared account outbound hard cap.
     AccountRiskAction.OWNED_GROUP_MESSAGE: RiskBudget(daily_limit=0, cooldown_seconds=0),
+    # Owned-group membership writes (bulk invites, self-join, invite-link
+    # management) share one dedicated budget.  It is deliberately separate
+    # from the organic JOIN budget: one operator-driven invite batch would
+    # otherwise consume a single account's 10-joins-per-2-hours envelope.
+    # There is no per-invite cooldown here because an operation batch runs
+    # its items back to back; pacing is owned by the operation's
+    # batch_size/batch_interval_seconds config.
+    AccountRiskAction.OWNED_GROUP_JOIN: RiskBudget(daily_limit=300, cooldown_seconds=0),
     AccountRiskAction.PROFILE_UPDATE: RiskBudget(daily_limit=5, cooldown_seconds=3600),
     AccountRiskAction.REACTION: RiskBudget(daily_limit=120, cooldown_seconds=10),
     AccountRiskAction.FORWARD: RiskBudget(daily_limit=25, cooldown_seconds=120),
@@ -161,6 +170,7 @@ ACQUISITION_GROUP_WRITE_ACTIONS = {
 }
 ACCOUNT_WIDE_GROUP_WRITE_ACTIONS = ACQUISITION_GROUP_WRITE_ACTIONS | {
     AccountRiskAction.OWNED_GROUP_MESSAGE,
+    AccountRiskAction.OWNED_GROUP_JOIN,
 }
 CONTENT_DEDUP_EXEMPT_SOURCES = {
     "managed_group_channel_announcement",
@@ -259,6 +269,7 @@ class AccountRiskGuard:
     ) -> RiskDecision:
         action = AccountRiskAction(action)
         owned_group_message = action == AccountRiskAction.OWNED_GROUP_MESSAGE
+        owned_group_membership = action == AccountRiskAction.OWNED_GROUP_JOIN
         account_id = self._account_id(account)
         db_account = await self._get_db_account(account_id)
         now = datetime.utcnow()
@@ -274,7 +285,25 @@ class AccountRiskGuard:
                 return await self._block(
                     account, action, "account_inactive", target_type, target_id, details
                 )
-            if db_account.status in {AccountStatus.ERROR, AccountStatus.BANNED} or (
+            # Owned-group membership writes may target restricted or banned
+            # accounts: the operator explicitly plans them, and the per-item
+            # execution result records the concrete Telegram failure.  Hard
+            # system states below stay blocked.
+            if owned_group_membership and db_account.status in {
+                AccountStatus.ERROR,
+                AccountStatus.BANNED,
+                AccountStatus.RESTRICTED,
+            }:
+                pass
+            elif (
+                action == AccountRiskAction.PROFILE_UPDATE
+                and db_account.status == AccountStatus.RESTRICTED
+            ):
+                # A SpamBot-restricted account may still edit its own profile:
+                # Telegram's limit covers messaging and invites, not profile
+                # writes, so the status gate must not block self-updates.
+                pass
+            elif db_account.status in {AccountStatus.ERROR, AccountStatus.BANNED} or (
                 db_account.status == AccountStatus.RESTRICTED
                 and action != AccountRiskAction.SPAM_CHECK
             ):
@@ -338,7 +367,7 @@ class AccountRiskGuard:
                 account, action, "account_missing", target_type, target_id, details
             )
 
-        if not risk_settings["enabled"] and not owned_group_message:
+        if not risk_settings["enabled"] and not owned_group_message and not owned_group_membership:
             await self.record_event(
                 account,
                 action,
@@ -355,6 +384,7 @@ class AccountRiskGuard:
         if (
             not ad_only_delivery
             and not owned_group_message
+            and not owned_group_membership
             and action != AccountRiskAction.SPAM_CHECK
         ):
             warmup_settings = await get_account_warmup_policy_settings(self.db)
@@ -1419,6 +1449,7 @@ class AccountRiskGuard:
         if action in {
             AccountRiskAction.AD_PROBE,
             AccountRiskAction.OWNED_GROUP_MESSAGE,
+            AccountRiskAction.OWNED_GROUP_JOIN,
         }:
             # Never trust a stale database row or an old client payload for
             # this system-owned safety valve.

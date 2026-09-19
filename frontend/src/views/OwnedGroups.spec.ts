@@ -126,6 +126,7 @@ const mocks = vi.hoisted(() => {
     fetchGovernanceCandidates,
     bindGovernance: vi.fn(),
     reconcileGovernance: vi.fn(),
+    unbindGovernance: vi.fn(),
     select,
   };
   return {
@@ -790,12 +791,21 @@ describe("OwnedGroups governance view", () => {
     expect(vm.accountEligibilityReason(vm.promoterOptions[5])).toContain(
       "未就绪",
     );
+    // Restricted/banned/offline accounts stay selectable as planned members;
+    // only inactive or frozen/quarantined accounts are blocked.
+    expect(vm.memberEligibilityReason(vm.promoterOptions[1])).toBe("");
+    expect(vm.memberEligibilityReason(vm.promoterOptions[2])).toBe("");
+    expect(vm.memberEligibilityReason(vm.promoterOptions[3])).toBe("");
+    expect(vm.memberEligibilityReason(vm.promoterOptions[4])).toContain(
+      "风控",
+    );
+    expect(vm.memberEligibilityReason(vm.promoterOptions[5])).toBe("");
     expect(
       vm.isResourceOptionDisabled(
         "user:2",
-        Boolean(vm.accountEligibilityReason(vm.promoterOptions[1])),
+        Boolean(vm.memberEligibilityReason(vm.promoterOptions[1])),
       ),
-    ).toBe(true);
+    ).toBe(false);
     wrapper.unmount();
   });
 

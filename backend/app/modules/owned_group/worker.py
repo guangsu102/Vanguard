@@ -552,14 +552,24 @@ async def enqueue_asset_precheck(
         # NEEDS_ATTENTION is also used for an uncertain Telegram create.  Do
         # not let a normal retry button create a second remote group.  A pure
         # local preflight failure is safe to retry; identify that case from the
-        # latest audit event rather than from the status alone.
+        # latest audit event rather than from the status alone.  The same is
+        # true for a precheck-phase heartbeat quarantine: a PRECHECKING asset
+        # never dispatched a create RPC, so nothing can exist remotely.
         latest_audit = await db.scalar(
             select(OwnedGroupAuditEvent)
             .where(OwnedGroupAuditEvent.group_asset_id == asset.id)
             .order_by(OwnedGroupAuditEvent.id.desc())
             .limit(1)
         )
-        if latest_audit is None or latest_audit.event_type != "owned_group_precheck_failed":
+        retryable_quarantine = (
+            latest_audit is not None
+            and latest_audit.event_type == "owned_group_asset_unknown"
+            and latest_audit.reason_code == "precheck_heartbeat_stale"
+        )
+        if not retryable_quarantine and (
+            latest_audit is None
+            or latest_audit.event_type != "owned_group_precheck_failed"
+        ):
             raise ValueError(
                 "Asset requires explicit Telegram reconciliation before another create attempt"
             )
@@ -1739,6 +1749,16 @@ async def reconcile_stale_owned_group_assets(
         assert_transition("asset", previous, AssetStatus.NEEDS_ATTENTION.value)
         asset.status = AssetStatus.NEEDS_ATTENTION.value
         asset.updated_at = _now()
+        # A PRECHECKING asset has not dispatched any remote write yet (the
+        # create RPC only runs from CREATING), so its quarantine is provably
+        # free of Telegram side effects and precheck re-queueing stays safe.
+        # A CREATING asset may have created the group remotely: keep it on the
+        # stricter create_heartbeat_stale reason that blocks plain retries.
+        reason_code = (
+            "precheck_heartbeat_stale"
+            if previous == AssetStatus.PRECHECKING.value
+            else "create_heartbeat_stale"
+        )
         _audit(
             db,
             event_type="owned_group_asset_unknown",
@@ -1746,7 +1766,7 @@ async def reconcile_stale_owned_group_assets(
             before_state=previous,
             after_state=asset.status,
             result="unknown",
-            reason_code="create_heartbeat_stale",
+            reason_code=reason_code,
         )
         changed += 1
     await db.flush()

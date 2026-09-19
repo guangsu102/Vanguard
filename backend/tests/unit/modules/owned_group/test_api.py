@@ -440,6 +440,18 @@ async def test_strict_operation_precheck_is_read_only_and_checks_session(client,
     member.session_string = None
     member.auth_key_base64 = None
     await test_db.flush()
+    member_without_session = await client.post(
+        f"/api/owned-groups/{asset.id}/operations/precheck",
+        json={"resources": [{"resource_type": "user", "resource_id": member.id}]},
+    )
+    assert member_without_session.status_code == 200
+    # Planned members may lack a session: the per-item execution result
+    # records the concrete failure instead of blocking the whole batch.
+    assert member_without_session.json()["allowed"] is True
+
+    owner.session_string = None
+    owner.auth_key_base64 = None
+    await test_db.flush()
     failed = await client.post(
         f"/api/owned-groups/{asset.id}/operations/precheck",
         json={"resources": [{"resource_type": "user", "resource_id": member.id}]},
@@ -448,7 +460,7 @@ async def test_strict_operation_precheck_is_read_only_and_checks_session(client,
     failed_body = failed.json()
     assert failed_body["allowed"] is False
     assert any(
-        violation["resource_id"] == member.id and violation["reason"] == "account_session_missing"
+        violation["resource_id"] == owner.id and violation["reason"] == "account_session_missing"
         for violation in failed_body["details"]["violations"]
     )
     assert await test_db.scalar(select(func.count(OwnedGroupOperation.id))) == 0

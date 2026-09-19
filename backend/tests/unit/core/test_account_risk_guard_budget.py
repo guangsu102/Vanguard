@@ -91,3 +91,49 @@ async def test_redis_budget_blocks_private_messages_when_limit_is_exceeded(test_
     assert len(stats) == 2
     assert {stat.status for stat in stats} == {"allow", "block"}
     assert all(stat.action == AccountRiskAction.PRIVATE_MESSAGE.value for stat in stats)
+
+
+@pytest.mark.asyncio
+async def test_owned_group_join_allows_restricted_account_that_join_blocks(test_db):
+    account = TelegramAccount(
+        phone="+15559990051",
+        identifier="+15559990051",
+        account_type=AccountType.PROMOTER,
+        api_config_name="default",
+        country_code="US",
+        session_name="owned_join_restricted_session",
+        status=AccountStatus.RESTRICTED,
+        created_at=datetime.utcnow() - timedelta(days=20),
+        managed_started_at=datetime.utcnow() - timedelta(days=20),
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    wrapper = SimpleNamespace(account_id=account.id, country_code="US")
+
+    blocked = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.JOIN,
+        target_type="group",
+        target_id=-100123,
+    )
+    assert blocked.allowed is False
+
+    allowed_join = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.OWNED_GROUP_JOIN,
+        target_type="group",
+        target_id=-100123,
+    )
+    assert allowed_join.allowed is True
+
+    # A restricted account may still edit its own profile.
+    allowed_profile = await guard.check_and_reserve(
+        wrapper,
+        AccountRiskAction.PROFILE_UPDATE,
+        target_type="account",
+        target_id=account.id,
+    )
+    assert allowed_profile.allowed is True

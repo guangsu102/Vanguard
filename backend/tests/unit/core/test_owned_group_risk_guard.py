@@ -193,3 +193,19 @@ async def test_owned_group_preflight_release_is_idempotent_and_attempt_scoped(
     )
     assert second.allowed is True
     assert cache.values[outbound_key] == 1
+
+
+def test_owned_group_join_budget_cannot_be_overridden() -> None:
+    budget = AccountRiskGuard._budget_for_action(
+        AccountRiskAction.OWNED_GROUP_JOIN,
+        {
+            "enabled": True,
+            "actions": {
+                "owned_group_join": {"daily_limit": 999, "cooldown_seconds": 999},
+                "join": {"daily_limit": 1, "cooldown_seconds": 1},
+            },
+            "lifecycle": {},
+        },
+    )
+    assert budget.daily_limit == 300
+    assert budget.cooldown_seconds == 0

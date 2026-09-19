@@ -8,6 +8,7 @@ plumbing every time.
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -39,6 +40,14 @@ class TelegramSendReservationReleasePendingError(TelegramSendPreflightError):
 
 class TelegramJoinRequestPendingError(TelegramExecutionError):
     """Raised when Telegram accepted a join request that still needs approval."""
+
+
+_BOTFATHER_TOKEN_RE = re.compile(r"\b(\d{2,14}:[A-Za-z0-9_-]{30,})\b")
+
+
+def _extract_botfather_token(text: str) -> Optional[str]:
+    match = _BOTFATHER_TOKEN_RE.search(str(text or ""))
+    return match.group(1) if match else None
 
 
 @dataclass(frozen=True)
@@ -636,6 +645,121 @@ class TelegramExecutionService:
                 raise TelegramExecutionError("managed_bot_identity_mismatch")
         return created
 
+    async def create_bot_via_botfather(
+        self,
+        account: Any,
+        *,
+        name: str,
+        username: str,
+        source: str = "managed_bot_provision",
+        on_username_submitted: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> str:
+        """Create one Telegram bot through the @BotFather conversation.
+
+        Works from any authenticated user session and returns the HTTP API
+        token straight from BotFather's confirmation message, so no
+        ``can_manage_bots`` manager bot is required.  ``on_username_submitted``
+        fires right before the username is sent: from that moment the bot may
+        exist remotely even if this call fails, and the caller must fence its
+        retry accordingly.
+        """
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        normalized_name = _normalize_managed_bot_name(name)
+        normalized_username = _normalize_managed_bot_username(username)
+
+        async with self._risk_operation(
+            account,
+            AccountRiskAction.PRIVATE_MESSAGE,
+            target_type="user",
+            target_id="botfather",
+            details={"source": source},
+        ):
+            try:
+                return await self._botfather_new_bot_conversation(
+                    client,
+                    name=normalized_name,
+                    username=normalized_username,
+                    on_username_submitted=on_username_submitted,
+                )
+            except TelegramExecutionError:
+                raise
+            except Exception as exc:
+                raise TelegramExecutionError(
+                    f"botfather_conversation_failed:{type(exc).__name__}"
+                ) from None
+
+    async def _botfather_new_bot_conversation(
+        self,
+        client: Any,
+        *,
+        name: str,
+        username: str,
+        on_username_submitted: Optional[Callable[[], Awaitable[None]]],
+    ) -> str:
+        async with client.conversation("botfather", timeout=45) as conv:
+            await conv.send_message("/newbot")
+            await self._botfather_expect(conv, ("name", "robot"))
+            await conv.send_message(name)
+            await self._botfather_expect(conv, ("username",))
+            if on_username_submitted is not None:
+                await on_username_submitted()
+            await conv.send_message(username)
+            reply = await conv.get_response()
+            token = _extract_botfather_token(reply.message)
+            if token:
+                return token
+            lowered = (reply.message or "").lower()
+            if "taken" in lowered or "unavailable" in lowered or "in use" in lowered:
+                raise TelegramExecutionError("botfather_username_taken")
+            raise TelegramExecutionError(
+                f"botfather_create_rejected:{(reply.message or '')[:120]}"
+            )
+
+    async def _botfather_expect(self, conv: Any, keywords: tuple[str, ...]) -> Any:
+        reply = await conv.get_response()
+        text = str(getattr(reply, "message", "") or "").lower()
+        if not any(keyword in text for keyword in keywords):
+            raise TelegramExecutionError(f"botfather_flow_unexpected:{text[:120]}")
+        return reply
+
+    async def read_botfather_provisioned_token(
+        self,
+        account: Any,
+        *,
+        username: str,
+        source: str = "managed_bot_provision",
+    ) -> Optional[str]:
+        """Recover a provisioned bot's token from the @BotFather chat history.
+
+        Used when a previous conversation submitted the username but died
+        before the token could be parsed.  Returns ``None`` when no token
+        message for this username is found.
+        """
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+        normalized_username = _normalize_managed_bot_username(username)
+        async with self._risk_operation(
+            account,
+            AccountRiskAction.PRIVATE_MESSAGE,
+            target_type="user",
+            target_id="botfather",
+            details={"source": source},
+        ):
+            messages = await client.get_messages("botfather", limit=50)
+        for message in messages or []:
+            text = str(getattr(message, "message", "") or "")
+            if normalized_username.casefold() not in text.casefold():
+                continue
+            token = _extract_botfather_token(text)
+            if token:
+                return token
+        return None
+
     async def check_spambot_status(
         self,
         account: Any,
@@ -1166,6 +1290,7 @@ class TelegramExecutionService:
         group_link: str,
         *,
         source: str = "manual_link_join",
+        action: AccountRiskAction = AccountRiskAction.JOIN,
     ) -> dict[str, Any]:
         """Join a public group or private invite and return resolved chat data."""
         client = self._get_client(account)
@@ -1176,7 +1301,7 @@ class TelegramExecutionService:
         risk_target = parsed.target if parsed.kind == "public" else "private_invite"
         async with self._risk_operation(
             account,
-            AccountRiskAction.JOIN,
+            action,
             target_type="group",
             target_id=risk_target,
             details={"source": source, "link_type": parsed.kind},

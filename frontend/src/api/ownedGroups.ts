@@ -679,6 +679,18 @@ export const ownedGroupsApi = {
       ).data,
     ),
   /**
+   * Detach Guardian governance locally (never contacts Telegram). Required
+   * before a dissolution because only unmanaged assets may be dissolved.
+   */
+  unbindGovernance: async (
+    assetId: number,
+  ): Promise<OwnedGroupGovernanceStatus> =>
+    normalizeGovernanceStatus(
+      (
+        await apiClient.post("/owned-groups/" + assetId + "/governance/unbind")
+      ).data,
+    ),
+  /**
    * Explicitly reveal currently usable invite links for one asset.  Callers
    * should clear the returned plaintext when the asset is deselected/unmounted.
    */

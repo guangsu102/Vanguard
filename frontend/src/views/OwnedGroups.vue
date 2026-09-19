@@ -208,6 +208,17 @@ const accountEligibilityReason = (account: Account): string => {
   return "";
 };
 
+// Planned group members may be restricted, banned, or offline: the backend
+// allows them through precheck and records the concrete per-item Telegram
+// failure instead.  Only hard system states block selection here.
+const memberEligibilityReason = (account: Account): string => {
+  if (!account.is_active) return "系统已停用";
+  if (["frozen", "quarantined"].includes(account.risk_level || "normal")) {
+    return "账号风控已阻断";
+  }
+  return "";
+};
+
 const accountOptionLabel = (account: Account): string => {
   const phone = account.phone || account.identifier || "账号 #" + account.id;
   const displayName =
@@ -555,13 +566,14 @@ const validatePlannedResourceLimit = (): boolean => {
 const validateAccountEligibility = (
   accountId: number,
   contextLabel: string,
+  eligibilityReason: (account: Account) => string = accountEligibilityReason,
 ): boolean => {
   const account = accounts.value.find((item) => item.id === accountId);
   if (!account) {
     ElMessage.warning(contextLabel + "账号不存在或未加载，请刷新后重试");
     return false;
   }
-  const reason = accountEligibilityReason(account);
+  const reason = eligibilityReason(account);
   if (!reason) return true;
   ElMessage.warning(
     contextLabel +
@@ -575,20 +587,30 @@ const validateAccountEligibility = (
 
 const validatePlannedAccountEligibility = (): boolean => {
   if (!selectedAsset.value) return false;
-  const accountIds = new Set<number>([selectedAsset.value.owner_account_id]);
-  selectedResources.value.forEach((key) => {
+  // The owner stays strictly eligible; planned members may be restricted,
+  // banned, or offline and fail per item at execution time.
+  if (
+    !validateAccountEligibility(
+      selectedAsset.value.owner_account_id,
+      "群主",
+      accountEligibilityReason,
+    )
+  ) {
+    precheckResult.value = null;
+    return false;
+  }
+  for (const key of selectedResources.value) {
     const [resourceType, rawId] = key.split(":");
     const accountId = Number(rawId);
     if (
-      resourceType === "user" &&
-      Number.isInteger(accountId) &&
-      accountId > 0
+      resourceType !== "user" ||
+      !Number.isInteger(accountId) ||
+      accountId <= 0 ||
+      accountId === selectedAsset.value.owner_account_id
     ) {
-      accountIds.add(accountId);
+      continue;
     }
-  });
-  for (const accountId of accountIds) {
-    if (!validateAccountEligibility(accountId, "计划成员")) {
+    if (!validateAccountEligibility(accountId, "计划成员", memberEligibilityReason)) {
       precheckResult.value = null;
       return false;
     }
@@ -952,6 +974,32 @@ const reconcileGovernance = async () => {
     governanceActionError.value = getOwnedGroupGovernanceFailure(
       error,
       "Guardian 治理重新检测失败",
+    );
+  }
+};
+
+const unbindGovernance = async () => {
+  const assetId = selectedAsset.value?.id;
+  if (!assetId || !canOperateGovernance.value) return;
+  try {
+    await ElMessageBox.confirm(
+      "停用后系统将不再对该群执行 Guardian 治理检测，群内 Bot 权限保持不变（不会在 Telegram 中撤销管理员）。停用后才能解散该群。确认停用？",
+      "停用 Guardian 治理",
+      { type: "warning", confirmButtonText: "确认停用" },
+    );
+  } catch {
+    return;
+  }
+  governanceActionError.value = null;
+  try {
+    const result = await store.unbindGovernance(assetId);
+    actionMessage.value = "Guardian 治理已停用";
+    ElMessage.success("Guardian 治理已停用");
+    if (result.governance_status === "pending") startPolling();
+  } catch (error) {
+    governanceActionError.value = getOwnedGroupGovernanceFailure(
+      error,
+      "Guardian 治理停用失败",
     );
   }
 };
@@ -1985,6 +2033,13 @@ onBeforeUnmount(() => {
                   >
                     重新检测
                   </el-button>
+                  <el-button
+                    :loading="governanceLoading"
+                    :disabled="!canOperateGovernance"
+                    @click="unbindGovernance"
+                  >
+                    停用治理
+                  </el-button>
                 </template>
                 <template v-else>
                   <el-button type="danger" plain @click="viewGovernanceFailure">
@@ -1996,6 +2051,13 @@ onBeforeUnmount(() => {
                     @click="reconcileGovernance"
                   >
                     重新检测
+                  </el-button>
+                  <el-button
+                    :loading="governanceLoading"
+                    :disabled="!canOperateGovernance"
+                    @click="unbindGovernance"
+                  >
+                    停用治理
                   </el-button>
                 </template>
               </div>
@@ -2060,7 +2122,7 @@ onBeforeUnmount(() => {
                   :disabled="
                     isResourceOptionDisabled(
                       resourceKey('user', account.id),
-                      Boolean(accountEligibilityReason(account)),
+                      Boolean(memberEligibilityReason(account)),
                     )
                   "
                 />

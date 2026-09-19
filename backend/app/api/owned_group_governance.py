@@ -18,6 +18,7 @@ from app.modules.owned_group.governance import (
     list_eligible_guardian_bots,
     new_correlation_id,
     reconcile_governance,
+    unbind_governance,
 )
 
 router = APIRouter()
@@ -118,6 +119,23 @@ async def reconcile_owned_group_governance(
     correlation = new_correlation_id(asset_id, x_correlation_id)
     try:
         data = await reconcile_governance(db, asset_id, current_user, correlation)
+    except GovernanceServiceError as exc:
+        _raise_service_error(exc, asset_id=asset_id, correlation_id=correlation)
+    return GovernanceResponse(data=data)
+
+
+@router.post("/{asset_id:int}/governance/unbind", response_model=GovernanceResponse)
+async def unbind_owned_group_governance(
+    asset_id: int,
+    current_user: dict = Depends(require_owned_group_operator),
+    x_correlation_id: str | None = Header(default=None, alias="X-Correlation-ID"),
+    db: AsyncSession = Depends(get_db),
+) -> GovernanceResponse:
+    """Detach governance locally; never contacts Telegram or demotes the bot."""
+
+    correlation = new_correlation_id(asset_id, x_correlation_id)
+    try:
+        data = await unbind_governance(db, asset_id, current_user, correlation)
     except GovernanceServiceError as exc:
         _raise_service_error(exc, asset_id=asset_id, correlation_id=correlation)
     return GovernanceResponse(data=data)

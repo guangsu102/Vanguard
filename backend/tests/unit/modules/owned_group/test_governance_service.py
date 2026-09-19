@@ -20,6 +20,7 @@ from app.modules.guardian.models import (
     GroupPunishmentPolicy,
     GroupVerificationConfig,
     ManagedGroupBinding,
+    ManagedGroupBindingStatus,
 )
 from app.modules.owned_group.governance import GovernanceServiceError
 from app.modules.owned_group.models import OwnedGroupAsset
@@ -654,3 +655,54 @@ async def test_candidate_list_is_backend_filtered_and_secret_free(test_db):
     assert candidates[0]["guardian_bot_account_id"] == bot.id
     assert candidates[0]["owned_profile_status"] == "verified"
     assert "token" not in str(candidates).lower()
+
+
+@pytest.mark.asyncio
+async def test_unbind_detaches_managed_governance_for_dissolution(
+    test_db, monkeypatch
+):
+    asset, _owner, bot, _guardian_profile, _owned_profile = await _seed_eligible(
+        test_db
+    )
+    _install_client(monkeypatch)
+    bound = await governance.bind_governance(
+        test_db, asset.id, bot.id, {"id": 77}, "test-unbind-bind"
+    )
+    assert bound["governance_status"] == "managed"
+    binding = await test_db.get(ManagedGroupBinding, bound["managed_binding_id"])
+    assert binding is not None
+
+    result = await governance.unbind_governance(
+        test_db, asset.id, {"id": 77}, "test-unbind"
+    )
+
+    assert result["governance_status"] == "disabled"
+    assert result["guardian_bot_account_id"] is None
+    assert result["managed_binding_id"] is None
+    await test_db.refresh(asset)
+    assert asset.governance_status == "disabled"
+    assert asset.guardian_bot_account_id is None
+    assert asset.managed_binding_id is None
+    await test_db.refresh(binding)
+    assert binding.binding_status == ManagedGroupBindingStatus.INACTIVE
+    audit = await test_db.scalar(
+        select(OwnedGroupAuditEvent)
+        .where(OwnedGroupAuditEvent.event_type == "owned_group_governance_unbound")
+        .order_by(OwnedGroupAuditEvent.id.desc())
+        .limit(1)
+    )
+    assert audit is not None
+    assert audit.reason_code == "operator_unbind"
+
+
+@pytest.mark.asyncio
+async def test_unbind_rejects_asset_without_governance(test_db):
+    asset, _owner, _bot, _guardian_profile, _owned_profile = await _seed_eligible(
+        test_db, chat_id=-10091009
+    )
+
+    with pytest.raises(GovernanceServiceError) as caught:
+        await governance.unbind_governance(
+            test_db, asset.id, {"id": 77}, "test-unbind-missing"
+        )
+    assert caught.value.reason == "governance_not_bound"

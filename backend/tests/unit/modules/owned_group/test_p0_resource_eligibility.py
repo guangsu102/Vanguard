@@ -52,7 +52,7 @@ async def _account(
 
 
 @pytest.mark.asyncio
-async def test_precheck_rejects_runtime_unready_user(test_db):
+async def test_precheck_allows_offline_member_but_keeps_owner_ready(test_db):
     owner = await _account(test_db, "p0-owner")
     offline = await _account(
         test_db,
@@ -70,53 +70,64 @@ async def test_precheck_rejects_runtime_unready_user(test_db):
         owner.id,
     )
 
-    assert decision.allowed is False
-    assert decision.reason == "resource_eligibility_failed"
-    assert any(
-        item["resource_id"] == offline.id and item["reason"] == "account_status_not_ready"
-        for item in decision.details["violations"]
-    )
+    # Planned members may be offline; the per-item execution result records
+    # the concrete Telegram failure instead of blocking the whole batch.
+    assert decision.allowed is True
+    assert decision.details["selected_accounts"] == 2
 
 
 @pytest.mark.parametrize(
-    ("blocked_status", "spam_check_status", "expected_reason"),
+    ("member_status", "spam_check_status"),
     [
-        (AccountStatus.RESTRICTED, "clear", "account_restricted"),
-        (AccountStatus.BANNED, "clear", "account_banned"),
-        (AccountStatus.ERROR, "clear", "account_error"),
-        (AccountStatus.ONLINE, "restricted", "account_spam_restricted"),
+        (AccountStatus.RESTRICTED, "clear"),
+        (AccountStatus.BANNED, "clear"),
+        (AccountStatus.ERROR, "clear"),
+        (AccountStatus.ONLINE, "restricted"),
     ],
 )
 @pytest.mark.asyncio
-async def test_precheck_rejects_blocked_account_when_runtime_readiness_is_deferred(
+async def test_precheck_allows_unready_membership_for_members_only(
     test_db,
-    blocked_status,
+    member_status,
     spam_check_status,
-    expected_reason,
 ):
     owner = await _account(test_db, "p0-deferred-owner")
-    blocked = await _account(
+    member = await _account(
         test_db,
-        "p0-deferred-blocked-" + expected_reason,
-        status=blocked_status,
+        "p0-unready-member-" + str(member_status.value) + spam_check_status,
+        status=member_status,
         spam_check_status=spam_check_status,
     )
 
-    decision = await precheck_owned_group_resources(
+    member_decision = await precheck_owned_group_resources(
         test_db,
         [
             {"resource_type": "user", "resource_id": owner.id},
-            {"resource_type": "user", "resource_id": blocked.id},
+            {"resource_type": "user", "resource_id": member.id},
         ],
         owner.id,
         require_runtime_ready=False,
     )
+    assert member_decision.allowed is True
 
-    assert decision.allowed is False
-    assert any(
-        item["resource_id"] == blocked.id and item["reason"] == expected_reason
-        for item in decision.details["violations"]
+    # The same unready state on the owner account stays a hard block.
+    owner_decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+        require_runtime_ready=False,
     )
+    owner.status = member_status
+    owner.spam_check_status = spam_check_status
+    await test_db.flush()
+    blocked_owner_decision = await precheck_owned_group_resources(
+        test_db,
+        [{"resource_type": "user", "resource_id": owner.id}],
+        owner.id,
+        require_runtime_ready=False,
+    )
+    assert owner_decision.allowed is True
+    assert blocked_owner_decision.allowed is False
 
 
 @pytest.mark.asyncio

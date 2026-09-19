@@ -167,6 +167,18 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     }
   };
 
+  const unbindGovernance = async (assetId: number) => {
+    setGovernanceLoading(assetId, true);
+    try {
+      return cacheGovernance(await ownedGroupsApi.unbindGovernance(assetId));
+    } catch (error) {
+      await refreshGovernanceAfterFailure(assetId);
+      throw error;
+    } finally {
+      setGovernanceLoading(assetId, false);
+    }
+  };
+
   const fetchInviteLinks = async (
     id: number,
   ): Promise<OwnedGroupInviteLinkListResponse> => {
@@ -482,6 +494,7 @@ export const useOwnedGroupStore = defineStore("ownedGroup", () => {
     fetchGovernanceCandidates,
     bindGovernance,
     reconcileGovernance,
+    unbindGovernance,
     fetchInviteLinks,
     revokeInviteLink,
     regenerateInviteLink,
