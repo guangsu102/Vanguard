@@ -252,8 +252,8 @@ class AccountWarmupPolicyUpdate(BaseModel):
 
 class AdDeliveryThrottleUpdate(BaseModel):
     enabled: bool = True
-    growth_min_interval_seconds: int = Field(default=1800, ge=1800, le=86400)
-    growth_max_interval_seconds: int = Field(default=10800, ge=3000, le=86400)
+    growth_min_interval_seconds: int = Field(default=600, ge=600, le=86400)
+    growth_max_interval_seconds: int = Field(default=1800, ge=600, le=86400)
 
 
 class AdDeliveryExecutionUpdate(BaseModel):
@@ -274,8 +274,9 @@ class AdCapacityUpdate(BaseModel):
     survival_one_hour_seconds: int = Field(default=3600, ge=300, le=7200)
     survival_twenty_four_hour_seconds: int = Field(default=86400, ge=3600, le=172800)
     survival_check_batch_size: int = Field(default=50, ge=1, le=500)
-    max_groups_per_account: int = Field(default=400, ge=1, le=1000)
-    max_new_ad_groups_per_day: int = Field(default=2, ge=0, le=2)
+    max_groups_per_account: int = Field(default=100, ge=1, le=100)
+    max_new_ad_groups_per_day: int = Field(default=2, ge=0, le=10)
+    probe_backlog_max_days: int = Field(default=3, ge=0, le=30)
     leave_on_deleted_ad: bool = Field(
         default=True,
         description="删除广告达到触发条件时是否调用 Telegram 退群；关闭后仅暂停或记录",
@@ -1072,6 +1073,13 @@ async def update_ad_delivery_execution_config(
     return {"code": 0, "message": "success", "data": config}
 
 
+@router.get("/ads/probe-queue")
+async def get_probe_queue(db: AsyncSession = Depends(get_db)) -> dict:
+    from app.modules.acquisition.probe_queue import build_probe_queue
+
+    return {"code": 0, "message": "success", "data": await build_probe_queue(db, datetime.utcnow())}
+
+
 @router.get("/ads/capacity")
 async def get_ad_capacity_config(db: AsyncSession = Depends(get_db)) -> dict:
     return {"code": 0, "message": "success", "data": await get_ad_capacity_settings(db)}
@@ -1816,7 +1824,7 @@ class AccountOperationConfigUpdate(BaseModel):
     auto_join_enabled: Optional[bool] = None
     auto_ads_enabled: Optional[bool] = None
     max_groups_per_day: Optional[int] = Field(None, ge=0, le=10)
-    max_groups_total: Optional[int] = Field(None, ge=0, le=10000)
+    max_groups_total: Optional[int] = Field(None, ge=0, le=100)
     join_interval_min_seconds: Optional[int] = Field(None, ge=60)
     join_interval_max_seconds: Optional[int] = Field(None, ge=60)
     next_join_after: Optional[datetime] = None
@@ -2647,7 +2655,7 @@ class AdCampaignCreate(BaseModel):
     interval_minutes: int = Field(default=1440, ge=1)
     scheduled_times: Optional[list[str]] = None
     max_sends_per_group_per_day: int = Field(default=1, ge=1, le=1000)
-    max_sends_per_account_per_day: int = Field(default=10, ge=1, le=1000)
+    max_sends_per_account_per_day: int = Field(default=30, ge=1, le=1000)
 
 
 class AdCampaignUpdate(BaseModel):

@@ -19,9 +19,27 @@ const stats = computed(() => statsStore.dashboardStats || {
   onlineAccounts: 0,
   totalGroups: 0,
   totalUsers: 0,
+  activeUsers: 0,
   dailyRegistered: 0,
+  dailyConverted: 0,
+  dailyMessages: 0,
+  dailyViolations: 0,
   conversionRate: 0,
+  weeklyTrend: [],
+  accountDistribution: [],
+  topGroups: [],
 })
+
+const accountStatusLabels: Record<string, string> = {
+  online: '在线',
+  working: '工作中',
+  idle: '空闲',
+  offline: '离线',
+  restricted: '受限',
+  banned: '封禁',
+  error: '异常',
+  disabled: '禁用',
+}
 
 const trendChartOption = computed(() => {
   const data = statsStore.dashboardStats?.weeklyTrend || []
@@ -99,7 +117,7 @@ const distributionChartOption = computed(() => {
         },
         data: data.map((d) => ({
           value: d.count,
-          name: d.status === 'online' ? '在线' : d.status === 'offline' ? '离线' : '封禁',
+          name: accountStatusLabels[d.status] || d.status,
         })),
         itemStyle: {
           borderRadius: 6,
@@ -231,7 +249,7 @@ onUnmounted(() => {
     </el-row>
 
     <el-row :gutter="20" class="stats-row secondary">
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card class="stat-card small" shadow="hover">
           <el-statistic title="今日注册" :value="stats.dailyRegistered">
             <template #suffix>
@@ -241,7 +259,17 @@ onUnmounted(() => {
         </el-card>
       </el-col>
 
-      <el-col :span="8">
+      <el-col :span="6">
+        <el-card class="stat-card small" shadow="hover">
+          <el-statistic title="今日发送" :value="stats.dailyMessages">
+            <template #suffix>
+              <span class="stat-unit">条</span>
+            </template>
+          </el-statistic>
+        </el-card>
+      </el-col>
+
+      <el-col :span="6">
         <el-card class="stat-card small" shadow="hover">
           <el-statistic title="转化率" :value="stats.conversionRate" suffix="%">
             <template #prefix>
@@ -251,9 +279,9 @@ onUnmounted(() => {
         </el-card>
       </el-col>
 
-      <el-col :span="8">
+      <el-col :span="6">
         <el-card class="stat-card small" shadow="hover">
-          <el-statistic title="活跃用户" :value="stats.totalUsers" suffix="人">
+          <el-statistic title="活跃用户" :value="stats.activeUsers" suffix="人">
           </el-statistic>
         </el-card>
       </el-col>

@@ -64,6 +64,8 @@ class OwnedGroupAiPersonaFeatureMutation:
     value: dict[str, Any]
     before: dict[str, Any]
     changed: bool
+
+
 DEFAULT_NOTIFICATION_SETTINGS: dict[str, Any] = {
     "sub2apiAlertsEnabled": False,
     "sub2apiNotifyResolved": True,
@@ -450,6 +452,16 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
                 ),
                 default_verification["allow_text_answers"],
             ),
+            "allow_second_hop_bots": _bool_setting(
+                verification.get(
+                    "allow_second_hop_bots",
+                    verification.get(
+                        "allowSecondHopBots",
+                        default_verification["allow_second_hop_bots"],
+                    ),
+                ),
+                default_verification["allow_second_hop_bots"],
+            ),
             "answer_profile": str(
                 verification.get(
                     "answer_profile",
@@ -806,9 +818,7 @@ def normalize_owned_group_messaging_settings(payload: dict[str, Any] | None) -> 
     defaults = DEFAULT_OWNED_GROUP_MESSAGING_SETTINGS
     return {
         "enabled": _bool_setting(raw.get("enabled"), defaults["enabled"]),
-        "dryRun": _bool_setting(
-            raw.get("dryRun", raw.get("dry_run")), defaults["dryRun"]
-        ),
+        "dryRun": _bool_setting(raw.get("dryRun", raw.get("dry_run")), defaults["dryRun"]),
         "globalMaxPerGroupPerDay": _int_setting(
             raw.get(
                 "globalMaxPerGroupPerDay",
@@ -1002,12 +1012,8 @@ def normalize_app_runtime_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
         },
         "groupAiInteraction": normalize_group_ai_interaction_settings(group_ai),
-        "ownedGroupMessaging": normalize_owned_group_messaging_settings(
-            owned_group_messaging
-        ),
-        "ownedGroupAiPersona": normalize_owned_group_ai_persona_settings(
-            owned_group_ai_persona
-        ),
+        "ownedGroupMessaging": normalize_owned_group_messaging_settings(owned_group_messaging),
+        "ownedGroupAiPersona": normalize_owned_group_ai_persona_settings(owned_group_ai_persona),
         "keywordPrivateReply": {
             "enabled": _bool_setting(
                 keyword_private.get("enabled", DEFAULT_KEYWORD_PRIVATE_REPLY_SETTINGS["enabled"]),
@@ -1050,9 +1056,7 @@ def with_owned_group_ai_persona_effective_state(
 
 async def get_owned_group_ai_persona_settings(db: AsyncSession) -> dict[str, Any]:
     app_settings = await get_app_runtime_settings(db)
-    return with_owned_group_ai_persona_effective_state(
-        app_settings.get("ownedGroupAiPersona")
-    )
+    return with_owned_group_ai_persona_effective_state(app_settings.get("ownedGroupAiPersona"))
 
 
 def _deep_merge_runtime_settings(
@@ -1164,9 +1168,7 @@ async def mutate_owned_group_ai_persona_feature(
             http_status=503,
         )
     payload = _setting_payload(setting)
-    before = normalize_owned_group_ai_persona_settings(
-        payload.get("ownedGroupAiPersona")
-    )
+    before = normalize_owned_group_ai_persona_settings(payload.get("ownedGroupAiPersona"))
     target_enabled = bool(enabled)
     if bool(before["enabled"]) == target_enabled:
         return OwnedGroupAiPersonaFeatureMutation(
@@ -1184,12 +1186,7 @@ async def mutate_owned_group_ai_persona_feature(
                 "enabled": bool(before["enabled"]),
             },
         )
-    now = (
-        datetime.now(UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    now = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     updated = {
         "enabled": target_enabled,
         "revision": int(before["revision"]) + 1,
@@ -2012,7 +2009,7 @@ def normalize_ad_delivery_throttle_settings(payload: dict[str, Any] | None) -> d
         return _int_setting(
             raw.get(name, defaults[name]),
             defaults[name],
-            min_value=1800,
+            min_value=600,
             max_value=86400,
         )
 
@@ -2218,7 +2215,11 @@ def normalize_ad_capacity_settings(payload: dict[str, Any] | None) -> dict[str, 
             ),
             defaults["max_new_ad_groups_per_day"],
             min_value=0,
-            max_value=2,
+            max_value=10,
+        ),
+        "probe_backlog_max_days": _int_setting(
+            raw.get("probe_backlog_max_days", defaults["probe_backlog_max_days"]),
+            defaults["probe_backlog_max_days"], min_value=0, max_value=30,
         ),
         "leave_on_deleted_ad": _bool_setting(
             raw.get(

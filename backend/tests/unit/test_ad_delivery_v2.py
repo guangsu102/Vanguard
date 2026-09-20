@@ -40,6 +40,75 @@ from scripts.apply_sql_migrations import DEFAULT_MIGRATIONS, _split_sql_statemen
 
 
 @pytest.mark.asyncio
+async def test_ad_send_surfaces_account_pool_lease_contention():
+    pool = SimpleNamespace(acquire_by_id=AsyncMock(return_value=None))
+    service = AcquisitionAutomationService(db=AsyncMock(), account_pool=pool)
+    creative = SimpleNamespace(
+        content="test",
+        link_url=None,
+        creative_type="text",
+        media_url=None,
+    )
+
+    with pytest.raises(RuntimeError, match="account unavailable"):
+        await service._send_ad(8, -100123, creative)
+
+    pool.acquire_by_id.assert_awaited_once_with(
+        8,
+        purpose="ad_delivery",
+        raise_on_lease_failure=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ad_only_creative_selection_reuses_approved_pool_without_growth_dedupe():
+    service = AcquisitionAutomationService(db=AsyncMock())
+    creatives = [SimpleNamespace(id=index, weight=1) for index in range(1, 9)]
+    campaign = SimpleNamespace(id=2, delivery_policy=AdDeliveryPolicy.AD_ONLY.value)
+    binding = SimpleNamespace(campaign=campaign)
+    service._creative_pool_for_binding = AsyncMock(return_value=creatives)
+    service._filter_recent_target_creatives = AsyncMock(return_value=[])
+
+    selected = await service._choose_delivery_creative(binding, -100480)
+
+    assert selected in creatives
+    service._filter_recent_target_creatives.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_growth_creative_selection_keeps_target_dedupe():
+    service = AcquisitionAutomationService(db=AsyncMock())
+    creatives = [SimpleNamespace(id=index, weight=1) for index in range(1, 9)]
+    campaign = SimpleNamespace(id=1, delivery_policy=AdDeliveryPolicy.GROWTH.value)
+    binding = SimpleNamespace(campaign=campaign)
+    service._creative_pool_for_binding = AsyncMock(return_value=creatives)
+    service._filter_recent_target_creatives = AsyncMock(return_value=[creatives[-1]])
+
+    selected = await service._choose_delivery_creative(binding, -100123)
+
+    assert selected is creatives[-1]
+    service._filter_recent_target_creatives.assert_awaited_once_with(
+        creatives,
+        campaign.id,
+        -100123,
+    )
+
+
+def test_ad_delivery_pool_unavailable_is_transient_not_account_issue():
+    service = AcquisitionAutomationService(db=AsyncMock())
+
+    assert service._classify_ad_delivery_error(
+        RuntimeError("account unavailable")
+    ) == "transient:account unavailable"
+    assert service._classify_ad_delivery_error(
+        automation_module.AccountOperationLeaseBusy("busy")
+    ) == "account_operation_lease_busy"
+    assert service._classify_ad_delivery_error(
+        automation_module.AccountOperationLeaseUnavailable("redis unavailable")
+    ) == "account_operation_lease_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_growth_campaign_account_daily_quota_reserves_and_releases(test_db):
     account = TelegramAccount(
         identifier="growth-account-quota",
@@ -707,7 +776,7 @@ async def test_ad_only_group_mute_uses_configured_backoff_sequence(
     service = AcquisitionAutomationService(test_db)
     error = f"{automation_module.AD_GROUP_CONTROL_ERROR_PREFIX}ChatWriteForbiddenError"
 
-    expected_backoffs = (40, 160, 640, 320, 160)
+    expected_backoffs = (40, 160)
     for attempt, expected_minutes in enumerate(expected_backoffs, start=1):
         test_db.add(
             AdDeliveryLog(
@@ -748,7 +817,7 @@ async def test_ad_only_group_mute_uses_configured_backoff_sequence(
         )
     )
     state.status = AdScheduleStatus.SENDING.value
-    state.lock_token = "mute-6"
+    state.lock_token = "mute-3"
     await test_db.commit()
 
     await service._finish_ad_schedule_state(
@@ -764,7 +833,7 @@ async def test_ad_only_group_mute_uses_configured_backoff_sequence(
     assert state.status == AdScheduleStatus.PAUSED.value
     assert state.next_due_at == now
     assert state.last_reason.startswith(
-        f"{automation_module.AD_ONLY_GROUP_CONTROL_PAUSED_REASON_PREFIX}:6:"
+        f"{automation_module.AD_ONLY_GROUP_CONTROL_PAUSED_REASON_PREFIX}:3:"
     )
 
     sibling_campaign = AdCampaign(
@@ -1171,6 +1240,64 @@ async def test_ad_only_temporary_group_mute_never_leaves_membership(test_db):
 
 
 @pytest.mark.asyncio
+async def test_ad_only_group_control_failure_leaves_after_three_attempts(test_db):
+    account = TelegramAccount(
+        identifier="ad-only-leave-after-three",
+        session_name="ad-only-leave-after-three",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=940115,
+        title="Muted three times",
+        level=GroupLevel.A,
+        status="active",
+    )
+    membership = GroupAccountMembership(
+        group=group,
+        account=account,
+        telegram_group_id=group.group_id,
+        status="joined",
+    )
+    campaign = AdCampaign(
+        name="Leave after three campaign",
+        enabled=True,
+        status="active",
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+    )
+    test_db.add_all([account, group, membership, campaign])
+    await test_db.flush()
+    error = f"{automation_module.AD_GROUP_CONTROL_ERROR_PREFIX}ChatWriteForbiddenError"
+    for _ in range(3):
+        test_db.add(
+            AdDeliveryLog(
+                account_id=account.id,
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                ad_campaign_id=campaign.id,
+                status=DeliveryStatus.FAILED.value,
+                error=error,
+            )
+        )
+    await test_db.commit()
+    service = AcquisitionAutomationService(test_db)
+    service._leave_group = AsyncMock(return_value=None)
+
+    await service._handle_group_control_ad_failure(
+        account.id,
+        group,
+        error,
+        delivery_policy=AdDeliveryPolicy.AD_ONLY.value,
+    )
+
+    await test_db.refresh(membership)
+    assert membership.status == "left"
+    assert membership.ad_status == automation_module.MEMBERSHIP_AD_STATUS_BLOCKED
+    service._leave_group.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_exposure_reconciliation_creates_schedule_and_preserves_live_owners(test_db):
     observed_at = datetime(2026, 8, 30, 8, 0, 0)
     exposure_at = observed_at - timedelta(hours=1)
@@ -1479,3 +1606,24 @@ def test_join_and_ad_cooldown_sql_migration_is_registered_and_parseable():
         and "86400" in item
         for item in statements
     )
+
+
+def test_growth_ad_capacity_sql_migration_is_registered_and_parseable():
+    migration_name = "057_set_growth_ad_capacity.sql"
+    migrations_dir = Path(__file__).parents[2] / "migrations"
+    migration_path = migrations_dir / migration_name
+
+    assert migration_name in DEFAULT_MIGRATIONS
+    statements = _split_sql_statements(migration_path.read_text(encoding="utf-8"))
+    assert any(
+        "ALTER COLUMN max_sends_per_account_per_day SET DEFAULT 30" in item
+        for item in statements
+    )
+    assert any(
+        "growth_min_interval_seconds" in item
+        and "600" in item
+        and "growth_max_interval_seconds" in item
+        and "1800" in item
+        for item in statements
+    )
+    assert any("max_groups_per_account" in item and "100" in item for item in statements)

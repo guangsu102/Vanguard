@@ -156,14 +156,19 @@ class GroupFailoverService:
                 result.skipped += 1
                 continue
 
+            # AsyncSession.rollback() expires ORM state even when the session
+            # factory uses expire_on_commit=False. Keep the scalar identifier before
+            # entering the failure path so retry scheduling never triggers an
+            # implicit async refresh through an expired task.
+            task_id = int(task.id)
             try:
-                outcome = await self._execute_claimed_task(task.id, now)
+                outcome = await self._execute_claimed_task(task_id, now)
             except Exception as exc:
                 await self.db.rollback()
                 message = str(exc)[:2000]
-                await self._schedule_retry(task.id, "failover_execution_error", message, now)
+                await self._schedule_retry(task_id, "failover_execution_error", message, now)
                 result.failed += 1
-                result.errors.append(f"task={task.id}: {message}")
+                result.errors.append(f"task={task_id}: {message}")
                 continue
 
             result.details.append(outcome)
@@ -583,6 +588,14 @@ class GroupFailoverService:
         target_account_id = task.target_account_id
         if group is None or target_account_id is None:
             raise RuntimeError("claimed failover task lost group or target account")
+
+        target_account = await self.db.get(TelegramAccount, target_account_id)
+        if target_account is None:
+            raise RuntimeError("claimed failover task lost target account")
+        # Standalone Celery workers start with an empty process-local account
+        # pool. Auto-join hydrates that pool before Telegram work; failover must
+        # do the same for its selected replacement account.
+        await self.automation._sync_account_pool([target_account])
 
         membership = (
             await self.db.execute(

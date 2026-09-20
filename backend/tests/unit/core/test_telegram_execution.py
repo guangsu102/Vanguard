@@ -160,6 +160,31 @@ async def test_ad_delivery_marks_attempt_at_telegram_call_boundary():
 
 
 @pytest.mark.asyncio
+async def test_group_message_without_message_id_records_failure():
+    client = FakeClient()
+    client.send_message = AsyncMock(return_value=SimpleNamespace())
+    account = SimpleNamespace(account_id=13, client=client)
+    risk_guard = SimpleNamespace(
+        check_and_reserve=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, reason="reserved")
+        ),
+        record_failure=AsyncMock(),
+        record_success=AsyncMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="telegram send returned no message id"):
+        await TelegramExecutionService(risk_guard).send_group_message(
+            account,
+            123,
+            "probe",
+            source="ad_probe",
+        )
+
+    risk_guard.record_failure.assert_awaited_once()
+    risk_guard.record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_private_message_blocked_by_risk_guard_does_not_send_message():
     client = FakeClient()
     account = SimpleNamespace(account_id=3, client=client)

@@ -1049,7 +1049,11 @@ class TestAutoJoinStateHandling:
         )
 
     @pytest.mark.asyncio
-    async def test_ad_probe_risk_guard_block_is_rescheduled_without_failure(self):
+    async def test_ad_probe_risk_guard_block_is_rescheduled_without_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            acquisition_automation, "get_ad_capacity_settings",
+            AsyncMock(return_value={"window_start_hour": 9, "window_end_hour": 2, "timezone_offset_hours": 8}),
+        )
         service = AcquisitionAutomationService(db=MagicMock())
         service.db.commit = AsyncMock()
         account = MagicMock()

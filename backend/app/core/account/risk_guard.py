@@ -11,6 +11,8 @@ import hashlib
 import json
 import os
 import re
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
@@ -33,6 +35,7 @@ from app.core.account.warmup import account_warmup_block_reason, account_warmup_
 from app.core.automation_settings import (
     get_account_risk_guard_settings,
     get_account_warmup_policy_settings,
+    get_ad_capacity_settings,
 )
 from app.core.config import get_settings
 from app.core.operating_time import operating_date
@@ -76,6 +79,7 @@ class RiskDecision:
     allowed: bool
     reason: str = "allowed"
     retry_after_seconds: Optional[int] = None
+    content_reservation: Optional[dict[str, str]] = None
 
 
 DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
@@ -83,9 +87,8 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.JOIN: RiskBudget(daily_limit=10, cooldown_seconds=7200),
     AccountRiskAction.PRIVATE_MESSAGE: RiskBudget(daily_limit=40, cooldown_seconds=45),
     AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=4, cooldown_seconds=7200),
-    # AD_PROBE is a system-owned safety valve.  It is intentionally absent
-    # from the editable account-risk settings and always falls back to this
-    # fixed 10/day, 1-hour cooldown budget.
+    # AD_PROBE is a system-owned safety valve. Its runtime daily budget is
+    # derived from the successful-group target, with this value as the floor.
     AccountRiskAction.AD_PROBE: RiskBudget(daily_limit=10, cooldown_seconds=3600),
     AccountRiskAction.AI_WARMUP: RiskBudget(daily_limit=1, cooldown_seconds=21600),
     AccountRiskAction.MODERATION: RiskBudget(daily_limit=60, cooldown_seconds=15),
@@ -153,6 +156,19 @@ RISK_LEVEL_BUDGET_MULTIPLIER: dict[str, float] = {
     AccountRiskLevel.FROZEN.value: 0.0,
     AccountRiskLevel.QUARANTINED.value: 0.0,
 }
+def _ad_probe_attempt_limit(capacity: dict[str, Any]) -> int:
+    """Keep failure headroom without exposing another operator-managed quota."""
+    success_limit = max(0, min(10, int(capacity.get("max_new_ad_groups_per_day", 2))))
+    return max(10, min(20, (success_limit * 3 + 1) // 2))
+
+
+def _ad_probe_operating_date(now: datetime, capacity: dict[str, Any]) -> date:
+    offset = timedelta(hours=int(capacity.get("timezone_offset_hours", 8)))
+    start_hour = int(capacity.get("window_start_hour", 9))
+    local = now + offset - timedelta(hours=start_hour)
+    return local.date()
+
+
 MESSAGE_ACTIONS = {
     AccountRiskAction.PRIVATE_MESSAGE,
     AccountRiskAction.SPAM_CHECK,
@@ -183,6 +199,28 @@ AI_ERROR_CLASSIFIER_ALLOWED_REASONS = {
     "account_restricted",
     "telegram_error",
 }
+
+
+# Reserve both exact-content scopes atomically. Keep ambiguous send outcomes for
+# the normal dedupe horizon; only confirmed pre-send refusals release the token.
+CONTENT_RESERVATION_LUA = """
+if redis.call("EXISTS", KEYS[1]) == 1 then return {1, redis.call("TTL", KEYS[1])} end
+if redis.call("EXISTS", KEYS[2]) == 1 then return {2, redis.call("TTL", KEYS[2])} end
+redis.call("SET", KEYS[1], ARGV[1], "EX", 21600)
+redis.call("SET", KEYS[2], ARGV[1], "EX", 259200)
+redis.call("LPUSH", KEYS[3], ARGV[2])
+redis.call("LTRIM", KEYS[3], 0, 49)
+redis.call("EXPIRE", KEYS[3], 259200)
+return {0, 0}
+"""
+
+CONTENT_RESERVATION_RELEASE_LUA = """
+for i = 1, 2 do
+  if redis.call("GET", KEYS[i]) == ARGV[1] then redis.call("DEL", KEYS[i]) end
+end
+redis.call("LREM", KEYS[3], 1, ARGV[2])
+return 1
+"""
 
 
 ATOMIC_BUDGET_RESERVATION_LUA = """
@@ -381,6 +419,12 @@ class AccountRiskGuard:
         delivery_policy = str((details or {}).get("delivery_policy") or "growth")
         ad_only_delivery = action == AccountRiskAction.AD_DELIVERY and delivery_policy == "ad_only"
         budget = self._budget_for_action(action, risk_settings)
+        if action == AccountRiskAction.AD_PROBE:
+            capacity = await get_ad_capacity_settings(self.db)
+            budget = RiskBudget(
+                daily_limit=_ad_probe_attempt_limit(capacity),
+                cooldown_seconds=budget.cooldown_seconds,
+            )
         if (
             not ad_only_delivery
             and not owned_group_message
@@ -405,12 +449,20 @@ class AccountRiskGuard:
                 risk_settings=risk_settings,
                 warmup_multiplier=warmup.action_multiplier,
             )
-        content_decision = await self._check_content_policy(
-            account_id, action, target_type, target_id, details
-        )
+        try:
+            content_decision = await self._check_content_policy(
+                account_id, action, target_type, target_id, details
+            )
+        except Exception as exc:
+            self.logger.warning("content_policy_unavailable", error_type=type(exc).__name__)
+            return await self._block(
+                account, action, "content_check_unavailable", target_type, target_id, details,
+                retry_after_seconds=300,
+            )
         if not content_decision.allowed:
             return await self._block(
-                account, action, content_decision.reason, target_type, target_id, details
+                account, action, content_decision.reason, target_type, target_id, details,
+                retry_after_seconds=content_decision.retry_after_seconds,
             )
         reservation_id = (
             str((details or {}).get("risk_reservation_id") or "")
@@ -421,14 +473,15 @@ class AccountRiskGuard:
             }
             else None
         )
-        allowed, reason, retry_after = await self._reserve_budget(
-            account_id,
-            action,
-            budget,
-            risk_settings,
-            reservation_id=reservation_id,
-        )
+        try:
+            allowed, reason, retry_after = await self._reserve_budget(
+                account_id, action, budget, risk_settings, reservation_id=reservation_id,
+            )
+        except BaseException:
+            await self.release_content_reservation(content_decision.content_reservation)
+            raise
         if not allowed:
+            await self.release_content_reservation(content_decision.content_reservation)
             return await self._block(
                 account,
                 action,
@@ -454,6 +507,7 @@ class AccountRiskGuard:
                 owned_group_message
                 or action == AccountRiskAction.MANAGED_BOT_CREATE
             ):
+                await self.release_content_reservation(content_decision.content_reservation)
                 raise
             try:
                 await self.db.rollback()
@@ -471,7 +525,7 @@ class AccountRiskGuard:
                 error_type=type(exc).__name__,
                 error=redact_sensitive_text(exc, max_length=500),
             )
-        return RiskDecision(True)
+        return RiskDecision(True, content_reservation=content_decision.content_reservation)
 
     async def record_success(
         self,
@@ -1054,9 +1108,15 @@ class AccountRiskGuard:
         if self.cache.client is None:
             return False, "risk_budget_unavailable", None
 
-        day_key = operating_date().strftime("%Y%m%d")
-        action_key = f"risk:account:{account_id}:daily:{action.value}:{day_key}"
-        outbound_key = f"risk:account:{account_id}:daily:outbound_message:{day_key}"
+        calendar_day_key = operating_date().strftime("%Y%m%d")
+        action_day_key = calendar_day_key
+        if action == AccountRiskAction.AD_PROBE:
+            capacity = await get_ad_capacity_settings(self.db)
+            action_day_key = _ad_probe_operating_date(datetime.utcnow(), capacity).strftime(
+                "%Y%m%d"
+            )
+        action_key = f"risk:account:{account_id}:daily:{action.value}:{action_day_key}"
+        outbound_key = f"risk:account:{account_id}:daily:outbound_message:{calendar_day_key}"
         cooldown_key = f"risk:account:{account_id}:cooldown:{action.value}"
         outbound_limit = (
             await self._outbound_message_hard_cap(account_id, risk_settings)
@@ -1391,6 +1451,10 @@ class AccountRiskGuard:
         account.risk_reason = reason
         account.last_risk_event_at = datetime.utcnow()
         self.db.add(account)
+        # ``record_event`` intentionally reloads the account with
+        # ``populate_existing``. Flush the operator adjustment first so that
+        # reload cannot restore the pre-adjustment risk state.
+        await self.db.flush()
         await self.record_event(
             account,
             AccountRiskAction.JOIN,
@@ -1619,6 +1683,39 @@ class AccountRiskGuard:
             cooldown_seconds = int(cooldown_seconds / max(multiplier, 0.25))
         return RiskBudget(daily_limit=daily_limit, cooldown_seconds=cooldown_seconds)
 
+    async def _content_ttl(self, key: str, fallback: int) -> int:
+        if self.cache.client is not None and hasattr(self.cache.client, "ttl"):
+            ttl = await self.cache.client.ttl(key)
+            if isinstance(ttl, int) and ttl >= 0:
+                return max(1, ttl)
+        return fallback
+
+    async def preview_content(
+        self, account_id: int, action: AccountRiskAction, target_type: str,
+        target_id: Any, content: str,
+    ) -> RiskDecision:
+        """Read-only candidate selection; the execution boundary still reserves."""
+        return await self._check_content_policy(
+            account_id, action, target_type, target_id, {"content": content}, reserve=False,
+        )
+
+    async def release_content_reservation(self, reservation: Optional[dict[str, str]]) -> None:
+        """Release only our reservation when a Telegram write was never attempted."""
+        if not reservation or self.cache.client is None:
+            return
+        client = self.cache.client
+        keys = [reservation["account_key"], reservation["target_key"], reservation["index_key"]]
+        if hasattr(client, "eval"):
+            await client.eval(
+                CONTENT_RESERVATION_RELEASE_LUA, 3, *keys,
+                reservation["token"], reservation["payload"],
+            )
+        else:
+            for key in keys[:2]:
+                if await client.get(key) == reservation["token"]:
+                    await client.delete(key)
+            await client.lrem(keys[2], 1, reservation["payload"])
+
     async def _check_content_policy(
         self,
         account_id: int,
@@ -1626,6 +1723,8 @@ class AccountRiskGuard:
         target_type: Optional[str],
         target_id: Optional[Any],
         details: Optional[dict[str, Any]],
+        *,
+        reserve: bool = True,
     ) -> RiskDecision:
         if action not in MESSAGE_ACTIONS or action == AccountRiskAction.OWNED_GROUP_MESSAGE:
             return RiskDecision(True)
@@ -1634,60 +1733,74 @@ class AccountRiskGuard:
             return RiskDecision(True)
         if (
             action == AccountRiskAction.AD_DELIVERY
-            # Literal to avoid a core->modules import; matches
-            # AdDeliveryPolicy.AD_ONLY.value.
             and str(details.get("delivery_policy") or "growth") == "ad_only"
         ):
-            # Dedicated (ad_only) accounts repeat operator-curated creatives on
-            # an explicit per-group cadence; growth deliveries keep duplicate
-            # protection.
             return RiskDecision(True)
         content = details.get("content") or details.get("text") or details.get("caption")
         if not content:
             return RiskDecision(True)
         normalized = self._normalize_content(str(content))
-        if len(normalized) < 12:
+        if len(normalized) < 12 or self.cache.client is None:
             return RiskDecision(True)
         content_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-        if self.cache.client is None:
-            return RiskDecision(True)
-
         target_scope = (
             f"{target_type or 'target'}:{target_id}" if target_id is not None else "target:unknown"
         )
         account_key = f"risk:content:account:{account_id}:{content_hash}"
         target_key = f"risk:content:target:{target_scope}:{content_hash}"
-        account_seen = await self.cache.exists(account_key)
-        target_seen = await self.cache.exists(target_key)
-        if account_seen:
-            return RiskDecision(False, reason="content_repeat_account")
-        if target_seen:
-            return RiskDecision(False, reason="content_repeat_target")
-
         index_key = f"risk:content:index:{target_scope}"
-        try:
-            recent = await self.cache.client.lrange(index_key, 0, 24)
-            for item in recent or []:
-                try:
-                    payload = json.loads(item)
-                    previous = str(payload.get("normalized") or "")
-                except Exception:
-                    previous = str(item)
-                if previous and SequenceMatcher(None, normalized, previous).ratio() >= 0.92:
-                    return RiskDecision(False, reason="content_similar_target")
-            await self.cache.client.lpush(
-                index_key,
-                json.dumps({"hash": content_hash, "normalized": normalized}, ensure_ascii=False),
+        blockers = []
+        for key, reason, ttl in (
+            (account_key, "content_repeat_account", 6 * 3600),
+            (target_key, "content_repeat_target", 3 * 24 * 3600),
+        ):
+            if await self.cache.exists(key):
+                blockers.append((reason, await self._content_ttl(key, ttl)))
+        if blockers:
+            return RiskDecision(False, blockers[0][0], max(item[1] for item in blockers))
+        recent = await self.cache.client.lrange(index_key, 0, 49)
+        similarity_waits = []
+        for item in recent or []:
+            expires_at = None
+            try:
+                payload = json.loads(item)
+                previous = str(payload.get("normalized") or "")
+                expires_at = payload.get("expires_at")
+            except Exception:
+                previous = str(item)
+            if isinstance(expires_at, (int, float)) and expires_at <= time.time():
+                continue
+            if previous and SequenceMatcher(None, normalized, previous).ratio() >= 0.92:
+                similarity_waits.append(
+                    max(1, int(expires_at - time.time())) if isinstance(expires_at, (int, float))
+                    else await self._content_ttl(index_key, 3 * 24 * 3600)
+                )
+        if similarity_waits:
+            return RiskDecision(False, "content_similar_target", max(similarity_waits))
+        if not reserve:
+            return RiskDecision(True)
+        token = uuid.uuid4().hex
+        payload = json.dumps({"hash": content_hash, "normalized": normalized, "token": token, "expires_at": time.time() + 259200}, ensure_ascii=False)
+        client = self.cache.client
+        if hasattr(client, "eval"):
+            code, retry = await client.eval(
+                CONTENT_RESERVATION_LUA, 3, account_key, target_key, index_key, token, payload,
             )
-            await self.cache.client.ltrim(index_key, 0, 49)
-            await self.cache.client.expire(index_key, 3 * 24 * 3600)
-        except Exception as exc:
-            self.logger.warning("content_similarity_check_failed", error=str(exc))
-
-        await self.cache.set(account_key, "1", ttl=6 * 3600)
-        await self.cache.set(target_key, "1", ttl=3 * 24 * 3600)
-        return RiskDecision(True)
+            if int(code):
+                return RiskDecision(
+                    False, "content_repeat_account" if int(code) == 1 else "content_repeat_target",
+                    max(1, int(retry)),
+                )
+        else:
+            await self.cache.set(account_key, token, ttl=6 * 3600)
+            await self.cache.set(target_key, token, ttl=3 * 24 * 3600)
+            await client.lpush(index_key, payload)
+            await client.ltrim(index_key, 0, 49)
+            await client.expire(index_key, 3 * 24 * 3600)
+        return RiskDecision(True, content_reservation={
+            "account_key": account_key, "target_key": target_key, "index_key": index_key,
+            "token": token, "payload": payload,
+        })
 
     async def _increment_daily_stat(
         self,

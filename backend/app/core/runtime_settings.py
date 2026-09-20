@@ -70,6 +70,7 @@ DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS: dict[str, Any] = {
         "unknown_challenge_action": "leave",
         "allow_button_clicks": True,
         "allow_text_answers": True,
+        "allow_second_hop_bots": True,
         "answer_profile": "中文用户，主要为了学习交流、找资料、行业沟通。",
     },
     "group_capacity_cleanup": {
@@ -377,8 +378,8 @@ DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_AD_DELIVERY_THROTTLE_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "growth_min_interval_seconds": 1800,
-    "growth_max_interval_seconds": 10800,
+    "growth_min_interval_seconds": 600,
+    "growth_max_interval_seconds": 1800,
 }
 DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -413,8 +414,9 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "survival_check_batch_size": 50,
     "survival_retry_max_attempts": 3,
     "survival_retry_base_seconds": 300,
-    "max_groups_per_account": 400,
+    "max_groups_per_account": 100,
     "max_new_ad_groups_per_day": 2,
+    "probe_backlog_max_days": 3,
     "leave_on_deleted_ad": True,
     "block_group_on_probe_failure": True,
     "ad_policy_ai_enabled": True,

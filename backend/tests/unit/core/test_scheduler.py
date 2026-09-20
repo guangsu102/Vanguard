@@ -5,6 +5,7 @@ Tests for tasks, alerts, and worker management.
 """
 
 import asyncio
+import json
 import subprocess
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -96,6 +97,21 @@ class TestAlertManager:
 
         assert result is True
         mock_client.send_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_send_task_alert_async_awaits_async_sender(self):
+        from app.core.scheduler.alerts import AlertManager
+
+        manager = AlertManager()
+        manager._send_telegram_message_async = AsyncMock(return_value=True)
+
+        result = await manager.send_task_alert_async(
+            task_name="test_task",
+            error="Test error",
+        )
+
+        assert result is True
+        manager._send_telegram_message_async.assert_awaited_once()
 
     def test_send_worker_alert_format(self):
         """Test worker alert message format."""
@@ -200,9 +216,9 @@ class TestCeleryConfig:
             "keywords_per_account": 30,
             "max_groups_per_keyword": 50,
         }
-        deliver_ads_schedule = beat_schedule["deliver-ads-every-10min"]
-        assert deliver_ads_schedule["schedule"] == 600.0
-        assert deliver_ads_schedule["options"]["rate_limit"] == "6/h"
+        deliver_ads_schedule = beat_schedule["deliver-ads-dispatcher-every-minute"]
+        assert deliver_ads_schedule["schedule"] == 60.0
+        assert deliver_ads_schedule["options"]["rate_limit"] == "60/h"
         assert beat_schedule["check-ad-survival-every-2min"]["schedule"] == 120.0
         assert "group-ai-warmup-dispatcher-every-30min" in beat_schedule
         ad_policy_audit_schedule = beat_schedule["audit-group-ad-policies-hourly"]
@@ -285,6 +301,53 @@ class TestCeleryConfig:
 
         redis_client.set.assert_awaited_once_with(tasks.AD_DELIVERY_LAST_RUN_KEY, "1234.5")
         redis_client.delete.assert_awaited_once_with(tasks.AD_DELIVERY_LOCK_KEY)
+
+    def test_ad_delivery_reclaims_stale_lock_after_worker_restart(self):
+        from app.core import automation_settings, database
+        from app.core.scheduler import tasks
+
+        db_context = MagicMock()
+        db_context.__aenter__ = AsyncMock(return_value=MagicMock())
+        db_context.__aexit__ = AsyncMock(return_value=None)
+        redis_client = MagicMock()
+        redis_client.get = AsyncMock(
+            side_effect=[
+                None,
+                json.dumps({"started_at": 1000.0, "source": "deliver_ads_task"}),
+            ]
+        )
+        redis_client.set = AsyncMock(side_effect=[False, True])
+        redis_client.delete = AsyncMock()
+        redis_client.aclose = AsyncMock()
+
+        with (
+            patch.object(tasks, "_ensure_db_initialized", new=AsyncMock()),
+            patch.object(database, "get_db_session", return_value=db_context),
+            patch.object(
+                automation_settings,
+                "get_ad_delivery_execution_settings",
+                new=AsyncMock(
+                    return_value={
+                        "enabled": True,
+                        "dispatcher_interval_seconds": 60,
+                        "job_lease_seconds": 300,
+                    }
+                ),
+            ),
+            patch.object(
+                tasks,
+                "_new_scheduler_redis_client",
+                new=AsyncMock(return_value=redis_client),
+            ),
+            patch.object(tasks.time, "time", return_value=2000.0),
+        ):
+            reservation = asyncio.run(tasks._reserve_ad_delivery_execution())
+
+        assert reservation["should_run"] is True
+        assert reservation["reason"] == "due"
+        assert reservation["stale_lock_reclaimed"] is True
+        redis_client.delete.assert_awaited_once_with(tasks.AD_DELIVERY_LOCK_KEY)
+        assert redis_client.set.await_count == 2
 
     def test_beat_schedule_has_minute_level_tasks(self):
         """Test beat schedule includes minute-level tasks."""

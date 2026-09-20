@@ -32,6 +32,7 @@ AUTO_JOIN_SCHEDULER_LOCK_MIN_STALE_SECONDS = 10 * 60
 AUTO_JOIN_SCHEDULER_LOCK_MAX_STALE_SECONDS = 45 * 60
 AD_DELIVERY_LOCK_KEY = "vanguard:ad_delivery:lock"
 AD_DELIVERY_LOCK_TTL_SECONDS = 60 * 60
+AD_DELIVERY_LOCK_MIN_STALE_SECONDS = 15 * 60
 AD_DELIVERY_LAST_RUN_KEY = "vanguard:ad_delivery:last_run_at"
 GROUP_AI_WARMUP_LAST_RUN_KEY = "vanguard:group_ai_warmup:last_run_at"
 GROUP_AI_WARMUP_LOCK_KEY = "vanguard:group_ai_warmup:lock"
@@ -423,6 +424,38 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
 
         lock_raw = await client.get(AD_DELIVERY_LOCK_KEY)
         lock_started_at, lock_source = _parse_auto_join_lock(lock_raw)
+        lock_stale_seconds = max(
+            AD_DELIVERY_LOCK_MIN_STALE_SECONDS,
+            int(execution.get("job_lease_seconds") or 300) * 2,
+        )
+        if lock_started_at is None or now - lock_started_at > lock_stale_seconds:
+            await client.delete(AD_DELIVERY_LOCK_KEY)
+            lock_acquired = await client.set(
+                AD_DELIVERY_LOCK_KEY,
+                lock_value,
+                nx=True,
+                ex=AD_DELIVERY_LOCK_TTL_SECONDS,
+            )
+            if lock_acquired:
+                logger.warning(
+                    "ad_delivery_stale_lock_reclaimed",
+                    lock_started_at=_timestamp_to_iso(lock_started_at)
+                    if lock_started_at is not None
+                    else None,
+                    lock_age_seconds=int(now - lock_started_at)
+                    if lock_started_at is not None
+                    else None,
+                    lock_stale_seconds=lock_stale_seconds,
+                    lock_source=lock_source,
+                )
+                return {
+                    "should_run": True,
+                    "reason": "due",
+                    "started_at": now,
+                    "stale_lock_reclaimed": True,
+                    "lock_ttl_seconds": AD_DELIVERY_LOCK_TTL_SECONDS,
+                    "execution": execution,
+                }
         lock_age = int(now - lock_started_at) if lock_started_at is not None else None
         return {
             "should_run": False,
@@ -431,6 +464,7 @@ async def _reserve_ad_delivery_execution() -> dict[str, Any]:
             "lock_age_seconds": lock_age,
             "lock_source": lock_source,
             "lock_ttl_seconds": AD_DELIVERY_LOCK_TTL_SECONDS,
+            "lock_stale_seconds": lock_stale_seconds,
             "execution": execution,
         }
     except Exception as exc:

@@ -5,12 +5,34 @@ import pytest
 from sqlalchemy import select
 
 from app.core.account.models import AccountRiskDailyStat, AccountStatus, AccountType, TelegramAccount
-from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.account.risk_guard import (
+    AccountRiskAction,
+    AccountRiskGuard,
+    _ad_probe_attempt_limit,
+    _ad_probe_operating_date,
+)
 
 
 class FakeRedisClient:
     def __init__(self):
         self.values = {}
+        self.lists = {}
+
+    async def lrange(self, key, start, end):
+        return self.lists.get(key, [])[start:end + 1]
+
+    async def lpush(self, key, value):
+        self.lists.setdefault(key, []).insert(0, value)
+
+    async def ltrim(self, key, start, end):
+        self.lists[key] = self.lists.get(key, [])[start:end + 1]
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+
+    async def lrem(self, key, count, value):
+        if value in self.lists.get(key, []):
+            self.lists[key].remove(value)
 
     async def exists(self, key):
         return 1 if key in self.values else 0
@@ -214,3 +236,11 @@ async def test_ad_only_delivery_repeats_content_while_growth_is_deduped(test_db)
     )
     assert growth_repeat.allowed is False
     assert growth_repeat.reason in {"content_repeat_account", "content_repeat_target"}
+
+def test_ad_probe_budget_is_derived_and_resets_at_nine_beijing():
+    assert _ad_probe_attempt_limit({"max_new_ad_groups_per_day": 5}) == 10
+    assert _ad_probe_attempt_limit({"max_new_ad_groups_per_day": 10}) == 15
+    assert _ad_probe_attempt_limit({"max_new_ad_groups_per_day": 100}) == 15
+    capacity = {"timezone_offset_hours": 8, "window_start_hour": 9}
+    assert _ad_probe_operating_date(datetime(2026, 9, 20, 0, 59), capacity).isoformat() == "2026-09-19"
+    assert _ad_probe_operating_date(datetime(2026, 9, 20, 1, 0), capacity).isoformat() == "2026-09-20"

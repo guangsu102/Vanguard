@@ -165,7 +165,8 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
     )
     await test_db.commit()
 
-    automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    account_pool = AsyncMock()
+    automation = AcquisitionAutomationService(test_db, account_pool=account_pool)
     automation._join_group = AsyncMock()
     automation._evaluate_joined_group = AsyncMock(
         return_value=JoinedGroupAuditResult(
@@ -183,6 +184,9 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
 
     result = await service.run(max_tasks=1)
     assert result["succeeded"] == 1
+    account_pool.sync_from_db.assert_awaited_once()
+    synced_accounts = account_pool.sync_from_db.await_args.args[0]
+    assert [account.id for account in synced_accounts] == [target.id]
     automation._join_group.assert_awaited_once()
 
     task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
@@ -206,6 +210,53 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
 
     await test_db.refresh(source_membership)
     assert source_membership.status == "account_lost"
+
+
+async def test_failover_execution_error_schedules_retry_after_session_rollback(test_db):
+    source = await _add_account(
+        test_db,
+        identifier="banned-source-retry",
+        status=AccountStatus.BANNED,
+        risk_reason="account_banned",
+    )
+    await _add_group_membership(
+        test_db,
+        source,
+        telegram_group_id=20002,
+        username="retryable_group",
+    )
+    target = await _add_account(
+        test_db,
+        identifier="healthy-target-retry",
+        status=AccountStatus.ONLINE,
+    )
+    test_db.add(
+        AccountOperationConfig(
+            account_id=target.id,
+            enabled=True,
+            auto_join_enabled=True,
+            auto_ads_enabled=True,
+            max_groups_per_day=10,
+            max_groups_total=100,
+        )
+    )
+    await test_db.commit()
+
+    automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    automation._join_group = AsyncMock(side_effect=RuntimeError("account unavailable"))
+    service = GroupFailoverService(test_db, automation)
+
+    result = await service.run(max_tasks=1)
+
+    assert result["failed"] == 1
+    assert len(result["errors"]) == 1
+    assert result["errors"][0].endswith(": account unavailable")
+    task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
+    assert task.status == GroupFailoverStatus.RETRY.value
+    assert task.reason == "failover_execution_error"
+    assert task.error == "account unavailable"
+    assert task.attempt_count == 1
+    assert task.next_retry_at is not None
 
 
 async def test_existing_ad_capable_membership_reuses_and_enables_binding(test_db):

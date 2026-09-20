@@ -1240,6 +1240,89 @@ async def test_group_ad_policy_audit_tries_next_joined_account(test_db, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_group_ad_policy_audit_continues_after_one_ai_timeout(
+    test_db,
+    monkeypatch,
+):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        phone="+15550003009",
+        identifier="+15550003009",
+        session_name="ad_policy_continue_after_timeout",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    first_group = Group(
+        group_id=930010,
+        title="First timed out audit",
+        level=GroupLevel.A,
+        status="active",
+    )
+    second_group = Group(
+        group_id=930011,
+        title="Second audit still runs",
+        level=GroupLevel.A,
+        status="active",
+    )
+    test_db.add_all([account, first_group, second_group])
+    await test_db.flush()
+    for group in (first_group, second_group):
+        test_db.add_all(
+            [
+                GroupAccountMembership(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    account_id=account.id,
+                    status="joined",
+                ),
+                GroupAdProfile(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                    ad_policy_verified_at=now - timedelta(hours=25),
+                ),
+            ]
+        )
+    await test_db.commit()
+    wrapper = SimpleNamespace(
+        client=SimpleNamespace(get_entity=AsyncMock(return_value=SimpleNamespace()))
+    )
+    pool = SimpleNamespace(
+        acquire_by_id=AsyncMock(return_value=wrapper),
+        release=AsyncMock(),
+    )
+    service = AcquisitionAutomationService(test_db, account_pool=pool)
+    monkeypatch.setattr(service, "_sync_account_pool", AsyncMock())
+    monkeypatch.setattr(service, "_fetch_recent_messages", AsyncMock(return_value=[]))
+    policy_audit = AsyncMock(
+        side_effect=[
+            GroupAdRulesAuditResult(
+                ad_allowed=None,
+                policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                reason="group_rules_ai_unavailable",
+                decision_source="gpt_fail_closed",
+            ),
+            GroupAdRulesAuditResult(
+                ad_allowed=True,
+                policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                reason="group_rules_ai_explicit_soft_ads_allowed",
+                confidence=100,
+                decision_source="gpt",
+            ),
+        ]
+    )
+    monkeypatch.setattr(service, "_audit_group_ad_rules", policy_audit)
+    monkeypatch.setattr(service, "_sync_group_ad_policy_from_audit", AsyncMock())
+
+    result = await service.refresh_group_ad_policies(limit=10)
+
+    assert result["processed"] == 2
+    assert result["updated"] == 2
+    assert policy_audit.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_group_ad_policy_audit_marks_lost_membership(test_db, monkeypatch):
     now = datetime.utcnow()
     account = TelegramAccount(
@@ -2814,6 +2897,176 @@ async def test_disabled_warmup_progress_continues_after_first_candidate_rolls_ba
     assert {
         (detail["group_id"], detail["account_id"]) for detail in result["details"]
     } == expected_ids
+
+
+@pytest.mark.asyncio
+async def test_disabled_warmup_skips_ineligible_head_and_processes_next_group(
+    test_db,
+    monkeypatch,
+):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        identifier="warmup-head-account",
+        session_name="warmup-head-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    blocked_group = Group(
+        group_id=939996,
+        title="Older C group",
+        level=GroupLevel.C,
+        status="active",
+    )
+    eligible_group = Group(
+        group_id=939997,
+        title="Newer A group",
+        level=GroupLevel.A,
+        status="active",
+    )
+    campaign = AdCampaign(
+        name="Warmup head fallback",
+        enabled=True,
+        status="active",
+        delivery_policy="growth",
+    )
+    test_db.add_all([account, blocked_group, eligible_group, campaign])
+    await test_db.flush()
+    memberships = [
+        GroupAccountMembership(
+            group_id=blocked_group.id,
+            telegram_group_id=blocked_group.group_id,
+            account_id=account.id,
+            status="joined",
+            joined_at=now - timedelta(days=2),
+            warmup_status="joined_pending_test",
+            probe_status="not_started",
+            ad_status="warming",
+        ),
+        GroupAccountMembership(
+            group_id=eligible_group.id,
+            telegram_group_id=eligible_group.group_id,
+            account_id=account.id,
+            status="joined",
+            joined_at=now - timedelta(days=1),
+            warmup_status="joined_pending_test",
+            probe_status="not_started",
+            ad_status="warming",
+        ),
+    ]
+    test_db.add_all(
+        [
+            *memberships,
+            GroupAdProfile(
+                group_id=blocked_group.id,
+                telegram_group_id=blocked_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+            ),
+            GroupAdProfile(
+                group_id=eligible_group.id,
+                telegram_group_id=eligible_group.group_id,
+                ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+            ),
+            AccountAdBinding(
+                account_id=account.id,
+                ad_campaign_id=campaign.id,
+                enabled=True,
+            ),
+        ]
+    )
+    await test_db.commit()
+
+    monkeypatch.setattr(
+        acquisition_automation,
+        "get_group_ai_interaction_settings",
+        AsyncMock(return_value={"enabled": False, "allowProactiveWarmup": False}),
+    )
+    service = AcquisitionAutomationService(test_db)
+    service._sync_account_pool = AsyncMock()
+    service._ad_account_risk_skip_reason = AsyncMock(return_value=None)
+    service._ad_warmup_skip_reason = AsyncMock(return_value="ad_probe_required")
+
+    result = await service._advance_disabled_group_warmup_to_write_probe(
+        now,
+        dry_run=True,
+    )
+
+    assert result["processed"] == 1
+    assert result["updated"] == 1
+    assert result["skipped"] == 1
+    service._ad_warmup_skip_reason.assert_awaited_once()
+    assert service._ad_warmup_skip_reason.await_args.args[1].group_id == eligible_group.id
+    assert any(
+        detail.get("group_id") == blocked_group.id
+        and detail.get("reason") == "group_level_disallows_ads"
+        for detail in result["details"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("send_result", "send_error", "expected_error"),
+    [
+        (None, TimeoutError("network timeout"), "transient:network timeout"),
+        (None, None, "transient:telegram send returned no message id"),
+    ],
+)
+async def test_write_probe_transient_or_unconfirmed_send_is_retried(
+    test_db,
+    monkeypatch,
+    send_result,
+    send_error,
+    expected_error,
+):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        identifier=f"probe-retry-{expected_error}",
+        session_name=f"probe-retry-{expected_error}",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=939998,
+        title="Retryable write probe",
+        level=GroupLevel.A,
+        status="active",
+    )
+    membership = GroupAccountMembership(
+        group=group,
+        account=account,
+        telegram_group_id=group.group_id,
+        status="joined",
+        warmup_status="probe_scheduled",
+        probe_status="scheduled",
+        ad_status="warming",
+    )
+    test_db.add_all([account, group, membership])
+    await test_db.commit()
+
+    runtime_account = SimpleNamespace(record_message=MagicMock())
+    pool = SimpleNamespace(
+        acquire_by_id=AsyncMock(return_value=runtime_account),
+        release=AsyncMock(),
+    )
+    service = AcquisitionAutomationService(test_db, account_pool=pool)
+    service._ad_send_target = AsyncMock(return_value=group.group_id)
+    if send_error is not None:
+        service.telegram_execution.send_group_message = AsyncMock(side_effect=send_error)
+    else:
+        service.telegram_execution.send_group_message = AsyncMock(return_value=send_result)
+    monkeypatch.setattr(acquisition_automation, "_now", lambda: now)
+
+    result = await service._send_ad_probe_locked(account.id, membership, group)
+
+    assert result == "ad_probe_transient_retry"
+    assert membership.probe_status == "scheduled"
+    assert membership.warmup_status == "probe_scheduled"
+    assert membership.ad_status == "warming"
+    assert membership.probe_due_at == now + timedelta(minutes=15)
+    assert membership.last_probe_error == expected_error
+    runtime_account.record_message.assert_called_once_with(success=False)
+    pool.release.assert_awaited_once_with(runtime_account)
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ from app.core.ephemeral_secret import (
     encrypt_ephemeral_secret,
 )
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
+from app.core.operating_time import operating_day_start
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AdCampaign,
@@ -97,6 +98,8 @@ class AdOnlyWorkflowError(ValueError):
 
 
 _JOIN_COOLDOWN_RETRY_SECONDS = 660
+_TRANSIENT_ACCOUNT_RETRY_SECONDS = 900
+_RISK_RETRY_BUFFER_SECONDS = 30
 
 
 def _now() -> datetime:
@@ -2548,8 +2551,43 @@ class AdOnlyRecommendationService:
             # A risk-guard cooldown is a pacing signal, not a defect: push the
             # attempt past the cooldown window instead of demanding a manual
             # retry for every queued partner group.
+            retry_after_seconds: int | None = None
             if error.startswith("risk_guard_blocked:join_cooldown"):
-                cooldown_deadline = _now() + timedelta(seconds=_JOIN_COOLDOWN_RETRY_SECONDS)
+                cooldown_remaining = await AccountRiskGuard(self.db).peek_join_cooldown(
+                    failed.target_ad_only_account_id
+                )
+                retry_after_seconds = max(
+                    _JOIN_COOLDOWN_RETRY_SECONDS,
+                    int(cooldown_remaining or 0) + _RISK_RETRY_BUFFER_SECONDS,
+                )
+            elif error.startswith("risk_guard_blocked:join_daily_budget"):
+                retry_now = _now()
+                next_operating_day = operating_day_start(retry_now) + timedelta(days=1)
+                retry_after_seconds = max(
+                    _RISK_RETRY_BUFFER_SECONDS,
+                    int((next_operating_day - retry_now).total_seconds())
+                    + _RISK_RETRY_BUFFER_SECONDS,
+                )
+            elif error == "target_account_unavailable" or error.startswith(
+                "risk_guard_blocked:ad_delivery_account_issue"
+            ):
+                target = await self.db.get(
+                    TelegramAccount, failed.target_ad_only_account_id
+                )
+                now = _now()
+                retry_after_seconds = _TRANSIENT_ACCOUNT_RETRY_SECONDS
+                if (
+                    target is not None
+                    and target.risk_pause_until is not None
+                    and target.risk_pause_until > now
+                ):
+                    retry_after_seconds = max(
+                        retry_after_seconds,
+                        int((target.risk_pause_until - now).total_seconds())
+                        + _RISK_RETRY_BUFFER_SECONDS,
+                    )
+            if retry_after_seconds is not None:
+                cooldown_deadline = _now() + timedelta(seconds=retry_after_seconds)
                 failed.status = "queued"
                 failed.last_error = error
                 failed.retry_count = int(failed.retry_count or 0) + 1
@@ -2562,8 +2600,8 @@ class AdOnlyRecommendationService:
                     event_type="handover_requeued",
                     step=failed.current_step,
                     status="retry_wait",
-                    message="Join cooldown active; attempt rescheduled",
-                    payload={"error": error, "retry_after_seconds": _JOIN_COOLDOWN_RETRY_SECONDS},
+                    message="Transient account gate active; attempt rescheduled",
+                    payload={"error": error, "retry_after_seconds": retry_after_seconds},
                 )
                 if failed.batch_id:
                     await self._schedule_next_join_queue_item(

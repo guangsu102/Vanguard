@@ -974,6 +974,104 @@ def test_production_ad_only_join_queue_migration_is_registered_and_parseable():
     )
 
 
+@pytest.mark.asyncio
+async def test_handover_join_cooldown_uses_real_remaining_ttl(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="real-cooldown")
+    _allow_direct_capacity(monkeypatch)
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="real-cooldown",
+        invite_link="https://t.me/+RealCooldown123",
+    )
+    fixed_now = datetime.utcnow()
+    monkeypatch.setattr(ad_only_module, "_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        service,
+        "_runtime_direct_values",
+        AsyncMock(side_effect=RuntimeError("risk_guard_blocked:join_cooldown")),
+    )
+    cooldown = AsyncMock(return_value=7200)
+    monkeypatch.setattr(ad_only_module.AccountRiskGuard, "peek_join_cooldown", cooldown)
+
+    result = await service.execute_handover(handover.id)
+    await test_db.refresh(handover)
+
+    assert result["status"] == "requeued"
+    assert handover.status == "queued"
+    assert handover.next_attempt_at == fixed_now + timedelta(seconds=7230)
+    cooldown.assert_awaited_once_with(seeded["target"].id)
+
+
+@pytest.mark.asyncio
+async def test_handover_join_daily_budget_requeues_after_next_operating_day(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="daily-budget")
+    _allow_direct_capacity(monkeypatch)
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="daily-budget",
+        invite_link="https://t.me/+DailyBudget123",
+    )
+    fixed_now = datetime(2026, 9, 20, 13, 37, 0)
+    monkeypatch.setattr(ad_only_module, "_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        service,
+        "_runtime_direct_values",
+        AsyncMock(side_effect=RuntimeError("risk_guard_blocked:join_daily_budget")),
+    )
+
+    result = await service.execute_handover(handover.id)
+    await test_db.refresh(handover)
+
+    assert result["status"] == "requeued"
+    assert handover.status == "queued"
+    assert handover.failed_at is None
+    assert handover.next_attempt_at == datetime(2026, 9, 20, 16, 0, 30)
+    assert handover.last_error == "risk_guard_blocked:join_daily_budget"
+
+
+@pytest.mark.asyncio
+async def test_handover_frozen_account_requeues_until_risk_pause_expires(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="risk-pause")
+    _allow_direct_capacity(monkeypatch)
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="risk-pause",
+        invite_link="https://t.me/+RiskPause123",
+    )
+    fixed_now = datetime.utcnow()
+    seeded["target"].risk_level = "frozen"
+    seeded["target"].risk_pause_until = fixed_now + timedelta(hours=2)
+    await test_db.commit()
+    monkeypatch.setattr(ad_only_module, "_now", lambda: fixed_now)
+    monkeypatch.setattr(
+        service,
+        "_runtime_direct_values",
+        AsyncMock(side_effect=AdOnlyWorkflowError("target_account_unavailable")),
+    )
+
+    result = await service.execute_handover(handover.id)
+    await test_db.refresh(handover)
+
+    assert result["status"] == "requeued"
+    assert handover.status == "queued"
+    assert handover.next_attempt_at == fixed_now + timedelta(hours=2, seconds=30)
+
+
 def test_runtime_health_consistency_sql_migration_is_registered_and_parseable():
     migration_name = "039_repair_runtime_health_consistency.sql"
     migrations_dir = Path(__file__).parents[2] / "migrations"

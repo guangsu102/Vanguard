@@ -278,6 +278,15 @@ export interface AdDeliveryExecutionSettings {
   growth_group_global_cooldown_seconds: number
 }
 
+export interface ProbeQueue {
+  as_of: string
+  total: number
+  counts: Record<string, number>
+  accounts: Array<{ account_id: number; daily_limit: number; completed_today: number; pending: number; approval_required: number; reset_at: string; minimum_capacity_cycles: number | null }>
+  items: Array<{ membership_id: number; account_id: number; group_id: number; title: string; probe_status: string; policy_mode: string; stage: string; label: string; queue_position: number | null; earliest_action_at: string | null; last_probe_error: string | null; permission_evidence: string | null }>
+  note: string
+}
+
 export interface AdCapacitySettings {
   enabled: boolean
   timezone_offset_hours: number
@@ -291,6 +300,7 @@ export interface AdCapacitySettings {
   survival_retry_base_seconds: number
   max_groups_per_account: number
   max_new_ad_groups_per_day: number
+  probe_backlog_max_days: number
   leave_on_deleted_ad: boolean
   block_group_on_probe_failure: boolean
   ad_policy_ai_enabled: boolean
@@ -771,6 +781,10 @@ export const automationApi = {
 
   updateAdDeliveryExecution: (data: Partial<AdDeliveryExecutionSettings>) => {
     return apiClient.put<{ data: AdDeliveryExecutionSettings }>('/automation/ads/delivery-execution', data)
+  },
+
+  getProbeQueue: () => {
+    return apiClient.get<{ data: ProbeQueue }>('/automation/ads/probe-queue')
   },
 
   getAdCapacity: () => {

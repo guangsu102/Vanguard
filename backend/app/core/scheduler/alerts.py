@@ -13,10 +13,10 @@ from typing import Optional
 
 import structlog
 
-from app.core.config import settings
+from app.core import database as db_module
 from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
-from app.core import database as db_module
+from app.core.config import settings
 from app.integrations.telegram.client import TelegramClient, TelegramConfig
 
 logger = structlog.get_logger()
@@ -24,6 +24,7 @@ logger = structlog.get_logger()
 
 class AlertSeverity(str, Enum):
     """Alert severity levels."""
+
     INFO = "info"
     WARNING = "warning"
     ERROR = "error"
@@ -62,53 +63,76 @@ class AlertManager:
         """Format severity for display."""
         return severity.value.upper()
 
-    def _send_telegram_message(self, message: str) -> bool:
-        """
-        Send message to Telegram alert chat.
-
-        Args:
-            message: Message content (Markdown supported)
-
-        Returns:
-            True if sent successfully
-        """
+    async def _send_telegram_message_async(self, message: str) -> bool:
+        """Send one Telegram alert without creating a nested event loop."""
         if not self._enabled:
             logger.debug("alerts_disabled_skip_telegram_send")
             return False
 
         try:
-            async def _send() -> None:
-                async with AsyncExitStack() as stack:
-                    risk_guard = None
-                    risk_account = None
-                    try:
-                        if db_module.async_session_factory is None:
-                            await db_module.init_db(create_tables=False)
-                        db = await stack.enter_async_context(db_module.get_db_session())
-                        risk_guard = AccountRiskGuard(db)
-                        risk_account = bot_risk_identity("scheduler_alerts")
-                    except Exception as exc:
-                        logger.warning("telegram_alert_risk_guard_unavailable", error=str(exc))
+            async with AsyncExitStack() as stack:
+                risk_guard = None
+                risk_account = None
+                try:
+                    if db_module.async_session_factory is None:
+                        await db_module.init_db(create_tables=False)
+                    db = await stack.enter_async_context(db_module.get_db_session())
+                    risk_guard = AccountRiskGuard(db)
+                    risk_account = bot_risk_identity("scheduler_alerts")
+                except Exception as exc:
+                    logger.warning("telegram_alert_risk_guard_unavailable", error=str(exc))
 
-                    client = TelegramClient(
-                        TelegramConfig(bot_token=settings.BOT_TOKEN),
-                        risk_guard=risk_guard,
-                        risk_account=risk_account,
-                    )
-                    try:
-                        await client.send_message(self._alert_chat_id, message, parse_mode="Markdown")
-                    finally:
-                        close_result = client.close()
-                        if inspect.isawaitable(close_result):
-                            await close_result
-
-            asyncio.run(_send())
+                client = TelegramClient(
+                    TelegramConfig(bot_token=settings.BOT_TOKEN),
+                    risk_guard=risk_guard,
+                    risk_account=risk_account,
+                )
+                try:
+                    await client.send_message(self._alert_chat_id, message, parse_mode="Markdown")
+                finally:
+                    close_result = client.close()
+                    if inspect.isawaitable(close_result):
+                        await close_result
             logger.info("alert_sent_to_telegram", chat_id=self._alert_chat_id)
             return True
-
-        except Exception as e:
-            logger.error("failed_to_send_telegram_alert", error=str(e))
+        except Exception as exc:
+            logger.error("failed_to_send_telegram_alert", error=str(exc))
             return False
+
+    def _send_telegram_message(self, message: str) -> bool:
+        """Synchronous adapter for Celery tasks that do not own an event loop."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self._send_telegram_message_async(message))
+        logger.error("sync_alert_called_from_async_context")
+        return False
+
+    def _task_alert_message(
+        self,
+        *,
+        task_name: str,
+        error: str,
+        severity: AlertSeverity,
+        details: Optional[str],
+        task_id: Optional[str],
+    ) -> str:
+        emoji = self._get_severity_emoji(severity)
+        severity_text = self._format_severity(severity)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        message_parts = [
+            f"{emoji} *任务执行{severity_text}*",
+            "",
+            f"📋 *任务名:* `{task_name}`",
+            f"❌ *错误:* `{error[:200]}`",
+            f"⏰ *时间:* `{timestamp}`",
+        ]
+        if task_id:
+            message_parts.append(f"🔧 *Task ID:* `{task_id}`")
+        if details:
+            message_parts.extend(["", f"📝 *详情:* {details}"])
+        return "\n".join(message_parts)
 
     def send_task_alert(
         self,
@@ -131,33 +155,40 @@ class AlertManager:
         Returns:
             True if alert was sent
         """
-        emoji = self._get_severity_emoji(severity)
-        severity_text = self._format_severity(severity)
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        message_parts = [
-            f"{emoji} *任务执行{severity_text}*",
-            "",
-            f"📋 *任务名:* `{task_name}`",
-            f"❌ *错误:* `{error[:200]}`",
-            f"⏰ *时间:* `{timestamp}`",
-        ]
-
-        if task_id:
-            message_parts.append(f"🔧 *Task ID:* `{task_id}`")
-
-        if details:
-            message_parts.extend(["", f"📝 *详情:* {details}"])
-
-        message = "\n".join(message_parts)
-
         logger.info(
             "sending_task_alert",
             task_name=task_name,
             severity=severity.value,
         )
+        return self._send_telegram_message(
+            self._task_alert_message(
+                task_name=task_name,
+                error=error,
+                severity=severity,
+                details=details,
+                task_id=task_id,
+            )
+        )
 
-        return self._send_telegram_message(message)
+    async def send_task_alert_async(
+        self,
+        task_name: str,
+        error: str,
+        severity: AlertSeverity = AlertSeverity.ERROR,
+        details: Optional[str] = None,
+        task_id: Optional[str] = None,
+    ) -> bool:
+        """Async task-alert entry point for scheduler services."""
+        logger.info("sending_task_alert", task_name=task_name, severity=severity.value)
+        return await self._send_telegram_message_async(
+            self._task_alert_message(
+                task_name=task_name,
+                error=error,
+                severity=severity,
+                details=details,
+                task_id=task_id,
+            )
+        )
 
     def send_worker_alert(
         self,
@@ -295,5 +326,3 @@ def TaskAlertManager() -> AlertManager:
     if _alert_manager is None:
         _alert_manager = AlertManager()
     return _alert_manager
-
-

@@ -41,6 +41,7 @@ DEFAULT_MIGRATIONS = [
     "054_add_managed_bot_provisions.sql",
     "055_add_account_profile_updates.sql",
     "056_add_api_config_platform.sql",
+    "057_set_growth_ad_capacity.sql",
 ]
 
 

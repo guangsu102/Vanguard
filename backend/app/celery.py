@@ -138,10 +138,10 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"max_tasks": 20},
         "options": {"queue": "automation", "rate_limit": "12/h"},
     },
-    "deliver-ads-every-10min": {
+    "deliver-ads-dispatcher-every-minute": {
         "task": "app.core.scheduler.tasks.deliver_ads_task",
-        "schedule": 600.0,
-        "options": {"queue": "automation", "rate_limit": "6/h"},
+        "schedule": 60.0,
+        "options": {"queue": "automation", "rate_limit": "60/h"},
     },
     "check-ad-survival-every-2min": {
         "task": "app.core.scheduler.tasks.check_ad_survival_task",

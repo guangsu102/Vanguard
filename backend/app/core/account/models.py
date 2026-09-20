@@ -1043,7 +1043,7 @@ class AccountOperationConfig(Base):
         comment="每日最大加群数",
     )
     max_groups_total: Mapped[int] = mapped_column(
-        Integer, default=400, nullable=False, comment="账号总群数上限"
+        Integer, default=100, nullable=False, comment="账号总群数上限"
     )
     join_interval_min_seconds: Mapped[int] = mapped_column(
         Integer, default=60, nullable=False, comment="加群最小间隔"

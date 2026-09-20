@@ -14,15 +14,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_db
-from app.core.account.models import TelegramAccount, AccountStatus
-from app.core.group.models import Group, GroupLevel
-from app.core.user.models import User, UserState
-from app.core.keyword.models import Keyword, KeywordType
+from app.core.account.models import AccountRiskDailyStat, AccountStatus, TelegramAccount
 from app.core.campaign.models import Campaign, CampaignTracking
-from app.modules.acquisition.models import AcquisitionTracking
+from app.core.database import get_db
+from app.core.group.models import Group, GroupLevel
+from app.core.keyword.models import Keyword, KeywordType
+from app.core.user.models import User, UserState
+from app.modules.acquisition.models import (
+    AcquisitionMessage,
+    AcquisitionTracking,
+    AdDeliveryLog,
+    DeliveryStatus,
+)
 from app.modules.guardian.models import Violation
-
 
 router = APIRouter()
 
@@ -83,6 +87,15 @@ def _csv_response(filename: str, rows: list[dict], fieldnames: list[str]) -> Res
     )
 
 
+def _beijing_day_bounds(now: Optional[datetime] = None) -> tuple[datetime, datetime]:
+    """Return naive UTC bounds for the current Beijing calendar day."""
+    utc_now = now or datetime.utcnow()
+    beijing_now = utc_now + timedelta(hours=8)
+    beijing_start = beijing_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    utc_start = beijing_start - timedelta(hours=8)
+    return utc_start, utc_start + timedelta(days=1)
+
+
 # =============================================================================
 # Dashboard Endpoint
 # =============================================================================
@@ -118,32 +131,72 @@ async def get_dashboard(
     )
     active_users = active_users_result.scalar() or 0
 
-    # Daily registrations
-    today = datetime.utcnow().date()
-    tomorrow = today + timedelta(days=1)
+    today_start, tomorrow = _beijing_day_bounds()
+
+    # Daily attributed registrations and conversions use the same acquisition
+    # event source and Beijing calendar boundary.
     daily_reg_result = await db.execute(
-        select(func.count(User.id))
-        .where(User.created_at >= today)
-        .where(User.created_at < tomorrow)
+        select(func.count(AcquisitionTracking.id))
+        .where(AcquisitionTracking.registered_at.isnot(None))
+        .where(AcquisitionTracking.registered_at >= today_start)
+        .where(AcquisitionTracking.registered_at < tomorrow)
     )
     daily_registered = daily_reg_result.scalar() or 0
 
-    # Daily conversions (users moved to active)
     daily_converted_result = await db.execute(
-        select(func.count(User.id))
-        .where(User.state == UserState.ACTIVE)
-        .where(User.updated_at >= today)
-        .where(User.updated_at < tomorrow)
+        select(func.count(AcquisitionTracking.id))
+        .where(AcquisitionTracking.converted_at.isnot(None))
+        .where(AcquisitionTracking.converted_at >= today_start)
+        .where(AcquisitionTracking.converted_at < tomorrow)
     )
     daily_converted = daily_converted_result.scalar() or 0
 
-    # Daily messages (placeholder - would need message tracking)
-    daily_messages = 0
+    # AcquisitionMessage is the canonical record for normal automated group
+    # writes, including linked owned-group executions. Successful ad delivery
+    # lives in a separate table, so add it once without counting the linked
+    # owned-group execution table again. Older ad probes were only aggregated
+    # in AccountRiskDailyStat; add only the portion that has no durable message
+    # row so current and historical probes are both counted exactly once.
+    acquisition_message_result = await db.execute(
+        select(func.count(AcquisitionMessage.id))
+        .where(AcquisitionMessage.message_id.isnot(None))
+        .where(AcquisitionMessage.sent_at >= today_start)
+        .where(AcquisitionMessage.sent_at < tomorrow)
+    )
+    ad_message_result = await db.execute(
+        select(func.count(AdDeliveryLog.id))
+        .where(AdDeliveryLog.status == DeliveryStatus.SUCCESS.value)
+        .where(AdDeliveryLog.telegram_message_id.isnot(None))
+        .where(AdDeliveryLog.sent_at >= today_start)
+        .where(AdDeliveryLog.sent_at < tomorrow)
+    )
+    recorded_probe_result = await db.execute(
+        select(func.count(AcquisitionMessage.id))
+        .where(AcquisitionMessage.message_purpose == "ad_probe")
+        .where(AcquisitionMessage.message_id.isnot(None))
+        .where(AcquisitionMessage.sent_at >= today_start)
+        .where(AcquisitionMessage.sent_at < tomorrow)
+    )
+    today_local_date = (today_start + timedelta(hours=8)).date()
+    aggregated_probe_result = await db.execute(
+        select(func.coalesce(func.sum(AccountRiskDailyStat.count), 0))
+        .where(AccountRiskDailyStat.stat_date == today_local_date)
+        .where(AccountRiskDailyStat.action == "ad_probe")
+        .where(AccountRiskDailyStat.status == "success")
+    )
+    recorded_probes = int(recorded_probe_result.scalar() or 0)
+    aggregated_probes = int(aggregated_probe_result.scalar() or 0)
+    historical_probe_gap = max(aggregated_probes - recorded_probes, 0)
+    daily_messages = (
+        int(acquisition_message_result.scalar() or 0)
+        + int(ad_message_result.scalar() or 0)
+        + historical_probe_gap
+    )
 
     # Daily violations
     daily_violations_result = await db.execute(
         select(func.count(Violation.id))
-        .where(Violation.created_at >= today)
+        .where(Violation.created_at >= today_start)
         .where(Violation.created_at < tomorrow)
     )
     daily_violations = daily_violations_result.scalar() or 0
@@ -151,20 +204,86 @@ async def get_dashboard(
     # Conversion rate
     conversion_rate = round(daily_converted / daily_registered * 100, 2) if daily_registered > 0 else 0.0
 
+    trend_start = today_start - timedelta(days=6)
+    registration_rows = (
+        await db.execute(
+            select(AcquisitionTracking.registered_at)
+            .where(AcquisitionTracking.registered_at.isnot(None))
+            .where(AcquisitionTracking.registered_at >= trend_start)
+            .where(AcquisitionTracking.registered_at < tomorrow)
+        )
+    ).scalars().all()
+    conversion_rows = (
+        await db.execute(
+            select(AcquisitionTracking.converted_at)
+            .where(AcquisitionTracking.converted_at.isnot(None))
+            .where(AcquisitionTracking.converted_at >= trend_start)
+            .where(AcquisitionTracking.converted_at < tomorrow)
+        )
+    ).scalars().all()
+    registrations_by_day: dict[str, int] = {}
+    conversions_by_day: dict[str, int] = {}
+    for timestamp in registration_rows:
+        key = (timestamp + timedelta(hours=8)).date().isoformat()
+        registrations_by_day[key] = registrations_by_day.get(key, 0) + 1
+    for timestamp in conversion_rows:
+        key = (timestamp + timedelta(hours=8)).date().isoformat()
+        conversions_by_day[key] = conversions_by_day.get(key, 0) + 1
+    weekly_trend = []
+    for offset in range(7):
+        key = (trend_start + timedelta(days=offset, hours=8)).date().isoformat()
+        weekly_trend.append(
+            {
+                "date": key,
+                "registered": registrations_by_day.get(key, 0),
+                "converted": conversions_by_day.get(key, 0),
+                "active": active_users,
+            }
+        )
+
+    account_distribution_rows = (
+        await db.execute(
+            select(TelegramAccount.status, func.count(TelegramAccount.id))
+            .group_by(TelegramAccount.status)
+        )
+    ).all()
+    account_distribution = [
+        {
+            "status": str(getattr(status_value, "value", status_value)).lower(),
+            "count": count,
+        }
+        for status_value, count in account_distribution_rows
+    ]
+
+    top_group_rows = (
+        await db.execute(
+            select(Group.id, Group.title, Group.member_count)
+            .order_by(Group.member_count.desc().nullslast(), Group.id.asc())
+            .limit(10)
+        )
+    ).all()
+    top_groups = [
+        {"id": group_id, "title": title, "memberCount": int(member_count or 0)}
+        for group_id, title, member_count in top_group_rows
+    ]
+
     return {
         "code": 0,
         "message": "success",
         "data": {
-            "total_accounts": total_accounts,
-            "online_accounts": online_accounts,
-            "total_groups": total_groups,
-            "total_users": total_users,
-            "active_users": active_users,
-            "daily_registered": daily_registered,
-            "daily_converted": daily_converted,
-            "conversion_rate": conversion_rate,
-            "daily_messages": daily_messages,
-            "daily_violations": daily_violations,
+            "totalAccounts": total_accounts,
+            "onlineAccounts": online_accounts,
+            "totalGroups": total_groups,
+            "totalUsers": total_users,
+            "activeUsers": active_users,
+            "dailyRegistered": daily_registered,
+            "dailyConverted": daily_converted,
+            "conversionRate": conversion_rate,
+            "dailyMessages": daily_messages,
+            "dailyViolations": daily_violations,
+            "weeklyTrend": weekly_trend,
+            "accountDistribution": account_distribution,
+            "topGroups": top_groups,
         }
     }
 

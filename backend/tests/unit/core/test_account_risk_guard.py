@@ -127,6 +127,46 @@ async def test_manual_ban_account_sets_banned_state_and_audits(test_db):
 
 
 @pytest.mark.asyncio
+async def test_manual_adjust_risk_persists_before_audit_reload(test_db):
+    account = TelegramAccount(
+        identifier="manual-risk-adjust-account",
+        session_name="manual-risk-adjust-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+        risk_score=27.0,
+        risk_level="frozen",
+        risk_pause_until=datetime.utcnow() + timedelta(hours=2),
+        risk_reason="ad_delivery_account_issue",
+    )
+    test_db.add(account)
+    await test_db.commit()
+
+    adjusted = await AccountRiskGuard(test_db).manual_adjust_risk(
+        account.id,
+        clear_pause=True,
+        target_level="watch",
+        reason="corrected_false_freeze",
+        operator="admin",
+    )
+
+    await test_db.refresh(account)
+    assert adjusted.id == account.id
+    assert account.risk_level == "watch"
+    assert account.risk_pause_until is None
+    assert account.risk_recovery_until is not None
+    assert account.risk_reason == "corrected_false_freeze"
+    event = await test_db.scalar(
+        select(AccountRiskEvent)
+        .where(AccountRiskEvent.account_id == account.id)
+        .order_by(AccountRiskEvent.id.desc())
+    )
+    assert event is not None
+    assert event.status == "manual"
+    assert event.reason == "corrected_false_freeze"
+
+
+@pytest.mark.asyncio
 async def test_risk_failure_event_redacts_proxy_credentials(test_db) -> None:
     account = TelegramAccount(
         identifier="risk-redaction-account",
@@ -789,6 +829,16 @@ class FakeRedisClient:
         self.values = {}
         self.lists = {}
 
+    async def delete(self, key):
+        return int(self.values.pop(key, None) is not None)
+
+    async def lrem(self, key, count, value):
+        items = self.lists.get(key, [])
+        if value in items:
+            items.remove(value)
+            return 1
+        return 0
+
     async def exists(self, key):
         return 1 if key in self.values else 0
 
@@ -1124,3 +1174,25 @@ def test_runtime_risk_guard_parses_redis_fail_closed_string():
     settings = normalize_account_risk_guard_settings({"redisFailClosed": "false"})
 
     assert settings["redis_fail_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_refused_action_budget_does_not_consume_content(test_db):
+    from unittest.mock import AsyncMock
+
+    account = TelegramAccount(
+        identifier="content-refused", session_name="content-refused", account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE, is_active=True, created_at=datetime.utcnow() - timedelta(days=20),
+    )
+    test_db.add(account)
+    await test_db.commit()
+    guard = AccountRiskGuard(test_db, cache=FakeCache())
+    guard._reserve_budget = AsyncMock(return_value=(False, "ad_probe_cooldown", 3570))
+    content = "A practical question about community deployment experience"
+    result = await guard.check_and_reserve(
+        SimpleNamespace(account_id=account.id, country_code="US"), AccountRiskAction.AD_PROBE,
+        target_type="group", target_id=12345, details={"content": content},
+    )
+    assert not result.allowed and result.retry_after_seconds == 3570
+    assert not any(key.startswith("risk:content:") for key in guard.cache.client.values)
+    assert (await guard.preview_content(account.id, AccountRiskAction.AD_PROBE, "group", 12345, content)).allowed

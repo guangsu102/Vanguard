@@ -100,13 +100,13 @@ export const createDefaultAssetPolicy = (): AccountAssetPolicySettings => ({
   },
 })
 export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 10, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
-export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 1800, growth_max_interval_seconds: 10800 })
+export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 600, growth_max_interval_seconds: 1800 })
 
 export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   enabled: true, timezone_offset_hours: 8, window_start_hour: 9, window_end_hour: 2,
   survival_check_delay_seconds: 120, survival_one_hour_seconds: 3600, survival_twenty_four_hour_seconds: 86400,
   survival_check_batch_size: 50, survival_retry_max_attempts: 3, survival_retry_base_seconds: 300,
-  max_groups_per_account: 400, max_new_ad_groups_per_day: 2,
+  max_groups_per_account: 100, max_new_ad_groups_per_day: 2, probe_backlog_max_days: 3,
   leave_on_deleted_ad: true, block_group_on_probe_failure: true, ad_policy_ai_enabled: true,
   ad_policy_ai_model: 'gpt-5.6-terra', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
   ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: true,

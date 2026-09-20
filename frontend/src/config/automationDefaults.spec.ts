@@ -25,12 +25,13 @@ describe('automation configuration defaults', () => {
     expect(execution.max_parallel_accounts).toBe(10)
 
     const throttle = createDefaultAdDeliveryThrottle()
-    expect(throttle.growth_min_interval_seconds).toBe(1800)
-    expect(throttle.growth_max_interval_seconds).toBe(10800)
+    expect(throttle.growth_min_interval_seconds).toBe(600)
+    expect(throttle.growth_max_interval_seconds).toBe(1800)
   })
 
   it('keeps ad policy and survival defaults without retired delivery caps', () => {
     const capacity = createDefaultAdCapacity()
+    expect(capacity.max_groups_per_account).toBe(100)
     expect(capacity.max_new_ad_groups_per_day).toBe(2)
     expect(capacity.survival_check_delay_seconds).toBe(120)
     expect('account_ad_daily_hard_cap' in capacity).toBe(false)

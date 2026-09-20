@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.core import automation_settings as automation_settings_module
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.automation_settings import (
     DEFAULT_NOTIFICATION_SETTINGS,
     normalize_account_asset_policy_settings,
@@ -14,10 +15,10 @@ from app.core.automation_settings import (
     normalize_ad_delivery_throttle_settings,
     normalize_ad_failure_policy,
     normalize_app_runtime_settings,
+    normalize_auto_join_scheduler_settings,
     normalize_group_ai_interaction_settings,
     normalize_owned_group_messaging_settings,
 )
-from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 
 
 @pytest.mark.asyncio
@@ -39,6 +40,22 @@ def test_ad_failure_policy_defaults_to_48_hour_window():
 
     assert config["group_control_failure_limit"] == 2
     assert config["group_control_failure_window_hours"] == 48
+
+
+def test_auto_join_settings_preserve_second_hop_switches():
+    disabled = normalize_auto_join_scheduler_settings(
+        {"join_verification": {"allow_second_hop_bots": False}}
+    )
+    camel_case = normalize_auto_join_scheduler_settings(
+        {"joinVerification": {"allowSecondHopBots": False}}
+    )
+
+    assert disabled["join_verification"]["allow_second_hop_bots"] is False
+    assert camel_case["join_verification"]["allow_second_hop_bots"] is False
+    assert (
+        normalize_auto_join_scheduler_settings(None)["join_verification"]["allow_second_hop_bots"]
+        is True
+    )
 
 
 def test_normalize_account_risk_guard_settings_configures_group_leave_policy():
@@ -107,7 +124,7 @@ def test_normalize_ad_capacity_settings_defaults_match_evidence_based_plan():
     assert "account_group_daily_cap_default" not in config
     assert "group_global_daily_hard_cap" not in config
     assert "group_min_interval_seconds" not in config
-    assert config["max_groups_per_account"] == 400
+    assert config["max_groups_per_account"] == 100
     assert config["max_new_ad_groups_per_day"] == 2
     assert config["leave_on_deleted_ad"] is True
     assert config["ad_policy_auto_probe_enabled"] is True
@@ -179,7 +196,7 @@ def test_normalize_ad_capacity_settings_accepts_camel_case_and_clamps_values():
     assert config["survival_check_delay_seconds"] == 30
     assert "account_group_daily_cap_default" not in config
     assert config["max_groups_per_account"] == 150
-    assert config["max_new_ad_groups_per_day"] == 2
+    assert config["max_new_ad_groups_per_day"] == 10
     assert "warmup_days_before_ads" not in config
     assert config["ad_policy_auto_probe_enabled"] is True
     assert "ad_policy_auto_probe_daily_limit" not in config
@@ -216,8 +233,8 @@ def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
         }
     )
 
-    assert config["growth_min_interval_seconds"] == 1800
-    assert config["growth_max_interval_seconds"] == 10800
+    assert config["growth_min_interval_seconds"] == 600
+    assert config["growth_max_interval_seconds"] == 1800
     assert "ad_only_min_interval_seconds" not in config
     assert "ad_only_max_interval_seconds" not in config
     assert "batch_size_min" not in config
@@ -228,16 +245,16 @@ def test_normalize_ad_delivery_throttle_settings_ignores_internal_batch_size():
     assert "cooldown_max_seconds" not in config
 
 
-def test_normalize_ad_delivery_throttle_settings_accepts_half_hour_minimum():
+def test_normalize_ad_delivery_throttle_settings_accepts_ten_to_thirty_minutes():
     config = normalize_ad_delivery_throttle_settings(
         {
-            "growth_min_interval_seconds": 1800,
-            "growth_max_interval_seconds": 10800,
+            "growth_min_interval_seconds": 600,
+            "growth_max_interval_seconds": 1800,
         }
     )
 
-    assert config["growth_min_interval_seconds"] == 1800
-    assert config["growth_max_interval_seconds"] == 10800
+    assert config["growth_min_interval_seconds"] == 600
+    assert config["growth_max_interval_seconds"] == 1800
 
 
 def test_normalize_ad_delivery_execution_settings_ignores_internal_run_caps():

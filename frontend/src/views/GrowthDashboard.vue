@@ -9,6 +9,7 @@ import {
   type AccountRiskGuardSettings,
   type AccountWarmupPolicySettings,
   type AdCapacitySettings,
+  type ProbeQueue,
   type AdDeliveryExecutionSettings,
   type AdDeliveryThrottleSettings,
   type AdDynamicStatus,
@@ -37,6 +38,10 @@ const props = withDefaults(
 )
 const isConfigView = computed(() => props.view === 'config')
 
+const probeQueue = ref<ProbeQueue | null>(null)
+const probeQueueError = ref('')
+const probeStage = ref('')
+const probeQueueItems = computed(() => (probeQueue.value?.items || []).filter(item => !probeStage.value || item.stage === probeStage.value))
 const loading = ref(false)
 const saving = ref('')
 const effectiveLimits = ref<EffectiveLimitSummary | null>(null)
@@ -590,6 +595,13 @@ const loadAll = async () => {
     syncGroupAiTextFields()
     effectiveLimits.value = effectiveLimitsRes.data.data
     captureAllSnapshots()
+    try {
+      const queueRes = await automationApi.getProbeQueue()
+      probeQueue.value = queueRes.data.data
+      probeQueueError.value = ''
+    } catch {
+      probeQueueError.value = '探测队列读取失败，请刷新重试'
+    }
   } finally {
     loading.value = false
   }
@@ -864,6 +876,33 @@ onBeforeUnmount(() => {
       <div class="limit-note">
         此处是全局硬上限。账号运营态中的实时额度还会受账号等级、暖号阶段、风险、健康度、探针质量和活动策略动态降低。
       </div>
+    </section>
+
+    <section v-if="!isConfigView" class="panel">
+      <div class="panel-header"><h3>中性探测与广告准入队列</h3><span>已加入关系 {{ probeQueue?.total || 0 }} 条</span></div>
+      <el-alert v-if="probeQueueError" :title="probeQueueError" type="error" :closable="false" />
+      <p class="limit-note">中性发言成功仅验证可写入。广告权限试探和正式投放分别检查许可、观察期与额度；最早时间不是发送承诺。</p>
+      <el-table :data="probeQueue?.accounts || []" size="small" max-height="260">
+        <el-table-column prop="account_id" label="账号" width="75" />
+        <el-table-column prop="completed_today" label="本运营日探测成功" />
+        <el-table-column prop="daily_limit" label="每日新群探测上限" />
+        <el-table-column prop="pending" label="可自动推进待探测" />
+        <el-table-column prop="approval_required" label="待人工许可" />
+        <el-table-column prop="minimum_capacity_cycles" label="库存所需最少额度周期" />
+      </el-table>
+      <el-select v-model="probeStage" clearable placeholder="筛选阶段" style="margin: 16px 0; width: 340px">
+        <el-option v-for="(count, stage) in probeQueue?.counts || {}" :key="stage" :value="stage" :label="`${probeQueue?.items.find(item => item.stage === stage)?.label || stage} (${count})`" />
+      </el-select>
+      <el-table :data="probeQueueItems" size="small" max-height="500" row-key="membership_id">
+        <el-table-column prop="account_id" label="账号" width="65" />
+        <el-table-column prop="group_id" label="群 ID" width="75" />
+        <el-table-column prop="title" label="群" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="label" label="当前等待 / 下一步" min-width="245" />
+        <el-table-column prop="queue_position" label="账号队列位置" width="120" />
+        <el-table-column label="最早时间" min-width="180"><template #default="{ row }">{{ row.earliest_action_at ? new Date(row.earliest_action_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '待条件满足' }}</template></el-table-column>
+        <el-table-column prop="permission_evidence" label="许可证据来源" min-width="130" />
+        <el-table-column prop="last_probe_error" label="最近等待原因" min-width="190" show-overflow-tooltip />
+      </el-table>
     </section>
 
     <section v-if="isConfigView" class="panel">
@@ -1288,10 +1327,10 @@ onBeforeUnmount(() => {
                 <el-switch v-model="adThrottleForm.enabled" />
               </el-form-item>
               <el-form-item label="Growth最小间隔秒">
-                <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="1800" :max="86400" />
+                <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="600" :max="86400" />
               </el-form-item>
               <el-form-item label="Growth最大间隔秒">
-                <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="3000" :max="86400" />
+                <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="600" :max="86400" />
               </el-form-item>
             </el-form>
             <el-form label-width="150px" size="small">
@@ -1311,10 +1350,15 @@ onBeforeUnmount(() => {
 
 
               <el-form-item label="单号最大群数">
-                <el-input-number v-model="adCapacityForm.max_groups_per_account" :min="1" :max="1000" />
+                <el-input-number v-model="adCapacityForm.max_groups_per_account" :min="1" :max="100" />
               </el-form-item>
-              <el-form-item label="新广告群/天">
-                <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="2" />
+              <el-form-item label="中性探测成功新群/天">
+                <el-input-number v-model="adCapacityForm.max_new_ad_groups_per_day" :min="0" :max="10" />
+                <span class="muted-text">最高 10；正常风险且不在暂停或恢复期的账号按配置执行，其他账号最多 2。底层尝试预算自动保留失败余量并与本额度同在 09:00 重置。</span>
+              </el-form-item>
+              <el-form-item label="探测积压限流天数">
+                <el-input-number v-model="adCapacityForm.probe_backlog_max_days" :min="0" :max="30" />
+                <span class="muted-text">超过阈值暂停该账号普通自动加群，继续处理库存；0 关闭。</span>
               </el-form-item>
               <el-form-item label="删除广告检测延迟">
                 <el-input-number v-model="adCapacityForm.survival_check_delay_seconds" :min="30" :max="3600" :step="10" />

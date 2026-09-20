@@ -5,7 +5,11 @@ export interface DashboardStats {
   onlineAccounts: number
   totalGroups: number
   totalUsers: number
+  activeUsers: number
   dailyRegistered: number
+  dailyConverted: number
+  dailyMessages: number
+  dailyViolations: number
   conversionRate: number
   weeklyTrend: Array<{
     date: string

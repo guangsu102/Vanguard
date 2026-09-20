@@ -1139,7 +1139,7 @@ class AdCampaign(Base):
         Integer, default=1, nullable=False, comment="单群每日上限"
     )
     max_sends_per_account_per_day: Mapped[int] = mapped_column(
-        Integer, default=10, nullable=False, comment="单账号每日上限"
+        Integer, default=30, nullable=False, comment="单账号每日上限"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

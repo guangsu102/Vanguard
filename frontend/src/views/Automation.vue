@@ -182,7 +182,7 @@ const campaignForm = reactive({
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
   max_sends_per_group_per_day: 1,
-  max_sends_per_account_per_day: 10,
+  max_sends_per_account_per_day: 30,
 })
 
 const emptyCampaignForm = () => ({
@@ -198,7 +198,7 @@ const emptyCampaignForm = () => ({
   min_wait_after_join_minutes: 60,
   interval_minutes: 180,
   max_sends_per_group_per_day: 1,
-  max_sends_per_account_per_day: 10,
+  max_sends_per_account_per_day: 30,
 })
 
 const scheduledTimesText = ref('')
@@ -242,7 +242,7 @@ const accountConfigForm = reactive({
   auto_join_enabled: false,
   auto_ads_enabled: true,
   max_groups_per_day: 10,
-  max_groups_total: 400,
+  max_groups_total: 100,
   join_interval_min_seconds: 60,
   join_interval_max_seconds: 900,
   max_messages_per_day: null as number | null,
@@ -947,7 +947,7 @@ const editCampaign = (campaign: any) => {
     min_wait_after_join_minutes: campaign.min_wait_after_join_minutes,
     interval_minutes: campaign.interval_minutes,
     max_sends_per_group_per_day: campaign.max_sends_per_group_per_day ?? 1,
-    max_sends_per_account_per_day: campaign.max_sends_per_account_per_day ?? 10,
+    max_sends_per_account_per_day: campaign.max_sends_per_account_per_day ?? 30,
   });
   scheduledTimesText.value = campaign.scheduled_times?.join(",") || "";
   campaignDrawerVisible.value = true;
@@ -2900,7 +2900,7 @@ onBeforeUnmount(() => {
                     <el-input-number v-model="accountConfigForm.max_groups_per_day" :min="0" :max="10" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="账号总群上限">
-                    <el-input-number v-model="accountConfigForm.max_groups_total" :min="0" :max="10000" />
+                    <el-input-number v-model="accountConfigForm.max_groups_total" :min="0" :max="100" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="加群最小间隔(秒)">
                     <el-input-number v-model="accountConfigForm.join_interval_min_seconds" :min="60" :max="86400" />

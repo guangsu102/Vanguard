@@ -25,6 +25,10 @@ from app.modules.owned_group.security import safe_exception_message
 class TelegramExecutionError(RuntimeError):
     """Raised when a Telegram operation cannot be executed."""
 
+    def __init__(self, message: str, *, retry_after_seconds: Optional[int] = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
 
 class TelegramSendOutcomeUnknownError(TelegramExecutionError):
     """A Telegram write may have occurred but its outcome cannot be confirmed."""
@@ -252,11 +256,16 @@ class TelegramExecutionService:
                 ) from exc
             raise TelegramSendPreflightError("owned-group risk preflight unavailable") from exc
         if not decision.allowed:
-            raise TelegramExecutionError(f"risk_guard_blocked:{decision.reason}")
+            raise TelegramExecutionError(
+                f"risk_guard_blocked:{decision.reason}",
+                retry_after_seconds=getattr(decision, "retry_after_seconds", None),
+            )
 
         try:
             yield
         except TelegramSendPreflightError:
+            if getattr(decision, "content_reservation", None):
+                await self.risk_guard.release_content_reservation(decision.content_reservation)
             raise
         except Exception as exc:
             try:
@@ -418,7 +427,10 @@ class TelegramExecutionService:
             details={"source": source, "reply_to": reply_to, "content": message},
         ):
             result = await client.send_message(group_id, message, reply_to=reply_to)
-        return getattr(result, "id", getattr(result, "message_id", None))
+            message_id = getattr(result, "id", getattr(result, "message_id", None))
+            if message_id is None:
+                raise RuntimeError("telegram send returned no message id")
+        return message_id
 
     async def send_owned_group_message(
         self,
