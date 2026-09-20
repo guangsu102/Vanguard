@@ -3074,7 +3074,10 @@ class AdOnlyRecommendationService:
             .where(
                 GroupAdHandover.workflow_type == DIRECT_WORKFLOW_TYPE,
                 GroupAdHandover.batch_id.is_not(None),
-                GroupAdHandover.status == "dispatching",
+                # A lost execute task (worker restart, crashed RPC) leaves the
+                # row in running just as surely as in dispatching; recover
+                # both or the account's whole queue deadlocks behind it.
+                GroupAdHandover.status.in_(["dispatching", "running"]),
                 GroupAdHandover.updated_at < stale_before,
             )
             .with_for_update(skip_locked=True, of=GroupAdHandover)
