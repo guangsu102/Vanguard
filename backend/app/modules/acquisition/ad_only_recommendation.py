@@ -96,6 +96,9 @@ class AdOnlyWorkflowError(ValueError):
     """Raised when an assessment or handover precondition is not satisfied."""
 
 
+_JOIN_COOLDOWN_RETRY_SECONDS = 660
+
+
 def _now() -> datetime:
     return datetime.utcnow()
 
