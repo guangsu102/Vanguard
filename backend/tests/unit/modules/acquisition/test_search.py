@@ -2117,6 +2117,160 @@ class TestAdDeliveryFailureHandling:
         service._ad_warmup_skip_reason.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_disabled_group_warmup_selects_one_candidate_per_account(
+        self, test_db, monkeypatch
+    ):
+        now = datetime(2026, 8, 29, 4, 0)
+        accounts = [
+            TelegramAccount(
+                phone=f"+1555000100{index}",
+                identifier=f"+1555000100{index}",
+                session_name=f"fair_probe_account_{index}",
+                account_type=AccountType.PROMOTER,
+                status=AccountStatus.ONLINE,
+                is_active=True,
+            )
+            for index in range(2)
+        ]
+        campaign = AdCampaign(
+            name="Fair probe campaign",
+            enabled=True,
+            status="active",
+            delivery_policy="growth",
+        )
+        test_db.add_all([*accounts, campaign])
+        await test_db.flush()
+        test_db.add_all(
+            [
+                AccountOperationConfig(
+                    account_id=account.id,
+                    enabled=True,
+                    auto_ads_enabled=True,
+                    operation_mode="growth",
+                )
+                for account in accounts
+            ]
+            + [
+                AccountAdBinding(
+                    account_id=account.id,
+                    ad_campaign_id=campaign.id,
+                    enabled=True,
+                )
+                for account in accounts
+            ]
+        )
+        joined_at = now - timedelta(days=1)
+        for index in range(101):
+            account = accounts[0] if index < 100 else accounts[1]
+            group = Group(
+                group_id=920000 + index,
+                title=f"Fair probe group {index}",
+                level=GroupLevel.A,
+                status="active",
+            )
+            test_db.add(group)
+            await test_db.flush()
+            test_db.add_all(
+                [
+                    GroupAccountMembership(
+                        group_id=group.id,
+                        telegram_group_id=group.group_id,
+                        account_id=account.id,
+                        status="joined",
+                        join_method="manual",
+                        warmup_status="joined_pending_test",
+                        probe_status="not_started",
+                        ad_status="warming",
+                        joined_at=joined_at,
+                    ),
+                    GroupAdProfile(
+                        group_id=group.id,
+                        telegram_group_id=group.group_id,
+                        ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                    ),
+                ]
+            )
+        await test_db.commit()
+
+        monkeypatch.setattr(
+            acquisition_automation,
+            "get_group_ai_interaction_settings",
+            AsyncMock(return_value={"enabled": False, "allowProactiveWarmup": False}),
+        )
+        service = AcquisitionAutomationService(test_db)
+        service._group_can_receive_ads = AsyncMock(return_value=True)
+        service._ad_account_risk_skip_reason = AsyncMock(return_value=None)
+        service._ad_warmup_skip_reason = AsyncMock(return_value="ad_probe_required")
+
+        result = await service._advance_disabled_group_warmup_to_write_probe(
+            now,
+            dry_run=True,
+        )
+
+        assert result["processed"] == 2
+        assert {detail["account_id"] for detail in result["details"]} == {
+            account.id for account in accounts
+        }
+
+    @pytest.mark.asyncio
+    async def test_successful_probe_repairs_missing_account_warmup_deadline(self, test_db):
+        now = datetime(2026, 8, 29, 4, 0)
+        joined_at = now - timedelta(days=20)
+        account = TelegramAccount(
+            phone="+15550001010",
+            identifier="+15550001010",
+            session_name="repair_probe_deadline_account",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+        )
+        group = Group(
+            group_id=920101,
+            title="Repair probe deadline",
+            level=GroupLevel.A,
+            status="active",
+        )
+        test_db.add_all([account, group])
+        await test_db.flush()
+        membership = GroupAccountMembership(
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            account_id=account.id,
+            status="joined",
+            join_method="manual",
+            warmup_status="writable_verified",
+            probe_status="success",
+            ad_status="active",
+            joined_at=joined_at,
+            interaction_started_at=None,
+            first_ad_allowed_at=None,
+            ad_eligible_after=now - timedelta(days=1),
+        )
+        test_db.add_all(
+            [
+                membership,
+                GroupAdProfile(
+                    group_id=group.id,
+                    telegram_group_id=group.group_id,
+                    ad_policy_mode=GroupAdPolicyMode.UNKNOWN.value,
+                ),
+            ]
+        )
+        await test_db.commit()
+
+        service = AcquisitionAutomationService(test_db)
+        service._account_ad_warmup_days = AsyncMock(return_value=7)
+        result = await service._repair_successful_probe_warmup_deadlines(
+            now,
+            dry_run=False,
+        )
+        await test_db.refresh(membership)
+
+        assert result == {"scanned": 1, "repaired": 1, "would_repair": 0}
+        assert membership.interaction_started_at == joined_at
+        assert membership.first_ad_allowed_at == joined_at + timedelta(days=7)
+
+    @pytest.mark.asyncio
     async def test_auto_policy_probe_requires_persisted_eligibility_deadline(
         self, test_db, monkeypatch
     ):
@@ -3512,17 +3666,24 @@ class TestCaptchaSubtyping:
 
     def test_tme_link_routes_to_second_hop(self):
         service = self._service()
-        decision = self._decision(
-            service, "请点击 https://t.me/somecaptcha_bot 完成验证"
-        )
+        decision = self._decision(service, "请点击 https://t.me/somecaptcha_bot 完成验证")
         assert decision.challenge_type == "second_hop_bot"
         assert decision.bot_username == "somecaptcha_bot"
+        assert decision.confidence >= 0.72
+
+    def test_tme_start_payload_is_preserved(self):
+        service = self._service()
+        decision = self._decision(
+            service,
+            "请点击 https://t.me/somecaptcha_bot?start=group_123 完成验证",
+        )
+
+        assert decision.bot_username == "somecaptcha_bot"
+        assert decision.bot_start_payload == "group_123"
 
     def test_webpage_captcha_stays_manual(self):
         service = self._service()
-        decision = self._decision(
-            service, "请点击 https://captcha.example.org/verify 完成验证"
-        )
+        decision = self._decision(service, "请点击 https://captcha.example.org/verify 完成验证")
         assert decision.challenge_type == "captcha"
         assert decision.action == "manual"
 
@@ -3534,7 +3695,14 @@ class TestCaptchaSubtyping:
 
     def test_button_whitelist_expanded_variants(self):
         service = self._service()
-        for text in ("同意并加入", "我已阅读并同意群规", "完成验证", "通过验证", "加入群聊", "Join"):
+        for text in (
+            "同意并加入",
+            "我已阅读并同意群规",
+            "完成验证",
+            "通过验证",
+            "加入群聊",
+            "Join",
+        ):
             assert service._is_safe_verification_button(text), text
         assert not service._is_safe_verification_button("举报此消息")
 
@@ -3545,19 +3713,29 @@ class SecondHopBot:
     def __init__(self, script):
         self.script = list(script)
         self.sent = []
+        self.next_message_id = 100
 
     async def get_entity(self, username):
         return SimpleNamespace(id=555, bot=True, username=username)
 
     async def send_message(self, entity, text):
         self.sent.append(text)
+        return SimpleNamespace(id=99, out=True)
 
     async def get_messages(self, entity, limit=10):
         batch = self.script.pop(0) if self.script else []
-        return [
-            SimpleNamespace(id=100 + i, message=text, buttons=None)
-            for i, text in enumerate(batch)
-        ]
+        messages = []
+        for text in batch:
+            messages.append(
+                SimpleNamespace(
+                    id=self.next_message_id,
+                    message=text,
+                    buttons=None,
+                    out=False,
+                )
+            )
+            self.next_message_id += 1
+        return messages
 
 
 class TestSecondHopBotVerification:
@@ -3592,6 +3770,48 @@ class TestSecondHopBotVerification:
         assert bot.sent == ["/start", "42"]
 
     @pytest.mark.asyncio
+    async def test_start_payload_is_sent_to_bot(self):
+        bot = SecondHopBot([["验证通过"]])
+        service, bot = self._service(bot)
+        decision = self._decision()
+        decision.bot_start_payload = "group_123"
+
+        result = await service._run_second_hop_bot_verification(bot, decision)
+
+        assert result.success is True
+        assert bot.sent == ["/start group_123"]
+
+    @pytest.mark.asyncio
+    async def test_production_confidence_threshold_reaches_second_hop(self):
+        bot = SecondHopBot([["验证通过"]])
+        service, bot = self._service(bot)
+        service._join_verification_settings = AsyncMock(
+            return_value=acquisition_automation.JoinVerificationSettings(
+                ai_enabled=False,
+                confidence_threshold=0.72,
+            )
+        )
+        messages = [
+            SimpleNamespace(
+                id=1,
+                message="请点击 https://t.me/verify_helper_bot?start=group_123 完成验证",
+                buttons=None,
+            )
+        ]
+
+        result = await service._handle_join_verification(
+            bot,
+            None,
+            messages,
+            can_send_messages=False,
+            permission_reason="account_send_restricted",
+        )
+
+        assert result.reason == "second_hop_bot_verified"
+        assert result.confidence >= 0.72
+        assert bot.sent == ["/start group_123"]
+
+    @pytest.mark.asyncio
     async def test_button_challenge_clicked_then_verified(self):
         bot = SecondHopBot(
             [
@@ -3610,6 +3830,58 @@ class TestSecondHopBotVerification:
         assert result.success is True
         assert result.reason == "second_hop_bot_verified"
         service._click_verification_button.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_disabled_actions_are_not_executed(self, monkeypatch):
+        monkeypatch.setattr(acquisition_automation.asyncio, "sleep", AsyncMock())
+        bot = SecondHopBot(
+            [[SimpleNamespace(id=10, message="请输入 12+30=?", buttons=MagicMock())]]
+        )
+        service, bot = self._service(bot)
+        service._extract_message_buttons = lambda messages: [{"text": "同意加入", "message_id": 10}]
+        service._click_verification_button = AsyncMock(return_value=True)
+
+        result = await service._run_second_hop_bot_verification(
+            bot,
+            self._decision(),
+            acquisition_automation.JoinVerificationSettings(
+                allow_button_clicks=False,
+                allow_text_answers=False,
+            ),
+        )
+
+        assert result.reason == "second_hop_no_resolution"
+        assert bot.sent == ["/start"]
+        service._click_verification_button.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_question_uses_configured_answer_profile(self):
+        bot = SecondHopBot([["请回答你的加群目的"]])
+        service, bot = self._service(bot)
+
+        await service._run_second_hop_bot_verification(
+            bot,
+            self._decision(),
+            acquisition_automation.JoinVerificationSettings(
+                answer_profile="产品研发，从事后端工程，希望交流技术。",
+            ),
+        )
+
+        assert bot.sent == ["/start", "产品研发，从事后端工程，希望交流技术。"]
+
+    @pytest.mark.asyncio
+    async def test_historical_success_message_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(acquisition_automation.asyncio, "sleep", AsyncMock())
+        bot = SecondHopBot([])
+        bot.get_messages = AsyncMock(
+            return_value=[SimpleNamespace(id=98, message="验证通过", buttons=None, out=False)]
+        )
+        service, bot = self._service(bot)
+
+        result = await service._run_second_hop_bot_verification(bot, self._decision())
+
+        assert result.success is False
+        assert result.reason == "second_hop_no_resolution"
 
     @pytest.mark.asyncio
     async def test_rejection_signal_leaves_group(self):
@@ -3671,7 +3943,12 @@ class TestSecondHopLinkExtraction:
     def test_bot_link_routes_to_second_hop(self):
         service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
         decision = service._local_join_verification_decision(
-            [SimpleNamespace(text="请加 @ t.me/verify_helper_bot 请输入验证码", raw_text="t.me/verify_helper_bot")],
+            [
+                SimpleNamespace(
+                    text="请加 @ t.me/verify_helper_bot 请输入验证码",
+                    raw_text="t.me/verify_helper_bot",
+                )
+            ],
             can_send_messages=False,
             permission_reason="default_send_restricted",
             settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
@@ -3682,7 +3959,12 @@ class TestSecondHopLinkExtraction:
     def test_joinchat_invite_stays_manual(self):
         service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
         decision = service._local_join_verification_decision(
-            [SimpleNamespace(text="t.me/joinchat/AbCdEf12345 请输入验证码", raw_text="t.me/joinchat/AbCdEf12345 请输入验证码")],
+            [
+                SimpleNamespace(
+                    text="t.me/joinchat/AbCdEf12345 请输入验证码",
+                    raw_text="t.me/joinchat/AbCdEf12345 请输入验证码",
+                )
+            ],
             can_send_messages=False,
             permission_reason="default_send_restricted",
             settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
@@ -3692,7 +3974,12 @@ class TestSecondHopLinkExtraction:
     def test_webpage_link_stays_manual(self):
         service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
         decision = service._local_join_verification_decision(
-            [SimpleNamespace(text="https://verify.example.com/captcha 完成验证", raw_text="https://verify.example.com/captcha 完成验证")],
+            [
+                SimpleNamespace(
+                    text="https://verify.example.com/captcha 完成验证",
+                    raw_text="https://verify.example.com/captcha 完成验证",
+                )
+            ],
             can_send_messages=False,
             permission_reason="default_send_restricted",
             settings_config=acquisition_automation.JoinVerificationSettings(ai_enabled=False),
@@ -3702,7 +3989,12 @@ class TestSecondHopLinkExtraction:
     def test_second_hop_can_be_disabled(self):
         service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
         decision = service._local_join_verification_decision(
-            [SimpleNamespace(text="t.me/verify_helper_bot 请输入验证码", raw_text="t.me/verify_helper_bot 请输入验证码")],
+            [
+                SimpleNamespace(
+                    text="t.me/verify_helper_bot 请输入验证码",
+                    raw_text="t.me/verify_helper_bot 请输入验证码",
+                )
+            ],
             can_send_messages=False,
             permission_reason="default_send_restricted",
             settings_config=acquisition_automation.JoinVerificationSettings(
@@ -3710,6 +4002,48 @@ class TestSecondHopLinkExtraction:
             ),
         )
         assert decision.action == "manual"
+
+
+class TestAcquisitionLlmHealthAlerts:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("alert_sent,expected_suppression_writes", [(False, 0), (True, 1)])
+    async def test_alert_suppression_is_written_only_after_successful_send(
+        self,
+        monkeypatch,
+        alert_sent,
+        expected_suppression_writes,
+    ):
+        cache = MagicMock()
+        cache.client = object()
+        cache.incr = AsyncMock(return_value=5)
+        cache.expire = AsyncMock()
+        cache.get = AsyncMock(return_value=None)
+        cache.set = AsyncMock(return_value=True)
+        manager = MagicMock()
+        manager.send_task_alert_async = AsyncMock(return_value=alert_sent)
+        monkeypatch.setattr("app.core.redis.RedisCache", lambda: cache)
+        monkeypatch.setattr(
+            "app.core.scheduler.alerts.TaskAlertManager",
+            lambda: manager,
+        )
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+
+        await service._record_llm_health(success=False, error="simulated outage")
+
+        manager.send_task_alert_async.assert_awaited_once()
+        assert cache.set.await_count == expected_suppression_writes
+
+    @pytest.mark.asyncio
+    async def test_success_resets_consecutive_failure_counter(self, monkeypatch):
+        cache = MagicMock()
+        cache.client = object()
+        cache.delete = AsyncMock(return_value=1)
+        monkeypatch.setattr("app.core.redis.RedisCache", lambda: cache)
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=MagicMock())
+
+        await service._record_llm_health(success=True)
+
+        cache.delete.assert_awaited_once_with("llm_health:acquisition:consecutive_failures")
 
 
 class TestCaptchaWeakSignalGuard:
@@ -3735,3 +4069,21 @@ class TestCaptchaWeakSignalGuard:
     def test_strong_signal_alone_is_captcha(self):
         decision = self._decision("请完成图形验证码")
         assert decision.challenge_type == "captcha"
+
+
+def test_ad_only_interval_floor_is_ten_minutes():
+    from app.modules.acquisition.ad_only_recommendation import (
+        AdOnlyRecommendationService,
+        AdOnlyWorkflowError,
+    )
+
+    validate = AdOnlyRecommendationService._validate_schedule
+    mode, interval, times, estimated = validate("interval", 10, None)
+    assert (mode, interval, estimated) == ("interval", 10, 144)
+    for below_floor in (0, 9):
+        try:
+            validate("interval", below_floor, None)
+        except AdOnlyWorkflowError as exc:
+            assert str(exc) == "interval_minutes_out_of_range"
+        else:
+            raise AssertionError(f"{below_floor} should be below the floor")

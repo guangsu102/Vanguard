@@ -734,7 +734,10 @@ class AdOnlyRecommendationService:
                 values.append(normalized)
         values.sort()
         if mode == AdSendMode.INTERVAL.value:
-            if not 30 <= interval <= 10080:
+            # The ad_only floor is 10 minutes: dedicated accounts send
+            # operator-curated creatives on an explicit cadence, bounded by
+            # the per-account outbound hard cap. Growth keeps its own limits.
+            if not 10 <= interval <= 10080:
                 raise AdOnlyWorkflowError("interval_minutes_out_of_range")
             estimated = max(1, math.ceil(1440 / interval))
         else:
@@ -2539,6 +2542,37 @@ class AdOnlyRecommendationService:
             if failed is None:
                 raise
             error = _safe_error(exc)
+            # A risk-guard cooldown is a pacing signal, not a defect: push the
+            # attempt past the cooldown window instead of demanding a manual
+            # retry for every queued partner group.
+            if error.startswith("risk_guard_blocked:join_cooldown"):
+                cooldown_deadline = _now() + timedelta(seconds=_JOIN_COOLDOWN_RETRY_SECONDS)
+                failed.status = "queued"
+                failed.last_error = error
+                failed.retry_count = int(failed.retry_count or 0) + 1
+                failed.next_attempt_at = cooldown_deadline
+                failed.updated_at = _now()
+                await self._add_event(
+                    group_id=failed.group_id,
+                    assessment_id=failed.assessment_id,
+                    handover_id=failed.id,
+                    event_type="handover_requeued",
+                    step=failed.current_step,
+                    status="retry_wait",
+                    message="Join cooldown active; attempt rescheduled",
+                    payload={"error": error, "retry_after_seconds": _JOIN_COOLDOWN_RETRY_SECONDS},
+                )
+                if failed.batch_id:
+                    await self._schedule_next_join_queue_item(
+                        failed.target_ad_only_account_id,
+                        now=failed.updated_at,
+                    )
+                await self.db.commit()
+                return {
+                    "status": "requeued",
+                    "error": error,
+                    "handover": self.handover_payload(failed),
+                }
             failed.status = "failed"
             failed.failed_at = _now()
             failed.last_error = error
