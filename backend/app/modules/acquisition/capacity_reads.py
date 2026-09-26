@@ -18,11 +18,14 @@ class CapacityReads:
     async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
         if not statement.is_select or statement._for_update_arg is not None:
             raise RuntimeError("capacity_projection_requires_unlocked_select")
-        compiled = statement.compile(compile_kwargs={"render_postcompile": True})
         shape = statement._generate_cache_key()
+        if shape is None:
+            return await self.db.execute(statement, *args, **kwargs)
+        # SQLAlchemy's structural key already identifies bind positions. Reading
+        # their values avoids recompiling SQL just to discover query parameters.
         key = (
-            shape.key if shape else str(compiled),
-            repr(compiled.params),
+            shape.key,
+            repr(tuple(param.effective_value for param in shape.bindparams)),
             repr(args),
             repr(kwargs),
         )
