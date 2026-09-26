@@ -28,6 +28,7 @@ from app.core.account.risk_guard import AccountRiskGuard
 from app.core.account.telegram_execution import (
     TelegramExecutionError,
     TelegramExecutionService,
+    TelegramJoinRequestPendingError,
     parse_telegram_group_link,
 )
 from app.core.automation_settings import (
@@ -41,6 +42,11 @@ from app.core.ephemeral_secret import (
     encrypt_ephemeral_secret,
 )
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
+from app.core.group.join_review import (
+    JOIN_REVIEW_LEFT,
+    approve_join_review,
+    reset_join_review,
+)
 from app.core.operating_time import operating_day_start
 from app.modules.acquisition.models import (
     AccountAdBinding,
@@ -61,6 +67,7 @@ from app.modules.acquisition.models import (
     GroupAdProfile,
     GroupAdTier,
 )
+from app.modules.acquisition.join_budget import JoinRequestBudgetService
 
 logger = structlog.get_logger()
 
@@ -168,6 +175,7 @@ class AdOnlyRecommendationService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.logger = logger.bind(module="ad_only_recommendation")
+        self.join_budget = JoinRequestBudgetService(db)
 
     async def _add_event(
         self,
@@ -1023,7 +1031,7 @@ class AdOnlyRecommendationService:
         links = self._normalize_invite_links(invite_links)
         minimum = int(join_interval_min_minutes)
         maximum = int(join_interval_max_minutes)
-        if minimum < 1 or maximum > 30 or minimum > maximum:
+        if minimum < 48 or maximum > 1440 or minimum > maximum:
             raise AdOnlyWorkflowError("invalid_join_interval_range")
 
         campaign = await self.db.get(AdCampaign, campaign_id)
@@ -1718,6 +1726,74 @@ class AdOnlyRecommendationService:
         }
         return len(normalized) == 1
 
+    async def _join_by_link_with_budget(
+        self,
+        target: TelegramAccount,
+        wrapper: Any,
+        invite_link: str,
+        *,
+        source: str,
+        group: Group | None = None,
+    ) -> dict[str, Any]:
+        reservation = await self.join_budget.reserve(
+            target.id,
+            group_id=group.id if group else None,
+            telegram_group_id=group.group_id if group else None,
+            group_username=group.username if group else None,
+            group_title=group.title if group else None,
+            source_keyword=group.source_keyword if group else None,
+            target_key=invite_link,
+            source=source,
+            require_auto_join_enabled=False,
+        )
+
+        async def mark_join_request_sent() -> None:
+            await self.join_budget.mark_sent(reservation)
+
+        try:
+            resolved = await TelegramExecutionService(
+                AccountRiskGuard(self.db)
+            ).join_group_by_link(
+                wrapper,
+                invite_link,
+                source=source,
+                on_join_request_attempted=mark_join_request_sent,
+            )
+        except TelegramJoinRequestPendingError as exc:
+            await self.join_budget.finalize(
+                reservation,
+                status=DeliveryStatus.PENDING,
+                reason=f"{source}_pending_approval",
+                error=str(exc),
+            )
+            raise
+        except Exception as exc:
+            if reservation.request_state == "reserved":
+                await self.join_budget.release(
+                    reservation,
+                    reason=f"{source}_not_sent",
+                )
+            else:
+                await self.join_budget.finalize(
+                    reservation,
+                    status=DeliveryStatus.FAILED,
+                    reason=f"{source}_failed",
+                    error=str(exc),
+                    outcome_unknown=not isinstance(exc, TelegramExecutionError),
+                )
+            raise
+
+        await self.join_budget.finalize(
+            reservation,
+            status=DeliveryStatus.SUCCESS,
+            reason=f"{source}_succeeded",
+            joined_at=_now(),
+            telegram_group_id=int(resolved.get("id") or 0) or None,
+            group_username=str(resolved.get("username") or "").strip().lstrip("@") or None,
+            group_title=str(resolved.get("title") or "").strip() or None,
+        )
+        return resolved
+
     async def _joined_membership(
         self, group_id: int, account_id: int
     ) -> GroupAccountMembership | None:
@@ -1776,6 +1852,20 @@ class AdOnlyRecommendationService:
             and profile.ad_policy_evidence_hash == evidence_hash
         )
         now = _now()
+        if handover.target_ad_only_account_id is not None:
+            membership = (
+                await self.db.execute(
+                    select(GroupAccountMembership).where(
+                        GroupAccountMembership.group_id == group.id,
+                        GroupAccountMembership.account_id
+                        == handover.target_ad_only_account_id,
+                        GroupAccountMembership.status == "joined",
+                    )
+                )
+            ).scalar_one_or_none()
+            if membership is not None:
+                approve_join_review(membership, now)
+                membership.updated_at = now
         profile.telegram_group_id = group.group_id
         profile.ad_policy_mode = str(handover.permission_mode)
         profile.ad_policy_confidence = 100
@@ -1852,9 +1942,8 @@ class AdOnlyRecommendationService:
         if wrapper is None:
             raise AdOnlyWorkflowError("target_account_session_unavailable")
         try:
-            resolved = await TelegramExecutionService(
-                AccountRiskGuard(self.db)
-            ).join_group_by_link(
+            resolved = await self._join_by_link_with_budget(
+                target,
                 wrapper,
                 invite_link,
                 source="ad_only_direct_assignment",
@@ -1918,6 +2007,17 @@ class AdOnlyRecommendationService:
                     "warmup_status": membership.warmup_status if membership else None,
                     "probe_status": membership.probe_status if membership else None,
                     "ad_status": membership.ad_status if membership else None,
+                    "review_status": membership.review_status if membership else None,
+                    "review_started_at": _iso(membership.review_started_at)
+                    if membership
+                    else None,
+                    "review_next_at": _iso(membership.review_next_at)
+                    if membership
+                    else None,
+                    "review_deadline_at": _iso(membership.review_deadline_at)
+                    if membership
+                    else None,
+                    "review_attempts": membership.review_attempts if membership else None,
                 }
             )
         if membership is None:
@@ -1937,6 +2037,7 @@ class AdOnlyRecommendationService:
         membership.probe_status = "not_started"
         membership.ad_status = "warming"
         membership.updated_at = now
+        reset_join_review(membership, now)
         await self.db.commit()
 
         await self._claim_direct_group(handover, group, target)
@@ -2002,12 +2103,12 @@ class AdOnlyRecommendationService:
         if wrapper is None:
             raise AdOnlyWorkflowError("target_account_session_unavailable")
         try:
-            resolved = await TelegramExecutionService(
-                AccountRiskGuard(self.db)
-            ).join_group_by_link(
+            resolved = await self._join_by_link_with_budget(
+                target,
                 wrapper,
                 invite_link,
                 source="ad_only_handover",
+                group=group,
             )
             resolved_id = int(resolved.get("id") or 0)
             if not resolved_id or not self._telegram_group_matches(
@@ -2052,6 +2153,7 @@ class AdOnlyRecommendationService:
         membership.probe_status = "not_started"
         membership.ad_status = "warming"
         membership.updated_at = now
+        reset_join_review(membership, now)
         await self.db.commit()
         return membership
 
@@ -2980,6 +3082,23 @@ class AdOnlyRecommendationService:
             target_membership.ad_status = membership_previous.get(
                 "ad_status"
             ) or target_membership.ad_status
+            target_membership.review_status = membership_previous.get(
+                "review_status"
+            ) or target_membership.review_status
+            for field_name in (
+                "review_started_at",
+                "review_next_at",
+                "review_deadline_at",
+            ):
+                serialized = membership_previous.get(field_name)
+                setattr(
+                    target_membership,
+                    field_name,
+                    datetime.fromisoformat(serialized) if serialized else None,
+                )
+            target_membership.review_attempts = int(
+                membership_previous.get("review_attempts") or 0
+            )
             target_membership.updated_at = _now()
         elif target_membership is not None:
             now = _now()
@@ -2989,6 +3108,10 @@ class AdOnlyRecommendationService:
             target_membership.warmup_status = "blocked"
             target_membership.probe_status = "skipped"
             target_membership.ad_status = "blocked"
+            target_membership.review_status = JOIN_REVIEW_LEFT
+            target_membership.review_next_at = None
+            target_membership.leave_confirmed_at = now
+            target_membership.leave_error = None
             target_membership.updated_at = now
         completed_at = _now()
         handover.status = "rolled_back"
@@ -3090,10 +3213,10 @@ class AdOnlyRecommendationService:
         ).scalar_one_or_none()
         if next_row is None:
             return None
-        minimum = max(1, min(30, int(next_row.join_interval_min_minutes or 1)))
+        minimum = max(48, min(1440, int(next_row.join_interval_min_minutes or 48)))
         maximum = max(
             minimum,
-            min(30, int(next_row.join_interval_max_minutes or minimum)),
+            min(1440, int(next_row.join_interval_max_minutes or minimum)),
         )
         delay_minutes = random.randint(minimum, maximum)
         next_row.next_attempt_at = (now or _now()) + timedelta(

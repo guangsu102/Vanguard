@@ -50,6 +50,8 @@ TASK_CONCURRENCY = {
     "campaign_check": 2,
     "bulk_import": 2,
     "automation": 3,
+    "qualification": 2,
+    "growth_maintenance": 1,
     "resource_search": 1,
     "account_spam": 1,
     "account_profile_update": 1,
@@ -73,12 +75,34 @@ celery_app.conf.update(
     worker_max_tasks_per_child=_env_int("CELERY_WORKER_MAX_TASKS_PER_CHILD", 100),
     task_acks_late=True,
     task_reject_on_worker_lost=True,
+    result_expires=21600,
 )
 
 # =============================================================================
 # Beat Schedule - Second-level Precision Tasks
 # =============================================================================
 celery_app.conf.beat_schedule = {
+    "runtime-recovery-every-minute": {
+        "task": "app.core.scheduler.tasks.runtime_recovery_task", "schedule": 60.0,
+        "options": {"queue": "growth_maintenance", "expires": 55},
+    },
+    "group-qualification-every-minute": {
+        "task": "app.core.scheduler.tasks.group_qualification_task",
+        "schedule": 60.0,
+        "options": {"queue": "qualification", "expires": 55},
+    },
+    "qualification-verification-every-minute": {
+        "task": "app.core.scheduler.tasks.group_verification_task", "schedule": 60.0,
+        "options": {"queue": "growth_maintenance", "expires": 55},
+    },
+    "join-reconciliation-every-minute": {
+        "task": "app.core.scheduler.tasks.reconcile_join_requests_task", "schedule": 60.0,
+        "options": {"queue": "growth_maintenance", "expires": 55},
+    },
+    "qualification-exits-every-two-minutes": {
+        "task": "app.core.scheduler.tasks.qualification_exits_task", "schedule": 120.0,
+        "options": {"queue": "automation", "expires": 110},
+    },
     # -------------------------------------------------------------------------
     # Second-level Tasks
     # -------------------------------------------------------------------------
@@ -146,7 +170,7 @@ celery_app.conf.beat_schedule = {
     "check-ad-survival-every-2min": {
         "task": "app.core.scheduler.tasks.check_ad_survival_task",
         "schedule": 120.0,
-        "options": {"queue": "automation", "rate_limit": "30/h"},
+        "options": {"queue": "growth_maintenance", "rate_limit": "30/h"},
     },
     "audit-group-ad-policies-hourly": {
         "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
@@ -285,6 +309,10 @@ celery_app.conf.beat_schedule = {
 # Task Routing to Queues
 # =============================================================================
 celery_app.conf.task_routes = {
+    "app.core.scheduler.tasks.group_qualification_task": {"queue": "qualification"},
+    "app.core.scheduler.tasks.group_verification_task": {"queue": "growth_maintenance"},
+    "app.core.scheduler.tasks.reconcile_join_requests_task": {"queue": "growth_maintenance"},
+    "app.core.scheduler.tasks.qualification_exits_task": {"queue": "automation"},
     "app.core.scheduler.tasks.health_check_*": {"queue": "health_check"},
     "app.core.scheduler.tasks.check_proxy_status": {"queue": "proxy_validation"},
     "app.core.scheduler.tasks.campaign_check_task": {"queue": "campaign_check"},
@@ -298,7 +326,7 @@ celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.auto_join_groups_task": {"queue": "automation"},
     "app.core.scheduler.tasks.deliver_ads_task": {"queue": "automation"},
     "app.core.scheduler.tasks.recover_orphaned_groups_task": {"queue": "automation"},
-    "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "automation"},
+    "app.core.scheduler.tasks.check_ad_survival_task": {"queue": "growth_maintenance"},
     "app.core.scheduler.tasks.audit_group_ad_policies_task": {"queue": "automation"},
     "app.core.scheduler.tasks.evaluate_ad_only_candidates_task": {"queue": "automation"},
     "app.core.scheduler.tasks.dispatch_ad_only_join_queue_task": {"queue": "automation"},
@@ -357,6 +385,8 @@ celery_app.conf.task_queues = {
         "exchange": "broadcast",
         "routing_key": "broadcast",
     },
+    "qualification": {"exchange": "qualification", "routing_key": "qualification"},
+    "growth_maintenance": {"exchange": "growth_maintenance", "routing_key": "growth_maintenance"},
     "automation": {
         "exchange": "automation",
         "routing_key": "automation",

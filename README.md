@@ -18,7 +18,7 @@ vanguard/
 │   ├── Dockerfile
 │   └── requirements.txt
 │
-├── bot-matrix/              # Telegram Bot (Python)
+├── bot-matrix/              # Legacy/reference Telegram Bot implementation
 │   ├── src/
 │   │   ├── bots/          # Bot implementations
 │   │   ├── core/          # Core utilities
@@ -43,7 +43,7 @@ vanguard/
 │
 ├── monitoring/              # Prometheus & Grafana config
 ├── scripts/                # Deployment scripts
-├── docs/                   # Project documentation
+├── docs/                   # Project documentation; start with docs/README.md
 ├── logs/                   # Application logs
 │
 ├── docker-compose.yml       # Docker Compose orchestration
@@ -54,6 +54,10 @@ vanguard/
 ```
 
 ## Quick Start
+
+Documentation map: [docs/README.md](docs/README.md). The active Telegram
+execution path is backend/app/workers/telegram_worker.py; bot-matrix is
+kept as legacy/reference code behind an explicit Compose profile.
 
 ### Prerequisites
 

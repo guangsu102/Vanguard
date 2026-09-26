@@ -50,7 +50,46 @@ export interface GroupFailoverTask {
 
 export type AccountOperationMode = 'growth' | 'ad_only'
 
+export interface JoinRequestRuntime {
+  configured_limit: number
+  effective_limit: number
+  requested_today: number
+  requested_rolling_24h: number
+  active_reservations: number
+  pending_review_count: number
+  overdue_review_count: number
+  next_allowed_at?: string
+  blocked_reasons: string[]
+}
+
+export interface DynamicCapacitySnapshot {
+  account_id: number
+  enabled: boolean
+  configured: Record<string, number>
+  effective: Record<string, number>
+  used_today: Record<string, number>
+  used_rolling_24h: Record<string, number>
+  remaining: Record<string, number>
+  execution?: { state: string; resume_at?: string | null; reason?: string | null }
+  read_rpc?: { state: string; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; limits: Record<string, number> }
+  quota_remaining?: Record<string, number>
+  executable?: Record<string, number>
+  executable_now?: Record<string, number>
+  next_allowed_at?: string | null
+  ad_next_allowed_at?: string | null
+  blockers: string[]
+  inventory: Record<string, number>
+  workload?: { rollout_phase?: string; blocker_counts?: Record<string, number>; [key: string]: unknown }
+  group_frequencies?: { group_id: number; title?: string; telegram_group_id?: number; quota: number; mature: boolean; successes: number; status: string; reason?: string; next_allowed_at?: string | null }[]
+  outbound?: { categories?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }>; ad_lanes?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }> | null; unknown_count?: number }
+}
+
 export interface AccountOperationConfig {
+  dynamic_capacity_enabled?: boolean
+  adaptive_ads_enabled?: boolean
+  max_ads_per_day?: number
+  max_verification_messages_per_day?: number
+  max_diagnostic_messages_per_day?: number
   id: number
   account_id: number
   operation_mode: AccountOperationMode
@@ -71,10 +110,11 @@ export interface AccountOperationConfig {
   risk_level: string
   business_stage: 'new' | 'normal' | 'hot' | 'cooldown' | string
   enabled: boolean
+  join_runtime?: JoinRequestRuntime
 }
 
 export type AccountOperationConfigUpdatePayload = Partial<
-  Omit<AccountOperationConfig, 'id' | 'account_id' | 'risk_level' | 'business_stage'>
+  Omit<AccountOperationConfig, 'id' | 'account_id' | 'risk_level' | 'business_stage' | 'join_runtime'>
 > & { force_transition?: boolean }
 
 export interface AutoJoinSchedulerConfig {
@@ -727,6 +767,8 @@ export interface AdOnlyHandoverOptions {
 }
 
 export const automationApi = {
+  getRuntime: () => apiClient.get<{ data: { status: string; checked_at: string; alerts: { code: string; severity: string; account_id?: number }[] } }>('/operations/status'),
+  getCapacity: (accountId?: number) => apiClient.get<{ data: DynamicCapacitySnapshot[] }>('/automation/capacity', { params: { account_id: accountId } }),
   getAutoJoinSchedulerConfig: () => {
     return apiClient.get<{ data: AutoJoinSchedulerConfig }>('/automation/auto-join/scheduler-config')
   },

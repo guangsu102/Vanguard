@@ -69,8 +69,8 @@ const directForm = reactive<AdOnlyDirectAssignmentBatchRequest>({
   target_account_id: 0,
   creative_id: 0,
   invite_links: [],
-  join_interval_min_minutes: 1,
-  join_interval_max_minutes: 30,
+  join_interval_min_minutes: 48,
+  join_interval_max_minutes: 120,
   permission_mode: 'soft_ad_allowed',
   permission_note: '',
   permission_expires_at: defaultPermissionExpiry(),
@@ -300,8 +300,8 @@ const openDirectAssignment = (campaignId?: number) => {
     target_account_id: options.value.accounts[0]?.id || 0,
     creative_id: options.value.creatives[0]?.id || 0,
     invite_links: [],
-    join_interval_min_minutes: 1,
-    join_interval_max_minutes: 30,
+    join_interval_min_minutes: 48,
+    join_interval_max_minutes: 120,
     permission_mode: 'soft_ad_allowed',
     permission_note: '',
     permission_expires_at: defaultPermissionExpiry(),
@@ -820,8 +820,8 @@ onMounted(loadData)
           <el-form-item label="最小间隔" required>
             <el-input-number
               v-model="directForm.join_interval_min_minutes"
-              :min="1"
-              :max="30"
+              :min="48"
+              :max="1440"
               controls-position="right"
             />
             <span class="unit-label">分钟</span>
@@ -829,8 +829,8 @@ onMounted(loadData)
           <el-form-item label="最大间隔" required>
             <el-input-number
               v-model="directForm.join_interval_max_minutes"
-              :min="1"
-              :max="30"
+              :min="48"
+              :max="1440"
               controls-position="right"
             />
             <span class="unit-label">分钟</span>

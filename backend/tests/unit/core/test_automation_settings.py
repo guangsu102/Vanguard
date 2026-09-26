@@ -58,6 +58,18 @@ def test_auto_join_settings_preserve_second_hop_switches():
     )
 
 
+def test_auto_join_settings_force_no_conversion_cleanup_off():
+    config = normalize_auto_join_scheduler_settings(
+        {"group_capacity_cleanup": {"enabled": True}}
+    )
+
+    assert config["group_capacity_cleanup"]["enabled"] is False
+
+
+def test_auto_join_settings_default_to_globally_paused():
+    assert normalize_auto_join_scheduler_settings(None)["enabled"] is False
+
+
 def test_normalize_account_risk_guard_settings_configures_group_leave_policy():
     config = normalize_account_risk_guard_settings(
         {
@@ -89,7 +101,7 @@ def test_normalize_account_risk_guard_settings_enforces_acquisition_hard_caps():
     assert config["account_outbound_message_hard_cap_default"] == 30
     assert config["global_daily_limit"] == 30
     assert config["group_write_daily_limit"] == 8
-    assert config["actions"]["join"] == {"daily_limit": 10, "cooldown_seconds": 7200}
+    assert config["actions"]["join"] == {"daily_limit": 30, "cooldown_seconds": 2880}
     assert config["actions"]["group_message"] == {
         "daily_limit": 4,
         "cooldown_seconds": 7200,

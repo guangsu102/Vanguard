@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import re
 import socket
 import time
@@ -38,7 +39,7 @@ from app.core.account.proxy_policy_events import (
     start_account_proxy_policy_listener,
     stop_account_proxy_policy_listener,
 )
-from app.core.account.risk_guard import AccountRiskGuard
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
 from app.core.account.telegram_execution import (
     TelegramExecutionError,
@@ -64,7 +65,9 @@ from app.modules.acquisition.models import (
     MessageTemplate,
     SearchKeywordStatus,
 )
+from app.modules.guardian.keyword_reply import handle_pp_ai_keyword_reply
 from app.modules.guardian.main import create_guardian_bot
+from app.modules.guardian.verification import runtime as pp_ai_verification
 from app.modules.guardian.models import (
     ManagedGroupBinding,
     ManagedGroupBindingStatus,
@@ -110,6 +113,52 @@ ENTITY_NAME_CACHE_TTL_SECONDS = 30 * 60
 ENTITY_NAME_CACHE_MAX_SIZE = 5000
 GROWTH_EVENT_CONCURRENCY_CAP = 8
 GROWTH_EVENT_DB_CONNECTION_RESERVE = 2
+TELETHON_ACCOUNT_LOGGER_PREFIX = "vanguard.telethon.account."
+TELEGRAM_PLATFORM_RESTRICTION_LOG_COOLDOWN_SECONDS = 5 * 60
+TELEGRAM_PLATFORM_RESTRICTION_MARKERS = (
+    "account is frozen",
+    "account frozen",
+    "frozenmethodinvalid",
+    "method that is not available for frozen accounts",
+)
+
+
+class TelegramPlatformRestrictionHandler(logging.Handler):
+    """Bridge account-scoped Telethon restriction logs into worker state."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        callback: Callable[[int, str], None],
+        *,
+        cooldown_seconds: float = TELEGRAM_PLATFORM_RESTRICTION_LOG_COOLDOWN_SECONDS,
+    ) -> None:
+        super().__init__(level=logging.NOTSET)
+        self._loop = loop
+        self._callback = callback
+        self._cooldown_seconds = max(0.0, float(cooldown_seconds))
+        self._last_scheduled_at: dict[int, float] = {}
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if not record.name.startswith(TELETHON_ACCOUNT_LOGGER_PREFIX):
+                return
+            account_text = record.name[len(TELETHON_ACCOUNT_LOGGER_PREFIX) :].split(".", 1)[0]
+            if not account_text.isdigit():
+                return
+            message = record.getMessage()
+            lowered = message.lower()
+            if not any(marker in lowered for marker in TELEGRAM_PLATFORM_RESTRICTION_MARKERS):
+                return
+            account_id = int(account_text)
+            now = time.monotonic()
+            previous = self._last_scheduled_at.get(account_id)
+            if previous is not None and now - previous < self._cooldown_seconds:
+                return
+            self._last_scheduled_at[account_id] = now
+            self._loop.call_soon_threadsafe(self._callback, account_id, message)
+        except Exception:
+            self.handleError(record)
 
 
 class TelegramWorker:
@@ -132,11 +181,15 @@ class TelegramWorker:
             self._growth_event_concurrency
         )
         self._private_outbox_task: asyncio.Task[None] | None = None
+        self._platform_restriction_handler: TelegramPlatformRestrictionHandler | None = None
+        self._platform_restriction_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         await init_db(create_tables=not settings.is_production)
         await init_redis()
         await start_account_proxy_policy_listener()
+        if self.role == TelegramWorkerRole.GROWTH_USER:
+            self._install_platform_restriction_handler()
         self._running = True
         try:
             await self._heartbeat(TelegramWorkerStatusValue.STARTING.value, {"phase": "startup"})
@@ -164,6 +217,8 @@ class TelegramWorker:
             await self._heartbeat(TelegramWorkerStatusValue.ERROR.value, {"phase": "error"}, last_error=str(exc))
             raise
         finally:
+            self._remove_platform_restriction_handler()
+            await self._drain_platform_restriction_tasks()
             if self._private_outbox_task is not None:
                 self._private_outbox_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -174,6 +229,99 @@ class TelegramWorker:
             await stop_account_proxy_policy_listener()
             await close_redis()
             await close_db()
+
+    def _install_platform_restriction_handler(self) -> None:
+        if self._platform_restriction_handler is not None:
+            return
+        handler = TelegramPlatformRestrictionHandler(
+            asyncio.get_running_loop(),
+            self._schedule_platform_restriction,
+        )
+        logging.getLogger().addHandler(handler)
+        self._platform_restriction_handler = handler
+
+    def _remove_platform_restriction_handler(self) -> None:
+        handler = self._platform_restriction_handler
+        if handler is None:
+            return
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+        self._platform_restriction_handler = None
+
+    def _schedule_platform_restriction(self, account_id: int, message: str) -> None:
+        if not self._running:
+            return
+        task = asyncio.create_task(
+            self._record_telegram_platform_restriction(account_id, message)
+        )
+        self._platform_restriction_tasks.add(task)
+        task.add_done_callback(self._platform_restriction_task_done)
+
+    def _platform_restriction_task_done(self, task: asyncio.Task[None]) -> None:
+        self._platform_restriction_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "telegram_platform_restriction_record_failed",
+                worker_id=self.worker_id,
+                error_type=type(error).__name__,
+                error=safe_exception_message(error, max_length=500),
+            )
+
+    async def _drain_platform_restriction_tasks(self) -> None:
+        tasks = list(self._platform_restriction_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "telegram_platform_restriction_drain_timed_out",
+                worker_id=self.worker_id,
+                pending=sum(not task.done() for task in tasks),
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self._platform_restriction_tasks.difference_update(tasks)
+
+    async def _record_telegram_platform_restriction(
+        self,
+        account_id: int,
+        message: str,
+    ) -> None:
+        async with get_db_session() as db:
+            account = await db.get(TelegramAccount, account_id)
+            if account is None:
+                logger.warning(
+                    "telegram_platform_restriction_account_missing",
+                    worker_id=self.worker_id,
+                    account_id=account_id,
+                )
+                return
+            await AccountRiskGuard(db).record_failure(
+                account,
+                AccountRiskAction.GROUP_MESSAGE,
+                message,
+                target_type="group",
+                details={"source": "telethon_update_loop"},
+            )
+            await db.commit()
+        self._growth_listener_sessions.pop(account_id, None)
+        logger.warning(
+            "telegram_platform_restriction_recorded",
+            worker_id=self.worker_id,
+            account_id=account_id,
+            source="telethon_update_loop",
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -386,6 +534,7 @@ class TelegramWorker:
 
         active_account_ids = {account.id for account in accounts}
         stopped = 0
+        deferred = 0
         errors: list[dict[str, Any]] = []
 
         for account_id, session_name in list(self._growth_listener_sessions.items()):
@@ -398,6 +547,13 @@ class TelegramWorker:
 
         started = 0
         for account in accounts:
+            from app.core.account.rpc_governor import RpcDeferred, check_read_ready
+            try:
+                async with get_db_session() as db:
+                    await check_read_ready(db, account.id)
+            except RpcDeferred:
+                deferred += 1
+                continue
             if account.id in self._growth_listener_sessions:
                 try:
                     existing = await self._account_pool.get_account_by_id(account.id)
@@ -410,6 +566,8 @@ class TelegramWorker:
                     )
                     if wrapper is not None and wrapper.client is not None and wrapper.client is not previous_client:
                         self._attach_growth_event_handlers(wrapper)
+                except RpcDeferred:
+                    deferred += 1
                 except Exception as exc:
                     await self._account_pool.set_offline(account.session_name)
                     self._growth_listener_sessions.pop(account.id, None)
@@ -430,6 +588,8 @@ class TelegramWorker:
                 self._attach_growth_event_handlers(wrapper)
                 self._growth_listener_sessions[account.id] = wrapper.session_name
                 started += 1
+            except RpcDeferred:
+                deferred += 1
             except Exception as exc:
                 errors.append({"account_id": account.id, "error": str(exc)})
                 logger.warning("growth_listener_start_failed", account_id=account.id, error=str(exc))
@@ -439,6 +599,7 @@ class TelegramWorker:
             "listeners_started": started,
             "listeners_stopped": stopped,
             "listener_errors": errors[:5],
+            "listeners_deferred": deferred,
         }
 
     def _attach_growth_event_handlers(self, account: Any) -> None:
@@ -458,6 +619,12 @@ class TelegramWorker:
                 self._handle_growth_chat_action, account_id, event
             )
 
+        async def handle_ad_deleted(event: Any) -> None:
+            from app.modules.acquisition.adaptive_frequency import queue_deleted_observation
+            async with get_db_session() as db:
+                await queue_deleted_observation(db, account.account_id, event)
+
+        client.add_event_handler(handle_ad_deleted, telethon_events.MessageDeleted())
         client.add_event_handler(handle_new_message, telethon_events.NewMessage(incoming=True))
         client.add_event_handler(handle_chat_action, telethon_events.ChatAction())
         logger.info("growth_event_handlers_attached", account_id=account_id, session_name=account.session_name)
@@ -1014,6 +1181,14 @@ class TelegramWorker:
                         updates,
                         governance_metrics=owned_governance,
                     )
+                async with get_db_session() as verification_db:
+                    client.risk_guard = AccountRiskGuard(verification_db)
+                    client.risk_account = bot_risk_identity(
+                        f"guardian_verification:{profile.account_id}"
+                    )
+                    await pp_ai_verification.maintain(
+                        verification_db, client, bot_account_id=profile.account_id
+                    )
                 active_bindings = await self._guardian_active_binding_count(profile.account_id)
                 await self._mark_guardian_profile(
                     profile.id,
@@ -1535,6 +1710,14 @@ class TelegramWorker:
             member_id = member.get("id")
             if member_id is None:
                 continue
+            if target is not None and target.is_owned_group:
+                if await pp_ai_verification.handle_join(
+                    db, telegram_client, bot_account_id=bot_account_id,
+                    chat_id=int(chat_id), member=member,
+                    source_message_id=int(message.get("message_id") or 0),
+                ):
+                    processed += 1
+                    continue
             response = await bot.handle_new_member(
                 chat_id=chat_id,
                 user_id=member_id,
@@ -1554,9 +1737,19 @@ class TelegramWorker:
             )
             processed += 1
 
+        if (
+            target is not None and target.is_owned_group
+            and user_id is not None and not message.get("new_chat_members")
+            and not message.get("left_chat_member")
+            and await pp_ai_verification.handle_answer(
+                db, telegram_client, bot_account_id=bot_account_id,
+                message=message, update_kind=update_kind,
+            )
+        ):
+            return processed + 1
         text = message.get("text") or message.get("caption") or ""
         if text and user_id is not None:
-            await bot.handle_message(
+            moderated = await bot.handle_message(
                 message_id=message.get("message_id", 0),
                 chat_id=chat_id,
                 user_id=user_id,
@@ -1564,6 +1757,23 @@ class TelegramWorker:
                 text=text,
                 core_group_id=core_group_id,
             )
+            if not moderated and target is not None and target.is_owned_group:
+                try:
+                    await handle_pp_ai_keyword_reply(
+                        db,
+                        telegram_client,
+                        bot_account_id=bot_account_id,
+                        message=message,
+                        update_kind=update_kind,
+                        verification_manager=bot._context.verification_manager,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "pp_ai_guardian_keyword_reply_failed",
+                        bot_account_id=bot_account_id,
+                        telegram_chat_id=chat_id,
+                        error_type=type(exc).__name__,
+                    )
             processed += 1
 
         return processed

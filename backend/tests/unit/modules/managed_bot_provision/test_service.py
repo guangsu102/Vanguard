@@ -693,9 +693,12 @@ class BotFatherStrategyExecution:
         raise AssertionError("BotFather strategy must not pre-check usernames via MTProto")
 
     async def create_bot_via_botfather(
-        self, wrapper, *, name: str, username: str, on_username_submitted=None, source="managed_bot_provision"
+        self, wrapper, *, name: str, username: str, on_username_submitted=None,
+        source="managed_bot_provision", provision_id=None, lease_id=None,
     ):
         assert wrapper is not None
+        assert isinstance(provision_id, int) and provision_id > 0
+        assert isinstance(lease_id, str) and lease_id
         self.botfather_calls.append({"name": name, "username": username})
         if on_username_submitted is not None:
             await on_username_submitted()

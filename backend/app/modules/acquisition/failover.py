@@ -11,6 +11,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.account.age import account_age_eligibility_reason
 from app.core.account.models import (
     AccountOperationConfig,
     AccountOperationMode,
@@ -28,6 +29,7 @@ from app.modules.acquisition.models import (
     GroupFailoverStatus,
     GroupFailoverTask,
 )
+from app.modules.owned_group.models import OwnedGroupAsset
 
 if TYPE_CHECKING:
     from app.modules.acquisition.automation import (
@@ -225,6 +227,23 @@ class GroupFailoverService:
         for membership, source_account, group in orphaned:
             if membership.id in existing_ids:
                 continue
+            if source_account.status in {
+                AccountStatus.BANNED,
+                AccountStatus.RESTRICTED,
+                AccountStatus.ERROR,
+            } or source_account.risk_reason in {
+                "account_banned",
+                "account_restricted",
+                "peer_flood",
+            }:
+                self.logger.warning(
+                    "group_failover_source_risk_isolated",
+                    source_account_id=source_account.id,
+                    group_id=group.id,
+                    account_status=source_account.status.value,
+                    risk_reason=source_account.risk_reason,
+                )
+                continue
             covered_account_id = await self._healthy_joined_account_id(
                 group.id, source_account.id, now, target_account_ids=target_account_ids
             )
@@ -320,6 +339,23 @@ class GroupFailoverService:
         )
         updated = 0
         for task in rows.scalars().all():
+            source_account = await self.db.get(TelegramAccount, task.source_account_id)
+            if source_account is None or source_account.status in {
+                AccountStatus.BANNED,
+                AccountStatus.RESTRICTED,
+                AccountStatus.ERROR,
+            } or source_account.risk_reason in {
+                "account_banned",
+                "account_restricted",
+                "peer_flood",
+            }:
+                task.status = GroupFailoverStatus.MANUAL_REQUIRED.value
+                task.reason = "source_account_risk_isolated"
+                task.error = None
+                task.completed_at = now
+                task.updated_at = now
+                updated += 1
+                continue
             account_id = await self._healthy_joined_account_id(
                 task.group_id,
                 task.source_account_id,
@@ -432,7 +468,10 @@ class GroupFailoverService:
                 AutoJoinAttempt.account_id.label("account_id"),
                 func.count(AutoJoinAttempt.id).label("daily_count"),
             )
-            .where(AutoJoinAttempt.attempted_at >= _day_start(now))
+            .where(
+                AutoJoinAttempt.request_state.in_(("sent", "outcome_unknown")),
+                AutoJoinAttempt.request_sent_at >= _day_start(now),
+            )
             .group_by(AutoJoinAttempt.account_id)
             .subquery()
         )
@@ -457,6 +496,11 @@ class GroupFailoverService:
                 GroupAccountMembership.account_id == TelegramAccount.id,
                 GroupAccountMembership.status.in_(["joined", "pending", "banned", "rejected"]),
             )
+            .exists()
+        )
+        owned_group_owner = (
+            select(OwnedGroupAsset.id)
+            .where(OwnedGroupAsset.owner_account_id == TelegramAccount.id)
             .exists()
         )
         joined_count = func.coalesce(joined_counts.c.joined_count, 0)
@@ -491,6 +535,7 @@ class GroupFailoverService:
                 ),
                 joined_count + assignment_count < AccountOperationConfig.max_groups_total,
                 daily_count < AccountOperationConfig.max_groups_per_day,
+                ~owned_group_owner,
                 ~existing_membership,
             )
             .order_by(
@@ -500,9 +545,10 @@ class GroupFailoverService:
                 TelegramAccount.last_active_at.desc().nullslast(),
                 TelegramAccount.id,
             )
-            .limit(1)
+            .limit(100)
         )
-        return rows.scalar_one_or_none()
+        return next((account for account in rows.scalars().all()
+                     if account_age_eligibility_reason(account, now) is None), None)
 
     async def _account_is_eligible(
         self,
@@ -529,6 +575,15 @@ class GroupFailoverService:
                 )
             )
         ).scalar_one_or_none()
+        if account_age_eligibility_reason(account, now) is not None:
+            return False
+        owner_asset = await self.db.execute(
+            select(OwnedGroupAsset.id)
+            .where(OwnedGroupAsset.owner_account_id == account.id)
+            .limit(1)
+        )
+        if owner_asset.scalar_one_or_none() is not None:
+            return False
         if (
             not config
             or not config.enabled
@@ -589,6 +644,24 @@ class GroupFailoverService:
         if group is None or target_account_id is None:
             raise RuntimeError("claimed failover task lost group or target account")
 
+        source_account = await self.db.get(TelegramAccount, task.source_account_id)
+        if source_account is None or source_account.status in {
+            AccountStatus.BANNED,
+            AccountStatus.RESTRICTED,
+            AccountStatus.ERROR,
+        } or source_account.risk_reason in {
+            "account_banned",
+            "account_restricted",
+            "peer_flood",
+        }:
+            await self._mark_terminal(
+                task,
+                GroupFailoverStatus.MANUAL_REQUIRED,
+                "source_account_risk_isolated",
+                now,
+            )
+            return self._task_detail(task)
+
         target_account = await self.db.get(TelegramAccount, target_account_id)
         if target_account is None:
             raise RuntimeError("claimed failover task lost target account")
@@ -606,6 +679,7 @@ class GroupFailoverService:
             )
         ).scalar_one_or_none()
         discovered = self.automation._group_to_discovered(group)
+        join_reservation = None
         if membership is None or membership.status not in {"joined", "pending"}:
             if not group.username:
                 await self._mark_terminal(
@@ -615,11 +689,50 @@ class GroupFailoverService:
                     now,
                 )
                 return self._task_detail(task)
-            await self.automation._join_group(target_account_id, discovered)
+            join_reservation = await self.automation.join_budget.reserve(
+                target_account_id,
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                group_username=group.username,
+                group_title=group.title,
+                source_keyword=group.source_keyword,
+                source="account_failover",
+                require_auto_join_enabled=True,
+            )
+            try:
+                await self.automation._join_group(
+                    target_account_id,
+                    discovered,
+                    reservation=join_reservation,
+                )
+            except Exception as exc:
+                await self.automation._record_join_attempt(
+                    target_account_id,
+                    discovered,
+                    DeliveryStatus.FAILED,
+                    db_group=group,
+                    source_keyword=group.source_keyword,
+                    reason="account_failover_join_failed",
+                    error=str(exc),
+                    telegram_action_attempted=join_reservation.telegram_action_attempted,
+                    attempt=join_reservation,
+                    outcome_unknown=self.automation._join_error_outcome_unknown(
+                        exc,
+                        telegram_action_attempted=join_reservation.telegram_action_attempted,
+                    ),
+                )
+                raise
 
         audit = await self.automation._evaluate_joined_group(target_account_id, group)
         if not audit.passed:
-            return await self._handle_failed_audit(task, group, discovered, audit, now)
+            return await self._handle_failed_audit(
+                task,
+                group,
+                discovered,
+                audit,
+                now,
+                join_reservation=join_reservation,
+            )
 
         note = self.automation._format_join_audit_note(audit)
         note = self.automation._append_membership_note(
@@ -646,6 +759,10 @@ class GroupFailoverService:
             source_keyword=group.source_keyword,
             reason="account_failover",
             joined_at=now,
+            telegram_action_attempted=bool(
+                join_reservation and join_reservation.telegram_action_attempted
+            ),
+            attempt=join_reservation,
         )
         await self.automation._sync_group_ad_policy_from_audit(group, audit)
         if audit.ad_allowed is False:
@@ -678,6 +795,8 @@ class GroupFailoverService:
         discovered: Any,
         audit: JoinedGroupAuditResult,
         now: datetime,
+        *,
+        join_reservation: AutoJoinAttempt | None = None,
     ) -> dict[str, Any]:
         leave_error = (
             await self.automation._leave_group(task.target_account_id, discovered)
@@ -705,6 +824,10 @@ class GroupFailoverService:
             reason=audit.reason or "failover_join_audit_failed",
             error=leave_error,
             joined_at=now,
+            telegram_action_attempted=bool(
+                join_reservation and join_reservation.telegram_action_attempted
+            ),
+            attempt=join_reservation,
         )
         if membership_status == "pending":
             if audit.reason == "verification_manual_required":

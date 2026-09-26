@@ -34,13 +34,16 @@ from app.core.group import Group, GroupAccountMembership, GroupLevel, GroupManag
 from app.core.security import require_admin
 from app.exceptions import GroupNotFoundError, ValidationError
 from app.modules.acquisition.automation import (
-    JOIN_AUDIT_MESSAGE_LIMIT,
     AcquisitionAutomationService,
-    JoinedGroupAuditResult,
+)
+from app.modules.acquisition.join_budget import (
+    JoinBudgetBlocked,
+    JoinRequestBudgetService,
 )
 from app.modules.acquisition.models import (
     AcquisitionMessage,
     AcquisitionTracking,
+    DeliveryStatus,
     TriggerAction,
     TriggerRecord,
 )
@@ -116,6 +119,7 @@ class GroupMembershipCreate(BaseModel):
 class GroupMetricsResponse(BaseModel):
     """Aggregated business metrics for a group."""
 
+    collection: dict = Field(default_factory=lambda: {"status": "unknown", "stale": True})
     ads_sent: int = 0
     group_replies: int = 0
     private_messages: int = 0
@@ -346,6 +350,11 @@ async def _get_group_metrics(db: AsyncSession, telegram_group_ids: list[int]) ->
     metrics: dict[int, GroupMetricsResponse] = {
         group_id: GroupMetricsResponse() for group_id in telegram_group_ids
     }
+
+    from app.core.group.collection import collection_for_groups
+    collections = await collection_for_groups(db, telegram_group_ids)
+    for group_id, collection in collections.items():
+        metrics[group_id].collection = collection
 
     message_result = await db.execute(
         select(
@@ -714,10 +723,25 @@ async def join_group_by_link(
             detail="ad_only_join_requires_handover_workflow",
         )
 
+    join_budget = JoinRequestBudgetService(db)
+    try:
+        join_reservation = await join_budget.reserve(
+            account.id,
+            target_key=request.group_link,
+            source="manual_group_link_join",
+            require_auto_join_enabled=False,
+        )
+    except JoinBudgetBlocked as exc:
+        status_code = 429 if exc.retry_after_seconds else 409
+        raise HTTPException(status_code=status_code, detail=exc.reason) from exc
+
+    async def mark_join_request_sent() -> None:
+        await join_budget.mark_sent(join_reservation)
+
     account_pool = get_account_pool()
-    await account_pool.add_account_from_db(account)
     wrapper = None
     try:
+        await account_pool.add_account_from_db(account)
         wrapper = await account_pool.acquire_by_id(
             account.id,
             purpose="manual_group_link_join",
@@ -727,16 +751,44 @@ async def join_group_by_link(
         resolved = await TelegramExecutionService(AccountRiskGuard(db)).join_group_by_link(
             wrapper,
             request.group_link,
+            join_reservation_key=join_reservation.reservation_key,
+            on_join_request_attempted=mark_join_request_sent,
         )
     except HTTPException:
+        if join_reservation.request_state == "reserved":
+            await join_budget.release(join_reservation, reason="manual_join_not_sent")
         raise
     except TelegramJoinRequestPendingError as exc:
+        await join_budget.finalize(
+            join_reservation,
+            status=DeliveryStatus.PENDING,
+            reason="join_request_pending_approval",
+        )
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TelegramExecutionError as exc:
+        if join_reservation.request_state == "reserved":
+            await join_budget.release(join_reservation, reason="manual_join_not_sent")
+        else:
+            await join_budget.finalize(
+                join_reservation,
+                status=DeliveryStatus.FAILED,
+                reason="manual_join_failed",
+                error=str(exc),
+            )
         detail = str(exc)
         status_code = 429 if detail.startswith("risk_guard_blocked:") else 400
         raise HTTPException(status_code=status_code, detail=detail) from exc
     except Exception as exc:
+        if join_reservation.request_state == "reserved":
+            await join_budget.release(join_reservation, reason="manual_join_not_sent")
+        else:
+            await join_budget.finalize(
+                join_reservation,
+                status=DeliveryStatus.FAILED,
+                reason="manual_join_failed",
+                error=str(exc),
+                outcome_unknown=True,
+            )
         flood_wait_seconds = extract_flood_wait_seconds(exc)
         if flood_wait_seconds is not None:
             raise HTTPException(
@@ -765,13 +817,14 @@ async def join_group_by_link(
 
     group_result = await db.execute(select(Group).where(Group.group_id == telegram_group_id))
     group = group_result.scalar_one_or_none()
+    existing_group_was_active = bool(group is not None and group.status == "active")
     if group is None:
         group = Group(
             group_id=telegram_group_id,
             title=title,
             username=username,
             member_count=member_count,
-            status="active",
+            status="pending",
             discovery_source="manual_link_join",
             level=GroupLevel.A,
         )
@@ -784,79 +837,18 @@ async def join_group_by_link(
             group.username = username
         if member_count:
             group.member_count = member_count
-        group.status = "active"
+        if not existing_group_was_active:
+            group.status = "pending"
         group.updated_at = now
-    membership_result = await db.execute(
-        select(GroupAccountMembership).where(
-            GroupAccountMembership.group_id == group.id,
-            GroupAccountMembership.account_id == account.id,
-        )
-    )
-    membership = membership_result.scalar_one_or_none()
-    if membership is None:
-        membership = GroupAccountMembership(
-            group_id=group.id,
-            telegram_group_id=telegram_group_id,
-            account_id=account.id,
-            status="joined",
-            join_method="manual_link_join",
-            joined_at=now,
-            last_checked_at=now,
-        )
-        db.add(membership)
-    else:
-        membership.telegram_group_id = telegram_group_id
-        membership.status = "joined"
-        membership.join_method = "manual_link_join"
-        membership.joined_at = membership.joined_at or now
-        membership.left_at = None
-        membership.last_checked_at = now
-        membership.updated_at = now
-
+    service = AcquisitionAutomationService(db)
+    await service._persist_join_qualification_result(group, join_reservation, status="joined")
     await db.commit()
-
-    policy_service = AcquisitionAutomationService(db)
-    policy_audit = None
-    policy_wrapper = None
+    # A committed review is sufficient for recovery; dispatch only accelerates it.
     try:
-        policy_wrapper = await account_pool.acquire_by_id(
-            account.id,
-            purpose="manual_group_link_policy_audit",
-        )
-        if policy_wrapper is not None and policy_wrapper.client is not None:
-            entity = await policy_wrapper.client.get_entity(group.username or group.group_id)
-            messages = await policy_service._fetch_recent_messages(
-                policy_wrapper.client,
-                entity,
-                limit=JOIN_AUDIT_MESSAGE_LIMIT,
-            )
-            policy_audit = await policy_service._audit_group_ad_rules(
-                policy_wrapper.client,
-                entity,
-                messages,
-            )
+        from app.core.scheduler.tasks import group_qualification_task
+        group_qualification_task.apply_async(queue="qualification")
     except Exception as exc:
-        logger.warning(
-            "manual_group_link_policy_audit_failed",
-            extra={"group_id": group.id, "error": str(exc)},
-        )
-    finally:
-        if policy_wrapper is not None:
-            await account_pool.release(policy_wrapper)
-
-    if policy_audit is not None:
-        audit = JoinedGroupAuditResult(
-            passed=True,
-            ad_allowed=policy_audit.ad_allowed,
-            ad_rule_reason=policy_audit.reason,
-            ad_rule_details=policy_audit.details(),
-        )
-        await policy_service._sync_group_ad_policy_from_audit(group, audit)
-        if policy_audit.ad_allowed is False:
-            await policy_service._apply_join_audit_ad_rule_decision(group, membership, audit)
-        else:
-            group.status = "active"
-            await db.commit()
+        logger.warning("manual_join_review_dispatch_deferred", error_type=type(exc).__name__)
     await db.refresh(group)
     metrics = await _get_group_metrics(db, [group.group_id])
     account_summary = await _get_group_account_summary(db, [group.id])

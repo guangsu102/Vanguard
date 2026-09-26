@@ -11,6 +11,7 @@ import {
 
 describe('automation configuration defaults', () => {
   it('uses the backend scheduler and warmup minimums', () => {
+    expect(createDefaultAutoJoinScheduler().enabled).toBe(false)
     expect(createDefaultAutoJoinScheduler().scan_interval_minutes).toBe(5)
 
     const warmup = createDefaultWarmupPolicy()
@@ -33,6 +34,7 @@ describe('automation configuration defaults', () => {
     const capacity = createDefaultAdCapacity()
     expect(capacity.max_groups_per_account).toBe(100)
     expect(capacity.max_new_ad_groups_per_day).toBe(2)
+    expect(capacity.ad_policy_ai_model).toBe('glm-5.3-flash')
     expect(capacity.survival_check_delay_seconds).toBe(120)
     expect('account_ad_daily_hard_cap' in capacity).toBe(false)
     expect('tier_daily_capacities' in capacity).toBe(false)
@@ -42,7 +44,7 @@ describe('automation configuration defaults', () => {
     const risk = createDefaultRiskGuard()
     expect(risk.account_outbound_message_hard_cap_default).toBe(30)
     expect(risk.redis_fail_closed).toBe(true)
-    expect(risk.actions.join).toEqual({ daily_limit: 10, cooldown_seconds: 7200 })
+    expect(risk.actions.join).toEqual({ daily_limit: 30, cooldown_seconds: 2880 })
     expect(risk.actions.owned_group_message).toEqual({ daily_limit: 0, cooldown_seconds: 0 })
     expect(risk.actions.ad_probe).toBeUndefined()
     expect(risk.actions.ad_delivery).toBeUndefined()

@@ -92,6 +92,11 @@ def _classify_botfather_create_error(exc: BaseException) -> ManagedBotProvisionF
     """Map @BotFather conversation failures to provision failure codes."""
 
     message = str(exc)
+    if any(marker in message for marker in (
+        "botfather_provision_context_required", "botfather_provision_lease_invalid",
+        "botfather_create_fence_missing", "botfather_official_identity_invalid",
+    )):
+        return ManagedBotProvisionFailure("BOTFATHER_PROVISION_CONTEXT_INVALID")
     if "botfather_username_taken" in message:
         return ManagedBotProvisionFailure("USERNAME_OCCUPIED")
     if "botfather_username_invalid" in message:
@@ -284,7 +289,8 @@ def _safe_error_message(code: str) -> str:
     messages = {
         "ACCOUNT_NOT_ELIGIBLE": "Selected user account is unavailable",
         "ACCOUNT_OPERATION_LEASE_UNAVAILABLE": "Selected user account is busy",
-        "ACCOUNT_RISK_BLOCKED": "Selected user account reached its managed Bot safety limit",
+        "ACCOUNT_RISK_BLOCKED": "Selected user account is blocked by an account safety rule",
+        "BOTFATHER_PROVISION_CONTEXT_INVALID": "Official BotFather identity or provision lease could not be verified",
         "MANAGER_INVALID": "Manager Bot is unavailable",
         "MANAGER_PERMISSION_MISSING": "Manager Bot has not enabled Bot Management Mode",
         "USERNAME_INVALID": "Managed Bot username is invalid",
@@ -514,6 +520,31 @@ async def create_managed_bot_provision(
         raise
     await db.refresh(row)
     return row, True
+
+
+async def requeue_unattempted_managed_bot_provision(
+    db: AsyncSession, provision_id: int,
+) -> ManagedBotProvision:
+    """Retry the same pre-send blocked operation without resetting any safety budgets."""
+    row = await db.scalar(
+        select(ManagedBotProvision)
+        .where(ManagedBotProvision.id == int(provision_id))
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if row is None:
+        raise ValueError("PROVISION_NOT_FOUND")
+    if (row.status != ManagedBotProvisionStatus.RETRY_WAIT.value
+            or not row.retryable or row.error_code != "ACCOUNT_RISK_BLOCKED"
+            or row.create_attempted_at is not None or row.external_created_at is not None
+            or row.bot_user_id is not None or row.lease_id is not None
+            or row.attempts >= row.max_attempts):
+        raise ValueError("PROVISION_REQUEUE_REQUIRES_RECONCILIATION")
+    row.status = ManagedBotProvisionStatus.QUEUED.value
+    row.next_retry_at = datetime.utcnow()
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    return row
 
 
 class ManagedBotProvisionService:
@@ -1015,6 +1046,8 @@ class ManagedBotProvisionService:
                                 name=row.display_name,
                                 username=row.username,
                                 on_username_submitted=mark_botfather_username_submitted,
+                                provision_id=int(row.id),
+                                lease_id=lease_id,
                             ),
                             timeout=_BOTFATHER_CONVERSATION_TIMEOUT_SECONDS,
                         )

@@ -211,10 +211,14 @@ class Settings(BaseSettings):
     # LLM/AI
     OPENAI_API_KEY: str | None = Field(default=None, description="OpenAI API Key")
     OPENAI_BASE_URL: str | None = Field(default=None, description="OpenAI-compatible API base URL")
+    GROUP_AD_POLICY_API_KEY: str | None = Field(default=None, description="Dedicated group ad policy API key")
+    GROUP_AD_POLICY_BASE_URL: str | None = Field(default=None, description="Dedicated group ad policy OpenAI-compatible base URL")
     ANTHROPIC_API_KEY: str | None = Field(default=None, description="Anthropic API Key")
     LLM_PROVIDER: str = Field(default="openai", description="LLM provider: openai/anthropic/local")
     LLM_MODEL: str = Field(default="gpt-5.6-sol", description="Default LLM model")
     LLM_FAST_MODEL: str = Field(default="", description="Low-latency LLM model; falls back to LLM_MODEL when empty")
+    LLM_MODEL_OVERRIDE: str = Field(default="", description="Pin all OpenAI-compatible requests to this model, including explicit caller models")
+    LLM_REASONING_EFFORT: str = Field(default="", description="Optional reasoning effort for OpenAI-compatible requests")
 
     # CORS
     CORS_ORIGINS: str = Field(

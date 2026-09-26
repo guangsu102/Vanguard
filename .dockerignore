@@ -56,3 +56,6 @@ htmlcov/
 tmp/
 temp/
 NUL
+
+deploy-artifacts/
+*.tgz

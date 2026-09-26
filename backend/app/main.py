@@ -138,7 +138,20 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 @app.get("/health")
 async def health_check() -> dict:
     """Health check endpoint for load balancers and monitoring."""
+    from app.core.runtime_health import dependencies
+    try:
+        await dependencies()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "unready", "version": "1.0.0"})
     return {"status": "healthy", "version": "1.0.0"}
+
+
+@app.get("/api/operations/status", dependencies=[Depends(get_current_user)])
+async def operations_status() -> dict:
+    from app.core.database import get_db_session
+    from app.core.runtime_health import operational_snapshot
+    async with get_db_session() as db:
+        return {"data": await operational_snapshot(db)}
 
 
 # Include API routers

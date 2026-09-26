@@ -83,6 +83,13 @@ _CLEAR_PATTERNS = (
     r"ваш аккаунт (?:сейчас )?не ограничен",
 )
 _RESTRICTED_PATTERNS = (
+    # Verified SpamBot's moderator-confirmed block is a current enforcement
+    # verdict even though the exact official template uses "was blocked".
+    r"your account was blocked for violations of the telegram terms of service "
+    r"based on user reports confirmed by our moderators",
+    # The time-limited verdict can follow the moderator decision in the same
+    # sentence; keep the official prefix exact rather than matching substrings.
+    r"the moderators have confirmed the report and your account is now limited" + _UNTIL,
     r"your account (?:is|has been) (?:(?:now|currently|temporarily|permanently) )?"
     r"(?:limited|restricted)" + _UNTIL,
     # Official @SpamBot template. Keep this deliberately exact: generic

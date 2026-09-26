@@ -9,6 +9,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import AccountOperationConfig, TelegramAccount
+from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.automation_settings import get_ad_capacity_settings
 from app.core.group.models import Group, GroupAccountMembership
 from app.modules.acquisition.models import AccountAdBinding, AdCampaign, GroupAdProfile
@@ -78,11 +79,20 @@ async def build_probe_queue(db: AsyncSession, now: datetime) -> dict[str, Any]:
         )
     ).all()
     accounts: dict[int, dict[str, Any]] = {}
+    cooldowns: dict[int, int | None] = {}
+    risk_guard = AccountRiskGuard(db)
     positions: dict[int, int] = defaultdict(int)
     counts: Counter[str] = Counter()
     items = []
     for membership, group, account, profile, config in rows:
         account_id = int(account.id)
+        if account_id not in cooldowns:
+            try:
+                cooldowns[account_id] = await risk_guard.peek_action_cooldown(
+                    account_id, AccountRiskAction.AD_PROBE,
+                )
+            except Exception:
+                cooldowns[account_id] = None
         mode = str(profile.ad_policy_mode if profile else "unknown")
         limit = write_probe_limit(capacity, account, now)
         completed = int(success_counts.get(account_id, 0))
@@ -94,6 +104,7 @@ async def build_probe_queue(db: AsyncSession, now: datetime) -> dict[str, Any]:
                 "completed_today": completed,
                 "remaining_today": max(0, limit - completed) if limit else None,
                 "pending": 0,
+                "cooldown_seconds": cooldowns[account_id],
                 "approval_required": 0,
                 "reset_at": _iso(day_start + timedelta(days=1)),
             },
@@ -137,11 +148,15 @@ async def build_probe_queue(db: AsyncSession, now: datetime) -> dict[str, Any]:
             position = positions[account_id]
             stage, label = "write_probe_queued", "等待中性写入探测"
             due = max(now, membership.probe_due_at or now)
+            if cooldowns[account_id]:
+                due = max(due, now + timedelta(seconds=cooldowns[account_id] + 30))
             if limit and completed >= limit:
                 stage, label = "daily_quota", "等待账号中性探测日额度"
                 due = max(due, day_start + timedelta(days=1, seconds=30))
             elif due > now:
                 stage, label = "probe_wait", "等待探测排期或冷却"
+            if cooldowns[account_id] is None:
+                stage, label, due = "probe_wait", "冷却状态暂不可用，等待风控复核", None
         elif membership.probe_status == "success":
             if mode == "unknown_probe":
                 stage, label = "trial_observing", "广告权限试探已发出，观察消息存活"

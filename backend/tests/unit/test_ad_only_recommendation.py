@@ -16,7 +16,10 @@ from app.core.account.models import (
     AccountType,
     TelegramAccount,
 )
-from app.core.automation_settings import save_ad_only_recommendation_settings
+from app.core.automation_settings import (
+    save_ad_only_recommendation_settings,
+    save_auto_join_scheduler_settings,
+)
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.core.security import get_current_user
 from app.main import app
@@ -143,6 +146,7 @@ async def _seed_candidate(
 
 
 async def _seed_direct_target(test_db, *, suffix: str) -> dict:
+    await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     target = TelegramAccount(
         identifier=f"direct-target-{suffix}",
         display_name=f"Direct target {suffix}",
@@ -151,6 +155,8 @@ async def _seed_direct_target(test_db, *, suffix: str) -> dict:
         status=AccountStatus.ONLINE,
         risk_level="normal",
         is_active=True,
+        registered_at=datetime.utcnow() - timedelta(days=365),
+        asset_verified_at=datetime.utcnow() - timedelta(days=1),
     )
     operation = AccountOperationConfig(
         account=target,
@@ -208,15 +214,17 @@ def _patch_direct_telegram(
         acquire_by_id=AsyncMock(return_value=wrapper),
         release=AsyncMock(),
     )
+    async def join_group_by_link(_wrapper, _invite_link, **kwargs):
+        await kwargs["on_join_request_attempted"]()
+        return {
+            "id": telegram_group_id,
+            "title": title,
+            "username": username,
+            "participants_count": 321,
+        }
+
     execution = SimpleNamespace(
-        join_group_by_link=AsyncMock(
-            return_value={
-                "id": telegram_group_id,
-                "title": title,
-                "username": username,
-                "participants_count": 321,
-            }
-        ),
+        join_group_by_link=AsyncMock(side_effect=join_group_by_link),
         leave_group_by_id=AsyncMock(),
     )
     monkeypatch.setattr(ad_only_module, "get_account_pool", lambda: pool)
@@ -768,6 +776,7 @@ async def test_direct_assignment_creates_campaign_binding_schedule_and_ownership
         username="direct_success_group",
     )
     service = AdOnlyRecommendationService(test_db)
+    service.join_budget._effective_limit = AsyncMock(return_value=30)
     handover = await _create_direct_assignment(
         service,
         seeded,
@@ -797,6 +806,7 @@ async def test_direct_assignment_creates_campaign_binding_schedule_and_ownership
             )
         )
     ).scalar_one()
+    membership = await service._joined_membership(group.id, seeded["target"].id)
 
     assert result["status"] == "completed"
     assert handover.workflow_type == "direct"
@@ -808,6 +818,9 @@ async def test_direct_assignment_creates_campaign_binding_schedule_and_ownership
     assert campaign.get_target_group_ids() == [group.id]
     assert binding.enabled is True
     assert schedule.status == "idle"
+    assert membership is not None
+    assert membership.review_status == "approved"
+    assert membership.review_next_at is None
 
 
 @pytest.mark.asyncio
@@ -843,6 +856,7 @@ async def test_direct_ownership_conflict_persists_join_state_and_can_roll_back(
         username=None,
     )
     service = AdOnlyRecommendationService(test_db)
+    service.join_budget._effective_limit = AsyncMock(return_value=30)
     handover = await _create_direct_assignment(
         service,
         seeded,
@@ -875,6 +889,7 @@ async def test_direct_ownership_conflict_persists_join_state_and_can_roll_back(
     assert rollback_result["status"] == "rolled_back"
     execution.leave_group_by_id.assert_awaited_once()
     assert membership.status == "left"
+    assert membership.review_status == "left"
     assert group.ad_delivery_account_id == owner_id
 
 
@@ -935,6 +950,8 @@ async def test_direct_rollback_preserves_membership_that_existed_before_assignme
     execution.leave_group_by_id.assert_not_awaited()
     assert membership.status == "joined"
     assert membership.join_method == "manual"
+    assert membership.review_status == "initial_pending"
+    assert membership.review_started_at is None
     assert profile is None
 
 
@@ -1120,8 +1137,8 @@ async def test_direct_assignment_batch_deduplicates_and_paces_links(
             "https://t.me/batch_group_one",
             "  https://t.me/+BatchInviteTwo  ",
         ],
-        join_interval_min_minutes=3,
-        join_interval_max_minutes=11,
+        join_interval_min_minutes=48,
+        join_interval_max_minutes=60,
         permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
         permission_note="admin confirmed batch advertising permission",
         permission_expires_at=datetime.utcnow() + timedelta(days=30),
@@ -1179,8 +1196,8 @@ async def test_batch_assignment_api_returns_campaign_options_and_paced_rows(
                 "https://t.me/batch_api_one",
                 "https://t.me/batch_api_two",
             ],
-            "join_interval_min_minutes": 2,
-            "join_interval_max_minutes": 8,
+            "join_interval_min_minutes": 48,
+            "join_interval_max_minutes": 60,
             "permission_mode": GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
             "permission_note": "admin confirmed API batch permission",
             "permission_expires_at": (
@@ -1228,8 +1245,8 @@ async def test_direct_assignment_queue_claims_only_one_item_per_account(
             "https://t.me/claim_group_one",
             "https://t.me/claim_group_two",
         ],
-        join_interval_min_minutes=1,
-        join_interval_max_minutes=30,
+        join_interval_min_minutes=48,
+        join_interval_max_minutes=120,
         permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
         permission_note="admin confirmed claim serialization",
         permission_expires_at=datetime.utcnow() + timedelta(days=30),
@@ -1270,8 +1287,8 @@ async def test_join_queue_releases_next_item_with_random_interval(
             "https://t.me/interval_group_one",
             "https://t.me/interval_group_two",
         ],
-        join_interval_min_minutes=4,
-        join_interval_max_minutes=9,
+        join_interval_min_minutes=48,
+        join_interval_max_minutes=60,
         permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
         permission_note="admin confirmed random interval",
         permission_expires_at=datetime.utcnow() + timedelta(days=30),
@@ -1281,7 +1298,7 @@ async def test_join_queue_releases_next_item_with_random_interval(
     handovers[0].status = "completed"
     handovers[0].next_attempt_at = None
     await test_db.commit()
-    monkeypatch.setattr(ad_only_module.random, "randint", lambda _min, _max: 7)
+    monkeypatch.setattr(ad_only_module.random, "randint", lambda _min, _max: 55)
     now = datetime.utcnow().replace(microsecond=0)
 
     scheduled = await service._schedule_next_join_queue_item(
@@ -1291,7 +1308,7 @@ async def test_join_queue_releases_next_item_with_random_interval(
 
     assert scheduled is not None
     assert scheduled.id == handovers[1].id
-    assert scheduled.next_attempt_at == now + timedelta(minutes=7)
+    assert scheduled.next_attempt_at == now + timedelta(minutes=55)
 
 
 @pytest.mark.asyncio
@@ -1319,8 +1336,8 @@ async def test_cancelled_queue_item_releases_next_without_joining(
             "https://t.me/cancel_group_one",
             "https://t.me/cancel_group_two",
         ],
-        join_interval_min_minutes=1,
-        join_interval_max_minutes=1,
+        join_interval_min_minutes=48,
+        join_interval_max_minutes=48,
         permission_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
         permission_note="admin confirmed cancellation test",
         permission_expires_at=datetime.utcnow() + timedelta(days=30),

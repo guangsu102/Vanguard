@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AccountAgeAttestation from "@/components/AccountAgeAttestation.vue";
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElAlert, ElButton, ElIcon, ElMessage, ElMessageBox, ElTag } from 'element-plus'
 import { ChatDotRound, CircleCheck, CircleClose, Delete, Edit, MagicStick, Plus, RefreshLeft, UserFilled, View } from '@element-plus/icons-vue'
@@ -1642,6 +1643,8 @@ onBeforeUnmount(() => {
             <span>{{ formatDate(riskSummary?.warmup_hold_until || selectedSecurityAccount?.warmup_hold_until) }}</span>
           </div>
         </div>
+
+        <AccountAgeAttestation v-if="selectedSecurityAccount" :account="selectedSecurityAccount" />
 
         <div class="security-actions">
           <el-button type="warning" plain :disabled="!riskSummary?.risk_pause_until" @click="handleClearRiskPause">

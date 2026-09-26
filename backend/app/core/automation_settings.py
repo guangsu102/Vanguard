@@ -471,9 +471,10 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
             ).strip()[:500],
         },
         "group_capacity_cleanup": {
-            "enabled": _bool_setting(
-                cleanup.get("enabled", default_cleanup["enabled"]), default_cleanup["enabled"]
-            ),
+            # Product policy: never leave a group solely because it has not
+            # produced a conversion. Keep the remaining fields for backward
+            # compatible reads, but ignore any persisted legacy enable flag.
+            "enabled": False,
             "no_conversion_days": _int_setting(
                 cleanup.get(
                     "no_conversion_days",
@@ -1340,14 +1341,14 @@ def normalize_account_risk_guard_settings(payload: dict[str, Any] | None) -> dic
 
     actions: dict[str, dict[str, int]] = {}
     action_hard_limits = {
-        "join": 10,
+        "join": 30,
         "group_message": 4,
         "ai_warmup": 1,
         "channel_create": 1,
         "managed_bot_create": 1,
     }
     action_min_cooldowns = {
-        "join": 7200,
+        "join": 2880,
         "group_message": 7200,
         "ai_warmup": 21600,
         "channel_create": 86400,

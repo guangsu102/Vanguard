@@ -20,7 +20,13 @@ export type AccountListPersonaSummary = Omit<
 > &
   Partial<Pick<AccountPersonaSummary, "effective_enabled">>;
 
+export interface AgeAttestation {
+  version: number; minimum_age_days?: number; confirmed_at?: string; confirmed_by?: number;
+  source?: string; revoked_at?: string | null; note?: string;
+}
 export interface Account {
+  age_attestation?: AgeAttestation;
+  verified_age?: { minimum_age_days: number | null; source: string; conflict: boolean };
   id: number;
   phone?: string;
   identifier: string;
@@ -257,6 +263,8 @@ const normalizeAccount = (item: unknown): Account => {
         ? (value.asset_tier as AccountAssetTier)
         : "unknown",
     registered_at: optionalString(value.registered_at),
+    age_attestation: value.age_attestation as AgeAttestation | undefined,
+    verified_age: value.verified_age as Account['verified_age'],
     asset_verified_at: optionalString(value.asset_verified_at),
     asset_note: optionalString(value.asset_note),
     managed_started_at: optionalString(value.managed_started_at),
@@ -316,6 +324,8 @@ const normalizeAccount = (item: unknown): Account => {
 };
 
 export const accountsApi = {
+  setAgeAttestation: (id: number, data: { expected_version: number; minimum_age_days: number; revoke?: boolean; note?: string }, key: string) =>
+    apiClient.put<{ data: AgeAttestation }>(`/accounts/${id}/age-attestation`, data, { headers: { 'Idempotency-Key': key } }),
   list: async (params?: AccountListParams): Promise<AccountListPayload> => {
     const response = await apiClient.get("/accounts", { params });
     return {

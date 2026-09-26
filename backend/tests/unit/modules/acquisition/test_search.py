@@ -24,6 +24,8 @@ from app.core.account.operation_lease import (
 )
 from app.core.account.telegram_execution import TelegramExecutionService
 from app.core.ai.keyword_generator import KeywordGenerator
+from app.core.automation_settings import save_auto_join_scheduler_settings
+from app.core.group.join_review import JOIN_REVIEW_APPROVED
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel, GroupLevelConfig
 from app.core.keyword.models import KeywordType
 from app.core.runtime_settings import DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS
@@ -403,6 +405,7 @@ class TestGroupFinder:
                     member_count=5000,
                     is_private=False,
                 ),
+                reservation=SimpleNamespace(reservation_key="broadcast-guard-test"),
             )
 
         assert calls == []
@@ -416,6 +419,7 @@ class TestAutoJoinAudit:
         account_pool.acquire_by_id = AsyncMock(return_value=account)
         account_pool.release = AsyncMock()
         db = MagicMock()
+        db.get = AsyncMock(return_value=None)
         settings_result = MagicMock()
         settings_result.scalar_one_or_none.return_value = None
         db.execute = AsyncMock(return_value=settings_result)
@@ -888,6 +892,13 @@ class TestAutoJoinStateHandling:
         )
         service._evaluate_joined_group = AsyncMock()
         service._record_join_attempt = AsyncMock()
+        service.join_budget.reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                id=1,
+                request_state="reserved",
+                telegram_action_attempted=False,
+            )
+        )
         service._set_discovered_group_status = AsyncMock()
         service._schedule_next_join = MagicMock()
 
@@ -932,6 +943,13 @@ class TestAutoJoinStateHandling:
         )
         service._evaluate_joined_group = AsyncMock()
         service._record_join_attempt = AsyncMock()
+        service.join_budget.reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                id=1,
+                request_state="reserved",
+                telegram_action_attempted=False,
+            )
+        )
         service._set_discovered_group_status = AsyncMock()
         service._schedule_next_join = MagicMock()
 
@@ -973,6 +991,13 @@ class TestAutoJoinStateHandling:
         )
         service._join_group = AsyncMock(side_effect=RuntimeError("account unavailable"))
         service._record_join_attempt = AsyncMock()
+        service.join_budget.reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                id=1,
+                request_state="reserved",
+                telegram_action_attempted=False,
+            )
+        )
         service._set_discovered_group_status = AsyncMock()
 
         result = await service._attempt_join_queued_group(
@@ -1008,7 +1033,7 @@ class TestAutoJoinStateHandling:
         )
 
         with pytest.raises(RuntimeError, match="account unavailable"):
-            await service._join_group(7, group)
+            await service._join_group(7, group, reservation=SimpleNamespace())
 
         pool.acquire_by_id.assert_awaited_once_with(
             7,
@@ -1056,6 +1081,7 @@ class TestAutoJoinStateHandling:
         )
         service = AcquisitionAutomationService(db=MagicMock())
         service.db.commit = AsyncMock()
+        service.db.get = AsyncMock(return_value=None)
         account = MagicMock()
         service.account_pool.acquire_by_id = AsyncMock(return_value=account)
         service.account_pool.release = AsyncMock()
@@ -1141,6 +1167,8 @@ class TestAutoJoinStateHandling:
             account_type=AccountType.PROMOTER,
             status=AccountStatus.ONLINE,
             is_active=True,
+            registered_at=datetime.utcnow() - timedelta(days=365),
+            asset_verified_at=datetime.utcnow() - timedelta(days=1),
         )
         test_db.add(account)
         await test_db.flush()
@@ -1163,9 +1191,10 @@ class TestAutoJoinStateHandling:
         await test_db.commit()
         await test_db.refresh(config)
         config.account = account
+        await save_auto_join_scheduler_settings(test_db, {"enabled": True})
 
         service = AcquisitionAutomationService(db=test_db)
-        service._auto_join_dynamic_daily_limit = AsyncMock(return_value=1)
+        service.join_budget._effective_limit = AsyncMock(return_value=1)
         service.group_finder.search_by_keyword = AsyncMock(
             return_value=[
                 DiscoveredGroup(91001, "群组一", "group_1", 0, False),
@@ -1843,6 +1872,7 @@ class TestAdDeliveryFailureHandling:
     async def test_recent_successful_probe_enforces_24_hour_ad_wait(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="writable_verified",
             probe_status="success",
             note="",
@@ -1865,6 +1895,7 @@ class TestAdDeliveryFailureHandling:
     async def test_missing_probe_eligibility_is_backfilled_before_ad_delivery(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="writable_verified",
             probe_status="success",
             note="",
@@ -1889,6 +1920,7 @@ class TestAdDeliveryFailureHandling:
     async def test_ad_only_mode_cannot_bypass_probe_eligibility_wait(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="writable_verified",
             probe_status="success",
             note="",
@@ -1941,6 +1973,7 @@ class TestAdDeliveryFailureHandling:
             account_id=account.id,
             status="joined",
             join_method="manual",
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="joined_pending_test",
             probe_status="not_started",
             ad_status="warming",
@@ -2038,6 +2071,7 @@ class TestAdDeliveryFailureHandling:
             account_id=account.id,
             status="joined",
             join_method="manual",
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="probe_scheduled",
             probe_status="scheduled",
             probe_due_at=now - timedelta(minutes=5),
@@ -2399,6 +2433,7 @@ class TestAdDeliveryFailureHandling:
     async def test_account_warmup_deadline_blocks_ad_when_interactions_are_disabled(self, test_db):
         now = datetime(2026, 8, 24, 4, 0)
         membership = SimpleNamespace(
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="writable_verified",
             probe_status="success",
             note="",
@@ -2512,10 +2547,32 @@ class TestAdDeliveryFailureHandling:
 
     @pytest.mark.asyncio
     async def test_zero_dynamic_join_limit_reports_health_pause(self, test_db):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            identifier="join-health-paused",
+            session_name="join-health-paused",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            registered_at=now - timedelta(days=365),
+            asset_verified_at=now - timedelta(days=1),
+        )
+        test_db.add(account)
+        await test_db.flush()
+        config = AccountOperationConfig(
+            account_id=account.id,
+            enabled=True,
+            auto_join_enabled=True,
+            max_groups_total=100,
+        )
+        test_db.add(config)
+        await test_db.commit()
+        await save_auto_join_scheduler_settings(test_db, {"enabled": True})
         service = AcquisitionAutomationService(db=test_db)
-        service._auto_join_dynamic_daily_limit = AsyncMock(return_value=0)
+        service.risk_guard.peek_join_cooldown = AsyncMock(return_value=0)
+        service.join_budget._effective_limit = AsyncMock(return_value=0)
 
-        reason = await service._check_join_quota(SimpleNamespace(account_id=3))
+        reason = await service._check_join_quota(config)
 
         assert reason == "account_dynamic_health_paused"
 
@@ -2527,9 +2584,19 @@ class TestAdDeliveryFailureHandling:
             account_type=AccountType.PROMOTER,
             status=AccountStatus.ONLINE,
             is_active=True,
+            registered_at=datetime.utcnow() - timedelta(days=365),
+            asset_verified_at=datetime.utcnow() - timedelta(days=1),
         )
         test_db.add(account)
         await test_db.flush()
+        config = AccountOperationConfig(
+            account_id=account.id,
+            enabled=True,
+            auto_join_enabled=True,
+            max_groups_per_day=1,
+            max_groups_total=100,
+        )
+        test_db.add(config)
         test_db.add(
             AutoJoinAttempt(
                 account_id=account.id,
@@ -2540,10 +2607,11 @@ class TestAdDeliveryFailureHandling:
             )
         )
         await test_db.commit()
+        await save_auto_join_scheduler_settings(test_db, {"enabled": True})
 
         service = AcquisitionAutomationService(db=test_db)
-        service._auto_join_dynamic_daily_limit = AsyncMock(return_value=1)
-        config = SimpleNamespace(account_id=account.id, max_groups_total=100)
+        service.risk_guard.peek_join_cooldown = AsyncMock(return_value=0)
+        service.join_budget._effective_limit = AsyncMock(return_value=1)
 
         assert await service._check_join_quota(config) is None
 
@@ -2553,6 +2621,8 @@ class TestAdDeliveryFailureHandling:
                 status=DeliveryStatus.FAILED.value,
                 reason="join_failed",
                 telegram_action_attempted=True,
+                request_state="sent",
+                request_sent_at=datetime.utcnow(),
                 attempted_at=datetime.utcnow(),
             )
         )
@@ -2570,6 +2640,8 @@ class TestAdDeliveryFailureHandling:
             account_type=AccountType.PROMOTER,
             status=AccountStatus.ONLINE,
             is_active=True,
+            registered_at=datetime.utcnow() - timedelta(days=365),
+            asset_verified_at=datetime.utcnow() - timedelta(days=1),
             created_at=now - timedelta(days=60),
         )
         joined_group = Group(
@@ -2633,6 +2705,8 @@ class TestAdDeliveryFailureHandling:
             account_type=AccountType.PROMOTER,
             status=AccountStatus.ONLINE,
             is_active=True,
+            registered_at=datetime.utcnow() - timedelta(days=365),
+            asset_verified_at=datetime.utcnow() - timedelta(days=1),
             risk_score=69.0,
             risk_level="limited",
             created_at=now - timedelta(days=30),
@@ -2662,7 +2736,7 @@ class TestAdDeliveryFailureHandling:
         assert limit > 0
 
     @pytest.mark.asyncio
-    async def test_business_stage_sync_clears_stale_join_cooldown(self, test_db):
+    async def test_business_stage_sync_preserves_longer_join_cooldown(self, test_db):
         now = datetime(2026, 1, 1, 12, 0, 0)
         account = TelegramAccount(
             phone="+15550000923",
@@ -2688,7 +2762,7 @@ class TestAdDeliveryFailureHandling:
         service = AccountDynamicFrequencyService(test_db)
         await service.apply_business_stage_state(config, "normal", now)
 
-        assert config.next_join_after == now
+        assert config.next_join_after == now + timedelta(hours=12)
 
     @pytest.mark.asyncio
     async def test_dynamic_frequency_caps_stable_join_range(self, test_db):
@@ -3019,6 +3093,9 @@ class TestAdDeliveryFailureHandling:
 
     @pytest.mark.asyncio
     async def test_ad_delivery_continues_after_failed_group(self, test_db, monkeypatch):
+        from app.modules.acquisition import automation as dispatch_module
+        # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
+        monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
         account = TelegramAccount(
             phone="+15550000002",
             identifier="+15550000002",
@@ -3075,6 +3152,7 @@ class TestAdDeliveryFailureHandling:
             account_id=account.id,
             status="joined",
             join_method="manual",
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="ad_eligible",
             probe_status="success",
             ad_status="active",
@@ -3089,6 +3167,7 @@ class TestAdDeliveryFailureHandling:
             account_id=account.id,
             status="joined",
             join_method="manual",
+            review_status=JOIN_REVIEW_APPROVED,
             warmup_status="ad_eligible",
             probe_status="success",
             ad_status="active",
@@ -3555,6 +3634,8 @@ class TestJoinQuotaCooldownPeek:
             account_type=AccountType.PROMOTER,
             status=AccountStatus.ONLINE,
             is_active=True,
+            registered_at=datetime.utcnow() - timedelta(days=365),
+            asset_verified_at=datetime.utcnow() - timedelta(days=1),
         )
         test_db.add(account)
         await test_db.flush()

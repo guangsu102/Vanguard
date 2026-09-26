@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import DynamicCapacityPanel from '@/components/DynamicCapacityPanel.vue'
+import GroupQualificationPanel from '@/components/GroupQualificationPanel.vue'
+import { useAuthStore } from '@/stores/auth'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Check, Refresh, VideoPause } from '@element-plus/icons-vue'
@@ -30,6 +33,7 @@ import {
   createDefaultWarmupPolicy,
 } from '@/config/automationDefaults'
 
+const authStore = useAuthStore()
 const props = withDefaults(
   defineProps<{
     view?: 'dashboard' | 'config'
@@ -778,6 +782,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="growth-dashboard" v-loading="loading">
+    <DynamicCapacityPanel v-if="!isConfigView && authStore.userInfo?.role === 'admin'" />
+    <GroupQualificationPanel v-if="!isConfigView && authStore.userInfo?.role === 'admin'" />
     <div class="page-toolbar">
       <div>
         <h2>{{ isConfigView ? '配置中心' : '增长驾驶舱' }}</h2>
@@ -999,16 +1005,17 @@ onBeforeUnmount(() => {
                 />
               </el-form-item>
               <el-form-item label="清理无转化群">
-                <el-switch v-model="schedulerForm.group_capacity_cleanup!.enabled" />
+                <el-switch v-model="schedulerForm.group_capacity_cleanup!.enabled" disabled />
+                <el-text type="info" size="small">已关闭，不会因长期无转化自动退群</el-text>
               </el-form-item>
               <el-form-item label="无转化天数">
-                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.no_conversion_days" :min="1" :max="365" />
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.no_conversion_days" :min="1" :max="365" disabled />
               </el-form-item>
               <el-form-item label="最小入群天数">
-                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.min_join_age_days" :min="1" :max="365" />
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.min_join_age_days" :min="1" :max="365" disabled />
               </el-form-item>
               <el-form-item label="单轮清理上限">
-                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.max_cleanup_per_run" :min="1" :max="15" />
+                <el-input-number v-model="schedulerForm.group_capacity_cleanup!.max_cleanup_per_run" :min="1" :max="15" disabled />
               </el-form-item>
               <el-form-item>
                 <div class="config-save-row">

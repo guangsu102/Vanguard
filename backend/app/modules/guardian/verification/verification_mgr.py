@@ -373,9 +373,9 @@ class VerificationManager:
         
         correct = False
         if session.verify_type == VerificationType.CAPTCHA:
-            correct = answer.upper().strip() == (session.captcha_code or "").upper().strip()
+            correct = bool(session.captcha_code) and answer.upper().strip() == session.captcha_code.upper().strip()
         else:
-            correct = answer.strip().lower() == (session.answer or "").strip().lower()
+            correct = bool(session.answer) and answer.strip().lower() == session.answer.strip().lower()
         
         if correct:
             session.state = VerificationState.PASSED
@@ -472,14 +472,13 @@ class VerificationManager:
             select(VerificationSession).where(
                 and_(
                     VerificationSession.user_id == user_id,
-                    VerificationSession.chat_id == chat_id,
-                    VerificationSession.state == VerificationState.PASSED
+                    VerificationSession.chat_id == chat_id
                 )
-            ).order_by(VerificationSession.completed_at.desc())
+            ).order_by(VerificationSession.id.desc()).limit(1)
         )
         session = result.scalar_one_or_none()
         
-        return session is not None
+        return session is not None and session.state == VerificationState.PASSED
     
     async def generate_captcha_for_session(
         self,

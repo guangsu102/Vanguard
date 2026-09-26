@@ -86,7 +86,7 @@ async def test_semantic_reply_is_persisted_for_workflow_audit(test_db):
 
 
 @pytest.mark.asyncio
-async def test_capacity_cleanup_leaves_only_old_zero_conversion_group(test_db, monkeypatch):
+async def test_capacity_cleanup_never_leaves_zero_conversion_group(test_db, monkeypatch):
     now = datetime.utcnow()
     account = TelegramAccount(
         phone="+15550004002",
@@ -147,10 +147,9 @@ async def test_capacity_cleanup_leaves_only_old_zero_conversion_group(test_db, m
 
     await test_db.refresh(zero_membership)
     await test_db.refresh(converted_membership)
-    assert result["left"] == 1
-    assert zero_membership.status == "left"
-    assert zero_membership.ad_status == "blocked"
-    assert "capacity_cleanup_no_recent_conversion" in zero_membership.note
+    assert result == {"left": 0, "reason": "cleanup_disabled_by_policy"}
+    service._leave_group.assert_not_awaited()
+    assert zero_membership.status == "joined"
     assert converted_membership.status == "joined"
 
 

@@ -418,6 +418,7 @@ class AccountSpamCheckService:
             reply = await self.telegram_execution.check_spambot_status(
                 wrapper,
                 source="account_spam_check",
+                attempt_key=f"diagnostic:spam-check:{item_id}",
             )
             classified_result = classify_spambot_reply(reply)
             summary = summarize_spambot_reply(reply, max_length=240)

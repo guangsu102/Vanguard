@@ -439,3 +439,43 @@ class TestCostStats:
         assert stats.total_tokens == 0
         assert stats.total_cost == 0.0
         assert stats.cache_hits == 0
+
+
+def test_openai_base_url_preserves_ark_coding_version():
+    assert LLMClient._normalize_openai_base_url(
+        "https://ark.cn-beijing.volces.com/api/coding/v3"
+    ) == "https://ark.cn-beijing.volces.com/api/coding/v3"
+    assert LLMClient._normalize_openai_base_url(
+        "https://api.example.test"
+    ) == "https://api.example.test/v1"
+
+
+@pytest.mark.asyncio
+async def test_openai_extra_body_is_opt_in_and_separates_cache():
+    ordinary = LLMClient(provider=LLMProvider.OPENAI, api_key="test-key")
+    policy = LLMClient(
+        provider=LLMProvider.OPENAI,
+        api_key="test-key",
+        base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+        openai_extra_body={"reasoning_effort": "low"},
+    )
+    assert ordinary.openai_extra_body == {}
+    assert policy._get_cache_key("prompt", "glm-5.3-flash", 0, "system") != ordinary._get_cache_key(
+        "prompt", "glm-5.3-flash", 0, "system"
+    )
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "OK"
+    with patch("openai.AsyncOpenAI") as mock_openai:
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=response)
+        mock_openai.return_value = sdk
+        policy._check_upstream_cooldown = AsyncMock()
+        assert await policy._call_openai([{"role": "user", "content": "Hi"}], "glm-5.3-flash", 0, 256) == "OK"
+        assert sdk.chat.completions.create.await_args.kwargs["extra_body"] == {
+            "reasoning_effort": "low"
+        }
+        sdk.chat.completions.create.reset_mock()
+        ordinary._check_upstream_cooldown = AsyncMock()
+        assert await ordinary._call_openai([{"role": "user", "content": "Hi"}], "glm-5.3-flash", 0, 256) == "OK"
+        assert "extra_body" not in sdk.chat.completions.create.await_args.kwargs

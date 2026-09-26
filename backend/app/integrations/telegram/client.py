@@ -507,6 +507,52 @@ class TelegramClient:
             data = await self._request("sendMessage", params)
         return Message.from_dict(data)
 
+    async def send_message_once(
+        self, chat_id: Union[int, str], text: str, **kwargs: Any
+    ) -> Message:
+        """A single Bot API send attempt for durable externally fenced operations."""
+        await self._rate_limiter.acquire("message")
+        params = {"chat_id": chat_id, "text": text}
+        params.update({key: value for key, value in kwargs.items() if value is not None})
+        async with self._risk_operation(
+            AccountRiskAction.BOT_MESSAGE, target_type="chat", target_id=chat_id,
+            details={"source": "bot_api_send_message_once"},
+        ):
+            data = await self._request("sendMessage", params, retry=0)
+        return Message.from_dict(data)
+
+    async def send_verification_photo(
+        self, chat_id: int, png: bytes, caption: str
+    ) -> Message:
+        """Upload a real PNG once; an unknown transport outcome is never retried."""
+        if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("verification photo must be PNG")
+        if not self.config.bot_token:
+            raise TelegramAPIError("Bot token not configured", method="sendPhoto")
+        await self._rate_limiter.acquire("message")
+        async with self._risk_operation(
+            AccountRiskAction.BOT_MESSAGE, target_type="chat", target_id=chat_id,
+            details={"source": "guardian_verification_photo"},
+        ):
+            client = await self._get_client()
+            url = self.BOT_API_URL.format(token=self.config.bot_token, method="sendPhoto")
+            try:
+                response = await client.post(
+                    url, data={"chat_id": str(chat_id), "caption": caption},
+                    files={"photo": ("verification.png", png, "image/png")},
+                )
+                data = response.json()
+            except (httpx.RequestError, ValueError):
+                raise TelegramAPIError(
+                    "Verification photo outcome unknown", method="sendPhoto"
+                ) from None
+            if not data.get("ok"):
+                raise TelegramAPIError(
+                    "Verification photo rejected", code=data.get("error_code"),
+                    method="sendPhoto",
+                )
+        return Message.from_dict(data.get("result") or {})
+
     async def send_photo(
         self,
         chat_id: Union[int, str],

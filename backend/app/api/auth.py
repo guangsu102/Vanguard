@@ -56,12 +56,19 @@ def get_password_hash(password: str) -> str:
 async def login(request: LoginRequest, db: AsyncSession = Depends(get_db)):
     """User login"""
     result = await db.execute(
-        text("SELECT id, username, password, role, email, avatar FROM admin_user WHERE username = :username"),
+        text(
+            "SELECT id, username, password, role, email, avatar, is_active "
+            "FROM admin_user WHERE username = :username"
+        ),
         {"username": request.username}
     )
     user = result.fetchone()
 
-    if not user or not verify_password(request.password, user[2]):
+    if (
+        not user
+        or not bool(user[6])
+        or not verify_password(request.password, user[2])
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码错误"

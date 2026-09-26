@@ -797,6 +797,30 @@ def test_high_risk_telegram_errors_are_account_scoped():
     )
 
 
+    frozen_error = "Your account is frozen and can't access the chat"
+    assert (
+        AccountRiskGuard.classify_error(
+            frozen_error, action=AccountRiskAction.AD_PROBE, target_type="group"
+        )
+        == "account_restricted"
+    )
+    assert AccountRiskGuard._is_user_restricted_error(frozen_error) is True
+
+    frozen_method_error = (
+        "FrozenMethodInvalidError: You tried to use a method that is not available "
+        "for frozen accounts (caused by GetParticipantRequest)"
+    )
+    assert (
+        AccountRiskGuard.classify_error(
+            frozen_method_error,
+            action=AccountRiskAction.AD_PROBE,
+            target_type="group",
+        )
+        == "account_restricted"
+    )
+    assert AccountRiskGuard._is_user_restricted_error(frozen_method_error) is True
+
+
 @pytest.mark.asyncio
 async def test_risk_guard_records_daily_stats_for_low_value_events(test_db):
     account = TelegramAccount(

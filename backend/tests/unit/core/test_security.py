@@ -2,8 +2,14 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 
+import pytest
+from fastapi import HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
+from unittest.mock import AsyncMock, MagicMock
+
+from app.api.auth import LoginRequest, login
 from app.core.config import settings
-from app.core.security import create_access_token, verify_access_token
+from app.core.security import create_access_token, get_current_user, verify_access_token
 
 
 def _token(payload: dict) -> str:
@@ -42,3 +48,51 @@ def test_access_token_default_expiration_uses_configured_hours(monkeypatch):
     )
     expires_at = datetime.fromtimestamp(payload["exp"], timezone.utc)
     assert timedelta(hours=2, seconds=-1) <= expires_at - issued_at <= timedelta(hours=2, seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_get_current_user_rejects_inactive_user():
+    row_result = MagicMock()
+    row_result.fetchone.return_value = (
+        7,
+        "disabled-admin",
+        "admin",
+        None,
+        None,
+        datetime.utcnow(),
+        False,
+    )
+    db = AsyncMock()
+    db.execute.return_value = row_result
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer",
+        credentials=create_access_token({"sub": "7"}),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_current_user(credentials=credentials, db=db)
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "User not found or inactive"
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_inactive_user_before_issuing_token():
+    row_result = MagicMock()
+    row_result.fetchone.return_value = (
+        8,
+        "disabled-admin",
+        "unused-password-hash",
+        "admin",
+        None,
+        None,
+        False,
+    )
+    db = AsyncMock()
+    db.execute.return_value = row_result
+
+    with pytest.raises(HTTPException) as exc_info:
+        await login(LoginRequest(username="disabled-admin", password="secret"), db=db)
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "用户名或密码错误"

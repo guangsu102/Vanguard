@@ -10,6 +10,7 @@ Features:
 - Deduplication checking
 """
 
+from datetime import datetime
 from typing import Optional
 
 import structlog
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel, GroupLevelConfig
+from app.core.group.join_review import JOIN_REVIEW_LEFT, reset_join_review
 from app.core.group.scorer import GroupScorer
 from app.exceptions import GroupNotFoundError, ValidationError
 
@@ -526,6 +528,7 @@ class GroupManager:
         if existing:
             raise ValidationError("This account has already joined this group")
 
+        now = datetime.utcnow()
         membership = GroupAccountMembership(
             group_id=group.id,
             telegram_group_id=group.group_id,
@@ -534,7 +537,24 @@ class GroupManager:
             join_method=join_method,
             source_keyword=source_keyword or group.source_keyword,
             note=note,
+            joined_at=now if status in {"joined", "pending"} else None,
+            left_at=now if status in {"left", "banned", "rejected"} else None,
+            last_checked_at=now,
+            review_status=JOIN_REVIEW_LEFT
+            if status in {"left", "banned", "rejected"}
+            else "initial_pending",
+            ad_status="blocked"
+            if status in {"left", "banned", "rejected"}
+            else "warming",
+            warmup_status="blocked"
+            if status in {"left", "banned", "rejected"}
+            else "joined_pending_test",
+            probe_status="skipped"
+            if status in {"left", "banned", "rejected"}
+            else "not_started",
         )
+        if status in {"joined", "pending"}:
+            reset_join_review(membership, now)
         self.db.add(membership)
 
         try:

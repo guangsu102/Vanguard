@@ -8,6 +8,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -509,6 +510,25 @@ class TestTaskDefinitions:
             with pytest.raises(RuntimeError, match="^probe workflow failed$"):
                 tasks.auto_probe_unknown_group_ad_policies_task.run()
 
+    def test_check_ad_survival_task_propagates_failures(self):
+        from app.core.scheduler import tasks
+        from app.modules.acquisition import automation as acquisition_automation
+
+        with (
+            patch.object(
+                acquisition_automation,
+                "run_ad_survival_check_with_db",
+                new=MagicMock(return_value=object()),
+            ),
+            patch.object(
+                tasks,
+                "_run_async",
+                side_effect=RuntimeError("survival workflow failed"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="^survival workflow failed$"):
+                tasks.check_ad_survival_task.run()
+
     def test_result_skip_reasons_counts_only_skip_details(self):
         from app.core.scheduler.tasks import _result_skip_reasons
 
@@ -575,6 +595,7 @@ class TestSchedulerModuleExports:
     def test_worker_cli_help_has_no_runpy_reimport_warning(self):
         result = subprocess.run(
             [sys.executable, "-m", "app.core.scheduler.worker", "--help"],
+            cwd=Path(__file__).resolve().parents[3],
             capture_output=True,
             text=True,
             check=False,

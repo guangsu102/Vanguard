@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.core.account.models import AccountType, TelegramAccount
+from app.core.automation_settings import save_auto_join_scheduler_settings
 from app.core.group.models import Group, GroupAccountMembership
 from app.modules.acquisition.automation import (
     AcquisitionAutomationService,
@@ -21,6 +22,7 @@ from app.modules.acquisition.models import AutoJoinAttempt
 async def make_case(db, *, number=1, member_status="joined", note=None):
     submitted = datetime(2026, 9, 12, 1, 0)
     checked = submitted + timedelta(minutes=5)
+    review_now = datetime.utcnow()
     account = TelegramAccount(
         identifier=f"reconcile-{number}",
         session_name=f"reconcile-{number}",
@@ -42,6 +44,9 @@ async def make_case(db, *, number=1, member_status="joined", note=None):
         join_method="auto_keyword_search",
         joined_at=submitted + timedelta(seconds=1),
         last_checked_at=checked,
+        review_started_at=review_now - timedelta(hours=2),
+        review_next_at=review_now - timedelta(minutes=1),
+        review_deadline_at=review_now + timedelta(hours=22),
         ad_status="warming" if member_status == "joined" else "blocked",
         note=json.dumps({"passed": True}) if note is None else note,
     )
@@ -188,13 +193,18 @@ async def test_sync_marks_newly_approved_attempt_success_without_another_join(te
     attempt, membership, _ = await make_case(
         test_db, member_status="pending", note=json.dumps({"reason": "join_request_pending"})
     )
+    await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     service = AcquisitionAutomationService(test_db)
     service._join_verification_settings = AsyncMock(return_value=JoinVerificationSettings())
     service._reconcile_failed_auto_join_groups = AsyncMock(
         return_value={"updated": 0, "details": []}
     )
     service._evaluate_joined_group = AsyncMock(
-        return_value=JoinedGroupAuditResult(passed=True, can_send_messages=True)
+        return_value=JoinedGroupAuditResult(
+            passed=True,
+            can_send_messages=True,
+            ad_allowed=True,
+        )
     )
     service._account_ad_warmup_days = AsyncMock(return_value=0)
     service._sync_group_ad_policy_from_audit = AsyncMock()
@@ -215,9 +225,10 @@ async def test_sync_marks_newly_approved_attempt_success_without_another_join(te
 
 @pytest.mark.asyncio
 async def test_sync_leaves_still_unapproved_request_pending(test_db):
-    attempt, _, _ = await make_case(
+    attempt, membership, _ = await make_case(
         test_db, member_status="pending", note=json.dumps({"reason": "join_request_pending"})
     )
+    await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     service = AcquisitionAutomationService(test_db)
     service._join_verification_settings = AsyncMock(return_value=JoinVerificationSettings())
     service._reconcile_failed_auto_join_groups = AsyncMock(
@@ -227,11 +238,15 @@ async def test_sync_leaves_still_unapproved_request_pending(test_db):
         return_value=JoinedGroupAuditResult(passed=False, reason="account_not_participant")
     )
     service._join_group = AsyncMock()
+    service._leave_group = AsyncMock()
     result = await service._sync_pending_auto_join_memberships()
     await test_db.refresh(attempt)
+    await test_db.refresh(membership)
     assert attempt.status == "pending"
-    assert result["details"][0]["reason"] == "join_request_still_pending"
+    assert membership.status == "pending"
+    assert result["details"][0]["reason"] == "account_not_participant"
     service._join_group.assert_not_awaited()
+    service._leave_group.assert_not_awaited()
 
 
 @pytest.mark.asyncio

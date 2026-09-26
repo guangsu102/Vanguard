@@ -42,6 +42,11 @@ DEFAULT_MIGRATIONS = [
     "055_add_account_profile_updates.sql",
     "056_add_api_config_platform.sql",
     "057_set_growth_ad_capacity.sql",
+    "058_add_durable_join_request_budget.sql",
+    "059_add_join_reconciliation_schedule.sql",
+    "060_add_group_qualification_audit.sql",
+    "061_add_dynamic_growth_capacity.sql",
+    "062_add_adaptive_group_frequency.sql",
 ]
 
 

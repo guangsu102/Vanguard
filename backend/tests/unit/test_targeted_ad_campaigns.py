@@ -674,6 +674,7 @@ async def test_ad_only_scheduled_time_is_enforced_without_growth_gates(test_db, 
         AsyncMock(
             return_value=SimpleNamespace(
                 ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+                ad_policy_source="manual",
                 ad_policy_confidence=100,
                 ad_policy_expires_at=None,
                 paused_until=None,
@@ -727,7 +728,7 @@ async def test_approval_required_group_is_blocked_before_writable_probe(test_db,
         target_group_levels=json.dumps(["A"]),
     )
     binding = SimpleNamespace(account_id=7)
-    membership = SimpleNamespace(telegram_group_id=group.group_id, group=group)
+    membership = SimpleNamespace(telegram_group_id=group.group_id, group=group, ad_pause_until=None)
     warmup_check = AsyncMock(return_value=None)
     monkeypatch.setattr(automation_module, "_now", lambda: now)
     monkeypatch.setattr(service, "_ad_recent_inflight_delivery_reason", AsyncMock(return_value=None))
@@ -744,7 +745,7 @@ async def test_approval_required_group_is_blocked_before_writable_probe(test_db,
         membership,
     )
 
-    assert reason == "group_ad_approval_required"
+    assert reason == "group_manual_ad_hold"
     warmup_check.assert_not_awaited()
 
 

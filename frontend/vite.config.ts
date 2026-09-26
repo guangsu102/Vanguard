@@ -16,7 +16,7 @@ export default defineConfig({
     }),
     Components({
       resolvers: [ElementPlusResolver()],
-      dts: 'src/auto-imports.d.ts',
+      dts: 'src/components.d.ts',
     }),
   ],
   resolve: {

@@ -188,6 +188,40 @@ class GroupAccountMembership(Base):
     joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, nullable=True, comment="加入时间")
     left_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="离开时间")
     last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, comment="最后检查时间")
+    review_status: Mapped[str] = mapped_column(
+        String(40),
+        default="initial_pending",
+        server_default="initial_pending",
+        nullable=False,
+        comment="加群后审核状态",
+    )
+    review_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="审核固定起点"
+    )
+    review_next_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="下次审核或退出重试时间"
+    )
+    review_deadline_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="24小时最终审核截止时间"
+    )
+    review_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False, comment="审核次数"
+    )
+    leave_requested_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="首次请求退出时间"
+    )
+    leave_confirmed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="确认退出时间"
+    )
+    leave_retry_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="退出重试时间"
+    )
+    leave_attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False, comment="退出尝试次数"
+    )
+    leave_error: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True, comment="最近退出失败"
+    )
     warmup_status: Mapped[str] = mapped_column(
         String(40),
         default="joined_pending_test",
@@ -233,7 +267,8 @@ class GroupAccountMembership(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "account_id", name="uq_group_account_membership_group_account"),
         CheckConstraint(
-            "status NOT IN ('left', 'banned', 'rejected') OR ad_status = 'blocked'",
+            "status NOT IN ('left', 'banned', 'rejected', 'leave_failed') "
+            "OR ad_status = 'blocked'",
             name="ck_group_membership_inactive_ad_blocked",
         ),
         Index("idx_group_membership_group", "group_id"),
@@ -243,4 +278,5 @@ class GroupAccountMembership(Base):
         Index("idx_group_membership_warmup", "account_id", "warmup_status", "probe_status"),
         Index("idx_group_membership_ad_eligible", "account_id", "ad_eligible_after"),
         Index("idx_group_membership_ad_status", "account_id", "ad_status"),
+        Index("idx_group_membership_review_due", "account_id", "review_status", "review_next_at"),
     )

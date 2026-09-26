@@ -61,6 +61,10 @@ from app.modules.acquisition.automation import (
     WEB_ERROR_RESPONSE_RE,
     AcquisitionAutomationService,
 )
+from app.modules.acquisition.join_budget import (
+    JOIN_REQUEST_MIN_INTERVAL_SECONDS,
+    JoinRequestBudgetService,
+)
 from app.modules.acquisition.models import (
     AccountAdBinding,
     AdCampaign,
@@ -82,6 +86,8 @@ from app.modules.acquisition.models import (
 from app.modules.owned_group.models import OwnedGroupAsset
 
 router = APIRouter()
+from app.api.group_qualification import router as qualification_router
+router.include_router(qualification_router)
 
 
 def _paused_ad_delivery_payload(state: AdDeliveryScheduleState) -> dict[str, Any]:
@@ -274,7 +280,7 @@ class AdCapacityUpdate(BaseModel):
     survival_one_hour_seconds: int = Field(default=3600, ge=300, le=7200)
     survival_twenty_four_hour_seconds: int = Field(default=86400, ge=3600, le=172800)
     survival_check_batch_size: int = Field(default=50, ge=1, le=500)
-    max_groups_per_account: int = Field(default=100, ge=1, le=100)
+    max_groups_per_account: int = Field(default=100, ge=1, le=300)
     max_new_ad_groups_per_day: int = Field(default=2, ge=0, le=10)
     probe_backlog_max_days: int = Field(default=3, ge=0, le=30)
     leave_on_deleted_ad: bool = Field(
@@ -286,7 +292,7 @@ class AdCapacityUpdate(BaseModel):
         description="写权限探针失败或探针广告被删除时是否封禁整个群的广告",
     )
     ad_policy_ai_enabled: bool = True
-    ad_policy_ai_model: str = Field(default="gpt-5.6-sol", min_length=1, max_length=100)
+    ad_policy_ai_model: str = Field(default="gpt-6-sol", min_length=1, max_length=100)
     ad_policy_ai_timeout_seconds: int = Field(default=45, ge=5, le=120)
     ad_policy_ai_min_confidence: int = Field(default=95, ge=90, le=100)
     ad_policy_ai_require_second_pass: bool = Field(
@@ -1819,14 +1825,23 @@ async def update_ad_failure_policy(
 
 
 class AccountOperationConfigUpdate(BaseModel):
+    dynamic_capacity_enabled: Optional[bool] = None
+    adaptive_ads_enabled: Optional[bool] = None
+    max_ads_per_day: Optional[int] = Field(None, ge=0, le=30)
+    max_verification_messages_per_day: Optional[int] = Field(None, ge=0, le=30)
+    max_diagnostic_messages_per_day: Optional[int] = Field(None, ge=0, le=2)
     operation_mode: Optional[str] = Field(None, pattern="^(growth|ad_only)$")
     force_transition: bool = False
     auto_join_enabled: Optional[bool] = None
     auto_ads_enabled: Optional[bool] = None
-    max_groups_per_day: Optional[int] = Field(None, ge=0, le=10)
-    max_groups_total: Optional[int] = Field(None, ge=0, le=100)
-    join_interval_min_seconds: Optional[int] = Field(None, ge=60)
-    join_interval_max_seconds: Optional[int] = Field(None, ge=60)
+    max_groups_per_day: Optional[int] = Field(None, ge=0, le=30)
+    max_groups_total: Optional[int] = Field(None, ge=0, le=300)
+    join_interval_min_seconds: Optional[int] = Field(
+        None, ge=JOIN_REQUEST_MIN_INTERVAL_SECONDS
+    )
+    join_interval_max_seconds: Optional[int] = Field(
+        None, ge=JOIN_REQUEST_MIN_INTERVAL_SECONDS
+    )
     next_join_after: Optional[datetime] = None
     max_messages_per_day: Optional[int] = Field(None, ge=1, le=20000)
     message_interval_seconds: Optional[int] = Field(None, ge=1)
@@ -1857,6 +1872,11 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
         or AccountOperationMode.GROWTH.value,
         "auto_join_enabled": config.auto_join_enabled,
         "auto_ads_enabled": config.auto_ads_enabled,
+        "dynamic_capacity_enabled": bool(getattr(config, "dynamic_capacity_enabled", False)),
+        "adaptive_ads_enabled": bool(getattr(config, "adaptive_ads_enabled", False)),
+        "max_ads_per_day": getattr(config, "max_ads_per_day", None) or 0,
+        "max_verification_messages_per_day": getattr(config, "max_verification_messages_per_day", None) or 0,
+        "max_diagnostic_messages_per_day": getattr(config, "max_diagnostic_messages_per_day", None) or 0,
         "max_groups_per_day": config.max_groups_per_day,
         "max_groups_total": config.max_groups_total,
         "join_interval_min_seconds": config.join_interval_min_seconds,
@@ -1875,6 +1895,17 @@ def _operation_config_to_dict(config: AccountOperationConfig) -> dict:
         "created_at": config.created_at.isoformat() if config.created_at else "",
         "updated_at": config.updated_at.isoformat() if config.updated_at else "",
     }
+
+
+async def _operation_config_response(
+    db: AsyncSession,
+    config: AccountOperationConfig,
+) -> dict:
+    payload = _operation_config_to_dict(config)
+    payload["join_runtime"] = (
+        await JoinRequestBudgetService(db).status(config.account_id)
+    ).as_dict()
+    return payload
 
 
 async def _get_or_create_operation_config(
@@ -2074,10 +2105,33 @@ def _apply_operation_config_update(config: AccountOperationConfig, data: dict[st
         setattr(config, field, value)
 
 
+@router.get("/capacity")
+async def get_dynamic_capacity(
+    account_id: int | None = Query(None, ge=1),
+    db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
+) -> dict:
+    from app.modules.acquisition.capacity import capacity_snapshot
+    if account_id is not None:
+        if await db.get(TelegramAccount, account_id) is None:
+            raise HTTPException(404, "Account not found")
+        ids = [account_id]
+    else:
+        ids = list((await db.scalars(select(AccountOperationConfig.account_id).where(
+            AccountOperationConfig.dynamic_capacity_enabled.is_(True)
+        ).order_by(AccountOperationConfig.account_id))).all())
+    snapshots = [await capacity_snapshot(db, value) for value in ids]
+    return {"code": 0, "data": snapshots}
+
+
 @router.get("/accounts/{account_id:int}/operation-config")
 async def get_account_operation_config(account_id: int, db: AsyncSession = Depends(get_db)) -> dict:
     config = await _get_or_create_operation_config(db, account_id)
-    return {"code": 0, "message": "success", "data": _operation_config_to_dict(config)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": await _operation_config_response(db, config),
+    }
 
 
 @router.put("/accounts/{account_id:int}/operation-config")
@@ -2098,7 +2152,11 @@ async def update_account_operation_config(
 
     await db.commit()
     await db.refresh(config)
-    return {"code": 0, "message": "success", "data": _operation_config_to_dict(config)}
+    return {
+        "code": 0,
+        "message": "success",
+        "data": await _operation_config_response(db, config),
+    }
 
 
 @router.put("/accounts/operation-config/batch")

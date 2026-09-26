@@ -40,6 +40,7 @@ from app.core.automation_settings import (
 from app.core.config import get_settings
 from app.core.operating_time import operating_date
 from app.core.redis import RedisCache
+from app.modules.owned_group.models import OwnedGroupAsset
 from app.modules.owned_group.security import redact_sensitive_text, redact_sensitive_value
 
 logger = structlog.get_logger()
@@ -66,6 +67,20 @@ class AccountRiskAction(str, Enum):
     CHANNEL_DELETE = "channel_delete"
     MANAGED_BOT_CREATE = "managed_bot_create"
     SPAM_CHECK = "spam_check"
+    VERIFICATION_ANSWER = "verification_answer"
+    VERIFICATION_CALLBACK = "verification_callback"
+
+
+OWNER_ACCOUNT_EXTERNAL_PROMOTION_ACTIONS = frozenset(
+    {
+        AccountRiskAction.JOIN,
+        AccountRiskAction.PRIVATE_MESSAGE,
+        AccountRiskAction.GROUP_MESSAGE,
+        AccountRiskAction.AD_PROBE,
+        AccountRiskAction.AD_DELIVERY,
+        AccountRiskAction.FORWARD,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -84,7 +99,7 @@ class RiskDecision:
 
 DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.SEARCH: RiskBudget(daily_limit=100, cooldown_seconds=30),
-    AccountRiskAction.JOIN: RiskBudget(daily_limit=10, cooldown_seconds=7200),
+    AccountRiskAction.JOIN: RiskBudget(daily_limit=30, cooldown_seconds=2880),
     AccountRiskAction.PRIVATE_MESSAGE: RiskBudget(daily_limit=40, cooldown_seconds=45),
     AccountRiskAction.GROUP_MESSAGE: RiskBudget(daily_limit=4, cooldown_seconds=7200),
     # AD_PROBE is a system-owned safety valve. Its runtime daily budget is
@@ -114,6 +129,8 @@ DEFAULT_ACTION_BUDGETS: dict[AccountRiskAction, RiskBudget] = {
     AccountRiskAction.CHANNEL_DELETE: RiskBudget(daily_limit=1, cooldown_seconds=86400),
     AccountRiskAction.MANAGED_BOT_CREATE: RiskBudget(daily_limit=1, cooldown_seconds=3600),
     AccountRiskAction.SPAM_CHECK: RiskBudget(daily_limit=3, cooldown_seconds=300),
+    AccountRiskAction.VERIFICATION_ANSWER: RiskBudget(daily_limit=30, cooldown_seconds=0),
+    AccountRiskAction.VERIFICATION_CALLBACK: RiskBudget(daily_limit=30, cooldown_seconds=0),
 }
 
 GLOBAL_DAILY_LIMIT = 30
@@ -170,6 +187,7 @@ def _ad_probe_operating_date(now: datetime, capacity: dict[str, Any]) -> date:
 
 
 MESSAGE_ACTIONS = {
+    AccountRiskAction.VERIFICATION_ANSWER,
     AccountRiskAction.PRIVATE_MESSAGE,
     AccountRiskAction.SPAM_CHECK,
     AccountRiskAction.GROUP_MESSAGE,
@@ -312,9 +330,19 @@ class AccountRiskGuard:
         db_account = await self._get_db_account(account_id)
         now = datetime.utcnow()
         risk_settings = await get_account_risk_guard_settings(self.db)
+        restricted_profile_cleanup = False
 
         if db_account is not None:
             await self._apply_risk_lifecycle(db_account, now, risk_settings=risk_settings)
+            restricted_profile_cleanup = (
+                action == AccountRiskAction.PROFILE_UPDATE
+                and db_account.status == AccountStatus.RESTRICTED
+                and db_account.risk_reason == "account_restricted"
+                and target_type == "account"
+                and target_id == account_id
+                and (details or {}).get("source") == "account_profile_update_batch"
+                and (details or {}).get("bio_length") == 0
+            )
             restricted_spam_diagnostic = (
                 action == AccountRiskAction.SPAM_CHECK
                 and db_account.status == AccountStatus.RESTRICTED
@@ -387,6 +415,7 @@ class AccountRiskGuard:
             if (
                 db_account.risk_pause_until
                 and db_account.risk_pause_until > now
+                and not restricted_profile_cleanup
                 and not restricted_spam_diagnostic
             ):
                 retry_after = max(1, int((db_account.risk_pause_until - now).total_seconds()))
@@ -404,7 +433,39 @@ class AccountRiskGuard:
             return await self._block(
                 account, action, "account_missing", target_type, target_id, details
             )
+        if (
+            action in OWNER_ACCOUNT_EXTERNAL_PROMOTION_ACTIONS
+            and await self._is_owned_group_owner(account_id)
+        ):
+            return await self._block(
+                account,
+                action,
+                "owned_group_owner_protected",
+                target_type,
+                target_id,
+                details,
+            )
 
+        dynamic_config = await self.db.scalar(select(AccountOperationConfig).where(
+            AccountOperationConfig.account_id == account_id
+        ))
+        dynamic_enabled = getattr(dynamic_config, "dynamic_capacity_enabled", None) is True
+        feedback = {}
+        if dynamic_enabled:
+            from app.core.account.outbound_budget import (
+                ActionCapacityFeedbackService,
+                _feedback_time,
+            )
+            feedback = (await ActionCapacityFeedbackService(self.db).read(account_id)).get(action.value) or {}
+            action_pause = _feedback_time(feedback.get("pause_until"))
+            if action_pause and action_pause > now:
+                return await self._block(account, action, "action_flood_wait", target_type, target_id, details,
+                    retry_after_seconds=max(1, int((action_pause-now).total_seconds()) + 1))
+        durable_outbound = False
+        if dynamic_enabled and action in MESSAGE_ACTIONS:
+            durable_outbound = await self._validated_dynamic_outbound(account_id, action, target_id, details)
+            if not durable_outbound:
+                return await self._block(account, action, "outbound_reservation_required", target_type, target_id, details)
         if not risk_settings["enabled"] and not owned_group_message and not owned_group_membership:
             await self.record_event(
                 account,
@@ -419,6 +480,12 @@ class AccountRiskGuard:
         delivery_policy = str((details or {}).get("delivery_policy") or "growth")
         ad_only_delivery = action == AccountRiskAction.AD_DELIVERY and delivery_policy == "ad_only"
         budget = self._budget_for_action(action, risk_settings)
+        if restricted_profile_cleanup:
+            # One self-profile cleanup remains possible without lifting the account freeze.
+            budget = RiskBudget(daily_limit=1, cooldown_seconds=3600)
+        if feedback and action in {AccountRiskAction.SEARCH, AccountRiskAction.VERIFICATION_CALLBACK}:
+            budget = RiskBudget(daily_limit=min(budget.daily_limit, int(feedback["limit"])),
+                cooldown_seconds=max(budget.cooldown_seconds, int(feedback["interval_seconds"])))
         if action == AccountRiskAction.AD_PROBE:
             capacity = await get_ad_capacity_settings(self.db)
             budget = RiskBudget(
@@ -426,10 +493,12 @@ class AccountRiskGuard:
                 cooldown_seconds=budget.cooldown_seconds,
             )
         if (
-            not ad_only_delivery
+            not dynamic_enabled
+            and not ad_only_delivery
             and not owned_group_message
             and not owned_group_membership
             and action != AccountRiskAction.SPAM_CHECK
+            and not restricted_profile_cleanup
         ):
             warmup_settings = await get_account_warmup_policy_settings(self.db)
             warmup = account_warmup_context(
@@ -474,9 +543,12 @@ class AccountRiskGuard:
             else None
         )
         try:
-            allowed, reason, retry_after = await self._reserve_budget(
-                account_id, action, budget, risk_settings, reservation_id=reservation_id,
-            )
+            if durable_outbound:
+                allowed, reason, retry_after = True, "durable_outbound_reserved", None
+            else:
+                allowed, reason, retry_after = await self._reserve_budget(
+                    account_id, action, budget, risk_settings, reservation_id=reservation_id,
+                )
         except BaseException:
             await self.release_content_reservation(content_decision.content_reservation)
             raise
@@ -545,6 +617,10 @@ class AccountRiskGuard:
             target_id=target_id,
             details=details,
         )
+        from app.core.account.outbound_budget import FEEDBACK_ACTIONS, ActionCapacityFeedbackService
+        account_id = self._account_id(account)
+        if account_id is not None and action.value in FEEDBACK_ACTIONS:
+            await ActionCapacityFeedbackService(self.db).record_success(account_id, action.value)
         if (
             action
             in {
@@ -570,6 +646,15 @@ class AccountRiskGuard:
         reason: Optional[str] = None,
     ) -> None:
         action = AccountRiskAction(action)
+        from app.core.account.rpc_governor import RpcDeferred
+        if isinstance(exc, RpcDeferred) or getattr(exc, "_vanguard_read_flood", False) is True:
+            await self.record_event(
+                account, action, "skip",
+                reason=exc.reason if isinstance(exc, RpcDeferred) else "telegram_read_flood_wait",
+                target_type=target_type, target_id=target_id,
+                details={"retry_after_seconds": getattr(exc, "retry_after_seconds", getattr(exc, "seconds", 60))},
+            )
+            return
         reason = reason or await self._classify_error(
             exc,
             action=action,
@@ -590,6 +675,19 @@ class AccountRiskGuard:
             target_id=target_id,
             details=merged_details,
         )
+        if reason == "flood_wait":
+            from app.core.account.outbound_budget import (
+                FEEDBACK_ACTIONS,
+                ActionCapacityFeedbackService,
+            )
+            account_id = self._account_id(account)
+            operation = await self.db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
+            if getattr(operation, "dynamic_capacity_enabled", None) is True and action.value in FEEDBACK_ACTIONS:
+                seconds = self.extract_wait_seconds(exc)
+                await ActionCapacityFeedbackService(self.db).record_flood(account_id, action.value,
+                    seconds if seconds is not None else int(lifecycle.get("default_freeze_seconds", DEFAULT_FREEZE_SECONDS)),
+                    event_key=(details or {}).get("outbound_attempt_key") or (details or {}).get("join_reservation_key"))
+                return
         if reason == "peer_flood":
             await self.freeze_account(
                 account,
@@ -747,6 +845,10 @@ class AccountRiskGuard:
                 "userrestrictederror",
                 "user_restricted_error",
                 "user_restricted",
+                "account is frozen",
+                "account frozen",
+                "frozenmethodinvalid",
+                "method that is not available for frozen accounts",
             )
         )
 
@@ -881,10 +983,16 @@ class AccountRiskGuard:
         group_scoped_write_failure = (
             status == "failure" and reason == "group_write_forbidden" and target_type == "group"
         )
+        action_scoped_flood = False
+        if status == "failure" and reason == "flood_wait" and account_id is not None:
+            from app.core.account.outbound_budget import FEEDBACK_ACTIONS
+            operation = await self.db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
+            action_scoped_flood = getattr(operation, "dynamic_capacity_enabled", None) is True and action.value in FEEDBACK_ACTIONS
         if (
             db_account is not None
             and status in {"failure", "freeze"}
             and not group_scoped_write_failure
+            and not action_scoped_flood
         ):
             now = datetime.utcnow()
             db_account.last_risk_event_at = now
@@ -1076,7 +1184,12 @@ class AccountRiskGuard:
         return max(1, int(override) if override is not None else configured_default)
 
     async def peek_join_cooldown(self, account_id: int) -> int:
-        """Return remaining JOIN cooldown seconds WITHOUT reserving budget.
+        return await self.peek_action_cooldown(account_id, AccountRiskAction.JOIN)
+
+    async def peek_action_cooldown(
+        self, account_id: int, action: AccountRiskAction | str,
+    ) -> int:
+        """Read remaining action cooldown without reserving budget or recording an event.
 
         Lets schedulers skip an account before consuming a candidate group or
         recording a futile attempt row; the key layout matches what
@@ -1085,7 +1198,7 @@ class AccountRiskGuard:
         client = self.cache.client
         if client is None:
             return 0
-        cooldown_key = f"risk:account:{int(account_id)}:cooldown:{AccountRiskAction.JOIN.value}"
+        cooldown_key = f"risk:account:{int(account_id)}:cooldown:{AccountRiskAction(action).value}"
         raw = await self.cache.get(cooldown_key)
         if not raw:
             return 0
@@ -1124,6 +1237,7 @@ class AccountRiskGuard:
             else 0
         )
         business_budget_actions = {
+            AccountRiskAction.JOIN,
             AccountRiskAction.AD_DELIVERY,
             AccountRiskAction.OWNED_GROUP_MESSAGE,
         }
@@ -1539,16 +1653,25 @@ class AccountRiskGuard:
 
         if account.risk_pause_until and account.risk_pause_until <= now:
             account.risk_pause_until = None
-            account.risk_recovery_until = now + timedelta(
-                seconds=int(lifecycle.get("recovery_seconds", RECOVERY_SECONDS))
+            read_only_pause = (
+                account.risk_reason == "telegram_read_flood_wait"
+                and account.risk_level == AccountRiskLevel.NORMAL.value
+                and float(account.risk_score or 0) == 0
+                and account.risk_recovery_until is None
             )
+            if not read_only_pause:
+                account.risk_recovery_until = now + timedelta(
+                    seconds=int(lifecycle.get("recovery_seconds", RECOVERY_SECONDS))
+                )
             account.risk_score = min(
                 float(account.risk_score or 0.0),
                 float(lifecycle.get("post_freeze_score_cap", 69.0)),
             )
             if account.risk_level == AccountRiskLevel.FROZEN.value:
                 account.risk_level = AccountRiskLevel.LIMITED.value
-            if account.risk_reason != "platform_group_write_banned":
+            if read_only_pause:
+                account.risk_reason = "telegram_read_cooldown_completed"
+            elif account.risk_reason != "platform_group_write_banned":
                 account.risk_reason = "risk_recovery"
             changed = True
 
@@ -1716,6 +1839,52 @@ class AccountRiskGuard:
                     await client.delete(key)
             await client.lrem(keys[2], 1, reservation["payload"])
 
+    async def _validated_dynamic_outbound(
+        self, account_id: int, action: AccountRiskAction, target_id: Any, details: Optional[dict[str, Any]],
+    ) -> bool:
+        from app.core.account.models import AccountOutboundAttempt
+        details = details or {}
+        key = details.get("outbound_attempt_key")
+        if not isinstance(key, str) or not key:
+            return False
+        config = await self.db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
+        if getattr(config, "dynamic_capacity_enabled", None) is not True:
+            return False
+        attempt = await self.db.scalar(select(AccountOutboundAttempt).where(AccountOutboundAttempt.attempt_key == key))
+        expected = {AccountRiskAction.AD_DELIVERY: "ad", AccountRiskAction.VERIFICATION_ANSWER: "verification",
+                    AccountRiskAction.SPAM_CHECK: "diagnostic"}.get(action)
+        now = datetime.utcnow()
+        if (attempt is None or expected is None or attempt.account_id != account_id or attempt.category != expected
+                or attempt.state != "reserved" or not attempt.lease_expires_at or attempt.lease_expires_at <= now):
+            return False
+        if action != AccountRiskAction.AD_DELIVERY:
+            if action == AccountRiskAction.SPAM_CHECK and str(target_id) != "178220800":
+                return False
+            return attempt.target_key == str(target_id)
+        from app.modules.acquisition.qualification_service import (
+            current_authorization,
+            policy,
+            send_gate,
+        )
+        if not (await policy(self.db)).get("enabled"):
+            return False
+        resolution = await current_authorization(self.db, account_id, target_id)
+        row, group, member = resolution
+        if row is None or group is None or member is None:
+            return False
+        try:
+            context = json.loads(attempt.context_json or "{}")
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(context, dict) or attempt.target_key != str(group.group_id)
+                or context.get("qualification_audit_id") != row.id or context.get("evidence_hash") != row.evidence_hash
+                or context.get("policy_version") != row.policy_version or context.get("content_scope") != "text_profile"
+                or row.content_scope != "text_profile"
+                or context.get("telegram_group_id") != group.group_id or context.get("membership_id") != member.id):
+            return False
+        return await send_gate(self.db, account_id, target_id, str(details.get("content") or ""),
+            details.get("media_url"), reservation_token=details.get("reservation_token")) is None
+
     async def _check_content_policy(
         self,
         account_id: int,
@@ -1729,6 +1898,11 @@ class AccountRiskGuard:
         if action not in MESSAGE_ACTIONS or action == AccountRiskAction.OWNED_GROUP_MESSAGE:
             return RiskDecision(True)
         details = details or {}
+        if (details.get("outbound_attempt_key")
+                and await self._validated_dynamic_outbound(account_id, action, target_id, details)):
+            # Only a current server-side qualification plus a durable budget reservation
+            # can replace legacy text cooldowns. Group-wide 24h and event idempotency remain enforced.
+            return RiskDecision(True)
         if details.get("source") in CONTENT_DEDUP_EXEMPT_SOURCES:
             return RiskDecision(True)
         if (
@@ -1888,6 +2062,14 @@ class AccountRiskGuard:
         )
         return result.scalar_one_or_none()
 
+    async def _is_owned_group_owner(self, account_id: int) -> bool:
+        result = await self.db.execute(
+            select(OwnedGroupAsset.id)
+            .where(OwnedGroupAsset.owner_account_id == account_id)
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
     @staticmethod
     def _account_id(account: Any) -> Optional[int]:
         if isinstance(account, int):
@@ -1920,6 +2102,19 @@ class AccountRiskGuard:
             if isinstance(exc, Exception)
             else str(exc).lower()
         )
+        if any(
+            marker in text
+            for marker in (
+                "account is frozen",
+                "account frozen",
+                "frozenmethodinvalid",
+                "method that is not available for frozen accounts",
+            )
+        ):
+            return "account_restricted"
+        if "slowmode" in text or "slow mode" in text:
+            # Telegram group slow mode is a target wait, never account-wide FloodWait.
+            return "group_write_forbidden"
         if "peer_flood" in text or "peer flood" in text or "peerflood" in text:
             return "peer_flood"
         if "flood" in text or "wait of" in text or "retry after" in text:
@@ -1988,6 +2183,9 @@ class AccountRiskGuard:
 
     @staticmethod
     def extract_wait_seconds(exc: Exception | str) -> Optional[int]:
+        seconds = getattr(exc, "seconds", None)
+        if type(seconds) is int and seconds >= 0:
+            return seconds
         text = f"{exc.__class__.__name__}: {exc}" if isinstance(exc, Exception) else str(exc)
         patterns = (
             r"flood\D+(\d+)",

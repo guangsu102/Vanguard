@@ -5,17 +5,16 @@ Generates verification captchas for group join.
 Supports both text-based and image-based captchas.
 """
 
+import base64
+import io
 import random
 import secrets
-import io
-import base64
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
 from enum import Enum
 
 import structlog
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 logger = structlog.get_logger()
 
@@ -32,7 +31,7 @@ class CaptchaType(str, Enum):
 class Captcha:
     """Captcha data."""
     code: str
-    image_data: Optional[str]  # Base64 encoded image
+    image_data: str | None  # Base64 encoded image
     expires_at: datetime
     captcha_type: CaptchaType = CaptchaType.TEXT
 
@@ -50,8 +49,9 @@ class CaptchaGenerator:
     CAPTCHA_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     CAPTCHA_LENGTH = 4
     CAPTCHA_EXPIRE_MINUTES = 5
-    IMAGE_WIDTH = 200
-    IMAGE_HEIGHT = 80
+    IMAGE_WIDTH = 320
+    IMAGE_HEIGHT = 120
+    RENDER_VERSION = "pp-ai-readable-captcha-v2"
 
     # Font settings
     FONT_SIZE = 40
@@ -62,15 +62,51 @@ class CaptchaGenerator:
         self._font = None
 
     def _get_font(self) -> ImageFont.FreeTypeFont:
-        """Get or create font object."""
+        """Require a real 40px scalable font, including on fontless containers."""
         if self._font is None:
             try:
-                # Try to use a system font
-                self._font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", self.FONT_SIZE)
-            except (OSError, IOError):
-                # Fallback to default font
-                self._font = ImageFont.load_default()
+                font = ImageFont.truetype(
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", self.FONT_SIZE
+                )
+            except OSError:
+                # Pillow >=10.1 bundles a scalable default font. Calling this
+                # without size silently selects the old tiny bitmap font.
+                try:
+                    font = ImageFont.load_default(size=self.FONT_SIZE)
+                except (TypeError, OSError) as exc:
+                    raise RuntimeError("Readable CAPTCHA font is unavailable") from exc
+            if getattr(font, "size", None) != self.FONT_SIZE:
+                raise RuntimeError("CAPTCHA font size was not honored")
+            heights = [font.getbbox(char)[3] - font.getbbox(char)[1]
+                       for char in self.CAPTCHA_CHARS]
+            if min(heights) < int(self.FONT_SIZE * 0.6):
+                raise RuntimeError("CAPTCHA glyphs are too small")
+            self._font = font
         return self._font
+
+    def verify_rendering(self) -> dict[str, str | int]:
+        """Safe deployment probe: synthetic glyph metrics, never a live answer."""
+        font = self._get_font()
+        return {
+            "version": self.RENDER_VERSION,
+            "font_size": font.size,
+            "font_height": min(font.getbbox(char)[3] - font.getbbox(char)[1]
+                               for char in self.CAPTCHA_CHARS),
+            "width": self.IMAGE_WIDTH,
+            "height": self.IMAGE_HEIGHT,
+        }
+
+    def _render_character(self, char: str, rotation: int, color: tuple[int, int, int]) -> Image.Image:
+        """Position the actual glyph bbox inside padded space before rotating."""
+        font = self._get_font()
+        padding = 5
+        left, top, right, bottom = font.getbbox(char, stroke_width=1)
+        glyph = Image.new("RGBA", (right-left+padding*2, bottom-top+padding*2), (0, 0, 0, 0))
+        ImageDraw.Draw(glyph).text(
+            (padding-left, padding-top), char, font=font, fill=color,
+            stroke_width=1, stroke_fill=color,
+        )
+        return glyph.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=True)
 
     def generate_code(self, length: int = None) -> str:
         """
@@ -122,60 +158,28 @@ class CaptchaGenerator:
             )
             draw.line([(x1, y1), (x2, y2)], fill=color, width=2)
 
-    def _create_image_captcha(self, code: str) -> Tuple[str, Image.Image]:
-        """
-        Create an image captcha with the given code.
-
-        Args:
-            code: The captcha code
-
-        Returns:
-            Tuple of (base64_image, PIL_Image)
-        """
-        # Create image with gradient background
-        image = Image.new('RGB', (self.IMAGE_WIDTH, self.IMAGE_HEIGHT))
+    def _create_image_captcha(self, code: str) -> Image.Image:
+        """Draw each character centered in its own slot with unclipped margins."""
+        if not code:
+            raise ValueError("CAPTCHA code cannot be empty")
+        width = max(self.IMAGE_WIDTH, len(code) * 80)
+        height = self.IMAGE_HEIGHT
+        image = Image.new("RGB", (width, height))
         draw = ImageDraw.Draw(image)
-
-        # Draw gradient background
-        for y in range(self.IMAGE_HEIGHT):
-            color_value = 240 - int((y / self.IMAGE_HEIGHT) * 20)
-            draw.rectangle([(0, y), (self.IMAGE_WIDTH, y + 1)], fill=(color_value, color_value + 5, 255))
-
-        # Draw干扰 lines
-        self._draw_lines(draw, self.IMAGE_WIDTH, self.IMAGE_HEIGHT, num_lines=4)
-
-        # Calculate character positions
-        char_width = self.IMAGE_WIDTH // (len(code) + 1)
-        x_start = char_width // 2
-
-        # Draw each character with rotation
-        font = self._get_font()
-        for i, char in enumerate(code):
-            x = x_start + i * char_width + random.randint(-5, 5)
-            y = random.randint(10, 20)
-            rotation = random.randint(-25, 25)
-
-            # Create temporary image for rotation
-            char_img = Image.new('RGBA', (50, 50), (255, 255, 255, 0))
-            char_draw = ImageDraw.Draw(char_img)
-
-            # Use different colors for each character
-            color = (
-                random.randint(20, 60),
-                random.randint(20, 80),
-                random.randint(100, 200)
-            )
-
-            char_draw.text((15, 5), char, font=font, fill=color)
-
-            # Rotate and paste
-            rotated = char_img.rotate(rotation, expand=1)
-            image.paste(rotated, (x, y), rotated)
-
-        # Apply distortion
-        image = self._generate_distortion(image)
-
-        return image
+        for y in range(height):
+            color_value = 240 - int((y / height) * 20)
+            draw.line((0, y, width, y), fill=(color_value, color_value+5, 255))
+        self._draw_lines(draw, width, height, num_lines=4)
+        slot_width = width / len(code)
+        for index, char in enumerate(code):
+            color = (random.randint(20, 50), random.randint(20, 60), random.randint(60, 110))
+            glyph = self._render_character(char, random.randint(-12, 12), color)
+            x = round((index + 0.5) * slot_width - glyph.width / 2) + random.randint(-3, 3)
+            y = (height - glyph.height) // 2 + random.randint(-5, 5)
+            if x < 8 or y < 8 or x+glyph.width > width-8 or y+glyph.height > height-8:
+                raise RuntimeError("CAPTCHA glyph would be clipped")
+            image.paste(glyph, (x, y), glyph)
+        return self._generate_distortion(image)
 
     def generate(self, captcha_type: CaptchaType = CaptchaType.TEXT) -> Captcha:
         """

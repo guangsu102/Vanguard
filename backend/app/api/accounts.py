@@ -4,6 +4,8 @@ Accounts API Router
 RESTful API for Telegram account management with cursor pagination.
 """
 
+import hashlib
+import json
 import shutil
 import tempfile
 from datetime import datetime
@@ -11,13 +13,14 @@ from pathlib import Path
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Header, Query, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, lazyload, undefer_group
 from sqlalchemy.orm.attributes import set_committed_value
 
+from app.core.account.age import age_attestation_payload, age_evidence
 from app.core.account.auth_helper import TelegramAuthHelper
 from app.core.account.environment_guard import AccountEnvironmentGuard
 from app.core.account.manager import AccountManager
@@ -274,6 +277,8 @@ class AccountResponse(BaseModel):
     persona_applicable: bool = False
     asset_tier: str = AccountAssetTier.UNKNOWN.value
     registered_at: Optional[str] = None
+    age_attestation: Optional[dict] = None
+    verified_age: Optional[dict] = None
     asset_verified_at: Optional[str] = None
     asset_note: Optional[str] = None
     managed_started_at: Optional[str] = None
@@ -499,6 +504,8 @@ def _account_to_response(
         **persona_summary,
         asset_tier=account.asset_tier or AccountAssetTier.UNKNOWN.value,
         registered_at=account.registered_at.isoformat() if account.registered_at else None,
+        age_attestation={k: v for k, v in age_attestation_payload(account).items() if k not in {"request_key", "request_hash"}},
+        verified_age=age_evidence(account, datetime.utcnow()),
         asset_verified_at=account.asset_verified_at.isoformat() if account.asset_verified_at else None,
         asset_note=account.asset_note,
         managed_started_at=account.managed_started_at.isoformat() if account.managed_started_at else None,
@@ -968,6 +975,53 @@ async def get_account(
     return _account_to_response(account)
 
 
+class AccountAgeAttestationRequest(BaseModel):
+    expected_version: int = Field(0, ge=0)
+    minimum_age_days: int = Field(180, ge=0, le=36500)
+    revoke: bool = False
+    note: str = Field("", max_length=255)
+
+
+@router.put("/{account_id:int}/age-attestation")
+async def update_age_attestation(
+    account_id: int,
+    request: AccountAgeAttestationRequest,
+    idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=8, max_length=128),
+    current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    account = await db.scalar(select(TelegramAccount).where(TelegramAccount.id == account_id).with_for_update(of=TelegramAccount))
+    if account is None:
+        raise HTTPException(404, "Account not found")
+    before = age_attestation_payload(account)
+    digest = hashlib.sha256(json.dumps(request.model_dump(), sort_keys=True).encode()).hexdigest()
+    if before.get("request_key") == idempotency_key:
+        if before.get("request_hash") != digest:
+            raise HTTPException(409, "Idempotency key payload differs")
+        return {"code": 0, "data": {k: v for k, v in before.items() if k not in {"request_key", "request_hash"}}}
+    if int(before.get("version", 0)) != request.expected_version:
+        raise HTTPException(409, "Age attestation revision changed")
+    actor = int(current_user.get("id") or current_user.get("sub") or 0)
+    if actor <= 0:
+        raise HTTPException(403, "Verified administrator identity required")
+    now = datetime.utcnow()
+    value = dict(before) if request.revoke else {
+        "minimum_age_days": request.minimum_age_days,
+        "confirmed_at": now.isoformat(), "confirmed_by": actor,
+        "source": "owner_confirmation", "revoked_at": None,
+    }
+    value.update(version=request.expected_version + 1, note=request.note,
+                 request_key=idempotency_key, request_hash=digest)
+    if request.revoke:
+        value.update(revoked_at=now.isoformat(), revoked_by=actor)
+    account.age_attestation_json = json.dumps(value, ensure_ascii=False)
+    db.add(AccountRiskEvent(account_id=account_id, action="age_attestation", status="success",
+                            reason="revoked" if request.revoke else "owner_confirmed",
+                            details=json.dumps({"before": before, "after": value, "actor_id": actor}, ensure_ascii=False)))
+    await db.commit()
+    return {"code": 0, "data": {k: v for k, v in value.items() if k not in {"request_key", "request_hash"}}}
+
+
 @router.put("/{account_id:int}", response_model=AccountResponse)
 async def update_account(
     account_id: int,
@@ -1043,6 +1097,7 @@ async def update_account(
 async def delete_account(
     account_id: int,
     db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
 ) -> None:
     """Delete account."""
     manager = AccountManager(db)
@@ -1121,7 +1176,8 @@ async def sync_account_profile_bio(
             raise HTTPException(status_code=400, detail="Telegram client unavailable")
 
         account.profile_bio_synced_at = datetime.utcnow()
-        account.status = AccountStatus.ONLINE
+        if account.status in {AccountStatus.ONLINE, AccountStatus.IDLE, AccountStatus.OFFLINE}:
+            account.status = AccountStatus.ONLINE
         account.last_connected_at = account.profile_bio_synced_at
         await db.commit()
         await db.refresh(account)
@@ -1560,6 +1616,7 @@ async def batch_import_accounts(
 async def batch_delete_accounts(
     account_ids: list[int],
     db: AsyncSession = Depends(get_db),
+    _admin: dict = Depends(require_admin),
 ) -> dict:
     """Batch delete accounts."""
     manager = AccountManager(db)

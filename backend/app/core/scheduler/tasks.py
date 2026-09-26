@@ -648,12 +648,13 @@ async def _reconcile_stale_worker_statuses_async(
 
 
 async def _group_snapshot_async(task_name: str) -> dict[str, Any]:
-    from app.core.group.manager import GroupManager
+    from app.core.group.collection import sync_stale_groups
 
     async def handler(db: AsyncSession) -> dict[str, Any]:
-        manager = GroupManager(db)
-        stats = await manager.get_group_stats()
-        return _skipped_result(task_name, "telegram_group_sync_not_implemented", stats=stats)
+        result = await sync_stale_groups(db, limit=5)
+        result["task"] = task_name
+        logger.info("group_sync_completed", **result)
+        return result
 
     return await _run_with_db(handler)
 
@@ -1221,7 +1222,7 @@ def sync_group_metrics():
             error=str(exc),
             severity=AlertSeverity.WARNING,
         )
-        return {"error": str(exc)}
+        raise
 
 
 @celery_app.task
@@ -1281,7 +1282,7 @@ def sync_group_info():
         return _run_async(_group_snapshot_async("sync_group_info"))
     except Exception as exc:
         logger.error("sync_group_info_failed", error=str(exc))
-        return {"error": str(exc)}
+        raise
 
 
 @celery_app.task
@@ -1574,7 +1575,7 @@ def check_ad_survival_task(limit: Optional[int] = None):
         return result
     except Exception as exc:
         logger.error("check_ad_survival_failed", error=str(exc))
-        return {"error": str(exc)}
+        raise
 
 
 @celery_app.task
@@ -1954,3 +1955,60 @@ def get_task_status(task_id: str):
 def cleanup_completed_tasks():
     logger.info("cleanup_completed_tasks", task="cleanup_completed_tasks")
     return {"status": "ok"}
+
+
+@celery_app.task(time_limit=1200, soft_time_limit=1100)
+def group_qualification_task():
+    """Read-only evidence plus model review on an isolated queue."""
+    async def run(db):
+        from app.modules.acquisition.automation import AcquisitionAutomationService
+        from app.modules.acquisition.qualification_service import policy, run_reviews
+        if not (await policy(db, fresh=True)).get("enabled"):
+            return {"processed": 0, "reason": "qualification_disabled"}
+        return await run_reviews(AcquisitionAutomationService(db), limit=2)
+    return _run_async(_run_with_db(run))
+
+
+@celery_app.task(time_limit=300, soft_time_limit=270)
+def group_verification_task():
+    async def run(db):
+        from app.modules.acquisition.automation import AcquisitionAutomationService
+        from app.modules.acquisition.qualification_verification import run_verifications
+        return await run_verifications(AcquisitionAutomationService(db), limit=2)
+    return _run_async(_run_with_db(run))
+
+
+@celery_app.task(time_limit=300, soft_time_limit=270)
+def reconcile_join_requests_task():
+    # No new-join switch check: pending original requests must always reconcile.
+    from app.modules.acquisition.automation import run_join_reconciliation_with_db
+    return _run_async(run_join_reconciliation_with_db(limit=10))
+
+
+@celery_app.task(time_limit=300, soft_time_limit=270)
+def qualification_exits_task():
+    async def run(db):
+        from app.modules.acquisition.automation import AcquisitionAutomationService
+        from app.modules.acquisition.qualification_actions import run_exits
+        return await run_exits(AcquisitionAutomationService(db), limit=1)
+    return _run_async(_run_with_db(run))
+
+
+@celery_app.task(name="app.core.scheduler.tasks.runtime_recovery_task")
+def runtime_recovery_task() -> dict[str, Any]:
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.core.account.models import TelegramAccount
+        from app.core.redis import get_redis
+        now = datetime.utcnow()
+        rows = (await db.scalars(select(TelegramAccount).where(
+            TelegramAccount.risk_reason == "telegram_read_flood_wait",
+            TelegramAccount.risk_pause_until <= now,
+        ).with_for_update(skip_locked=True, of=TelegramAccount))).all()
+        guard = AccountRiskGuard(db)
+        for account in rows:
+            await guard._apply_risk_lifecycle(account, now, commit=False)
+        await db.commit()
+        redis = await get_redis()
+        await redis.set("vanguard:runtime_recovery:last_run_at", now.isoformat(), ex=600)
+        return {"recovered": [account.id for account in rows], "checked_at": now.isoformat()}
+    return _run_async(_run_with_db(handler))

@@ -20,6 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.account.models import AccountType, TelegramAccount
 from app.core.account.session_crypto import decrypt_session_string
 from app.core.group.auto_rating import apply_joined_group_auto_rating
+from app.core.group.join_review import JOIN_REVIEW_APPROVED, exclude_owned_group_review, reset_join_review
+from app.core.group.identity import is_owned_group_target
 from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.search.group_finder import (
@@ -187,7 +189,7 @@ async def _upsert_synced_group_membership(
             title=title or None,
             username=username,
             member_count=max(0, member_count),
-            status="active",
+            status="pending",
             discovery_source=DISCOVERY_SOURCE,
             level=GroupLevel.UNRATED,
         )
@@ -200,8 +202,8 @@ async def _upsert_synced_group_membership(
             group.username = username
         if member_count:
             group.member_count = member_count
-        if group.status in {"pending", "left", "rejected"}:
-            group.status = "active"
+        if group.status in {"left", "rejected"}:
+            group.status = "pending"
         group.updated_at = now
 
     await apply_joined_group_auto_rating(group, group_manager.scorer)
@@ -225,8 +227,10 @@ async def _upsert_synced_group_membership(
             left_at=None,
             last_checked_at=now,
         )
+        reset_join_review(membership, now)
         db.add(membership)
     else:
+        was_inactive = membership.status in {"left", "banned", "rejected", "leave_failed"}
         membership.status = "joined"
         membership.join_method = DISCOVERY_SOURCE
         membership.telegram_group_id = group.group_id
@@ -235,5 +239,12 @@ async def _upsert_synced_group_membership(
         if membership.joined_at is None:
             membership.joined_at = now
         membership.left_at = None
+        if was_inactive or (
+            membership.review_started_at is None
+            and membership.review_status != JOIN_REVIEW_APPROVED
+        ):
+            reset_join_review(membership, now)
 
+    if await is_owned_group_target(db, core_group_id=group.id, telegram_group_id=group.group_id):
+        exclude_owned_group_review(membership)
     return membership

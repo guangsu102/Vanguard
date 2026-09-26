@@ -93,15 +93,18 @@ async def get_current_user(
     user_id = _get_user_id_from_payload(payload)
 
     result = await db.execute(
-        text("SELECT id, username, role, email, avatar, created_at FROM admin_user WHERE id = :user_id"),
+        text(
+            "SELECT id, username, role, email, avatar, created_at, is_active "
+            "FROM admin_user WHERE id = :user_id"
+        ),
         {"user_id": user_id}
     )
     user = result.fetchone()
 
-    if user is None:
+    if user is None or not bool(user[6]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found"
+            detail="User not found or inactive"
         )
 
     return {

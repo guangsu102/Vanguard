@@ -63,9 +63,10 @@ async def test_ad_send_surfaces_account_pool_lease_contention():
 @pytest.mark.asyncio
 async def test_ad_only_creative_selection_reuses_approved_pool_without_growth_dedupe():
     service = AcquisitionAutomationService(db=AsyncMock())
+    service._dynamic_qualification_mode = AsyncMock(return_value=False)
     creatives = [SimpleNamespace(id=index, weight=1) for index in range(1, 9)]
     campaign = SimpleNamespace(id=2, delivery_policy=AdDeliveryPolicy.AD_ONLY.value)
-    binding = SimpleNamespace(campaign=campaign)
+    binding = SimpleNamespace(campaign=campaign, account_id=1)
     service._creative_pool_for_binding = AsyncMock(return_value=creatives)
     service._filter_recent_target_creatives = AsyncMock(return_value=[])
 
@@ -78,9 +79,10 @@ async def test_ad_only_creative_selection_reuses_approved_pool_without_growth_de
 @pytest.mark.asyncio
 async def test_growth_creative_selection_keeps_target_dedupe():
     service = AcquisitionAutomationService(db=AsyncMock())
+    service._dynamic_qualification_mode = AsyncMock(return_value=False)
     creatives = [SimpleNamespace(id=index, weight=1) for index in range(1, 9)]
     campaign = SimpleNamespace(id=1, delivery_policy=AdDeliveryPolicy.GROWTH.value)
-    binding = SimpleNamespace(campaign=campaign)
+    binding = SimpleNamespace(campaign=campaign, account_id=1)
     service._creative_pool_for_binding = AsyncMock(return_value=creatives)
     service._filter_recent_target_creatives = AsyncMock(return_value=[creatives[-1]])
 
@@ -106,6 +108,27 @@ def test_ad_delivery_pool_unavailable_is_transient_not_account_issue():
     assert service._classify_ad_delivery_error(
         automation_module.AccountOperationLeaseUnavailable("redis unavailable")
     ) == "account_operation_lease_unavailable"
+
+
+    assert service._classify_ad_delivery_error(
+        RuntimeError("An invalid Peer was used")
+    ) == "transient:An invalid Peer was used"
+    assert service._classify_ad_delivery_error(
+        RuntimeError("Your account is frozen and can't access the chat")
+    ) == (
+        "account_issue:account_restricted:"
+        "Your account is frozen and can't access the chat"
+    )
+    assert service._classify_ad_delivery_error(
+        RuntimeError(
+            "You tried to use a method that is not available for frozen accounts "
+            "(caused by GetParticipantRequest)"
+        )
+    ) == (
+        "account_issue:account_restricted:"
+        "You tried to use a method that is not available for frozen accounts "
+        "(caused by GetParticipantRequest)"
+    )
 
 
 @pytest.mark.asyncio
@@ -1627,3 +1650,136 @@ def test_growth_ad_capacity_sql_migration_is_registered_and_parseable():
         for item in statements
     )
     assert any("max_groups_per_account" in item and "100" in item for item in statements)
+
+
+@pytest.mark.asyncio
+async def test_invalid_peer_probe_retries_are_bounded():
+    prior_events = "\n".join(
+        json.dumps(
+            {
+                "event": "ad_probe_retry_scheduled",
+                "error": "transient:An invalid Peer was used",
+                "retry_attempt": attempt,
+            }
+        )
+        for attempt in range(1, 4)
+    )
+    membership = SimpleNamespace(
+        telegram_group_id=-100987654,
+        note=prior_events,
+        warmup_status="probe_scheduled",
+        probe_status="scheduled",
+        ad_status="warming",
+        probe_due_at=None,
+        last_probe_at=None,
+        last_probe_error=None,
+        last_checked_at=None,
+        updated_at=None,
+    )
+    account_results = []
+    account = SimpleNamespace(record_message=lambda success: account_results.append(success))
+    pool = SimpleNamespace(
+        acquire_by_id=AsyncMock(return_value=account),
+        release=AsyncMock(),
+    )
+    service = AcquisitionAutomationService(db=AsyncMock(), account_pool=pool)
+    service._qualification_workflow_enabled = AsyncMock(return_value=False)
+    service._ad_send_target = AsyncMock(return_value=-100987654)
+    service.risk_guard.preview_content = AsyncMock(
+        return_value=SimpleNamespace(allowed=True, retry_after_seconds=None)
+    )
+    service.telegram_execution.send_group_message = AsyncMock(
+        side_effect=RuntimeError("An invalid Peer was used")
+    )
+
+    result = await service._send_ad_probe_locked(
+        77,
+        membership,
+        SimpleNamespace(id=88),
+    )
+
+    assert result == "ad_probe_failed"
+    assert membership.probe_status == "failed"
+    assert membership.ad_status == "blocked"
+    assert membership.last_probe_error.startswith("invalid_peer_retry_exhausted:")
+    assert account_results == [False]
+    pool.release.assert_awaited_once_with(account)
+
+
+@pytest.mark.asyncio
+async def test_invalid_peer_probe_confirms_frozen_account_without_blocking_group(monkeypatch):
+    now = datetime.utcnow()
+    frozen_error = RuntimeError(
+        "You tried to use a method that is not available for frozen accounts "
+        "(caused by GetParticipantRequest)"
+    )
+    entity = SimpleNamespace(id=987654)
+    client = SimpleNamespace(
+        get_entity=AsyncMock(return_value=entity),
+        get_permissions=AsyncMock(side_effect=frozen_error),
+    )
+    account_results = []
+    account = SimpleNamespace(
+        client=client,
+        record_message=lambda success: account_results.append(success),
+    )
+    membership = SimpleNamespace(
+        telegram_group_id=-100987654,
+        note="",
+        warmup_status="probe_scheduled",
+        probe_status="scheduled",
+        ad_status="warming",
+        probe_due_at=None,
+        last_probe_at=None,
+        last_probe_error=None,
+        last_checked_at=None,
+        updated_at=None,
+    )
+    pool = SimpleNamespace(
+        acquire_by_id=AsyncMock(return_value=account),
+        release=AsyncMock(),
+    )
+    service = AcquisitionAutomationService(db=AsyncMock(), account_pool=pool)
+    service._qualification_workflow_enabled = AsyncMock(return_value=False)
+    service._ad_send_target = AsyncMock(return_value=-100987654)
+    service.risk_guard.preview_content = AsyncMock(
+        return_value=SimpleNamespace(allowed=True, retry_after_seconds=None)
+    )
+    service.risk_guard.record_failure = AsyncMock()
+    service.telegram_execution.send_group_message = AsyncMock(
+        side_effect=RuntimeError("An invalid Peer was used")
+    )
+    service._pause_ad_account = AsyncMock()
+    monkeypatch.setattr(automation_module, "_now", lambda: now)
+
+    result = await service._send_ad_probe_locked(
+        77,
+        membership,
+        SimpleNamespace(id=88),
+    )
+
+    assert result == "ad_probe_account_issue"
+    assert membership.probe_status == "scheduled"
+    assert membership.warmup_status == "probe_scheduled"
+    assert membership.ad_status == "warming"
+    assert membership.probe_due_at == now + timedelta(
+        seconds=automation_module.AD_ACCOUNT_SUSPECT_PAUSE_SECONDS
+    )
+    assert membership.last_probe_error.startswith("account_issue:account_restricted:")
+    assert account_results == [False]
+    client.get_entity.assert_awaited_once_with(-100987654)
+    client.get_permissions.assert_awaited_once_with(entity, "me")
+    service.risk_guard.record_failure.assert_awaited_once_with(
+        account,
+        AccountRiskAction.AD_PROBE,
+        frozen_error,
+        target_type="group",
+        target_id=-100987654,
+        details={"source": "invalid_peer_followup"},
+    )
+    service._pause_ad_account.assert_awaited_once_with(
+        77,
+        reason="ad_probe_account_issue",
+        seconds=automation_module.AD_ACCOUNT_SUSPECT_PAUSE_SECONDS,
+    )
+    pool.release.assert_awaited_once_with(account)

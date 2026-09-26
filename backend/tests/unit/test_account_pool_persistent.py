@@ -708,12 +708,17 @@ async def test_static_proxy_resolver_fallback_is_used(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_client_uses_stable_telegram_device_profile(monkeypatch, tmp_path):
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr("app.core.account.pool.RpcGovernor.before", AsyncMock())
     settings = SimpleNamespace(TELEGRAM_SESSION_DIR=str(tmp_path))
     monkeypatch.setattr("app.core.config.get_settings", lambda: settings)
 
     captured = {}
 
     class FakeTelegramClient:
+        async def _call(self, *args, **kwargs):
+            raise AssertionError("this construction test must not perform an RPC")
+
         def __init__(self, session, api_id, api_hash, **kwargs):
             captured["session"] = session
             captured["api_id"] = api_id

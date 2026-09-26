@@ -89,6 +89,7 @@ async def test_join_public_group_by_link_uses_resolved_group():
 
 @pytest.mark.asyncio
 async def test_join_private_group_returns_existing_membership_without_importing():
+    from telethon.tl.types import ChatInviteAlready
     entity = SimpleNamespace(
         id=2002,
         title="Private Group",
@@ -104,7 +105,7 @@ async def test_join_private_group_returns_existing_membership_without_importing(
 
         async def __call__(self, request):
             self.requests.append(request)
-            return SimpleNamespace(chat=entity)
+            return ChatInviteAlready(chat=entity)
 
     client = PrivateClient()
     result = await TelegramExecutionService().join_group_by_link(
@@ -171,6 +172,64 @@ async def test_join_private_group_reports_pending_approval():
 
 
 @pytest.mark.asyncio
+async def test_resolve_private_pending_request_is_read_only():
+    class PendingClient:
+        def __init__(self):
+            self.requests = []
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            return SimpleNamespace(broadcast=False, megagroup=True)
+
+    client = PendingClient()
+    result = await TelegramExecutionService().resolve_join_group_by_link_membership(
+        SimpleNamespace(client=client),
+        "https://t.me/+AbCdEfGh123",
+    )
+
+    assert result is None
+    assert [request.__class__.__name__ for request in client.requests] == [
+        "CheckChatInviteRequest"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_public_membership_checks_permissions_without_joining():
+    entity = SimpleNamespace(
+        id=1002,
+        title="Existing Public Group",
+        username="existing_group",
+        broadcast=False,
+        megagroup=True,
+        type="supergroup",
+    )
+
+    class PublicClient:
+        def __init__(self):
+            self.permissions = []
+
+        async def get_entity(self, target):
+            assert target == "existing_group"
+            return entity
+
+        async def get_permissions(self, target, who):
+            self.permissions.append((target, who))
+            return SimpleNamespace(has_left=False)
+
+        async def __call__(self, _request):
+            raise AssertionError("read-only reconciliation must not send a join request")
+
+    client = PublicClient()
+    result = await TelegramExecutionService().resolve_join_group_by_link_membership(
+        SimpleNamespace(client=client),
+        "https://t.me/existing_group",
+    )
+
+    assert result["title"] == "Existing Public Group"
+    assert client.permissions == [(entity, "me")]
+
+
+@pytest.mark.asyncio
 async def test_join_group_by_link_rejects_broadcast_channel():
     entity = SimpleNamespace(
         id=3003,
@@ -209,14 +268,42 @@ async def test_join_group_api_persists_resolved_group_and_membership(test_db, mo
         acquire_by_id=AsyncMock(side_effect=[wrapper, None]),
         release=AsyncMock(),
     )
+    from app.modules.acquisition.models import AutoJoinAttempt, GroupQualificationAudit
+    from app.core.scheduler.tasks import group_qualification_task
+    from unittest.mock import Mock
+    monkeypatch.setattr(group_qualification_task, "apply_async", Mock())
+    reservation = AutoJoinAttempt(account_id=account.id, request_state="reserved", status="pending",
+        target_key="username:real_group", reservation_key="manual-test")
+    test_db.add(reservation)
+    await test_db.commit()
+
+    async def mark_sent(_reservation):
+        _reservation.request_state = "sent"
+        _reservation.telegram_action_attempted = True
+        await test_db.commit()
+
+    budget = SimpleNamespace(
+        reserve=AsyncMock(return_value=reservation),
+        mark_sent=AsyncMock(side_effect=mark_sent),
+        release=AsyncMock(),
+        finalize=AsyncMock(),
+    )
 
     class FakeExecutionService:
         def __init__(self, _risk_guard):
             pass
 
-        async def join_group_by_link(self, acquired_wrapper, group_link):
+        async def join_group_by_link(
+            self,
+            acquired_wrapper,
+            group_link,
+            *,
+            on_join_request_attempted,
+            join_reservation_key=None,
+        ):
             assert acquired_wrapper is wrapper
             assert group_link == "https://t.me/real_group"
+            await on_join_request_attempted()
             return {
                 "id": -100987654321,
                 "raw_id": 987654321,
@@ -227,6 +314,7 @@ async def test_join_group_api_persists_resolved_group_and_membership(test_db, mo
 
     monkeypatch.setattr(groups_api, "get_account_pool", lambda: pool)
     monkeypatch.setattr(groups_api, "TelegramExecutionService", FakeExecutionService)
+    monkeypatch.setattr(groups_api, "JoinRequestBudgetService", lambda _db: budget)
 
     response = await groups_api.join_group_by_link(
         GroupJoinByLinkRequest(
@@ -252,6 +340,17 @@ async def test_join_group_api_persists_resolved_group_and_membership(test_db, mo
     assert membership.telegram_group_id == -100987654321
     assert membership.status == "joined"
     assert membership.join_method == "manual_link_join"
+    assert membership.review_status == "initial_pending"
+    assert membership.review_next_at is None
+    assert membership.review_started_at is None
+    assert membership.review_deadline_at is None
+    audit = await test_db.scalar(select(GroupQualificationAudit))
+    assert audit.membership_id == membership.id and audit.state == "queued"
+    await test_db.refresh(reservation)
+    assert reservation.reconciliation_status == "confirmed"
+    assert reservation.status == "success"
+    assert pool.acquire_by_id.await_count == 1
+    assert response.status == "pending"
     pool.release.assert_awaited_once_with(wrapper)
 
     group_count = await test_db.scalar(select(func.count(Group.id)))
@@ -280,18 +379,38 @@ async def test_join_group_api_does_not_persist_pending_request(test_db, monkeypa
         acquire_by_id=AsyncMock(return_value=wrapper),
         release=AsyncMock(),
     )
+    reservation = SimpleNamespace(request_state="reserved", reservation_key="manual-test")
+
+    async def mark_sent(_reservation):
+        _reservation.request_state = "sent"
+
+    budget = SimpleNamespace(
+        reserve=AsyncMock(return_value=reservation),
+        mark_sent=AsyncMock(side_effect=mark_sent),
+        release=AsyncMock(),
+        finalize=AsyncMock(),
+    )
 
     class PendingExecutionService:
         def __init__(self, _risk_guard):
             pass
 
-        async def join_group_by_link(self, _wrapper, _group_link):
+        async def join_group_by_link(
+            self,
+            _wrapper,
+            _group_link,
+            *,
+            on_join_request_attempted,
+            join_reservation_key=None,
+        ):
+            await on_join_request_attempted()
             raise TelegramJoinRequestPendingError(
                 "Telegram join request is awaiting group approval"
             )
 
     monkeypatch.setattr(groups_api, "get_account_pool", lambda: pool)
     monkeypatch.setattr(groups_api, "TelegramExecutionService", PendingExecutionService)
+    monkeypatch.setattr(groups_api, "JoinRequestBudgetService", lambda _db: budget)
 
     with pytest.raises(HTTPException) as exc_info:
         await groups_api.join_group_by_link(

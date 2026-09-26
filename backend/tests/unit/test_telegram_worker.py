@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -8,9 +9,104 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import app.workers.telegram_worker as telegram_worker_module
+from app.core.account.models import AccountStatus, AccountType, TelegramAccount
 from app.core.worker_status import TelegramWorkerStatusValue
 from app.modules.guardian.models import ManagedGroupBindingStatus, ManagedGroupBotRole
-from app.workers.telegram_worker import TelegramWorker, TelegramWorkerRole
+from app.workers.telegram_worker import (
+    TelegramPlatformRestrictionHandler,
+    TelegramWorker,
+    TelegramWorkerRole,
+)
+
+
+@pytest.mark.asyncio
+async def test_telethon_frozen_log_schedules_account_restriction_once():
+    calls: list[tuple[int, str]] = []
+    handler = TelegramPlatformRestrictionHandler(
+        asyncio.get_running_loop(),
+        lambda account_id, message: calls.append((account_id, message)),
+        cooldown_seconds=300,
+    )
+    record = logging.LogRecord(
+        "vanguard.telethon.account.15.mtprotosender",
+        logging.ERROR,
+        __file__,
+        1,
+        "Your account is frozen and can't access the chat",
+        (),
+        None,
+    )
+
+    handler.emit(record)
+    handler.emit(record)
+    await asyncio.sleep(0)
+
+    assert calls == [(15, "Your account is frozen and can't access the chat")]
+
+
+@pytest.mark.asyncio
+async def test_telethon_frozen_method_log_schedules_account_restriction():
+    calls: list[tuple[int, str]] = []
+    handler = TelegramPlatformRestrictionHandler(
+        asyncio.get_running_loop(),
+        lambda account_id, message: calls.append((account_id, message)),
+        cooldown_seconds=0,
+    )
+    message = (
+        "FrozenMethodInvalidError: You tried to use a method that is not available "
+        "for frozen accounts (caused by GetParticipantRequest)"
+    )
+    record = logging.LogRecord(
+        "vanguard.telethon.account.17.mtprotosender",
+        logging.ERROR,
+        __file__,
+        1,
+        message,
+        (),
+        None,
+    )
+
+    handler.emit(record)
+    await asyncio.sleep(0)
+
+    assert calls == [(17, message)]
+
+
+@pytest.mark.asyncio
+async def test_growth_worker_persists_telethon_frozen_account(test_db, monkeypatch):
+    account = TelegramAccount(
+        phone="+15559990115",
+        identifier="+15559990115",
+        account_type=AccountType.PROMOTER,
+        api_config_name="default",
+        country_code="US",
+        session_name="worker_frozen_account",
+        status=AccountStatus.ONLINE,
+    )
+    test_db.add(account)
+    await test_db.commit()
+    await test_db.refresh(account)
+
+    @asynccontextmanager
+    async def fake_db_session():
+        yield test_db
+
+    monkeypatch.setattr(telegram_worker_module, "get_db_session", fake_db_session)
+    worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
+    worker._growth_listener_sessions[account.id] = account.session_name
+
+    await worker._record_telegram_platform_restriction(
+        account.id,
+        "Your account is frozen and can't access the chat",
+    )
+    await test_db.refresh(account)
+
+    assert account.status == AccountStatus.RESTRICTED
+    assert account.restriction_source == "telegram_rpc"
+    assert account.restriction_reason == "user_restricted"
+    assert account.risk_level == "frozen"
+    assert account.risk_reason == "account_restricted"
+    assert account.id not in worker._growth_listener_sessions
 
 
 def test_growth_worker_status_degraded_without_accounts():

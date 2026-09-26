@@ -132,3 +132,9 @@ NUL
 
 # Curated production schema migrations are source files.
 !backend/migrations/*.sql
+
+# Local release evidence and private operational snapshots
+/deploy-artifacts/
+/docs/reports/*
+!/docs/reports/*.md
+*.tgz

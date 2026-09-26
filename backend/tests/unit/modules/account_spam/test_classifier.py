@@ -198,3 +198,50 @@ def test_summary_redacts_quoted_credential_values():
     summary = summarize_spambot_reply('{"password":"hunter2", "token": "short-private"}')
     assert "hunter2" not in summary
     assert "short-private" not in summary
+
+MODERATOR_BLOCK_REPLY = (
+    'Your account was blocked for violations of the Telegram Terms of Service '
+    'based on user reports confirmed by our moderators.'
+)
+
+
+def test_official_moderator_confirmed_block_is_restricted():
+    assert classify_spambot_reply(MODERATOR_BLOCK_REPLY) == 'restricted'
+    advisory = 'Unfortunately, some phone numbers may trigger a harsh response from our anti-spam systems. '
+    assert classify_spambot_reply(advisory + MODERATOR_BLOCK_REPLY) == 'restricted'
+
+
+@pytest.mark.parametrize('reply', [
+    'If ' + MODERATOR_BLOCK_REPLY,
+    '"' + MODERATOR_BLOCK_REPLY + '"',
+    MODERATOR_BLOCK_REPLY.rstrip('.') + '?',
+    MODERATOR_BLOCK_REPLY + ' Your account is no longer restricted.',
+])
+def test_moderator_block_does_not_override_quote_condition_or_conflicting_state(reply):
+    assert classify_spambot_reply(reply) == 'unknown'
+
+
+MODERATOR_TIMED_LIMIT_REPLY = (
+    "I'm afraid some Telegram users found your messages annoying and forwarded "
+    "them to our team of moderators for inspection. The moderators have confirmed "
+    "the report and your account is now limited until 23 Sep 2026, 15:12 UTC."
+)
+
+
+@pytest.mark.parametrize("suffix", ["", " While the accou…"])
+def test_moderator_confirmed_timed_limit_is_restricted(suffix):
+    assert classify_spambot_reply(MODERATOR_TIMED_LIMIT_REPLY + suffix) == "restricted"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        '"' + MODERATOR_TIMED_LIMIT_REPLY + '"',
+        "If the moderators have confirmed the report and your account is now limited.",
+        "The moderators have confirmed the report and your account is now limited?",
+        "The moderators have confirmed the report and your account is not limited.",
+        MODERATOR_TIMED_LIMIT_REPLY + " Your account is no longer restricted.",
+    ],
+)
+def test_timed_limit_requires_unambiguous_current_assertion(reply):
+    assert classify_spambot_reply(reply) == "unknown"

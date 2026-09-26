@@ -272,6 +272,8 @@ class TelegramAccount(Base):
         nullable=True,
         comment="账号资产备注/采购批次",
     )
+    age_attestation_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     managed_started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime,
         nullable=True,
@@ -1009,10 +1011,40 @@ class AccountEnvironmentEvent(Base):
     )
 
 
+class AccountOutboundAttempt(Base):
+    """Durable account-wide reservations for all classified external messages."""
+
+    __tablename__ = "account_outbound_attempt"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("telegram_account.id", ondelete="CASCADE"), nullable=False)
+    attempt_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(24), nullable=False)
+    target_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(24), default="reserved", server_default="reserved", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    message_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    context_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    __table_args__ = (
+        Index("idx_outbound_account_category_time", "account_id", "category", "attempted_at"),
+        Index("idx_outbound_target_state", "target_key", "state"),
+        Index("idx_outbound_lease", "state", "lease_expires_at"),
+        CheckConstraint("category IN ('ad','verification','diagnostic','other')", name="outbound_valid_category"),
+        CheckConstraint("state IN ('reserved','attempted','succeeded','failed','unknown','cancelled')", name="outbound_valid_state"),
+    )
+
+
 class AccountOperationConfig(Base):
     """Per-account automation and risk-control settings."""
 
     __tablename__ = "telegram_account_operation_config"
+
+    adaptive_ads_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     account_id: Mapped[int] = mapped_column(
@@ -1020,6 +1052,13 @@ class AccountOperationConfig(Base):
         nullable=False,
         comment="Telegram账号ID",
     )
+
+    dynamic_capacity_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+    max_ads_per_day: Mapped[int] = mapped_column(Integer, default=30, server_default="30", nullable=False)
+    max_verification_messages_per_day: Mapped[int] = mapped_column(Integer, default=30, server_default="30", nullable=False)
+    max_diagnostic_messages_per_day: Mapped[int] = mapped_column(Integer, default=2, server_default="2", nullable=False)
 
     auto_join_enabled: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, comment="是否自动加群"
@@ -1037,8 +1076,8 @@ class AccountOperationConfig(Base):
 
     max_groups_per_day: Mapped[int] = mapped_column(
         Integer,
-        default=10,
-        server_default="10",
+        default=30,
+        server_default="30",
         nullable=False,
         comment="每日最大加群数",
     )
@@ -1046,13 +1085,23 @@ class AccountOperationConfig(Base):
         Integer, default=100, nullable=False, comment="账号总群数上限"
     )
     join_interval_min_seconds: Mapped[int] = mapped_column(
-        Integer, default=60, nullable=False, comment="加群最小间隔"
+        Integer, default=2880, server_default="2880", nullable=False, comment="加群最小间隔"
     )
     join_interval_max_seconds: Mapped[int] = mapped_column(
-        Integer, default=900, nullable=False, comment="加群最大间隔"
+        Integer, default=7200, server_default="7200", nullable=False, comment="加群最大间隔"
     )
     next_join_after: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="下次允许自动加群时间"
+    )
+    join_review_backlog_paused: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+        comment="是否因进群审核积压暂停新增",
+    )
+    join_review_backlog_reason: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, comment="进群审核积压暂停原因"
     )
     last_group_cleanup_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="最近低价值群清理时间"

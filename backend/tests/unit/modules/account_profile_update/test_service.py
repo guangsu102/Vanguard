@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from telethon.errors import FrozenMethodInvalidError, UserRestrictedError
 
 from app.core.account.models import (
     AccountOperationConfig,
@@ -24,6 +25,8 @@ from app.modules.account_profile_update.service import (
     account_is_profile_update_eligible,
     create_profile_update_operation,
     operation_snapshot,
+    safe_worker_error,
+    terminal_profile_failure_reason,
 )
 
 
@@ -272,3 +275,159 @@ def test_all_active_promoters_with_a_session_are_eligible():
     assert account_is_profile_update_eligible(inactive) is False
     missing_session = SimpleNamespace(**{**promoter.__dict__, "session_string": None})
     assert account_is_profile_update_eligible(missing_session) is False
+
+
+@pytest.mark.parametrize(("error", "reason"), [
+    (FrozenMethodInvalidError(None), "telegram_account_frozen"),
+    (UserRestrictedError(None), "telegram_account_restricted"),
+    (RuntimeError("Your account is frozen; session=private-value"), "telegram_account_frozen"),
+    (TelegramExecutionError("risk_guard_blocked:account_restricted"), "risk_guard_account_restricted"),
+])
+@pytest.mark.asyncio
+async def test_explicit_refusal_fails_once_preserving_account_state(test_db, error, reason):
+    accounts = await _seed_accounts(test_db, 1)
+    account = accounts[0]
+    account.status = AccountStatus.RESTRICTED
+    account.risk_level = "frozen"
+    account.spam_check_status = "restricted"
+    await test_db.commit()
+    operation = await _create_operation(test_db, accounts, profile_bio="")
+    operation_id, account_id = operation.id, account.id
+    execution = FakeTelegramExecution(error)
+    pool = FakeAccountPool()
+    service = AccountProfileUpdateService(test_db, account_pool=pool, telegram_execution=execution)
+
+    result = await service.run_tick()
+    item = await test_db.scalar(select(AccountProfileUpdateItem).where(
+        AccountProfileUpdateItem.operation_id == operation_id))
+    await test_db.refresh(operation)
+    await test_db.refresh(account)
+    assert result["processed"] == 1
+    assert item.status == AccountProfileUpdateItemStatus.FAILED.value
+    assert item.reason_code == reason
+    assert item.attempts == 1 and item.next_retry_at is None
+    assert item.finished_at is not None and item.remote_attempted_at is not None
+    assert operation.status == AccountProfileUpdateOperationStatus.FAILED.value
+    assert operation.failed_accounts == 1 and operation.succeeded_accounts == 0
+    assert account.status == AccountStatus.RESTRICTED
+    assert account.risk_level == "frozen" and account.spam_check_status == "restricted"
+    assert account.profile_bio == "old bio 0" and account.profile_bio_synced_at is None
+    assert "private-value" not in item.error_message
+    assert pool.acquired == [account_id]
+    await service.run_tick()
+    assert len(execution.calls) == 1
+
+
+@pytest.mark.parametrize("message", [
+    "risk_guard_blocked:profile_update_daily_budget",
+    "risk_guard_blocked:profile_update_cooldown",
+    "risk_guard_blocked:account_restricted_unknown",
+    "risk_guard_blocked:telegram_temporarily_unavailable",
+    "account is not frozen",
+    "TimeoutError: profile update failed",
+    "FloodWaitError: profile update failed",
+])
+def test_temporary_or_unconfirmed_errors_are_not_frozen(message):
+    assert terminal_profile_failure_reason(message) is None
+
+
+def test_safe_error_records_class_and_terminal_reason_without_raw_rpc_text():
+    error = RuntimeError("Your account is frozen; secret=private token")
+    assert safe_worker_error(error) == "RuntimeError: profile update failed [telegram_account_frozen]"
+    assert terminal_profile_failure_reason(safe_worker_error(error)) == "telegram_account_frozen"
+    assert safe_worker_error(FrozenMethodInvalidError(None)).startswith("FrozenMethodInvalidError:")
+
+
+@pytest.mark.asyncio
+async def test_reconcile_existing_refusals_without_rpc_or_attempt_increment(test_db):
+    accounts = await _seed_accounts(test_db, 3)
+    for account in accounts:
+        account.status = AccountStatus.RESTRICTED
+        account.risk_level = "frozen"
+    await test_db.commit()
+    operation = await _create_operation(test_db, accounts, profile_bio="")
+    operation_id = operation.id
+    next_operation = await _create_operation(test_db, [accounts[0]], key="another-operation")
+    next_operation_id = next_operation.id
+    items = list((await test_db.scalars(select(AccountProfileUpdateItem).where(
+        AccountProfileUpdateItem.operation_id == operation_id).order_by(AccountProfileUpdateItem.id))).all())
+    stamp = datetime.utcnow() - timedelta(hours=1)
+    for item, error in zip(items, [
+        "FrozenMethodInvalidError: profile update failed",
+        "risk_guard_blocked:account_restricted",
+        "TimeoutError: profile update failed",
+    ], strict=True):
+        item.status = AccountProfileUpdateItemStatus.RETRY_WAIT.value
+        item.attempts = 1
+        item.remote_attempted_at = stamp
+        item.next_retry_at = datetime.utcnow() + timedelta(days=1)
+        item.error_message = error
+        item.reason_code = "telegram_temporarily_unavailable"
+    await test_db.commit()
+    pool, execution = FakeAccountPool(), FakeTelegramExecution()
+    service = AccountProfileUpdateService(test_db, account_pool=pool, telegram_execution=execution)
+    assert await service.reconcile_terminal_failures(operation_id=operation_id) == 2
+    for item in items:
+        await test_db.refresh(item)
+    assert [item.status for item in items] == ["failed", "failed", "retry_wait"]
+    assert [item.reason_code for item in items[:2]] == [
+        "telegram_account_frozen", "risk_guard_account_restricted"]
+    assert all(item.attempts == 1 and item.remote_attempted_at == stamp for item in items)
+    assert items[2].next_retry_at is not None
+    await test_db.refresh(operation)
+    assert operation.failed_accounts == 2 and operation.succeeded_accounts == 0
+    assert operation.status == "running"
+    assert execution.calls == [] and pool.acquired == []
+    assert await service.reconcile_terminal_failures(operation_id=operation_id) == 0
+    await test_db.refresh(next_operation)
+    assert next_operation.id == next_operation_id and next_operation.status == "queued"
+    for account in accounts:
+        await test_db.refresh(account)
+        assert account.status == AccountStatus.RESTRICTED and account.risk_level == "frozen"
+        assert account.profile_bio_synced_at is None and account.profile_bio.startswith("old bio")
+
+
+@pytest.mark.asyncio
+async def test_tick_reconciles_old_frozen_retry_and_moves_to_next_operation(test_db):
+    accounts = await _seed_accounts(test_db, 2)
+    first = await _create_operation(test_db, [accounts[0]])
+    first_id = first.id
+    second = await _create_operation(test_db, [accounts[1]], key="next-profile-operation")
+    first_item = await test_db.scalar(select(AccountProfileUpdateItem).where(
+        AccountProfileUpdateItem.operation_id == first_id))
+    first_item.status = "retry_wait"
+    first_item.attempts = 1
+    first_item.error_message = "FrozenMethodInvalidError: profile update failed"
+    first_item.next_retry_at = datetime.utcnow() + timedelta(days=1)
+    await test_db.commit()
+    execution = FakeTelegramExecution()
+    service = AccountProfileUpdateService(test_db, account_pool=FakeAccountPool(), telegram_execution=execution)
+    result = await service.run_tick()
+    await test_db.refresh(first)
+    await test_db.refresh(second)
+    await test_db.refresh(first_item)
+    assert result["terminal_reconciled"] == 1 and result["processed"] == 1
+    assert first.status == "failed" and first_item.status == "failed"
+    assert first_item.attempts == 1 and first_item.reason_code == "telegram_account_frozen"
+    assert second.status == "succeeded"
+    assert len(execution.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_reconciliation_ignores_live_claims(test_db):
+    accounts = await _seed_accounts(test_db, 1)
+    operation = await _create_operation(test_db, accounts)
+    operation_id = operation.id
+    item = await test_db.scalar(select(AccountProfileUpdateItem).where(
+        AccountProfileUpdateItem.operation_id == operation_id))
+    item.status = "in_progress"
+    item.lease_id = "live-claim"
+    item.error_message = "FrozenMethodInvalidError: profile update failed"
+    item.lease_expires_at = datetime.utcnow() + timedelta(minutes=10)
+    await test_db.commit()
+    execution = FakeTelegramExecution()
+    service = AccountProfileUpdateService(test_db, account_pool=FakeAccountPool(), telegram_execution=execution)
+    assert await service.reconcile_terminal_failures(operation_id=operation_id) == 0
+    await test_db.refresh(item)
+    assert item.status == "in_progress" and item.lease_id == "live-claim"
+    assert execution.calls == []

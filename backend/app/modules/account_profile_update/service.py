@@ -10,7 +10,7 @@ from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -58,6 +58,21 @@ ELIGIBLE_ACCOUNT_STATUSES = {
 }
 _QUEUE_LEASE_ID = 1
 _QUEUE_LEASE_SECONDS = 900
+_TERMINAL_PROFILE_REASONS = {
+    "telegram_account_frozen",
+    "telegram_account_restricted",
+    "risk_guard_account_restricted",
+    "risk_guard_account_frozen",
+}
+_FROZEN_ERROR_MARKERS = (
+    "frozenmethodinvalid",
+    "frozen_method_invalid",
+    "frozenparticipantmissing",
+    "account is frozen",
+    "account frozen",
+    "method that is not available for frozen accounts",
+)
+_RESTRICTED_ERROR_MARKERS = ("userrestrictederror", "user_restricted")
 
 
 def normalize_account_ids(account_ids: Iterable[int]) -> list[int]:
@@ -87,7 +102,7 @@ def profile_bio_hash(value: str | None) -> str:
 
 def operation_snapshot(account_ids: Iterable[int], profile_bio: str) -> tuple[str, str]:
     values = normalize_account_ids(account_ids)
-    normalized_bio = normalize_profile_bio(profile_bio)
+    normalized_bio = normalize_profile_bio(profile_bio, allow_empty=True)
     raw = json.dumps(
         {"account_ids": values, "profile_bio": normalized_bio},
         ensure_ascii=False,
@@ -117,6 +132,34 @@ def account_is_profile_update_eligible(account: TelegramAccount | None) -> bool:
     return session_is_available(account)
 
 
+def terminal_profile_failure_reason(
+    error: BaseException | str | None, *, reason_code: str | None = None,
+) -> str | None:
+    """Classify explicit refusal evidence, never account status alone.
+
+    These failures end this requested batch. They do not prove a permanent
+    Telegram restriction or authorize changing the account's risk/status.
+    """
+    if reason_code in _TERMINAL_PROFILE_REASONS:
+        return reason_code
+    raw = str(error or "").strip().lower()
+    blocked = raw.split(":", 2)
+    if len(blocked) >= 2 and blocked[0] == "risk_guard_blocked":
+        if blocked[1] in {"account_restricted", "account_frozen"}:
+            return "risk_guard_" + blocked[1]
+        return None
+    value = f"{type(error).__name__}: {raw}" if isinstance(error, BaseException) else raw
+    value = value.lower()
+    for reason in _TERMINAL_PROFILE_REASONS:
+        if f"[{reason}]" in value:
+            return reason
+    if any(marker in value for marker in _FROZEN_ERROR_MARKERS):
+        return "telegram_account_frozen"
+    if any(marker in value for marker in _RESTRICTED_ERROR_MARKERS):
+        return "telegram_account_restricted"
+    return None
+
+
 def safe_worker_error(exc: BaseException) -> str:
     raw = str(exc or "")
     if isinstance(exc, AccountOperationLeaseBusy):
@@ -126,7 +169,9 @@ def safe_worker_error(exc: BaseException) -> str:
         or raw in {"telegram client unavailable", "account operation lease unavailable"}
     ):
         return raw[:240]
-    return f"{type(exc).__name__}: profile update failed"[:240]
+    reason = terminal_profile_failure_reason(exc)
+    suffix = f" [{reason}]" if reason else ""
+    return f"{type(exc).__name__}: profile update failed{suffix}"[:240]
 
 
 def _retry_delay_seconds(exc: BaseException, attempts: int) -> int:
@@ -146,6 +191,8 @@ def _retry_delay_seconds(exc: BaseException, attempts: int) -> int:
 
 
 def _error_is_permanent(exc: BaseException) -> bool:
+    if terminal_profile_failure_reason(exc):
+        return True
     raw = str(exc or "").lower()
     return any(
         marker in raw
@@ -188,7 +235,7 @@ async def create_profile_update_operation(
 ) -> tuple[AccountProfileUpdateOperation, bool]:
     """Create a preflighted batch without doing any Telegram RPC."""
     values = normalize_account_ids(account_ids)
-    normalized_bio = normalize_profile_bio(profile_bio)
+    normalized_bio = normalize_profile_bio(profile_bio, allow_empty=True)
     snapshot, snapshot_hash = operation_snapshot(values, normalized_bio)
     existing = (
         await db.execute(
@@ -262,6 +309,7 @@ class AccountProfileUpdateService:
             stale_after_seconds=stale_after_seconds
         )
         cancelled = await self.apply_cancellations()
+        terminal_reconciled = await self.reconcile_terminal_failures()
         reconciled = await self.reconcile_completed_operations()
         queue_lease_id = await self._acquire_queue_lease(
             lease_seconds=max(_QUEUE_LEASE_SECONDS, int(stale_after_seconds))
@@ -272,6 +320,7 @@ class AccountProfileUpdateService:
                 "recovered": recovered,
                 "cancelled": cancelled,
                 "reconciled": reconciled,
+                "terminal_reconciled": terminal_reconciled,
                 "queue_busy": 1,
             }
 
@@ -292,6 +341,7 @@ class AccountProfileUpdateService:
             "recovered": recovered,
             "cancelled": cancelled,
             "reconciled": reconciled,
+            "terminal_reconciled": terminal_reconciled,
             "queue_busy": 0,
         }
 
@@ -396,6 +446,15 @@ class AccountProfileUpdateService:
             return None
         if operation.cancel_requested_at is not None:
             await self._finish_locked_cancelled(item, operation, now=now)
+            return None
+        terminal_reason = terminal_profile_failure_reason(
+            item.error_message, reason_code=item.reason_code,
+        )
+        if item.status == AccountProfileUpdateItemStatus.RETRY_WAIT.value and terminal_reason:
+            self._mark_failed_item(item, operation, reason=terminal_reason,
+                                   summary=item.error_message or terminal_reason, now=now)
+            await self._recompute_operation(operation.id, now=now)
+            await self.db.commit()
             return None
         account = await self._load_account(item.account_id, for_update=True)
         reason = _preflight_reason(account, item)
@@ -625,21 +684,34 @@ class AccountProfileUpdateService:
                 now=now,
             )
             return
-        item.status = AccountProfileUpdateItemStatus.FAILED.value
-        item.reason_code = (
+        reason = terminal_profile_failure_reason(exc) or (
             "account_not_eligible"
             if force_permanent or _error_is_permanent(exc)
             else "profile_update_failed"
         )
-        item.error_message = summary
+        self._mark_failed_item(item, operation, reason=reason, summary=summary, now=now)
+        await self._recompute_operation(item.operation_id, now=now)
+        await self.db.commit()
+
+    @staticmethod
+    def _mark_failed_item(
+        item: AccountProfileUpdateItem,
+        operation: AccountProfileUpdateOperation,
+        *,
+        reason: str,
+        summary: str,
+        now: datetime,
+    ) -> None:
+        # Failure bookkeeping must never mutate profile, account status, or risk.
+        item.status = AccountProfileUpdateItemStatus.FAILED.value
+        item.reason_code = reason
+        item.error_message = summary[:240]
         item.next_retry_at = None
         item.lease_id = None
         item.lease_expires_at = None
         item.finished_at = now
         item.updated_at = now
-        operation.last_error = summary
-        await self._recompute_operation(item.operation_id, now=now)
-        await self.db.commit()
+        operation.last_error = item.error_message
 
     async def _finish_cancelled(self, item_id: int, lease_id: str) -> None:
         now = datetime.utcnow()
@@ -863,6 +935,66 @@ class AccountProfileUpdateService:
         else:
             await self.db.rollback()
         return len(items)
+
+    async def reconcile_terminal_failures(
+        self, *, operation_id: int | None = None, limit: int = 200,
+    ) -> int:
+        """Close recorded frozen/restricted retries without another external call.
+
+        Safe after deployment for an existing operation: preserves attempts and
+        remote_attempted_at, ignores live claims, and recomputes genuine failure
+        totals. Repeating the method is idempotent. No account is reset/unfrozen.
+        """
+        now = datetime.utcnow()
+        error_lower = func.lower(AccountProfileUpdateItem.error_message)
+        markers = (*_FROZEN_ERROR_MARKERS, *_RESTRICTED_ERROR_MARKERS)
+        statement = (
+            select(AccountProfileUpdateItem)
+            .join(AccountProfileUpdateOperation,
+                  AccountProfileUpdateOperation.id == AccountProfileUpdateItem.operation_id)
+            .where(
+                AccountProfileUpdateItem.status == AccountProfileUpdateItemStatus.RETRY_WAIT.value,
+                AccountProfileUpdateOperation.status.in_([
+                    AccountProfileUpdateOperationStatus.QUEUED.value,
+                    AccountProfileUpdateOperationStatus.RUNNING.value,
+                ]),
+                AccountProfileUpdateOperation.cancel_requested_at.is_(None),
+                or_(
+                    AccountProfileUpdateItem.reason_code.in_(list(_TERMINAL_PROFILE_REASONS)),
+                    error_lower.like("risk_guard_blocked:account_restricted%"),
+                    error_lower.like("risk_guard_blocked:account_frozen%"),
+                    *(error_lower.contains(marker) for marker in markers),
+                    *(error_lower.contains(f"[{reason}]") for reason in _TERMINAL_PROFILE_REASONS),
+                ),
+            )
+            .order_by(AccountProfileUpdateItem.id.asc())
+            .limit(max(1, min(int(limit), 1000)))
+            .with_for_update(skip_locked=True)
+        )
+        if operation_id is not None:
+            statement = statement.where(AccountProfileUpdateItem.operation_id == operation_id)
+        items = (await self.db.execute(statement)).scalars().all()
+        changed = 0
+        affected: set[int] = set()
+        for item in items:
+            reason = terminal_profile_failure_reason(item.error_message, reason_code=item.reason_code)
+            if reason is None:
+                continue
+            operation = await self.db.get(AccountProfileUpdateOperation, item.operation_id,
+                                          with_for_update=True)
+            if operation is None or operation.cancel_requested_at is not None:
+                continue
+            self._mark_failed_item(item, operation, reason=reason,
+                                   summary=item.error_message or reason, now=now)
+            affected.add(item.operation_id)
+            changed += 1
+        for affected_id in sorted(affected):
+            await self._recompute_operation(affected_id, now=now)
+        if changed:
+            await self.db.commit()
+        else:
+            await self.db.rollback()
+        return changed
 
     async def reconcile_completed_operations(self, *, limit: int = 200) -> int:
         now = datetime.utcnow()

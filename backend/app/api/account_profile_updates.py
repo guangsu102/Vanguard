@@ -34,7 +34,7 @@ router = APIRouter(prefix="/profile-updates")
 
 class AccountProfileUpdateCreateRequest(BaseModel):
     account_ids: list[int] = Field(..., min_length=1, max_length=2000)
-    profile_bio: str = Field(..., min_length=1, max_length=70)
+    profile_bio: str = Field(..., min_length=0, max_length=70)
 
     @field_validator("account_ids")
     @classmethod
@@ -48,7 +48,7 @@ class AccountProfileUpdateCreateRequest(BaseModel):
     @classmethod
     def validate_profile_bio(cls, value: str) -> str:
         try:
-            return normalize_profile_bio(value)
+            return normalize_profile_bio(value, allow_empty=True)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 

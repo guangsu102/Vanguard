@@ -16,7 +16,7 @@ type CompleteAutoJoinSchedulerConfig = AutoJoinSchedulerConfig & {
 }
 
 export const createDefaultAutoJoinScheduler = (): CompleteAutoJoinSchedulerConfig => ({
-  enabled: true,
+  enabled: false,
   scan_interval_minutes: 5,
   search_filter: { title_blacklist_enabled: true, title_blacklist: [] },
   join_verification: {
@@ -45,7 +45,7 @@ export const createDefaultRiskGuard = (): AccountRiskGuardSettings => ({
   redis_fail_closed: true,
   actions: {
     search: { daily_limit: 100, cooldown_seconds: 30 },
-    join: { daily_limit: 10, cooldown_seconds: 7200 },
+    join: { daily_limit: 30, cooldown_seconds: 2880 },
     private_message: { daily_limit: 20, cooldown_seconds: 300 },
     group_message: { daily_limit: 4, cooldown_seconds: 7200 },
     // Owned-group messaging has its own policy/cooldown domain.  This action
@@ -108,7 +108,7 @@ export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   survival_check_batch_size: 50, survival_retry_max_attempts: 3, survival_retry_base_seconds: 300,
   max_groups_per_account: 100, max_new_ad_groups_per_day: 2, probe_backlog_max_days: 3,
   leave_on_deleted_ad: true, block_group_on_probe_failure: true, ad_policy_ai_enabled: true,
-  ad_policy_ai_model: 'gpt-5.6-terra', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
+  ad_policy_ai_model: 'glm-5.3-flash', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
   ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: true,
   ad_policy_auto_probe_daily_limit_per_account: 10, ad_policy_auto_probe_interval_hours: 24, ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30, premium_min_samples: 20, premium_min_conversions: 1, premium_survival_rate_percent: 95,

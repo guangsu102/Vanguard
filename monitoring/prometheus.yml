@@ -15,7 +15,7 @@ alerting:
         - targets: []
 
 rule_files:
-  - 'alerts/*.yml'
+  - 'alerts.yml'
 
 scrape_configs:
   # ==================== Vanguard Backend ====================

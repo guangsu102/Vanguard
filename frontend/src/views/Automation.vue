@@ -20,6 +20,7 @@ import {
   type AccountAdBinding,
   type AccountOperationConfig,
   type AccountOperationMode,
+  type JoinRequestRuntime,
   type AdDeliveryExecutionSettings,
   type AdDeliveryThrottleSettings,
   type AdFailurePolicy,
@@ -105,6 +106,7 @@ const adBindingAccounts = computed(() =>
 )
 const creativePoolStatus = ref<CreativePoolSummary | null>(null)
 const accountConfigLoading = ref(false)
+const accountJoinRuntime = ref<JoinRequestRuntime | null>(null)
 const savingAccountConfig = ref(false)
 const schedulerConfigLoading = ref(false)
 const failurePolicyLoading = ref(false)
@@ -237,14 +239,18 @@ const bindingFilters = reactive({
 
 
 const accountConfigForm = reactive({
+  dynamic_capacity_enabled: false,
+  max_ads_per_day: 30,
+  max_verification_messages_per_day: 30,
+  max_diagnostic_messages_per_day: 2,
   operation_mode: 'growth' as AccountOperationMode,
   enabled: true,
   auto_join_enabled: false,
   auto_ads_enabled: true,
-  max_groups_per_day: 10,
+  max_groups_per_day: 30,
   max_groups_total: 100,
-  join_interval_min_seconds: 60,
-  join_interval_max_seconds: 900,
+  join_interval_min_seconds: 2880,
+  join_interval_max_seconds: 7200,
   max_messages_per_day: null as number | null,
   message_interval_seconds: 300,
   quiet_hours_start: '',
@@ -700,7 +706,12 @@ const campaignTargetLabel = (campaign: any) => {
 }
 
 const fillAccountConfigForm = (config: AccountOperationConfig) => {
+  accountJoinRuntime.value = config.join_runtime || null
   Object.assign(accountConfigForm, {
+    dynamic_capacity_enabled: config.dynamic_capacity_enabled ?? false,
+    max_ads_per_day: config.max_ads_per_day ?? 30,
+    max_verification_messages_per_day: config.max_verification_messages_per_day ?? 30,
+    max_diagnostic_messages_per_day: config.max_diagnostic_messages_per_day ?? 2,
     operation_mode: config.operation_mode || 'growth',
     enabled: config.enabled,
     auto_join_enabled: config.auto_join_enabled,
@@ -791,6 +802,7 @@ const loadTargetGroups = async () => {
 const loadAccountConfig = async (accountId?: number) => {
   if (!accountId) return
   accountConfigLoading.value = true
+  accountJoinRuntime.value = null
   try {
     const response = await automationApi.getAccountOperationConfig(accountId)
     fillAccountConfigForm(response.data.data)
@@ -800,6 +812,10 @@ const loadAccountConfig = async (accountId?: number) => {
 }
 
 const accountConfigPayload = () => ({
+  dynamic_capacity_enabled: accountConfigForm.dynamic_capacity_enabled,
+  max_ads_per_day: accountConfigForm.max_ads_per_day,
+  max_verification_messages_per_day: accountConfigForm.max_verification_messages_per_day,
+  max_diagnostic_messages_per_day: accountConfigForm.max_diagnostic_messages_per_day,
   operation_mode: accountConfigForm.operation_mode,
   enabled: accountConfigForm.enabled,
   auto_join_enabled: accountConfigForm.auto_join_enabled,
@@ -2879,6 +2895,25 @@ onBeforeUnmount(() => {
                 <el-button :icon="Select" @click="loadAccountConfig(selectedAccountId)">读取配置</el-button>
               </div>
 
+              <el-descriptions
+                v-if="accountJoinRuntime"
+                :column="3"
+                border
+                class="join-runtime-summary"
+              >
+                <el-descriptions-item label="配置上限">{{ accountJoinRuntime.configured_limit }}</el-descriptions-item>
+                <el-descriptions-item label="实际额度">{{ accountJoinRuntime.effective_limit }}</el-descriptions-item>
+                <el-descriptions-item label="今日已请求">{{ accountJoinRuntime.requested_today }}</el-descriptions-item>
+                <el-descriptions-item label="滚动24小时">{{ accountJoinRuntime.requested_rolling_24h }}</el-descriptions-item>
+                <el-descriptions-item label="待审核">{{ accountJoinRuntime.pending_review_count }}</el-descriptions-item>
+                <el-descriptions-item label="已超时复核">{{ accountJoinRuntime.overdue_review_count }}</el-descriptions-item>
+                <el-descriptions-item label="预留中">{{ accountJoinRuntime.active_reservations }}</el-descriptions-item>
+                <el-descriptions-item label="下次允许时间">{{ formatTimestamp(accountJoinRuntime.next_allowed_at) }}</el-descriptions-item>
+                <el-descriptions-item label="阻塞原因">
+                  {{ accountJoinRuntime.blocked_reasons.length ? accountJoinRuntime.blocked_reasons.join('、') : '无' }}
+                </el-descriptions-item>
+              </el-descriptions>
+
               <el-form label-position="top" class="account-config-form">
                 <div class="account-config-grid">
                   <el-form-item label="账号模式">
@@ -2897,22 +2932,30 @@ onBeforeUnmount(() => {
                     <el-switch v-model="accountConfigForm.auto_ads_enabled" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="每日最大加群数">
-                    <el-input-number v-model="accountConfigForm.max_groups_per_day" :min="0" :max="10" />
+                    <el-input-number v-model="accountConfigForm.max_groups_per_day" :min="0" :max="30" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="账号总群上限">
-                    <el-input-number v-model="accountConfigForm.max_groups_total" :min="0" :max="100" />
+                    <el-input-number v-model="accountConfigForm.max_groups_total" :min="0" :max="300" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="加群最小间隔(秒)">
-                    <el-input-number v-model="accountConfigForm.join_interval_min_seconds" :min="60" :max="86400" />
+                    <el-input-number v-model="accountConfigForm.join_interval_min_seconds" :min="2880" :max="86400" />
                   </el-form-item>
                   <el-form-item v-if="!isAdOnlyAccount" label="加群最大间隔(秒)">
-                    <el-input-number v-model="accountConfigForm.join_interval_max_seconds" :min="60" :max="86400" />
+                    <el-input-number v-model="accountConfigForm.join_interval_max_seconds" :min="2880" :max="86400" />
                   </el-form-item>
-                  <el-form-item label="每日出站消息硬上限">
+                  <el-form-item label="按动态容量调度">
+                    <el-switch v-model="accountConfigForm.dynamic_capacity_enabled" />
+                  </el-form-item>
+                  <template v-if="accountConfigForm.dynamic_capacity_enabled">
+                    <el-form-item label="每日广告上限"><el-input-number v-model="accountConfigForm.max_ads_per_day" :min="0" :max="30" /></el-form-item>
+                    <el-form-item label="每日验证文字上限"><el-input-number v-model="accountConfigForm.max_verification_messages_per_day" :min="0" :max="30" /></el-form-item>
+                    <el-form-item label="每日诊断消息上限"><el-input-number v-model="accountConfigForm.max_diagnostic_messages_per_day" :min="0" :max="2" /></el-form-item>
+                  </template>
+                  <el-form-item label="每日总外发上限">
                     <el-input-number
                       v-model="accountConfigForm.max_messages_per_day"
                       :min="1"
-                      :max="20000"
+                      :max="accountConfigForm.dynamic_capacity_enabled ? 62 : 20000"
                       clearable
                       placeholder="留空使用配置中心默认值"
                     />

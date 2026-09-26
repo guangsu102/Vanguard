@@ -6,6 +6,16 @@ import pytest
 from app.core.account.telegram_execution import TelegramExecutionService
 
 
+@pytest.fixture
+def approved_ad(monkeypatch):
+    from app.modules.acquisition import qualification_service, qualification_actions
+    monkeypatch.setattr(qualification_service, "send_gate", AsyncMock(return_value=None))
+    monkeypatch.setattr(qualification_actions, "validate_live_send", AsyncMock())
+    monkeypatch.setattr(qualification_service, "current_authorization", AsyncMock(return_value=(
+        SimpleNamespace(id=1, evidence_hash="h", content_scope="text_profile", policy_version="test"),
+        SimpleNamespace(group_id=123), SimpleNamespace(id=1))))
+
+
 class FakeClient:
     def __init__(self) -> None:
         self.send_message_calls = []
@@ -61,6 +71,7 @@ async def test_auto_join_blocked_by_risk_guard_does_not_touch_telegram_client():
     client = FakeClient()
     account = SimpleNamespace(account_id=1, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=False, reason="join_frozen")
         ),
@@ -82,10 +93,13 @@ async def test_auto_join_blocked_by_risk_guard_does_not_touch_telegram_client():
 
 
 @pytest.mark.asyncio
-async def test_auto_join_marks_real_telegram_join_request():
+async def test_auto_join_marks_real_telegram_join_request(monkeypatch):
+    from app.modules.acquisition import qualification_join_gate
+    monkeypatch.setattr(qualification_join_gate, "qualification_join_gate", AsyncMock(return_value=None))
     client = FakeClient()
     account = SimpleNamespace(account_id=11, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=True, reason="reserved")
         ),
@@ -97,7 +111,7 @@ async def test_auto_join_marks_real_telegram_join_request():
 
     await service.join_group(
         account,
-        SimpleNamespace(username="demo_group", group_id=1001),
+        SimpleNamespace(username="demo_group", group_id=100),
         on_join_request_attempted=lambda: attempted.append(True),
     )
 
@@ -106,10 +120,11 @@ async def test_auto_join_marks_real_telegram_join_request():
 
 
 @pytest.mark.asyncio
-async def test_ad_delivery_blocked_by_risk_guard_does_not_send_message():
+async def test_ad_delivery_blocked_by_risk_guard_does_not_send_message(approved_ad):
     client = FakeClient()
     account = SimpleNamespace(account_id=2, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=False, reason="ad_delivery_daily_budget")
         ),
@@ -133,10 +148,11 @@ async def test_ad_delivery_blocked_by_risk_guard_does_not_send_message():
 
 
 @pytest.mark.asyncio
-async def test_ad_delivery_marks_attempt_at_telegram_call_boundary():
+async def test_ad_delivery_marks_attempt_at_telegram_call_boundary(approved_ad):
     client = FakeClient()
     account = SimpleNamespace(account_id=12, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=True, reason="reserved")
         ),
@@ -156,7 +172,7 @@ async def test_ad_delivery_marks_attempt_at_telegram_call_boundary():
 
     assert message_id == 321
     assert attempted == [True]
-    assert client.send_message_calls == [((123, "hello"), {})]
+    assert client.send_message_calls == [((123, "hello"), {"link_preview": False})]
 
 
 @pytest.mark.asyncio
@@ -165,6 +181,7 @@ async def test_group_message_without_message_id_records_failure():
     client.send_message = AsyncMock(return_value=SimpleNamespace())
     account = SimpleNamespace(account_id=13, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=True, reason="reserved")
         ),
@@ -189,6 +206,7 @@ async def test_private_message_blocked_by_risk_guard_does_not_send_message():
     client = FakeClient()
     account = SimpleNamespace(account_id=3, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=False, reason="private_message_daily_budget")
         ),
@@ -207,6 +225,7 @@ async def test_flood_wait_records_failure_and_freezes_account():
     client = FakeClient()
     account = SimpleNamespace(account_id=4, client=client)
     guard = SimpleNamespace(
+        db=SimpleNamespace(scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_success=AsyncMock(),
         record_failure=AsyncMock(),
@@ -229,6 +248,7 @@ async def test_moderation_blocked_by_risk_guard_does_not_touch_telegram_client()
     client = FakeClient()
     account = SimpleNamespace(account_id=5, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=False, reason="moderation_daily_budget")
         ),
@@ -248,6 +268,7 @@ async def test_delete_message_supports_telethon_delete_messages_api():
     client = SimpleNamespace(delete_messages=AsyncMock(return_value=True))
     account = SimpleNamespace(account_id=6, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),
@@ -265,6 +286,7 @@ async def test_delete_message_supports_telethon_delete_messages_api():
 async def test_bot_pin_uses_execution_layer_and_calls_pin():
     client = FakeClient()
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),
@@ -289,6 +311,7 @@ async def test_update_profile_bio_uses_telegram_profile_request():
     client = FakeClient()
     account = SimpleNamespace(account_id=6, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),
@@ -308,6 +331,7 @@ async def test_update_profile_bio_uses_telegram_profile_request():
 async def test_set_default_chat_permissions_uses_moderation_guard():
     client = FakeClient()
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),
@@ -342,6 +366,7 @@ async def test_create_channel_uses_broadcast_channel_request():
     client = ChannelClient()
     account = SimpleNamespace(account_id=7, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),
@@ -369,6 +394,7 @@ async def test_update_channel_username_uses_owner_session():
     client = UsernameClient()
     account = SimpleNamespace(account_id=8, client=client)
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(return_value=SimpleNamespace(allowed=True, reason="reserved")),
         record_failure=AsyncMock(),
         record_success=AsyncMock(),

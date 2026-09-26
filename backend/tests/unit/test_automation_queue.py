@@ -7,9 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import app.modules.acquisition.automation as automation_module
 from app.api.automation import (
+    AccountOperationConfigUpdate,
     _build_ad_delivery_diagnostic,
     _build_dynamic_health_diagnostic,
     _enqueue_automation_task,
@@ -23,6 +25,7 @@ from app.core.account.models import (
     AccountType,
     TelegramAccount,
 )
+from app.core.group.join_review import JOIN_REVIEW_APPROVED
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.automation import AcquisitionAutomationService
 from app.modules.acquisition.models import AccountAdBinding, AdCampaign
@@ -47,6 +50,23 @@ class DummyTask:
 class FailingTask:
     def apply_async(self, **kwargs):
         raise RuntimeError("broker down")
+
+
+def test_operation_config_join_limit_accepts_zero_through_thirty():
+    assert AccountOperationConfigUpdate(max_groups_per_day=0).max_groups_per_day == 0
+    assert AccountOperationConfigUpdate(max_groups_per_day=30).max_groups_per_day == 30
+    with pytest.raises(ValidationError):
+        AccountOperationConfigUpdate(max_groups_per_day=31)
+
+
+def test_operation_config_join_interval_requires_at_least_48_minutes():
+    assert (
+        AccountOperationConfigUpdate(join_interval_min_seconds=2880)
+        .join_interval_min_seconds
+        == 2880
+    )
+    with pytest.raises(ValidationError):
+        AccountOperationConfigUpdate(join_interval_min_seconds=2879)
 
 
 def test_enqueue_automation_task_returns_queued_result():
@@ -245,6 +265,9 @@ async def test_group_ai_warmup_marks_ad_interaction_start(test_db):
 
 @pytest.mark.asyncio
 async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(test_db, monkeypatch):
+    from app.modules.acquisition import automation as dispatch_module
+    # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
+    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
     service = AcquisitionAutomationService(test_db)
     campaign = SimpleNamespace(id=701)
     binding = SimpleNamespace(id=702, account_id=703, campaign=campaign)
@@ -292,6 +315,9 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
 async def test_ad_dispatcher_excludes_owned_group_before_creative_or_delivery_state(
     test_db, monkeypatch
 ):
+    from app.modules.acquisition import automation as dispatch_module
+    # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
+    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
     account = TelegramAccount(
         identifier="owned-group-ad-exclusion",
         session_name="owned-group-ad-exclusion",
@@ -375,6 +401,9 @@ async def test_ad_dispatcher_excludes_owned_group_before_creative_or_delivery_st
 async def test_ad_dispatcher_final_owned_group_recheck_runs_inside_chat_lock(
     test_db, monkeypatch
 ):
+    from app.modules.acquisition import automation as dispatch_module
+    # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
+    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
     group = SimpleNamespace(id=920021, group_id=920022)
     membership = SimpleNamespace(
         group_id=group.id,
@@ -513,6 +542,7 @@ async def test_ad_only_account_is_excluded_from_group_ai_warmup(test_db, monkeyp
         account=account,
         telegram_group_id=group.group_id,
         status="joined",
+        review_status=JOIN_REVIEW_APPROVED,
     )
     test_db.add_all([account, group, config, membership])
     await test_db.commit()
@@ -630,6 +660,7 @@ async def test_group_ai_warmup_final_owned_recheck_blocks_all_send_side_effects(
         account=account,
         telegram_group_id=group.group_id,
         status="joined",
+        review_status=JOIN_REVIEW_APPROVED,
     )
     test_db.add_all([account, group, config, membership])
     await test_db.commit()
@@ -690,7 +721,7 @@ async def test_group_ai_warmup_final_owned_recheck_blocks_all_send_side_effects(
 
     result = await service.run_group_ai_warmup(dry_run=False)
 
-    assert result["processed"] == 1
+    assert result["processed"] == 1, repr(result["details"])
     assert result["skipped"] == 1
     assert result["details"] == [
         {
@@ -820,6 +851,7 @@ async def test_ad_only_account_skips_ad_probe_and_warmup(test_db):
     membership = SimpleNamespace(
         warmup_status="joined_pending_test",
         probe_status="not_started",
+        review_status="approved",
         note="",
     )
 

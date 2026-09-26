@@ -549,23 +549,33 @@ def test_group_policy_ai_accepts_fractional_confidence_scale():
     assert parsed["confidence"] == 98
 
 
-def test_soft_ad_trial_history_requires_distinct_senders_and_retained_message():
+def test_soft_ad_trial_history_requires_one_retained_ordinary_message():
     service = AcquisitionAutomationService(MagicMock())
     one_sender = [
         {
             "source": "recent_promotional_message",
             "text": "GPT 低价通道，需要的私聊",
+            "message_id": 101,
             "sender_id": 10,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 48,
         },
         {
             "source": "recent_promotional_message",
             "text": "Claude 套餐，有需要看主页",
+            "message_id": 102,
             "sender_id": 10,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 30,
         },
     ]
-    assert service._has_soft_ad_trial_history(one_sender) is False
+    assert service._has_soft_ad_trial_history(one_sender) is True
 
     one_sender[1]["sender_id"] = 11
     one_sender[0]["age_hours"] = 2
@@ -635,13 +645,23 @@ async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(
         {
             "source": "recent_promotional_message",
             "text": "GPT Plus 低价通道，需要的私聊",
+            "message_id": 101,
             "sender_id": 10,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 49,
         },
         {
             "source": "recent_promotional_message",
             "text": "Claude 套餐试用，有需要看主页",
+            "message_id": 102,
             "sender_id": 11,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 25,
         },
     ]
@@ -667,7 +687,7 @@ async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(
 
 
 @pytest.mark.asyncio
-async def test_relevant_public_group_profile_can_enable_controlled_soft_ad_trial(test_db):
+async def test_relevant_public_group_profile_cannot_enable_controlled_soft_ad_trial(test_db):
     service = AcquisitionAutomationService(test_db)
     verdict = {
         "mode": "soft_ad_trial",
@@ -698,11 +718,9 @@ async def test_relevant_public_group_profile_can_enable_controlled_soft_ad_trial
         },
     )
 
-    assert result.ad_allowed is True
-    assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-    assert result.decision_source == "gpt-5.6-sol_two_pass"
-    assert len(result.ai_reviews) == 2
-    assert service._ad_policy_llm_client.generate.await_count == 2
+    assert result.ad_allowed is None
+    assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
+    assert service._ad_policy_llm_client.generate.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -727,13 +745,23 @@ async def test_soft_ad_trial_below_configured_confidence_fails_closed(test_db):
         {
             "source": "recent_promotional_message",
             "text": "GPT 低价通道，需要的私聊",
+            "message_id": 101,
             "sender_id": 10,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 49,
         },
         {
             "source": "recent_promotional_message",
             "text": "Claude 套餐试用，有需要看主页",
+            "message_id": 102,
             "sender_id": 11,
+            "sender_role": "ordinary",
+            "accessible": True,
+            "warning_search_complete": True,
+            "warning_reply_ids": [],
             "age_hours": 25,
         },
     ]
@@ -780,6 +808,7 @@ async def test_explicit_permission_must_cite_authoritative_group_rule(test_db):
             "source": "recent_promotional_message",
             "text": "GPT 低价通道，需要的私聊",
             "sender_id": 10,
+            "sender_role": "ordinary",
             "age_hours": 49,
         },
     ]
@@ -1024,6 +1053,7 @@ async def test_group_rules_audit_reuses_matching_evidence_hash_without_llm(test_
         ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
         ad_policy_confidence=98,
         ad_policy_verified_at=datetime.utcnow(),
+        ad_policy_expires_at=datetime.utcnow() + timedelta(hours=24),
         ad_policy_evidence_hash=evidence_hash,
     )
     service._ad_policy_llm_client = SimpleNamespace(generate=AsyncMock())
@@ -1958,12 +1988,17 @@ async def test_survival_check_failure_retries_before_becoming_inconclusive(test_
     service = AcquisitionAutomationService(test_db)
     service.account_pool.acquire_by_id = AsyncMock(return_value=None)
 
-    assert await service._check_one_ad_survival(log, now) == "check_failed"
+    assert await service._check_one_ad_survival(log, now) == "retry_scheduled"
     assert log.survival_status == AdSurvivalStatus.PENDING.value
     assert log.survival_retry_count == 1
     assert log.survival_check_due_at > now
 
+    # A duplicate worker cannot consume retries before the persisted retry deadline.
+    assert await service._check_one_ad_survival(log, now) == "claim_unavailable"
+    assert log.survival_retry_count == 1
     log.survival_retry_count = 3
+    log.survival_check_due_at = now
+    await test_db.commit()
     assert await service._check_one_ad_survival(log, now) == "check_failed"
     assert log.survival_status == AdSurvivalStatus.CHECK_FAILED.value
     assert log.survival_check_due_at is None
@@ -1973,6 +2008,9 @@ async def test_survival_check_failure_retries_before_becoming_inconclusive(test_
 async def test_telegram_success_never_releases_dispatcher_budget_when_log_confirmation_fails(
     monkeypatch,
 ):
+    from app.modules.acquisition import automation as dispatch_module
+    # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
+    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
     db = MagicMock()
     db.rollback = AsyncMock()
     service = AcquisitionAutomationService(db)
@@ -1982,6 +2020,7 @@ async def test_telegram_success_never_releases_dispatcher_budget_when_log_confir
     membership = SimpleNamespace(group=group, telegram_group_id=group.group_id)
     creative = SimpleNamespace(id=1)
     pending_log = SimpleNamespace(reservation_token="reserved-token")
+    service._get_account_operation_config = AsyncMock(return_value=None)
     service._list_enabled_ad_bindings_for_account = AsyncMock(return_value=[binding])
     service._list_joined_groups_for_account = AsyncMock(return_value=[membership])
     service._growth_ad_health_allowed = AsyncMock(return_value=True)
@@ -2716,12 +2755,13 @@ async def test_policy_probe_risk_guard_block_after_reservation_is_retryable_and_
     now = datetime.utcnow()
     target = await _create_policy_probe_target(test_db, now, 14)
     client = SimpleNamespace(send_message=AsyncMock())
-    wrapper = SimpleNamespace(client=client, record_message=MagicMock())
+    wrapper = SimpleNamespace(client=client, record_message=MagicMock(), account_id=target.account.id)
     pool = SimpleNamespace(
         acquire_by_id=AsyncMock(return_value=wrapper),
         release=AsyncMock(),
     )
     risk_guard = SimpleNamespace(
+        db=SimpleNamespace(get=AsyncMock(return_value=None), scalar=AsyncMock(return_value=None)),
         check_and_reserve=AsyncMock(
             return_value=SimpleNamespace(allowed=False, reason=block_reason)
         ),
@@ -2731,6 +2771,13 @@ async def test_policy_probe_risk_guard_block_after_reservation_is_retryable_and_
     service = AcquisitionAutomationService(test_db, account_pool=pool)
     service.telegram_execution = TelegramExecutionService(risk_guard)
     _configure_policy_probe_service(monkeypatch, service, lambda: now)
+    # This unit isolates content-dedup rejection after an already successful qualification preflight.
+    monkeypatch.setattr("app.modules.acquisition.qualification_service.send_gate", AsyncMock(return_value=None))
+    monkeypatch.setattr("app.modules.acquisition.qualification_actions.validate_live_send", AsyncMock(return_value=None))
+    monkeypatch.setattr("app.modules.acquisition.qualification_service.current_authorization", AsyncMock(return_value=(
+        SimpleNamespace(id=1, evidence_hash="test", content_scope="text_profile", policy_version="test"),
+        target.group, SimpleNamespace(id=1),
+    )))
     expected_reason = f"risk_guard_blocked:{block_reason}"
 
     with pytest.raises(RuntimeError, match=f"^{expected_reason}$"):
@@ -3160,3 +3207,121 @@ async def test_policy_probe_confirmation_failure_stays_inflight_and_blocks_resen
         )
     service._send_ad_text.assert_awaited_once()
     assert pool.acquire_by_id.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_survival_callbacks_preserve_inactive_membership_constraint(test_db):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        phone="+15550003041",
+        identifier="+15550003041",
+        session_name="inactive_survival_callback",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=930041,
+        title="Inactive Survival Callback",
+        level=GroupLevel.A,
+        status="active",
+    )
+    campaign = AdCampaign(name="Inactive Survival Campaign", enabled=True, status="active")
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        account_id=account.id,
+        status="left",
+        join_method="manual",
+        probe_status="failed",
+        warmup_status="blocked",
+        ad_status="blocked",
+    )
+    profile = GroupAdProfile(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        ad_policy_mode=GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
+        ad_policy_confidence=100,
+        ad_tier=GroupAdTier.TRIAL.value,
+        daily_capacity=1,
+    )
+    log = AdDeliveryLog(
+        account_id=account.id,
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        ad_campaign_id=campaign.id,
+        status=DeliveryStatus.SUCCESS.value,
+        telegram_message_id=321,
+        survival_status=AdSurvivalStatus.PENDING.value,
+        survival_stage="twenty_four_hour",
+        survival_check_due_at=now,
+        sent_at=now - timedelta(days=1),
+        group=group,
+    )
+    test_db.add_all([membership, profile, log])
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    await service._mark_ad_survival_survived(log, now)
+    await test_db.refresh(membership)
+    assert membership.status == "left"
+    assert membership.ad_status == "blocked"
+
+    await service._mark_ad_survival_deleted(log, now, "message_missing_or_deleted")
+    await test_db.refresh(membership)
+    assert membership.status == "left"
+    assert membership.ad_status == "blocked"
+    assert membership.last_ad_deleted_at == now
+
+
+@pytest.mark.asyncio
+async def test_survival_batch_continues_after_one_record_failure(test_db):
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        phone="+15550003042",
+        identifier="+15550003042",
+        session_name="survival_batch_isolation",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(
+        group_id=930042,
+        title="Survival Batch Isolation",
+        level=GroupLevel.A,
+        status="active",
+    )
+    campaign = AdCampaign(name="Survival Batch Campaign", enabled=True, status="active")
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    for message_id in (401, 402):
+        test_db.add(
+            AdDeliveryLog(
+                account_id=account.id,
+                group_id=group.id,
+                telegram_group_id=group.group_id,
+                ad_campaign_id=campaign.id,
+                status=DeliveryStatus.SUCCESS.value,
+                telegram_message_id=message_id,
+                survival_status=AdSurvivalStatus.PENDING.value,
+                survival_stage="two_minute",
+                survival_check_due_at=now - timedelta(minutes=1),
+                sent_at=now - timedelta(minutes=3),
+            )
+        )
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    service._sync_account_pool = AsyncMock()
+    service._check_one_ad_survival = AsyncMock(
+        side_effect=[RuntimeError("first record failed"), "not_required"]
+    )
+
+    result = await service.check_ad_survival(limit=2)
+
+    assert result["processed"] == 2
+    assert result["check_failed"] == 1
+    assert result["not_required"] == 1
+    assert service._check_one_ad_survival.await_count == 2

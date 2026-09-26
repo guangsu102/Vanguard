@@ -19,7 +19,6 @@ from app.core.account.models import (
     TelegramAccount,
 )
 from app.core.account.warmup import account_warmup_context
-
 from app.core.automation_settings import (
     get_account_asset_policy_settings,
     get_account_warmup_policy_settings,
@@ -52,15 +51,15 @@ class AccountDynamicFrequencyService:
     JOIN_DAILY_RANGES: dict[str, DailyRange] = {
         "new": DailyRange(1, 3),
         "recovery": DailyRange(1, 3),
-        "normal": DailyRange(5, 12),
-        "stable": DailyRange(8, 20),
+        "normal": DailyRange(5, 30),
+        "stable": DailyRange(8, 30),
         "cooldown": DailyRange(0, 0),
     }
     JOIN_INTERVAL_RANGES: dict[str, tuple[int, int]] = {
-        "new": (30 * 60, 120 * 60),
+        "new": (48 * 60, 120 * 60),
         "recovery": (60 * 60, 120 * 60),
-        "normal": (20 * 60, 75 * 60),
-        "stable": (15 * 60, 45 * 60),
+        "normal": (48 * 60, 75 * 60),
+        "stable": (48 * 60, 60 * 60),
         "cooldown": (8 * 3600, 24 * 3600),
     }
 
@@ -100,21 +99,6 @@ class AccountDynamicFrequencyService:
         if getattr(config, "business_stage", None) != stage:
             config.business_stage = stage
             changed = True
-
-        if stage != AccountBusinessStage.COOLDOWN.value and config.next_join_after:
-            segment = {
-                AccountBusinessStage.NEW.value: "new",
-                AccountBusinessStage.NORMAL.value: "normal",
-                AccountBusinessStage.HOT.value: "stable",
-            }.get(stage, "new")
-            policy_max = self.JOIN_INTERVAL_RANGES[segment][1]
-            configured_max = max(60, int(config.join_interval_max_seconds or 0))
-            max_effective_seconds = int(
-                max(policy_max, configured_max) / self.MIN_JOIN_TIME_WINDOW_MULTIPLIER
-            )
-            if config.next_join_after > now + timedelta(seconds=max_effective_seconds):
-                config.next_join_after = now
-                changed = True
 
         if changed:
             config.updated_at = now
@@ -729,6 +713,14 @@ class AccountDynamicFrequencyService:
         if config is None:
             return AccountBusinessStage.NEW.value
         account = getattr(config, "account", None) or await self.get_account(config.account_id)
+        if getattr(config, "dynamic_capacity_enabled", False):
+            from app.core.account.age import account_age_eligibility_reason
+            from app.core.account.outbound_budget import effective_capacity_limits
+            limits = await effective_capacity_limits(self.db, account, config, now)
+            stage = (AccountBusinessStage.COOLDOWN.value if limits["state"] == "blocked"
+                     or account_age_eligibility_reason(account, now) else AccountBusinessStage.NORMAL.value)
+            await self.apply_business_stage_state(config, stage, now)
+            return stage
         join_metrics = join_metrics or await self.account_join_quality_metrics(config.account_id, now)
         join_attempts = await self.join_attempt_metrics(config.account_id, now)
         asset_policy = await get_account_asset_policy_settings(self.db)
@@ -764,15 +756,35 @@ class AccountDynamicFrequencyService:
         health_ratio = self.clamp((health_score - 45.0) / 45.0, 0.0, 1.0)
         return int(round(low + (high - low) * health_ratio))
 
-    async def auto_join_dynamic_daily_limit(self, config: AccountOperationConfig, now: datetime) -> int:
+    async def auto_join_dynamic_daily_limit(
+        self,
+        config: AccountOperationConfig,
+        now: datetime,
+        *,
+        persist_state: bool = True,
+    ) -> int:
         account = getattr(config, "account", None) or await self.get_account(config.account_id)
-        configured_limit = max(1, int(config.max_groups_per_day or 1))
+        if getattr(config, "dynamic_capacity_enabled", False):
+            from app.core.account.age import account_age_eligibility_reason
+            from app.core.account.outbound_budget import effective_capacity_limits
+            from app.modules.acquisition.capacity import inventory_snapshot
+            if account_age_eligibility_reason(account, now):
+                return 0
+            limits = await effective_capacity_limits(self.db, account, config, now)
+            inventory = await inventory_snapshot(self.db, config.account_id, now)
+            if inventory["qualified"] + inventory["active_backlog"] >= 2 * limits["ad"]:
+                return 0
+            return limits["join"]
+        configured_limit = max(0, int(config.max_groups_per_day or 0))
+        if configured_limit <= 0:
+            return 0
         join_metrics = await self.account_join_quality_metrics(config.account_id, now)
         join_attempts = await self.join_attempt_metrics(config.account_id, now)
         asset_policy = await get_account_asset_policy_settings(self.db)
         warmup_policy = await get_account_warmup_policy_settings(self.db)
         warmup = account_warmup_context(warmup_policy, account, now, action="join")
-        await self.sync_account_warmup_stage(account, warmup.stage, now)
+        if persist_state:
+            await self.sync_account_warmup_stage(account, warmup.stage, now)
         health = await self.account_health(
             config.account_id,
             now,
@@ -792,7 +804,8 @@ class AccountDynamicFrequencyService:
             warmup_policy=warmup_policy,
         )
         stage = self.business_stage_for_segment(segment)
-        await self.apply_business_stage_state(config, stage, now)
+        if persist_state:
+            await self.apply_business_stage_state(config, stage, now)
         risk_multiplier = self.account_risk_limit_multiplier(account, now)
         if risk_multiplier <= 0 or segment == "cooldown" or warmup.action_multiplier <= 0:
             return 0
@@ -824,6 +837,15 @@ class AccountDynamicFrequencyService:
         now: datetime,
     ) -> dict[str, Any]:
         account = getattr(config, "account", None) or await self.get_account(config.account_id)
+        if getattr(config, "dynamic_capacity_enabled", False):
+            from app.core.account.age import account_age_eligibility_reason
+            from app.core.account.outbound_budget import effective_capacity_limits
+            limits = await effective_capacity_limits(self.db, account, config, now)
+            reason = account_age_eligibility_reason(account, now)
+            allowed = reason is None and limits["join"] > 0
+            return {"allowed": allowed, "reason": reason or ("dynamic_capacity_ready" if allowed else "account_dynamic_health_paused"),
+                "health_score": 100 if allowed else 0, "group_quality_score": 0,
+                "lifecycle_segment": limits["state"], "composite_score": 100 if allowed else 0}
         join_metrics = await self.account_join_quality_metrics(config.account_id, now)
         join_attempts = await self.join_attempt_metrics(config.account_id, now)
         asset_policy = await get_account_asset_policy_settings(self.db)
@@ -1006,6 +1028,10 @@ class AccountDynamicFrequencyService:
         op_config = await self._get_account_operation_config(account_id)
         account = getattr(op_config, "account", None) if op_config else None
         account = account or await self.get_account(account_id)
+        if op_config is not None and getattr(op_config, "dynamic_capacity_enabled", False):
+            from app.core.account.age import account_age_eligibility_reason
+            from app.core.account.outbound_budget import effective_capacity_limits
+            return account_age_eligibility_reason(account, now) is None and (await effective_capacity_limits(self.db, account, op_config, now))["ad"] > 0
         join_metrics = await self.account_join_quality_metrics(account_id, now)
         join_attempts = await self.join_attempt_metrics(account_id, now)
         asset_policy = await get_account_asset_policy_settings(self.db)

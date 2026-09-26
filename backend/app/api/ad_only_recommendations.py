@@ -98,8 +98,8 @@ class DirectAssignmentBatchPreflightRequest(BaseModel):
     target_account_id: int = Field(..., gt=0)
     creative_id: int = Field(..., gt=0)
     invite_links: list[str] = Field(..., min_length=1, max_length=100)
-    join_interval_min_minutes: int = Field(1, ge=1, le=30)
-    join_interval_max_minutes: int = Field(30, ge=1, le=30)
+    join_interval_min_minutes: int = Field(48, ge=48, le=1440)
+    join_interval_max_minutes: int = Field(120, ge=48, le=1440)
     permission_mode: Literal[
         "soft_ad_allowed", "high_volume_ad_allowed"
     ]

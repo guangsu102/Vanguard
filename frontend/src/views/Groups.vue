@@ -126,7 +126,7 @@ const columns = [
   { prop: 'title', label: '群池条目', minWidth: '220', slot: 'group' },
   { prop: 'sourceKeyword', label: '来源关键词', minWidth: '150', slot: 'source' },
   { prop: 'accountCount', label: '已入群账号', width: '120', slot: 'account' },
-  { prop: 'memberCount', label: '成员数', width: '100', slot: 'memberCount' },
+  { prop: 'memberCount', label: '人数与采集状态', minWidth: '215', slot: 'memberCount' },
   { prop: 'level', label: '群质量', width: '90', slot: 'level' },
   { prop: 'status', label: '状态', width: '90', slot: 'status' },
   { prop: 'adsSent', label: '广告', width: '85', slot: 'ads' },
@@ -425,7 +425,13 @@ onMounted(() => {
       </template>
 
       <template #memberCount="{ row }">
-        <span class="metric-number">{{ formatNumber(row.memberCount) }}</span>
+        <div class="account-cell">
+          <span class="metric-number">{{ formatNumber(row.memberCount) }} 人 <el-tag size="small" :type="row.metrics?.collection?.status === 'fresh' ? 'success' : 'warning'">{{ row.metrics?.collection?.status === 'fresh' ? '近期采集' : '旧值／待核实' }}</el-tag></span>
+          <small>来源：{{ row.metrics?.collection?.member_count_source || '历史缓存，来源未核实' }}</small>
+          <small>采集：{{ row.metrics?.collection?.member_count_checked_at ? new Date(row.metrics.collection.member_count_checked_at + 'Z').toLocaleString('zh-CN') : '暂无可靠时间' }}</small>
+          <small v-if="row.metrics?.collection?.online_count != null">在线 {{ row.metrics.collection.online_count }} 人；采集 {{ row.metrics.collection.online_count_checked_at ? new Date(row.metrics.collection.online_count_checked_at + 'Z').toLocaleString('zh-CN') : '未知' }}</small>
+          <small v-if="row.metrics?.collection?.error">最近读取失败，保留旧值：{{ row.metrics.collection.error }}</small>
+        </div>
       </template>
 
       <template #level="{ row }">

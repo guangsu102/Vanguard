@@ -8,6 +8,7 @@ plumbing every time.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ import structlog
 
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
 from app.core.account.system_identity import bot_risk_identity
+from app.core.group.identity import is_owned_group_target
 from app.modules.owned_group.security import safe_exception_message
 
 
@@ -192,6 +194,16 @@ class TelegramExecutionService:
         self.risk_guard = risk_guard
         self._bot_account = bot_risk_identity("telegram_execution")
         self.logger = logger.bind(module="telegram_execution")
+
+    @staticmethod
+    async def _notify_join_request_attempted(
+        callback: Optional[Callable[[], Awaitable[None] | None]],
+    ) -> None:
+        if callback is None:
+            return
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
 
     @staticmethod
     def _get_client(account: Any) -> Any:
@@ -391,6 +403,9 @@ class TelegramExecutionService:
         if client is None:
             raise TelegramExecutionError("telegram client unavailable")
 
+        if await self._outbound_service(account):
+            raise TelegramSendPreflightError("dynamic_promoter_private_messages_disabled")
+
         async with self._risk_operation(
             account,
             AccountRiskAction.PRIVATE_MESSAGE,
@@ -412,6 +427,9 @@ class TelegramExecutionService:
         client = self._get_client(account)
         if client is None:
             return None
+
+        if await self._outbound_service(account):
+            raise TelegramSendPreflightError("dynamic_promoter_use_qualified_ad_or_verification")
 
         action = AccountRiskAction.GROUP_MESSAGE
         if source == "ad_probe":
@@ -524,40 +542,258 @@ class TelegramExecutionService:
                 raise TelegramSendOutcomeUnknownError("Telegram send returned without a message id")
         return int(message_id)
 
+    async def _outbound_service(self, account: Any):
+        if self.risk_guard is None:
+            return None
+        from sqlalchemy import select
+        from app.core.account.models import AccountOperationConfig
+        from app.core.account.outbound_budget import AccountOutboundBudgetService
+        config = await self.risk_guard.db.scalar(select(AccountOperationConfig).where(
+            AccountOperationConfig.account_id == account.account_id
+        ).execution_options(populate_existing=True))
+        if getattr(config, "dynamic_capacity_enabled", False) is True:
+            return AccountOutboundBudgetService(self.risk_guard.db)
+        return None
+
+    async def _budgeted_write(
+        self, account: Any, action: AccountRiskAction, *, target: Any,
+        category: str, attempt_key: str, context: dict, details: dict,
+        write: Callable[[], Awaitable[Any]], preflight: Callable[[], Awaitable[None]] | None = None,
+        on_send_attempted: Callable[[], Any] | None = None,
+        require_budget: bool = False,
+        risk_target_type: str | None = None,
+    ) -> Any:
+        """Persist intent before RPC; an unknown write can only be reconciled."""
+        from telethon.errors import RPCError
+        from app.core.account.outbound_budget import OutboundBudgetBlocked
+        budget = await self._outbound_service(account)
+        if require_budget and budget is None:
+            raise TelegramSendPreflightError("outbound_budget_required")
+        if budget:
+            if not attempt_key:
+                raise TelegramSendPreflightError("outbound_idempotency_key_required")
+            try:
+                row = await budget.reserve(account.account_id, attempt_key=attempt_key,
+                    category=category, target_key=str(target), context=context)
+            except OutboundBudgetBlocked as exc:
+                raise TelegramSendPreflightError(str(exc), retry_after_seconds=exc.retry_after_seconds) from exc
+            if row.state != "reserved":
+                unknown = TelegramSendOutcomeUnknownError("outbound_original_attempt_requires_reconciliation")
+                unknown.telegram_message_id = row.message_id
+                raise unknown
+            details = {**details, "outbound_attempt_key": attempt_key}
+        attempted, message_id, rpc_error = False, None, None
+        try:
+            async with self._risk_operation(account, action, target_type=risk_target_type or ("group" if category != "diagnostic" else "official_bot"),
+                                            target_id=target, details=details):
+                if preflight:
+                    await preflight()
+                if on_send_attempted is not None:
+                    callback = on_send_attempted()
+                    if inspect.isawaitable(callback):
+                        await callback
+                if budget:
+                    await budget.mark_attempted(attempt_key, account_id=account.account_id)
+                attempted = True
+                try:
+                    result = await write()
+                except RPCError as exc:
+                    rpc_error = exc
+                    raise
+                except Exception as exc:
+                    rpc_error = TelegramSendOutcomeUnknownError("send_outcome_unknown:" + type(exc).__name__)
+                    raise rpc_error from exc
+                raw_id = getattr(result, "id", None) or getattr(result, "message_id", None)
+                try:
+                    message_id = int(raw_id) if raw_id is not None else None
+                except (TypeError, ValueError):
+                    message_id = None
+                if not message_id or message_id <= 0:
+                    rpc_error = TelegramSendOutcomeUnknownError("send_outcome_unknown:message_id_missing")
+                    raise rpc_error
+                if budget:
+                    await budget.finish(attempt_key, account_id=account.account_id,
+                                        state="succeeded", message_id=message_id)
+            return result
+        except Exception as exc:
+            # Audit/database errors must not rewrite a known Telegram result into a retry.
+            if budget:
+                try:
+                    await budget.db.rollback()
+                    await budget.finish(attempt_key, account_id=account.account_id,
+                        state="succeeded" if message_id else "failed" if isinstance(rpc_error, RPCError)
+                              else "unknown" if attempted else "cancelled",
+                        message_id=message_id, error_code=type(rpc_error or exc).__name__)
+                except Exception:
+                    pass  # attempted/reserved is durable and recovery remains responsible.
+            if not attempted:
+                if isinstance(exc, TelegramSendPreflightError):
+                    raise
+                raise TelegramSendPreflightError(str(exc), retry_after_seconds=getattr(exc, "retry_after_seconds", None)) from exc
+            if message_id:
+                unknown = TelegramSendOutcomeUnknownError("send_outcome_unknown:post_send_audit_failed:" + type(exc).__name__)
+                unknown.telegram_message_id = message_id
+                raise unknown from exc
+            if rpc_error is not None:
+                raise rpc_error from exc
+            raise TelegramSendOutcomeUnknownError("send_outcome_unknown:" + type(exc).__name__) from exc
+
     async def send_ad(
-        self,
-        account: Any,
-        target: int | str,
-        content: str,
-        *,
-        media_url: Optional[str] = None,
-        source: str = "acquisition_ad",
-        delivery_policy: str = "growth",
-        on_send_attempted: Optional[Callable[[], None]] = None,
+        self, account: Any, target: int | str, content: str, *,
+        media_url: Optional[str] = None, source: str = "acquisition_ad",
+        delivery_policy: str = "growth", on_send_attempted: Optional[Callable[[], Any]] = None,
+        reservation_token: Optional[str] = None,
     ) -> Optional[int]:
         client = self._get_client(account)
-        if client is None:
-            return None
+        if client is None or self.risk_guard is None:
+            raise TelegramSendPreflightError("qualification_execution_unavailable")
+        from app.modules.acquisition.qualification_service import current_authorization, send_gate
+        from app.modules.acquisition.qualification_actions import validate_live_send
 
-        async with self._risk_operation(
-            account,
-            AccountRiskAction.AD_DELIVERY,
-            target_type="group",
-            target_id=target,
-            details={
-                "source": source,
-                "content": content,
-                "media_url": media_url,
-                "delivery_policy": delivery_policy,
-            },
-        ):
-            if on_send_attempted is not None:
-                on_send_attempted()
+        async def preflight():
+            reason = await send_gate(self.risk_guard.db, account.account_id, target, content, media_url,
+                                     reservation_token=reservation_token)
+            if reason:
+                raise TelegramSendPreflightError(reason)
+            await validate_live_send(self.risk_guard.db, client, account.account_id, target)
+
+        await preflight()
+        audit, group, membership = await current_authorization(self.risk_guard.db, account.account_id, target)
+        if not audit or not group or not membership:
+            raise TelegramSendPreflightError("qualification_review_required")
+        import hashlib
+        context = {"content_hash": hashlib.sha256(content.encode()).hexdigest(),
+                   "qualification_audit_id": audit.id, "evidence_hash": audit.evidence_hash,
+                   "content_scope": audit.content_scope, "policy_version": audit.policy_version,
+                   "telegram_group_id": group.group_id, "membership_id": membership.id}
+        from app.modules.acquisition.adaptive_frequency import enabled, frequency_context
+        if await enabled(self.risk_guard.db, account.account_id):
+            from sqlalchemy import select
+            from app.modules.acquisition.models import AdDeliveryLog
+            reserved = await self.risk_guard.db.scalar(select(AdDeliveryLog).where(
+                AdDeliveryLog.reservation_token == reservation_token,
+                AdDeliveryLog.account_id == account.account_id,
+                AdDeliveryLog.group_id == group.id,
+            ))
+            if reserved is None or not frequency_context(reserved):
+                raise TelegramSendPreflightError("frequency_reservation_required")
+            context["frequency"] = frequency_context(reserved)
+        async def write():
             if media_url:
-                result = await client.send_file(target, media_url, caption=content)
-            else:
-                result = await client.send_message(target, content)
-        return getattr(result, "id", getattr(result, "message_id", None))
+                return await client.send_file(group.group_id, media_url, caption=content)
+            return await client.send_message(group.group_id, content, link_preview=False)
+        result = await self._budgeted_write(account, AccountRiskAction.AD_DELIVERY,
+            target=group.group_id, category="ad", attempt_key="ad:" + reservation_token if reservation_token else "",
+            context=context, details={"source": source, "content": content, "media_url": media_url,
+                "delivery_policy": delivery_policy, "reservation_token": reservation_token},
+            write=write, preflight=preflight, on_send_attempted=on_send_attempted)
+        return int(getattr(result, "id", None) or result.message_id)
+
+    async def _verification_preflight(self, account: Any) -> None:
+        if self.risk_guard is None:
+            raise TelegramSendPreflightError("verification_risk_guard_missing")
+        from app.modules.acquisition.qualification_service import (
+            account_block_reason, policy, verification_account_allowed,
+        )
+        from app.core.account.models import TelegramAccount
+        from datetime import datetime
+        config = await policy(self.risk_guard.db, fresh=True)
+        if not config.get("enabled") or not config.get("execute_verification"):
+            raise TelegramSendPreflightError("qualification_verification_paused")
+        if not verification_account_allowed(config, account.account_id):
+            raise TelegramSendPreflightError("qualification_account_outside_verification_scope")
+        if account_block_reason(await self.risk_guard.db.get(TelegramAccount, account.account_id, populate_existing=True), datetime.utcnow()):
+            raise TelegramSendPreflightError("qualification_account_unavailable")
+
+    async def _bot_verification_preflight(self, account: Any) -> None:
+        await self._verification_preflight(account)
+        from app.core.automation_settings import get_auto_join_scheduler_settings
+
+        settings = await get_auto_join_scheduler_settings(self.risk_guard.db)
+        if not settings.get("join_verification", {}).get("allow_second_hop_bots"):
+            raise TelegramSendPreflightError("qualification_second_hop_paused")
+
+    async def send_verification_answer(self, account: Any, entity: Any, text: str, *,
+            challenge_key: str, reply_to: int | None = None, source: str = "qualification_verification") -> Any:
+        import hashlib
+        from telethon.utils import get_peer_id
+        client = self._get_client(account)
+        if client is None or not challenge_key or not text.strip() or reply_to is None:
+            raise TelegramSendPreflightError("verification_context_required")
+        await self._verification_preflight(account)
+        target = get_peer_id(entity)
+        async def write():
+            return await client.send_message(entity, text, reply_to=reply_to, link_preview=False)
+        return await self._budgeted_write(account, AccountRiskAction.VERIFICATION_ANSWER,
+            target=target, category="verification", attempt_key="verification:" + hashlib.sha256(challenge_key.encode()).hexdigest(),
+            context={"challenge_key": challenge_key, "reply_to": reply_to},
+            details={"source": source, "content": text, "challenge_key": challenge_key}, write=write,
+            preflight=lambda: self._verification_preflight(account), require_budget=True)
+
+    async def send_verification_bot_text(
+        self, account: Any, bot_entity: Any, text: str, *, challenge_key: str,
+        group_id: int, source: str = "qualification_second_hop",
+    ) -> Any:
+        """Persist and budget one reply to a bot named by a verified group challenge."""
+        import hashlib
+        from telethon.utils import get_peer_id
+
+        client = self._get_client(account)
+        if (client is None or getattr(bot_entity, "bot", None) is not True
+                or not challenge_key or not text.strip() or len(text) > 160
+                or "\n" in text or "\r" in text):
+            raise TelegramSendPreflightError("verification_bot_context_required")
+        await self._bot_verification_preflight(account)
+        target = get_peer_id(bot_entity)
+
+        async def preflight():
+            await self._bot_verification_preflight(account)
+            current = await client.get_entity(bot_entity)
+            if (getattr(current, "bot", None) is not True
+                    or get_peer_id(current) != target):
+                raise TelegramSendPreflightError("verification_bot_identity_changed")
+
+        async def write():
+            return await client.send_message(bot_entity, text, link_preview=False)
+
+        return await self._budgeted_write(
+            account, AccountRiskAction.VERIFICATION_ANSWER,
+            target=target, category="verification",
+            attempt_key="verification_bot:" + hashlib.sha256(challenge_key.encode()).hexdigest(),
+            context={"challenge_key": challenge_key, "group_id": group_id,
+                     "bot_id": target, "content_hash": hashlib.sha256(text.encode()).hexdigest()},
+            details={"source": source, "content": text, "challenge_key": challenge_key},
+            write=write, preflight=preflight, require_budget=True,
+            risk_target_type="verification_bot",
+        )
+
+    async def click_verification_button(self, account: Any, entity: Any, message_id: int, data: bytes, *,
+            challenge_key: str, source: str = "qualification_verification",
+            risk_target_type: str = "group") -> Any:
+        from telethon.errors import RPCError
+        from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
+        from telethon.utils import get_peer_id
+        client = self._get_client(account)
+        if client is None or not challenge_key or not isinstance(data, bytes) or message_id <= 0:
+            raise TelegramSendPreflightError("verification_callback_context_required")
+        preflight = (
+            self._bot_verification_preflight
+            if risk_target_type == "verification_bot" else self._verification_preflight
+        )
+        await preflight(account)
+        async with self._risk_operation(account, AccountRiskAction.VERIFICATION_CALLBACK,
+                target_type=risk_target_type, target_id=get_peer_id(entity),
+                details={"source": source, "challenge_key": challenge_key, "message_id": message_id}):
+            await preflight(account)
+            try:
+                result = await client(GetBotCallbackAnswerRequest(peer=entity, msg_id=message_id, data=data))
+            except RPCError:
+                raise
+            except Exception as exc:
+                raise TelegramSendOutcomeUnknownError("verification_callback_outcome_unknown") from exc
+            if result is None:
+                raise TelegramSendOutcomeUnknownError("verification_callback_outcome_unknown")
+            return result
 
     async def check_managed_bot_username(
         self,
@@ -665,36 +901,74 @@ class TelegramExecutionService:
         username: str,
         source: str = "managed_bot_provision",
         on_username_submitted: Optional[Callable[[], Awaitable[None]]] = None,
+        provision_id: Optional[int] = None,
+        lease_id: Optional[str] = None,
     ) -> str:
-        """Create one Telegram bot through the @BotFather conversation.
+        """Run one leased provision against the verified official BotFather."""
+        from datetime import datetime
 
-        Works from any authenticated user session and returns the HTTP API
-        token straight from BotFather's confirmation message, so no
-        ``can_manage_bots`` manager bot is required.  ``on_username_submitted``
-        fires right before the username is sent: from that moment the bot may
-        exist remotely even if this call fails, and the caller must fence its
-        retry accordingly.
-        """
+        from app.core.account.models import ManagedBotProvision
 
         client = self._get_client(account)
         if client is None:
             raise TelegramExecutionError("telegram client unavailable")
+        if (self.risk_guard is None or not getattr(self.risk_guard, "db", None)
+                or not provision_id or not lease_id or on_username_submitted is None):
+            raise TelegramExecutionError("botfather_provision_context_required")
         normalized_name = _normalize_managed_bot_name(name)
         normalized_username = _normalize_managed_bot_username(username)
 
+        async def active_provision(*, allow_attempted: bool = False) -> Any:
+            row = await self.risk_guard.db.get(
+                ManagedBotProvision, int(provision_id), populate_existing=True
+            )
+            if (row is None or row.owner_account_id != getattr(account, "account_id", None)
+                    or row.status != "running" or row.current_step != "create_bot"
+                    or row.lease_id != lease_id or row.lease_expires_at is None
+                    or row.lease_expires_at <= datetime.utcnow()
+                    or row.username.casefold() != normalized_username.casefold()
+                    or row.display_name != normalized_name
+                    or not row.idempotency_key or not re.fullmatch(r"[0-9a-f]{64}", row.request_hash or "")
+                    or row.bot_user_id is not None or row.external_created_at is not None
+                    or (row.create_attempted_at is not None and not allow_attempted)):
+                raise TelegramExecutionError("botfather_provision_lease_invalid")
+            return row
+
+        row = await active_provision()
+        botfather = await client.get_entity("BotFather")
+        if (int(getattr(botfather, "id", 0) or 0) != 93372553
+                or getattr(botfather, "bot", None) is not True
+                or getattr(botfather, "verified", None) is not True
+                or str(getattr(botfather, "username", "") or "").casefold() != "botfather"):
+            raise TelegramExecutionError("botfather_official_identity_invalid")
+
+        async def fence_username_submission() -> None:
+            await active_provision()
+            await on_username_submitted()
+            recorded = await active_provision(allow_attempted=True)
+            if recorded.create_attempted_at is None:
+                raise TelegramExecutionError("botfather_create_fence_missing")
+
         async with self._risk_operation(
             account,
-            AccountRiskAction.PRIVATE_MESSAGE,
-            target_type="user",
-            target_id="botfather",
-            details={"source": source},
+            AccountRiskAction.MANAGED_BOT_CREATE,
+            target_type="official_botfather",
+            target_id=93372553,
+            details={
+                "source": "managed_bot_provision",
+                "provision_id": int(row.id),
+                "risk_reservation_id": f"managed-bot-{row.id}-{row.request_hash[:16]}",
+            },
         ):
+            # Revalidate after the asynchronous risk reservation before /newbot.
+            await active_provision()
             try:
                 return await self._botfather_new_bot_conversation(
                     client,
+                    botfather=botfather,
                     name=normalized_name,
                     username=normalized_username,
-                    on_username_submitted=on_username_submitted,
+                    on_username_submitted=fence_username_submission,
                 )
             except TelegramExecutionError:
                 raise
@@ -707,11 +981,12 @@ class TelegramExecutionService:
         self,
         client: Any,
         *,
+        botfather: Any,
         name: str,
         username: str,
         on_username_submitted: Optional[Callable[[], Awaitable[None]]],
     ) -> str:
-        async with client.conversation("botfather", timeout=45) as conv:
+        async with client.conversation(botfather, timeout=45) as conv:
             await conv.send_message("/newbot")
             await self._botfather_expect(conv, ("name", "robot"))
             await conv.send_message(name)
@@ -778,6 +1053,7 @@ class TelegramExecutionService:
         *,
         wait_seconds: int = 20,
         source: str = "account_spam_check",
+        attempt_key: str | None = None,
     ) -> str:
         """Ask Telegram's official @SpamBot and return its reply for classification."""
 
@@ -798,66 +1074,80 @@ class TelegramExecutionService:
         ):
             raise TelegramExecutionError("official_spambot_identity_mismatch")
 
-        async with self._risk_operation(
-            account,
-            AccountRiskAction.SPAM_CHECK,
-            target_type="official_bot",
-            target_id=int(entity_id),
-            details={"source": source},
-        ):
-            try:
-                sent = await client.send_message(entity, "/start")
-                sent_id = int(getattr(sent, "id", 0) or 0)
-                sent_at = getattr(sent, "date", None)
-                if sent_id <= 0 or sent_at is None:
-                    raise TelegramExecutionError("spambot_request_identity_missing")
-                deadline = asyncio.get_running_loop().time() + max(2, min(int(wait_seconds), 60))
-                while True:
-                    messages = await client.get_messages(entity, limit=10)
-                    if messages is None:
-                        candidates = []
-                    elif isinstance(messages, (list, tuple)):
+        async def write():
+            return await client.send_message(entity, "/start")
+        sent = None
+        budget = await self._outbound_service(account)
+        if budget and attempt_key:
+            from sqlalchemy import select
+            from app.core.account.models import AccountOutboundAttempt
+            original = await budget.db.scalar(select(AccountOutboundAttempt).where(
+                AccountOutboundAttempt.account_id == account.account_id,
+                AccountOutboundAttempt.attempt_key == attempt_key))
+            if original is not None and original.attempted_at is not None:
+                if not original.message_id:
+                    raise TelegramSendOutcomeUnknownError("spambot_original_request_requires_reconciliation")
+                sent = await client.get_messages(entity, ids=original.message_id)
+                if isinstance(sent, list):
+                    sent = sent[0] if sent else None
+                if sent is None or not getattr(sent, "out", False):
+                    raise TelegramSendOutcomeUnknownError("spambot_original_request_unavailable")
+        if sent is None:
+            sent = await self._budgeted_write(account, AccountRiskAction.SPAM_CHECK,
+                target=int(entity_id), category="diagnostic", attempt_key=attempt_key or "",
+                context={"source": "account_spam_check"}, details={"source": source}, write=write)
+        try:
+            sent_id = int(getattr(sent, "id", 0) or 0)
+            sent_at = getattr(sent, "date", None)
+            if sent_id <= 0 or sent_at is None:
+                raise TelegramExecutionError("spambot_request_identity_missing")
+            deadline = asyncio.get_running_loop().time() + max(2, min(int(wait_seconds), 60))
+            while True:
+                messages = await client.get_messages(entity, limit=10)
+                if messages is None:
+                    candidates = []
+                elif isinstance(messages, (list, tuple)):
+                    candidates = list(messages)
+                else:
+                    try:
                         candidates = list(messages)
-                    else:
-                        try:
-                            candidates = list(messages)
-                        except TypeError:
-                            candidates = [messages]
-                    for message in candidates:
-                        message_id = int(getattr(message, "id", 0) or 0)
-                        sender_id = getattr(message, "sender_id", None)
-                        if sender_id is None:
-                            sender_id = getattr(
-                                getattr(message, "from_id", None),
-                                "user_id",
-                                None,
-                            )
-                        message_at = getattr(message, "date", None)
-                        if (
-                            message_id <= sent_id
-                            or message_at is None
-                            or message_at < sent_at
-                            or bool(getattr(message, "out", False))
-                            or sender_id is None
-                            or int(sender_id) != _OFFICIAL_SPAMBOT_ID
-                        ):
-                            continue
-                        text = str(
-                            getattr(message, "raw_text", None)
-                            or getattr(message, "message", None)
-                            or ""
-                        ).strip()
-                        if text:
-                            return text
-                    if asyncio.get_running_loop().time() >= deadline:
-                        raise TelegramExecutionError("spambot_response_timeout")
-                    await asyncio.sleep(2)
-            except TelegramExecutionError:
-                raise
-            except Exception as exc:
-                raise TelegramExecutionError(
-                    f"spambot_request_failed:{type(exc).__name__}"
-                ) from exc
+                    except TypeError:
+                        candidates = [messages]
+                for message in candidates:
+                    message_id = int(getattr(message, "id", 0) or 0)
+                    sender_id = getattr(message, "sender_id", None)
+                    if sender_id is None:
+                        sender_id = getattr(
+                            getattr(message, "from_id", None),
+                            "user_id",
+                            None,
+                        )
+                    message_at = getattr(message, "date", None)
+                    if (
+                        message_id <= sent_id
+                        or message_at is None
+                        or message_at < sent_at
+                        or bool(getattr(message, "out", False))
+                        or sender_id is None
+                        or int(sender_id) != _OFFICIAL_SPAMBOT_ID
+                    ):
+                        continue
+                    text = str(
+                        getattr(message, "raw_text", None)
+                        or getattr(message, "message", None)
+                        or ""
+                    ).strip()
+                    if text:
+                        return text
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TelegramExecutionError("spambot_response_timeout")
+                await asyncio.sleep(2)
+        except TelegramExecutionError:
+            raise
+        except Exception as exc:
+            raise TelegramExecutionError(
+                f"spambot_request_failed:{type(exc).__name__}"
+            ) from exc
 
     async def update_profile_bio(
         self,
@@ -1260,13 +1550,35 @@ class TelegramExecutionService:
             result = await client.forward_messages(to_chat_id, message_id, from_chat_id)
         return getattr(result, "id", getattr(result, "message_id", None))
 
+    async def _validate_qualification_join(
+        self, entity: Any, *, action: AccountRiskAction = AccountRiskAction.JOIN
+    ) -> None:
+        # Owned-group resource workflows have their own operation/owner protections.
+        # No caller-controlled source string can bypass a normal JOIN action.
+        if action == AccountRiskAction.OWNED_GROUP_JOIN or self.risk_guard is None:
+            return
+        db = getattr(self.risk_guard, "db", None)
+        if db is None:
+            return
+        from app.modules.acquisition.qualification_join_gate import qualification_join_gate
+
+        try:
+            reason = await qualification_join_gate(db, entity)
+        except Exception as exc:
+            raise TelegramExecutionError("qualification_join_check_unavailable") from exc
+        if reason:
+            raise TelegramExecutionError(reason)
+
     async def join_group(
         self,
         account: Any,
         group: Any,
         *,
         source: str = "auto_join",
-        on_join_request_attempted: Optional[Callable[[], None]] = None,
+        join_reservation_key: str | None = None,
+        on_join_request_attempted: Optional[
+            Callable[[], Awaitable[None] | None]
+        ] = None,
     ) -> None:
         client = self._get_client(account)
         if client is None:
@@ -1282,7 +1594,7 @@ class TelegramExecutionService:
             AccountRiskAction.JOIN,
             target_type="group",
             target_id=target or getattr(group, "group_id", None),
-            details={"source": source},
+            details={"source": source, "join_reservation_key": join_reservation_key},
         ):
             entity = await client.get_entity(target)
             if not _is_joinable_telegram_entity(entity):
@@ -1290,10 +1602,30 @@ class TelegramExecutionService:
                     "target is a channel, only groups are allowed for auto join"
                 )
 
+            stored_group_id = getattr(group, "group_id", None)
+            if stored_group_id is not None:
+                from app.modules.acquisition.qualification_identity import (
+                    entity_identity,
+                    peer_identity,
+                )
+
+                stored_identity = peer_identity(stored_group_id)
+                resolved_identity = entity_identity(entity)
+                if (
+                    stored_identity is None
+                    or resolved_identity is None
+                    or stored_identity[0] != resolved_identity[0]
+                    or (
+                        stored_identity[1] is not None
+                        and stored_identity[1] != resolved_identity[1]
+                    )
+                ):
+                    raise TelegramExecutionError("join_target_identity_changed")
+
             from telethon.tl.functions.channels import JoinChannelRequest
 
-            if on_join_request_attempted is not None:
-                on_join_request_attempted()
+            await self._validate_qualification_join(entity)
+            await self._notify_join_request_attempted(on_join_request_attempted)
             await client(JoinChannelRequest(entity))
 
     async def join_group_by_link(
@@ -1302,7 +1634,11 @@ class TelegramExecutionService:
         group_link: str,
         *,
         source: str = "manual_link_join",
+        join_reservation_key: str | None = None,
         action: AccountRiskAction = AccountRiskAction.JOIN,
+        on_join_request_attempted: Optional[
+            Callable[[], Awaitable[None] | None]
+        ] = None,
     ) -> dict[str, Any]:
         """Join a public group or private invite and return resolved chat data."""
         client = self._get_client(account)
@@ -1311,59 +1647,167 @@ class TelegramExecutionService:
 
         parsed = parse_telegram_group_link(group_link)
         risk_target = parsed.target if parsed.kind == "public" else "private_invite"
-        async with self._risk_operation(
-            account,
-            action,
-            target_type="group",
-            target_id=risk_target,
-            details={"source": source, "link_type": parsed.kind},
-        ):
-            if parsed.kind == "public":
-                entity = await client.get_entity(parsed.target)
-                if not _is_joinable_telegram_entity(entity):
-                    raise TelegramExecutionError(
-                        "target is a broadcast channel; only groups and supergroups are allowed"
-                    )
+        if parsed.kind == "public":
+            entity = await client.get_entity(parsed.target)
+            if not _is_joinable_telegram_entity(entity):
+                raise TelegramExecutionError(
+                    "target is a broadcast channel; only groups and supergroups are allowed"
+                )
+            from telethon.tl.functions.channels import JoinChannelRequest
 
-                from telethon.tl.functions.channels import JoinChannelRequest
-
+            async with self._risk_operation(
+                account,
+                action,
+                target_type="group",
+                target_id=risk_target,
+                details={"source": source, "link_type": parsed.kind, "join_reservation_key": join_reservation_key},
+            ):
+                await self._validate_qualification_join(entity, action=action)
+                await self._notify_join_request_attempted(on_join_request_attempted)
                 try:
                     await client(JoinChannelRequest(entity))
                 except Exception as exc:
                     if exc.__class__.__name__ != "UserAlreadyParticipantError":
                         raise
-            else:
-                entity = await self._join_private_group(client, parsed.target)
+        else:
+            from telethon.tl.functions.messages import CheckChatInviteRequest
+            from telethon.tl.types import ChatInviteAlready
 
-            if not _is_joinable_telegram_entity(entity):
+            preview = await client(CheckChatInviteRequest(parsed.target))
+            existing_chat = getattr(preview, "chat", None)
+            if existing_chat is not None and not _is_joinable_telegram_entity(existing_chat):
                 raise TelegramExecutionError(
                     "target is a broadcast channel; only groups and supergroups are allowed"
                 )
+            if isinstance(preview, ChatInviteAlready):
+                entity = existing_chat
+            else:
+                if getattr(preview, "broadcast", False) and not (
+                    getattr(preview, "megagroup", False)
+                    or getattr(preview, "gigagroup", False)
+                ):
+                    raise TelegramExecutionError(
+                        "target is a broadcast channel; only groups and supergroups are allowed"
+                    )
+                async with self._risk_operation(
+                    account,
+                    action,
+                    target_type="group",
+                    target_id=risk_target,
+                    details={"source": source, "link_type": parsed.kind, "join_reservation_key": join_reservation_key},
+                ):
+                    await self._validate_qualification_join(existing_chat, action=action)
+                    await self._notify_join_request_attempted(
+                        on_join_request_attempted
+                    )
+                    entity = await self._join_private_group(
+                        client, parsed.target, preview=preview
+                    )
 
-            from telethon import utils
+        if not _is_joinable_telegram_entity(entity):
+            raise TelegramExecutionError(
+                "target is a broadcast channel; only groups and supergroups are allowed"
+            )
 
-            from app.modules.acquisition.search.group_finder import telegram_chat_to_dict
+        from telethon import utils
 
-            data = telegram_chat_to_dict(entity)
-            raw_id = int(data.get("id") or 0)
+        from app.modules.acquisition.search.group_finder import telegram_chat_to_dict
+
+        data = telegram_chat_to_dict(entity)
+        raw_id = int(data.get("id") or 0)
+        try:
+            data["id"] = int(utils.get_peer_id(entity))
+        except (TypeError, ValueError):
+            data["id"] = raw_id
+        data["raw_id"] = raw_id
+        if not data["id"]:
+            raise TelegramExecutionError("Telegram did not return the joined group ID")
+        return data
+
+    async def resolve_join_group_by_link_membership(
+        self,
+        account: Any,
+        group_link: str | int,
+    ) -> dict[str, Any] | None:
+        """Resolve an already-approved join request without sending another join."""
+
+        client = self._get_client(account)
+        if client is None:
+            raise TelegramExecutionError("telegram client unavailable")
+
+        parsed = parse_telegram_group_link(group_link) if isinstance(group_link, str) else None
+        confirmed_by_invite = False
+        if parsed is not None and parsed.kind == "private":
+            from telethon.tl.functions.messages import CheckChatInviteRequest
+            from telethon.tl.types import ChatInviteAlready
+
+            preview = await client(CheckChatInviteRequest(parsed.target))
+            entity = getattr(preview, "chat", None)
+            if entity is None:
+                return None
+            confirmed_by_invite = isinstance(preview, ChatInviteAlready)
+        else:
+            entity = await client.get_entity(parsed.target if parsed else group_link)
+
+        if not _is_joinable_telegram_entity(entity):
+            raise TelegramExecutionError(
+                "target is a broadcast channel; only groups and supergroups are allowed"
+            )
+
+        if not confirmed_by_invite:
             try:
-                data["id"] = int(utils.get_peer_id(entity))
-            except (TypeError, ValueError):
-                data["id"] = raw_id
-            data["raw_id"] = raw_id
-            if not data["id"]:
-                raise TelegramExecutionError("Telegram did not return the joined group ID")
-            return data
+                if hasattr(client, "get_permissions"):
+                    permission = await client.get_permissions(entity, "me")
+                    if permission is None or not hasattr(permission, "has_left"):
+                        raise TelegramExecutionError("join_membership_permission_unknown")
+                    participant = getattr(permission, "participant", None)
+                    if (permission.has_left or getattr(entity, "left", False)
+                            or type(participant).__name__.endswith("Left")
+                            or getattr(getattr(participant, "banned_rights", None), "view_messages", False)):
+                        return None
+                else:
+                    from telethon.tl.functions.channels import GetParticipantRequest
 
-    async def _join_private_group(self, client: Any, invite_hash: str) -> Any:
+                    me = await client.get_me()
+                    await client(GetParticipantRequest(entity, me))
+            except Exception as exc:
+                if exc.__class__.__name__ in {
+                    "UserNotParticipantError",
+                }:
+                    return None
+                raise
+
+        from telethon import utils
+
+        from app.modules.acquisition.search.group_finder import telegram_chat_to_dict
+
+        data = telegram_chat_to_dict(entity)
+        raw_id = int(data.get("id") or 0)
+        try:
+            data["id"] = int(utils.get_peer_id(entity))
+        except (TypeError, ValueError):
+            data["id"] = raw_id
+        data["raw_id"] = raw_id
+        if not data["id"]:
+            raise TelegramExecutionError("Telegram did not return the joined group ID")
+        return data
+
+    async def _join_private_group(
+        self,
+        client: Any,
+        invite_hash: str,
+        *,
+        preview: Any | None = None,
+    ) -> Any:
         from telethon.tl.functions.messages import (
             CheckChatInviteRequest,
             ImportChatInviteRequest,
         )
+        from telethon.tl.types import ChatInviteAlready
 
-        preview = await client(CheckChatInviteRequest(invite_hash))
+        preview = preview or await client(CheckChatInviteRequest(invite_hash))
         existing_chat = getattr(preview, "chat", None)
-        if existing_chat is not None:
+        if isinstance(preview, ChatInviteAlready):
             return existing_chat
         if getattr(preview, "broadcast", False) and not (
             getattr(preview, "megagroup", False) or getattr(preview, "gigagroup", False)
@@ -1384,7 +1828,7 @@ class TelegramExecutionService:
                 raise
             checked = await client(CheckChatInviteRequest(invite_hash))
             existing_chat = getattr(checked, "chat", None)
-            if existing_chat is None:
+            if not isinstance(checked, ChatInviteAlready):
                 raise TelegramExecutionError("unable to resolve the group already joined") from exc
             return existing_chat
 
@@ -1402,6 +1846,10 @@ class TelegramExecutionService:
         group_id: int,
         source: str = "auto_join",
     ) -> None:
+        if self.risk_guard is not None and await is_owned_group_target(
+            self.risk_guard.db, telegram_group_id=group_id,
+        ):
+            raise TelegramExecutionError("owned_group_protected")
         client = self._get_client(account)
         if client is None:
             raise TelegramExecutionError("telegram client unavailable")

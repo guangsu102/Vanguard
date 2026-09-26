@@ -38,6 +38,7 @@ from app.core.account.operation_lease import (
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
 from app.core.account.session_crypto import decrypt_session_string
+from app.core.account.rpc_governor import RpcDeferred, RpcGovernor, install_governor
 from app.core.account.session_files import resolve_telegram_session_file
 from app.core.network.fingerprint import FingerprintManager
 from app.modules.owned_group.security import safe_exception_message
@@ -121,6 +122,7 @@ class TelegramAccountWrapper:
     operation_lease_renewal_task: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     operation_lease_lost: bool = field(default=False, repr=False)
     release_status_override: Optional[AccountStatus] = field(default=None, repr=False)
+    active_purpose: str = field(default="listener", repr=False)
 
     def get_client(self) -> Optional[TelegramClient]:
         """Get the bound Telegram client."""
@@ -702,9 +704,12 @@ class AccountPool:
                 self.logger.warning("no_unlocked_accounts", purpose=purpose)
                 return None
             previous_status = selected.status
+            selected.active_purpose = purpose
             selected.status = AccountStatus.WORKING
 
             try:
+                if selected.client is not None and getattr(selected.client, "_vanguard_governor", None) is not None:
+                    await selected.client._vanguard_governor.before([])
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 if (
@@ -718,6 +723,10 @@ class AccountPool:
                     country=selected.country_code,
                     proxy_host=selected.current_proxy.host if selected.current_proxy else None,
                 )
+            except RpcDeferred:
+                selected.status = previous_status
+                await self._release_operation_lease(selected)
+                raise
             except asyncio.CancelledError:
                 selected.status = previous_status
                 await self._release_operation_lease(selected)
@@ -813,6 +822,7 @@ class AccountPool:
                 return None
 
             previous_status = selected.status
+            selected.active_purpose = purpose
             selected.release_status_override = (
                 AccountStatus.RESTRICTED
                 if previous_status == AccountStatus.RESTRICTED
@@ -821,6 +831,8 @@ class AccountPool:
             selected.status = AccountStatus.WORKING
 
             try:
+                if selected.client is not None and getattr(selected.client, "_vanguard_governor", None) is not None:
+                    await selected.client._vanguard_governor.before([])
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 if (
@@ -828,6 +840,12 @@ class AccountPool:
                     or not getattr(selected.client, "is_connected", lambda: False)()
                 ):
                     selected.client = await self._create_client(selected)
+            except RpcDeferred:
+                selected.status = previous_status
+                selected.release_status_override = None
+                if operation_lease is None:
+                    await self._release_operation_lease(selected)
+                raise
             except asyncio.CancelledError:
                 selected.status = previous_status
                 selected.release_status_override = None
@@ -911,6 +929,9 @@ class AccountPool:
                     connected_now = True
                 selected.keep_connected = keep_connected
                 selected.status = AccountStatus.IDLE
+            except RpcDeferred:
+                # Waiting is not a broken session; the listener may reconnect at expiry.
+                raise
             except Exception as e:
                 selected.status = AccountStatus.ERROR
                 self.logger.warning(
@@ -1003,12 +1024,22 @@ class AccountPool:
             retry_delay=TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS,
             timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
             base_logger=f"vanguard.telethon.account.{account.account_id}",
+            flood_sleep_threshold=0,
         )
-        await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            raise RuntimeError(f"account {account.session_name} is not authorized")
-        return client
+        install_governor(client, RpcGovernor(
+            account.account_id, lambda: account.active_purpose,
+            budget_reads=account.account_type == AccountType.PROMOTER,
+        ))
+        try:
+            await client._vanguard_governor.before([])
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError(f"account {account.session_name} is not authorized")
+            return client
+        except BaseException:
+            with suppress(Exception):
+                await client.disconnect()
+            raise
 
     def _validate_runtime_environment(self, account: TelegramAccountWrapper) -> None:
         ok, reason = AccountEnvironmentGuard.validate_account_environment(account)

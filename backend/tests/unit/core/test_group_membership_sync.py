@@ -70,7 +70,7 @@ async def test_upsert_synced_group_membership_creates_group_and_membership(db_se
     assert group.title == "Already Joined"
     assert group.username == "already_joined"
     assert group.discovery_source == "account_dialog_sync"
-    assert group.status == "active"
+    assert group.status == "pending"
     assert group.level != GroupLevel.UNRATED
     assert float(group.level_score) > 0
     assert group.rule_score > 0
@@ -80,6 +80,10 @@ async def test_upsert_synced_group_membership_creates_group_and_membership(db_se
     assert membership.account_id == account.id
     assert membership.status == "joined"
     assert membership.join_method == "account_dialog_sync"
+    assert membership.review_status == "initial_pending"
+    assert membership.review_started_at is not None
+    assert membership.review_next_at is not None
+    assert membership.review_deadline_at is not None
 
 
 @pytest.mark.asyncio
@@ -158,6 +162,8 @@ async def test_upsert_synced_group_membership_refreshes_existing_left_membership
     assert refreshed.id == first.id
     assert refreshed.status == "joined"
     assert refreshed.left_at is None
+    assert refreshed.review_status == "initial_pending"
+    assert refreshed.review_started_at is not None
     group = (await db_session.execute(select(Group).where(Group.group_id == 777))).scalar_one()
     assert group.title == "New Title"
     assert group.username == "new_title"

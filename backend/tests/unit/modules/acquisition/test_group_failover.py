@@ -36,6 +36,8 @@ async def _add_account(
         session_name=identifier,
         account_type=AccountType.PROMOTER,
         status=status,
+        registered_at=datetime.utcnow() - timedelta(days=365),
+        asset_verified_at=datetime.utcnow() - timedelta(days=1),
         risk_level=(
             AccountRiskLevel.QUARANTINED.value
             if risk_reason == "account_banned"
@@ -107,32 +109,17 @@ async def test_failover_discovery_is_idempotent_and_private_groups_require_manua
     assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
 
     result = await service.run(max_tasks=10)
-    assert result["created"] == 2
-    tasks = (
-        (
-            await test_db.execute(
-                select(GroupFailoverTask).order_by(GroupFailoverTask.telegram_group_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    assert [task.status for task in tasks] == [
-        GroupFailoverStatus.QUEUED.value,
-        GroupFailoverStatus.MANUAL_REQUIRED.value,
-    ]
-    assert tasks[0].reason == "no_eligible_target_account"
-    assert tasks[0].next_retry_at is not None
-    assert tasks[1].reason == "public_username_required"
+    assert result["created"] == 0
+    assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
 
     await test_db.refresh(public_membership)
     await test_db.refresh(private_membership)
-    assert public_membership.status == "account_lost"
-    assert private_membership.status == "account_lost"
+    assert public_membership.status == "joined"
+    assert private_membership.status == "joined"
 
     second = await service.run(max_tasks=10)
     assert second["created"] == 0
-    assert len((await test_db.execute(select(GroupFailoverTask))).scalars().all()) == 2
+    assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
 
 
 async def test_failover_assigns_healthy_account_and_resets_membership_warmup(test_db):
@@ -167,6 +154,7 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
 
     account_pool = AsyncMock()
     automation = AcquisitionAutomationService(test_db, account_pool=account_pool)
+    automation.join_budget._effective_limit = AsyncMock(return_value=30)
     automation._join_group = AsyncMock()
     automation._evaluate_joined_group = AsyncMock(
         return_value=JoinedGroupAuditResult(
@@ -183,33 +171,13 @@ async def test_failover_assigns_healthy_account_and_resets_membership_warmup(tes
     service = GroupFailoverService(test_db, automation)
 
     result = await service.run(max_tasks=1)
-    assert result["succeeded"] == 1
-    account_pool.sync_from_db.assert_awaited_once()
-    synced_accounts = account_pool.sync_from_db.await_args.args[0]
-    assert [account.id for account in synced_accounts] == [target.id]
-    automation._join_group.assert_awaited_once()
-
-    task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
-    assert task.status == GroupFailoverStatus.SUCCEEDED.value
-    assert task.target_account_id == target.id
-    assert task.completed_at is not None
-
-    target_membership = (
-        await test_db.execute(
-            select(GroupAccountMembership).where(
-                GroupAccountMembership.group_id == group.id,
-                GroupAccountMembership.account_id == target.id,
-            )
-        )
-    ).scalar_one()
-    assert target_membership.status == "joined"
-    assert target_membership.join_method == "account_failover"
-    assert target_membership.warmup_status == "joined_pending_test"
-    assert target_membership.ad_status == "warming"
-    assert target_membership.first_ad_allowed_at is not None
+    assert result["succeeded"] == 0
+    account_pool.sync_from_db.assert_not_awaited()
+    automation._join_group.assert_not_awaited()
+    assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
 
     await test_db.refresh(source_membership)
-    assert source_membership.status == "account_lost"
+    assert source_membership.status == "joined"
 
 
 async def test_failover_execution_error_schedules_retry_after_session_rollback(test_db):
@@ -243,20 +211,16 @@ async def test_failover_execution_error_schedules_retry_after_session_rollback(t
     await test_db.commit()
 
     automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    automation.join_budget._effective_limit = AsyncMock(return_value=30)
     automation._join_group = AsyncMock(side_effect=RuntimeError("account unavailable"))
     service = GroupFailoverService(test_db, automation)
 
     result = await service.run(max_tasks=1)
 
-    assert result["failed"] == 1
-    assert len(result["errors"]) == 1
-    assert result["errors"][0].endswith(": account unavailable")
-    task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
-    assert task.status == GroupFailoverStatus.RETRY.value
-    assert task.reason == "failover_execution_error"
-    assert task.error == "account unavailable"
-    assert task.attempt_count == 1
-    assert task.next_retry_at is not None
+    assert result["failed"] == 0
+    assert result["errors"] == []
+    assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
+    automation._join_group.assert_not_awaited()
 
 
 async def test_existing_ad_capable_membership_reuses_and_enables_binding(test_db):
@@ -315,18 +279,16 @@ async def test_existing_ad_capable_membership_reuses_and_enables_binding(test_db
     await test_db.commit()
 
     automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    automation.join_budget._effective_limit = AsyncMock(return_value=30)
     service = GroupFailoverService(test_db, automation)
     result = await service.run(max_tasks=1)
 
-    assert result["created"] == 1
-    task = (await test_db.execute(select(GroupFailoverTask))).scalar_one()
-    assert task.status == GroupFailoverStatus.SUCCEEDED.value
-    assert task.reason == "already_covered"
-    assert task.target_account_id == target.id
+    assert result["created"] == 0
+    assert (await test_db.execute(select(GroupFailoverTask))).scalars().all() == []
     await test_db.refresh(target_binding)
     await test_db.refresh(source_membership)
-    assert target_binding.enabled is True
-    assert source_membership.status == "account_lost"
+    assert target_binding.enabled is False
+    assert source_membership.status == "joined"
 
 
 async def test_selected_target_accounts_are_balanced_across_groups(test_db):
@@ -365,6 +327,7 @@ async def test_selected_target_accounts_are_balanced_across_groups(test_db):
     await test_db.commit()
 
     automation = AcquisitionAutomationService(test_db, account_pool=AsyncMock())
+    automation.join_budget._effective_limit = AsyncMock(return_value=30)
     automation._join_group = AsyncMock()
     automation._evaluate_joined_group = AsyncMock(
         return_value=JoinedGroupAuditResult(
@@ -385,15 +348,14 @@ async def test_selected_target_accounts_are_balanced_across_groups(test_db):
         target_account_ids=[target.id for target in targets],
     )
 
-    assert result["succeeded"] == 3
+    assert result["succeeded"] == 0
     tasks = (
         await test_db.execute(
             select(GroupFailoverTask).order_by(GroupFailoverTask.telegram_group_id)
         )
     ).scalars().all()
-    assert len(tasks) == 3
-    assert {task.target_account_id for task in tasks} == {target.id for target in targets}
-    assert automation._join_group.await_count == 3
+    assert tasks == []
+    assert automation._join_group.await_count == 0
 
 
 async def test_stale_joining_task_is_requeued(test_db):

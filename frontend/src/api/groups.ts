@@ -14,6 +14,7 @@ export type GroupLevel = 'A' | 'B' | 'C' | 'unrated'
 export type DiscoverySource = 'manual' | 'keyword_search' | 'auto_keyword_search' | 'related_group' | 'import'
 
 export interface GroupMetrics {
+  collection?: { status?: string; stale?: boolean; member_count_source?: string; member_count_checked_at?: string; online_count?: number; online_count_checked_at?: string; last_result?: string; error?: string }
   adsSent: number
   groupReplies: number
   privateMessages: number
@@ -122,6 +123,7 @@ const toCamelGroup = (raw: any): Group => {
     accountCount: Number(raw.account_count ?? raw.accountCount ?? 0),
     primaryAccountPhone: raw.primary_account_phone || raw.primaryAccountPhone || '',
     metrics: {
+      collection: metrics.collection,
       adsSent: Number(metrics.ads_sent ?? metrics.adsSent ?? defaultMetrics.adsSent),
       groupReplies: Number(metrics.group_replies ?? metrics.groupReplies ?? defaultMetrics.groupReplies),
       privateMessages: Number(metrics.private_messages ?? metrics.privateMessages ?? defaultMetrics.privateMessages),

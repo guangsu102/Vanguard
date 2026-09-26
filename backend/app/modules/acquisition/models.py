@@ -328,6 +328,42 @@ class AutoJoinAttempt(Base):
         nullable=False,
         comment="是否已实际调用 Telegram 加群请求",
     )
+    request_state: Mapped[str] = mapped_column(
+        String(30),
+        default="released",
+        server_default="released",
+        nullable=False,
+        comment="请求预算状态: reserved/sent/outcome_unknown/released",
+    )
+    reservation_key: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True, unique=True, comment="加群请求持久化预留幂等键"
+    )
+    target_key: Mapped[Optional[str]] = mapped_column(
+        String(500), nullable=True, comment="规范化加群目标，用于未知结果核对"
+    )
+    require_auto_join_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+        nullable=False,
+        comment="发送前是否要求账号自动加群开关保持开启",
+    )
+    reserved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="请求额度预留时间"
+    )
+    reservation_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="未发送预留失效时间"
+    )
+    request_sent_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="实际发出 Telegram 加群请求时间"
+    )
+    reservation_released_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, comment="未发送预留释放时间"
+    )
+    reconciliation_status: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending", nullable=False)
+    reconciliation_failure_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    reconciliation_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reconciliation_next_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     attempted_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )
@@ -344,8 +380,21 @@ class AutoJoinAttempt(Base):
             "telegram_action_attempted",
             "attempted_at",
         ),
+        Index(
+            "idx_auto_join_account_request_state",
+            "account_id",
+            "request_state",
+            "request_sent_at",
+        ),
         Index("idx_auto_join_attempted_at", "attempted_at"),
+        Index("idx_auto_join_reconciliation_due", "reconciliation_next_at", "request_sent_at"),
         Index("idx_auto_join_tg_group", "telegram_group_id"),
+        Index(
+            "idx_auto_join_account_target_state",
+            "account_id",
+            "target_key",
+            "request_state",
+        ),
     )
 
 
@@ -1054,6 +1103,35 @@ class AcquisitionCampaign(Base):
 # =============================================================================
 
 
+class GroupAdFrequency(Base):
+    """Group-wide quota keyed by a namespace-qualified Telegram peer."""
+    __tablename__ = "group_ad_frequency"
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    quota: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    epoch: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    epoch_started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    mature: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="active", nullable=False)
+    pause_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    promote_after: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    reason: Mapped[Optional[str]] = mapped_column(String(160))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (CheckConstraint("quota >= 1 AND quota <= 30", name="frequency_quota_range"),)
+
+
+class GroupAdFrequencyEvent(Base):
+    __tablename__ = "group_ad_frequency_event"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_group_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    log_id: Mapped[int] = mapped_column(Integer, ForeignKey("ad_delivery_log.id"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    epoch: Mapped[int] = mapped_column(Integer, nullable=False)
+    old_quota: Mapped[int] = mapped_column(Integer, nullable=False)
+    new_quota: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (UniqueConstraint("log_id", "kind", name="uq_frequency_log_event"),)
+
+
 class AdCreative(Base):
     """Managed advertisement creative."""
 
@@ -1499,6 +1577,10 @@ class AdDeliveryLog(Base):
     survival_retry_count: Mapped[int] = mapped_column(
         Integer, default=0, nullable=False, comment="存活检测重试次数"
     )
+    survival_claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    survival_claim_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    survival_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    qualification_context_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     reservation_token: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True, comment="广告发送预留幂等标识"
     )
@@ -1635,10 +1717,10 @@ class GroupAdHandover(Base):
         Integer, default=0, server_default="0", nullable=False
     )
     join_interval_min_minutes: Mapped[int] = mapped_column(
-        Integer, default=1, server_default="1", nullable=False
+        Integer, default=48, server_default="48", nullable=False
     )
     join_interval_max_minutes: Mapped[int] = mapped_column(
-        Integer, default=30, server_default="30", nullable=False
+        Integer, default=120, server_default="120", nullable=False
     )
     next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     invite_link_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -1771,4 +1853,32 @@ class GroupAdOnlyEvent(Base):
             "handover_id",
             "created_at",
         ),
+    )
+
+
+class GroupQualificationAudit(Base):
+    """Durable account/member-scoped evidence, including queued read-only reviews."""
+    __tablename__ = "group_qualification_audit"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    batch_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    membership_id: Mapped[int] = mapped_column(ForeignKey("group_account_membership.id"), nullable=False)
+    account_id: Mapped[int] = mapped_column(ForeignKey("telegram_account.id"), nullable=False)
+    group_id: Mapped[int] = mapped_column(ForeignKey("group.id"), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_scope: Mapped[str] = mapped_column(String(64), default="text_profile", nullable=False)
+    state: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    decision: Mapped[str] = mapped_column(String(32), default="unknown", nullable=False)
+    evidence_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    evidence_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    membership_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    __table_args__ = (
+        UniqueConstraint("batch_id", "membership_id", name="uq_group_qualification_batch_member"),
+        Index("idx_group_qualification_due", "state", "next_retry_at"),
+        Index("idx_group_qualification_member", "membership_id", "checked_at"),
     )

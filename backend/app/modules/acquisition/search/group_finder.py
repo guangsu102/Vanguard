@@ -32,6 +32,9 @@ class TelegramFloodWaitError(RuntimeError):
 
 
 def extract_flood_wait_seconds(exc: Exception) -> Optional[int]:
+    from app.core.account.rpc_governor import RpcDeferred
+    if isinstance(exc, RpcDeferred):
+        return None
     seconds = getattr(exc, "seconds", None) or getattr(exc, "value", None)
     try:
         if seconds is not None:

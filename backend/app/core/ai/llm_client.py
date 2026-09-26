@@ -228,6 +228,7 @@ class LLMClient:
         provider: LLMProvider = LLMProvider.OPENAI,
         api_key: str | None = None,
         base_url: str | None = None,
+        openai_extra_body: dict[str, Any] | None = None,
         cache_ttl: int = 3600,
     ):
         """
@@ -237,6 +238,7 @@ class LLMClient:
             provider: LLM provider to use
             api_key: API key for the provider
             base_url: Optional OpenAI-compatible API base URL
+            openai_extra_body: Optional provider-specific OpenAI request parameters
             cache_ttl: Cache TTL in seconds
         """
         self.provider = provider
@@ -245,6 +247,10 @@ class LLMClient:
         )
         raw_base_url = base_url or (settings.OPENAI_BASE_URL if provider == LLMProvider.OPENAI else None)
         self.base_url = self._normalize_openai_base_url(raw_base_url) if provider == LLMProvider.OPENAI else None
+        self.openai_extra_body = {}
+        if provider == LLMProvider.OPENAI and settings.LLM_REASONING_EFFORT.strip():
+            self.openai_extra_body["reasoning_effort"] = settings.LLM_REASONING_EFFORT.strip()
+        self.openai_extra_body.update(openai_extra_body or {})
         self.cache = RedisCache()
         self.cache_ttl = cache_ttl
         self.stats = CostStats()
@@ -253,11 +259,19 @@ class LLMClient:
     def model_for(self, tier: str) -> str:
         """Resolve a model tier using runtime configuration where applicable."""
         if self.provider == LLMProvider.OPENAI:
+            if settings.LLM_MODEL_OVERRIDE.strip():
+                return settings.LLM_MODEL_OVERRIDE.strip()
             if tier == "fast":
                 return settings.LLM_FAST_MODEL
             if tier == "balanced":
                 return settings.LLM_MODEL
         return self.MODELS[self.provider][tier]
+
+    def _effective_model(self, model: str | None) -> str:
+        """Resolve the production model before cache lookup, logging, and provider I/O."""
+        if self.provider == LLMProvider.OPENAI and settings.LLM_MODEL_OVERRIDE.strip():
+            return settings.LLM_MODEL_OVERRIDE.strip()
+        return model if model is not None else self.model_for("balanced")
 
     def capabilities(self) -> LLMProviderCapabilities:
         """Return immutable local capabilities without making a provider request."""
@@ -390,7 +404,7 @@ class LLMClient:
                 "AI provider does not preserve the system role",
             )
 
-        resolved_model = model if model is not None else self.model_for("balanced")
+        resolved_model = self._effective_model(model)
         resolved_temperature = 0.7 if temperature is None else temperature
         resolved_max_tokens = 500 if max_tokens is None else max_tokens
         estimated_input_tokens = self._estimate_persona_input_tokens(
@@ -692,7 +706,7 @@ class LLMClient:
         if not base_url:
             return None
         normalized = base_url.rstrip("/")
-        if normalized.endswith("/v1") or "/v1/" in normalized:
+        if re.search(r"/v\d+(?:/|$)", normalized):
             return normalized
         return f"{normalized}/v1"
 
@@ -731,8 +745,7 @@ class LLMClient:
         Returns:
             Generated content
         """
-        if model is None:
-            model = self.model_for("balanced")
+        model = self._effective_model(model)
 
         cache_key = self._get_cache_key(prompt, model, temperature, system_prompt)
         cached = await self.cache.get(cache_key)
@@ -786,6 +799,7 @@ class LLMClient:
         max_tokens: int,
     ) -> str:
         """Call OpenAI API."""
+        model = self._effective_model(model)
         try:
             from openai import AsyncOpenAI, Timeout
 
@@ -806,6 +820,7 @@ class LLMClient:
                         messages=messages,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        **({"extra_body": self.openai_extra_body} if self.openai_extra_body else {}),
                     )
             except Exception as exc:
                 # Caller cancellation (for example the group audit's 45s
@@ -1022,6 +1037,8 @@ class LLMClient:
     ) -> str:
         """Generate cache key for prompt."""
         content = f"{prompt}:{model}:{temperature}:{system_prompt}"
+        if self.openai_extra_body:
+            content += f":{self.base_url}:{json.dumps(self.openai_extra_body, sort_keys=True)}"
         return f"llm:{hashlib.md5(content.encode()).hexdigest()}"
 
     def _estimate_tokens(self, prompt: str, response: str) -> int:
