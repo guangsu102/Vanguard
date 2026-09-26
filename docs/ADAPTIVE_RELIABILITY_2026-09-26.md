@@ -10,3 +10,5 @@
 - Telegram 的 `ChannelParticipantBanned` 也表示仍在群内的禁言成员；使用离群标记和查看权限区分禁言与被踢出。
 
 相关回归入口：`test_adaptive_review_regressions.py`、`test_rpc_listener_priority.py`、`test_three_day_send_restriction.py`，以及原资格审核、退出保护、账号预算和并发测试。
+
+删帖事件回查的 PostgreSQL 行锁限定于广告记录表；关联群和广告配置的外连接不参与行锁，避免事件处理在生产数据库中报错。

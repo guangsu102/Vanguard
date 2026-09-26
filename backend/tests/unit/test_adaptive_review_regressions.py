@@ -217,3 +217,33 @@ async def test_native_muted_member_is_distinct_from_expulsion(left, view_blocked
     assert permission.is_banned is True
     result = live_restriction(Obj(default_banned_rights=None), permission, now)
     assert result["permissions"]["member"] is expected_member
+
+
+async def test_deletion_event_locks_delivery_without_locking_nullable_joins(test_db, monkeypatch):
+    from sqlalchemy.dialects.postgresql import dialect
+
+    from app.modules.acquisition.adaptive_frequency import queue_deleted_observation
+    from tests.unit.test_adaptive_group_frequency import TARGET, delivery
+
+    account, config, campaign, frequency, state = await frequency_setup(test_db)
+    log = await delivery(test_db, account, campaign, state, NOW)
+    await test_db.commit()
+    original = test_db.scalars
+    statements = []
+
+    async def checked(statement, *args, **kwargs):
+        sql = str(statement.compile(dialect=dialect()))
+        statements.append(sql)
+        assert "LEFT OUTER JOIN" in sql
+        assert "FOR UPDATE OF ad_delivery_log" in sql
+        return await original(statement, *args, **kwargs)
+
+    monkeypatch.setattr(test_db, "scalars", checked)
+    await queue_deleted_observation(
+        test_db, account.id, Obj(chat_id=TARGET, deleted_ids=[log.telegram_message_id])
+    )
+    assert len(statements) == 1
+    assert (
+        log.survival_status == "pending"
+        and log.survival_error == "deletion_event_requires_confirmation"
+    )

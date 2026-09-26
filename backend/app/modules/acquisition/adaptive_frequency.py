@@ -612,7 +612,7 @@ async def queue_deleted_observation(db: Any, account_id: int, event: Any) -> Non
                     AdDeliveryLog.telegram_message_id.in_(ids),
                     AdDeliveryLog.status == "success",
                 )
-                .with_for_update()
+                .with_for_update(of=AdDeliveryLog)
             )
         ).all()
     )
