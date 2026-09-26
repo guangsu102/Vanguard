@@ -242,7 +242,11 @@ async def test_deletion_needs_two_successful_reads_no_ttl_or_transport_failure()
     assert negative_observation(facts, previous, NOW) == "deleted"
     assert negative_observation({**facts, "errors": ["FloodWait"]}, previous, NOW) is None
     assert negative_observation({**facts, "ttl_period": 60}, previous, NOW) is None
-    assert negative_observation({**facts, "member_muted": True}, [], NOW) == "muted"
+    assert negative_observation({**facts, "member_muted": True, "can_send": False}, [], NOW) is None
+    permission = {"member": True, "can_send_text": False, "restriction_evidence": "telegram_banned_rights",
+                  "permanent_send_restriction_verified": True}
+    assert negative_observation({**facts, "member_muted": True, "can_send": False,
+                                 "send_restriction": permission}, [], NOW) == "muted"
 
 
 async def test_rule_frequency_limit_caps_current_scheduling_and_ignores_member_claims(test_db):
@@ -406,6 +410,11 @@ async def test_pending_live_mute_has_exit_evidence_and_blocks_rejoin(test_db):
     test_db.add(SystemSetting(key="automation.group_qualification", value='{"enabled":true}'))
     await test_db.commit()
     await record_live_mute(test_db, a.id, TARGET, {})
+    assert state.status == "active"  # Missing duration evidence never authorizes an exit.
+    await record_live_mute(test_db, a.id, TARGET, {"permissions": {
+        "member": True, "can_send_text": False, "restriction_evidence": "telegram_banned_rights",
+        "permanent_send_restriction_verified": True,
+    }})
     assert state.status == "exit_pending"
     assert await svc.exit_reason(a.id, group, member) == "frequency_muted"
     assert await qualification_join_gate(test_db, PeerChannel(123)) == "frequency_rejoin_blocked"
@@ -592,3 +601,20 @@ async def test_survival_worker_requires_two_confirmed_reads_before_downshift(tes
     assert state.quota == 4 and state.epoch == 2 and log.survival_status == "deleted"
     assert state.pause_until == again + timedelta(days=1)
     assert worker._inspect_ad_survival_facts.await_count == 2
+
+
+async def test_mature_sends_do_not_consume_thirty_probe_allowance(test_db):
+    a, c, camp, svc, state = await setup(test_db)
+    for i in range(60):
+        test_db.add(AccountOutboundAttempt(
+            account_id=a.id, attempt_key=f"mature-old-{i}", category="ad",
+            target_key=str(i), state="succeeded", attempted_at=NOW - timedelta(hours=2),
+            context_json=json.dumps({"frequency": {"lane": "mature"}}),
+        ))
+    await test_db.commit()
+    budget = AccountOutboundBudgetService(test_db)
+    info = await budget.snapshot(a.id, NOW)
+    assert info["ad_lanes"]["mature"]["used_rolling_24h"] == 60
+    assert info["ad_lanes"]["probe"]["used_rolling_24h"] == 0
+    assert info["ad_lanes"]["probe"]["remaining"] == 30
+    await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})

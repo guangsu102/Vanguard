@@ -125,7 +125,7 @@ def _condition_changed(fact: dict[str, Any], review: GroupQualificationAudit) ->
     if reason == "messages_below_5_in_72h":
         count = current.get("valid_messages")
         return bool(isinstance(count, int) and count >= 5)
-    if reason == "account_permanent_send_restriction":
+    if reason in {"account_permanent_send_restriction", "account_long_send_restriction"}:
         permission = current.get("permissions", {})
         return bool(
             current.get("account_id") == old.get("account_id")

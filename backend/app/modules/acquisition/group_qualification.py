@@ -869,21 +869,11 @@ class EvidenceCollector:
             permissions["url_content_rules_checked"] = False
             blocked_rights = [value for value in (rights, own) if value is not None
                               and any(getattr(value, key, False) for key in ("send_messages", "send_plain"))]
-            expiries = [naive(getattr(value, "until_date", None)) for value in blocked_rights]
-            indefinite = bool(blocked_rights) and any(
-                end is None or end <= datetime(1970, 1, 2) or end >= now + timedelta(days=366) for end in expiries)
+            from app.modules.acquisition.send_restriction import restriction_facts
+            permissions.update(restriction_facts(blocked_rights, now))
             permissions["permanent_send_restriction_verified"] = bool(
-                permissions["member"] and not permissions["can_send_text"] and indefinite)
-            permissions["restriction_evidence"] = "telegram_banned_rights" if blocked_rights else None
-            until = max((end for end in expiries if end is not None), default=None)
-            if until:
-                permissions["restriction_until"] = until.isoformat()
-            if (
-                until
-                and now < until < now + timedelta(days=366)
-                and not permissions["can_send_text"] and not indefinite
-            ):
-                permissions["temporary_until"] = until.isoformat()
+                permissions["member"] and not permissions["can_send_text"]
+                and permissions["permanent_send_restriction_verified"])
             permissions["restriction_kind"] = (
                 "temporary"
                 if permissions.get("temporary_until")

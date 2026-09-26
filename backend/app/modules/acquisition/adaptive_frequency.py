@@ -121,8 +121,10 @@ def negative_observation(facts: dict, previous: list[dict], now: datetime) -> st
         facts.get(k) is True for k in ("group_accessible", "account_readable", "member")
     ):
         return None
-    if facts.get("member_muted") is True:
-        return "muted"
+    if facts.get("can_send") is False:
+        from app.modules.acquisition.send_restriction import verified_long_restriction
+        if verified_long_restriction({"permissions": facts.get("send_restriction") or {}}, now):
+            return "muted"
     if (
         facts.get("can_send") is not True
         or facts.get("exists") is not False
@@ -624,6 +626,9 @@ async def queue_deleted_observation(db: Any, account_id: int, event: Any) -> Non
 
 
 async def record_live_mute(db: Any, account_id: int, target: int, context: dict) -> None:
+    from app.modules.acquisition.send_restriction import verified_long_restriction
+    if not verified_long_restriction(context, datetime.utcnow()):
+        return
     if not await enabled(db, account_id):
         return
     logs = await FrequencyService(db).logs(target, context)

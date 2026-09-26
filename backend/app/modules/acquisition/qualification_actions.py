@@ -68,7 +68,18 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             and any(getattr(own, field, False) for field in ("view_messages", "send_messages", "send_plain"))
             and not getattr(current, "is_admin", False) and not getattr(current, "is_creator", False)):
         from app.modules.acquisition.adaptive_frequency import record_live_mute
-        await record_live_mute(db, account_id, group.group_id, snapshot)
+        from app.modules.acquisition.send_restriction import restriction_facts, track_restriction
+        from app.modules.acquisition.qualification_service import annotate_newcomer_restriction
+        observed_at = datetime.utcnow()
+        live = {**snapshot, "technical_errors": [], "collected_at": observed_at.isoformat(),
+                "permissions": {**restriction_facts([own], observed_at),
+                    "member": not bool(getattr(current, "is_banned", False)
+                                       or getattr(entity, "left", False)
+                                       or getattr(own, "view_messages", False)),
+                    "can_send_text": False}}
+        annotate_newcomer_restriction(live, member.joined_at, observed_at)
+        track_restriction(live, snapshot, observed_at)
+        await record_live_mute(db, account_id, group.group_id, live)
     if (
         getattr(current, "has_left", False)
         or getattr(current, "is_banned", False)

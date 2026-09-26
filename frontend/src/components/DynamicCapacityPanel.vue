@@ -12,7 +12,7 @@ const reasons: Record<string, string> = {
   frequency_survival_unresolved: '存活结果待核实，暂停续发', frequency_survival_due: '等待到期存活检测',
   frequency_first_checkpoint_required: '等待前条广告通过 2 分钟检测', frequency_group_inflight: '该群已有在途发送',
   frequency_reservation_stale: '频率已变化，等待重新调度', frequency_deleted_cooldown: '删帖降频，冷却后再复核',
-  frequency_muted: '确认禁言，等待退群', frequency_deleted_at_minimum: '最低频率仍删帖，等待退群',
+  frequency_muted: '永久或超过 3 天禁言，等待退群', frequency_deleted_at_minimum: '最低频率仍删帖，等待退群',
   frequency_rejoin_blocked: '已禁止自动重加', outbound_ad_probe_budget: '试投额度用尽，成熟投放独立计算',
   outbound_ad_mature_budget: '账号本轮成熟投放额度用尽',
   telegram_read_budget: '读取预算已用满，等待窗口恢复', telegram_rpc_guard_unavailable: '读取预算服务暂不可用',

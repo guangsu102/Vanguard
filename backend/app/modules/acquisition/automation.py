@@ -13074,6 +13074,14 @@ class AcquisitionAutomationService:
             facts["member"] = not bool(getattr(permission, "has_left", False) or getattr(entity, "left", False)
                                         or type(participant).__name__.endswith("Left")
                                         or getattr(rights, "view_messages", False))
+            from app.modules.acquisition.send_restriction import restriction_facts
+            facts["send_restriction"] = {
+                **restriction_facts([r for r in (rights, default)
+                                     if r is not None and self._banned_rights_block_text(r)], _now()),
+                "member": facts["member"],
+                "can_send_text": bool(facts["member"] and not self._banned_rights_block_text(rights)
+                                      and not self._banned_rights_block_text(default)),
+            }
             facts["member_muted"] = bool(facts["member"] and self._banned_rights_block_text(rights))
             facts["can_send"] = bool(facts["member"] and not self._banned_rights_block_text(rights)
                                       and not self._banned_rights_block_text(default))

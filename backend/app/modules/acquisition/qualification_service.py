@@ -34,6 +34,9 @@ from app.modules.acquisition.qualification_identity import (
     peer_identity,
 )
 from app.modules.acquisition.qualification_system_identity import covered_system_ids
+from app.modules.acquisition.send_restriction import (
+    confirmed_denial, track_restriction, verified_long_restriction,
+)
 
 SETTING_KEY = "automation.group_qualification"
 AI_REVIEW_INCOMPLETE_REASONS = {
@@ -344,6 +347,9 @@ def annotate_newcomer_restriction(snapshot: dict, joined_at: datetime | None, no
     never-writable new membership as a confirmed long-term restriction.
     """
     permissions = snapshot.get("permissions") or {}
+    # An explicit finite ban beyond three days is not an unspecified newcomer wait.
+    if permissions.get("temporary_until") and verified_long_restriction(snapshot, now):
+        return
     if permissions.get("can_send_text") is False and joined_at and joined_at > now - timedelta(hours=48):
         permissions["verification_pending"] = True
         permissions["newcomer_until"] = (joined_at + timedelta(hours=48)).isoformat()
@@ -463,6 +469,9 @@ def automatic_exit_reason(snapshot: dict[str, Any]) -> str | None:
         return None
     if verified_permanent_send_restriction(snapshot):
         return "account_permanent_send_restriction"
+    observed_at = _date(snapshot.get("collected_at")) or _date(snapshot.get("checked_at")) or datetime.utcnow()
+    if verified_long_restriction(snapshot, observed_at):
+        return "account_long_send_restriction"
     coverage = snapshot.get("coverage")
     recent_complete = (
         isinstance(coverage, list)
@@ -519,8 +528,17 @@ def _base_review_schedule(
 ) -> tuple[str, str, str, datetime | None]:
     """Bounded observation starts with valid evidence, never with queue creation."""
     verdict, reason = snapshot["decision"], snapshot["reason"]
-    if verdict == "observe" and verified_permanent_send_restriction(snapshot):
-        verdict, reason = "reject", "account_permanent_send_restriction"
+    if verdict in {"observe", "wait"}:
+        if verified_permanent_send_restriction(snapshot):
+            verdict, reason = "reject", "account_permanent_send_restriction"
+        elif verified_long_restriction(snapshot, now):
+            verdict, reason = "reject", "account_long_send_restriction"
+        elif confirmed_denial(snapshot, now):
+            # Keep collecting live rights throughout the three-day observation period.
+            expiry = _date((snapshot.get("permissions") or {}).get("temporary_until"))
+            retry = min(now + timedelta(hours=2), expiry) if expiry else now + timedelta(hours=2)
+            snapshot["decision"], snapshot["reason"] = verdict, reason
+            return verdict, reason, "completed", retry
     failures = int(previous.get("technical_failures", 0))
     started = _date(previous.get("observation_started_at"))
     state, retry = "completed", None
@@ -928,6 +946,15 @@ async def assess(
                 )
             ).all()
         )
+        if snapshot.get("collected_at") and not reuse:
+            track_restriction(
+                snapshot, previous, now,
+                last_sent_at=await service.db.scalar(select(func.max(AdDeliveryLog.sent_at)).where(
+                    AdDeliveryLog.account_id == account_id,
+                    AdDeliveryLog.group_id == group.id,
+                    AdDeliveryLog.status == "success",
+                )),
+            )
         snapshot["delivery_history"] = [
             {
                 "status": item.status,
@@ -1118,7 +1145,7 @@ async def assess(
             "telegram_group_id": group.group_id,
             "policy_version": POLICY_VERSION,
             "content_scope": "text_profile",
-            "exit_policy_logic": "A|B|(C&D)",
+            "exit_policy_logic": "permanent_or_over_3d_mute|A|B|(C&D)",
             "decision": verdict,
             "reason": reason,
             "advertising_audit": ad_result.details(),
