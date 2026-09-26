@@ -16,6 +16,11 @@ from app.modules.acquisition.group_qualification import POLICY_VERSION
 from app.modules.acquisition.models import AdDeliveryLog, GroupQualificationAudit
 
 
+@pytest.fixture(autouse=True)
+def available_read_budget(monkeypatch):
+    monkeypatch.setattr("app.core.account.read_schedule.check_read_ready", AsyncMock())
+
+
 async def setup(db, *, decision="allowed", account_id=2):
     now = datetime.utcnow()
     account = TelegramAccount(
@@ -1140,3 +1145,24 @@ async def test_live_self_identity_must_match_registered_account_mapping(test_db)
     config = await service.policy(test_db)
     _, fingerprint = await covered_system_ids(test_db, config, account_id=2, live_user_id=201)
     assert fingerprint is None
+
+
+async def test_budget_wait_preserves_evidence_and_attempts(test_db, monkeypatch):
+    from app.core.account.rpc_governor import RpcDeferred
+    _, _, member, old = await setup(test_db)
+    ids = await service.queue_reviews(test_db, [2], "budget-wait")
+    row = await test_db.get(GroupQualificationAudit, ids[0])
+    row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+    row.checked_at = datetime.utcnow() - timedelta(hours=1)
+    await test_db.commit()
+    previous = (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at)
+    monkeypatch.setattr("app.core.account.read_schedule.check_read_ready",
+        AsyncMock(side_effect=RpcDeferred("telegram_read_budget", 600)))
+    collect = AsyncMock()
+    monkeypatch.setattr(service, "assess", collect)
+    start = datetime.utcnow()
+    result = await service.run_reviews(SimpleNamespace(db=test_db), limit=3)
+    assert result["processed"] == 0
+    assert (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at) == previous
+    assert row.next_retry_at >= start + timedelta(seconds=600)
+    collect.assert_not_awaited()

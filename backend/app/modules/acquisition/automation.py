@@ -2657,7 +2657,6 @@ class AcquisitionAutomationService:
         if not attempts:
             return result
         for attempt in attempts:
-            attempt.reconciliation_checked_at = now
             attempt.reconciliation_next_at = now + timedelta(minutes=15)
         # Claim before network I/O; failed checks and worker crashes also rotate.
         await self.db.commit()
@@ -2688,6 +2687,16 @@ class AcquisitionAutomationService:
                 continue
             result["checked"] += 1
             account = accounts_by_id.get(attempt.account_id)
+            from app.core.account.read_schedule import read_wait
+            pause = await read_wait(
+                self.db, attempt.account_id, now, purpose="join_request_reconciliation",
+                risk_pause_until=account.risk_pause_until if account else None,
+            )
+            if pause:
+                await self._defer_join_reconciliation(attempt, now, pause[0], read_wait_until=pause[1])
+                result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
+                                          "status": "pending", "reason": pause[0]})
+                continue
             if self._join_review_account_block_reason(account, now):
                 await self._defer_join_reconciliation(attempt, now, "account_unavailable_for_join_reconciliation", technical=True)
                 result["details"].append(
@@ -2712,7 +2721,18 @@ class AcquisitionAutomationService:
                 resolved = await asyncio.wait_for(
                     self.telegram_execution.resolve_join_group_by_link_membership(wrapper, target), timeout=60,
                 )
+                attempt.reconciliation_checked_at = now
             except Exception as exc:
+                from app.core.account.rpc_governor import deferred_error
+                deferred = deferred_error(exc)
+                if deferred:
+                    await self._defer_join_reconciliation(
+                        attempt, now, deferred[0],
+                        read_wait_until=now + timedelta(seconds=deferred[1] + 1),
+                    )
+                    result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
+                                              "status": "pending", "reason": deferred[0]})
+                    continue
                 wait_seconds = extract_flood_wait_seconds(exc)
                 if wait_seconds:
                     until = now + timedelta(seconds=wait_seconds)
@@ -2857,14 +2877,16 @@ class AcquisitionAutomationService:
     async def _defer_join_reconciliation(
         self, attempt: AutoJoinAttempt, now: datetime, reason: str, *,
         technical: bool = False, manual: bool = False, contention: bool = False,
+        read_wait_until: datetime | None = None,
     ) -> None:
         # An unknown original RPC keeps its reservation. Reconciliation only reads;
         # technical failures, identity conflicts and age never create a human lane.
-        if technical:
+        if technical and read_wait_until is None:
             attempt.reconciliation_failure_count = int(attempt.reconciliation_failure_count or 0) + 1
         started = attempt.request_sent_at or attempt.attempted_at or now
         attempt.reconciliation_status = "pending"
-        attempt.reconciliation_checked_at = now
+        if read_wait_until is None:
+            attempt.reconciliation_checked_at = now
         attempt.reason = reason
         delay = (timedelta(minutes=1) if contention else timedelta(hours=6) if manual
                  else timedelta(minutes=15) if now < started + timedelta(hours=2)
@@ -2872,6 +2894,8 @@ class AcquisitionAutomationService:
         attempt.reconciliation_next_at = max(now + delay, attempt.reconciliation_next_at or now)
         if contention:
             attempt.reconciliation_next_at = now + delay
+        if read_wait_until is not None:
+            attempt.reconciliation_next_at = max(now, read_wait_until) + timedelta(seconds=1 + attempt.id % 7)
         await self.db.execute(update(GroupQualificationAudit).where(
             GroupQualificationAudit.batch_id == f"join-attempt:{attempt.id}:pending",
             GroupQualificationAudit.account_id == attempt.account_id,

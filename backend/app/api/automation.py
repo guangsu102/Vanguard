@@ -1651,20 +1651,21 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
         ).scalar() or 0
 
         recent_errors_rows = await db.execute(
-            select(AdDeliveryLog.error, func.count(AdDeliveryLog.id))
+            select(AdDeliveryLog.error, AdDeliveryLog.telegram_message_id, func.count(AdDeliveryLog.id))
             .where(
                 AdDeliveryLog.account_id == account.id,
                 AdDeliveryLog.status == "failed",
                 AdDeliveryLog.created_at >= now - timedelta(hours=24),
             )
-            .group_by(AdDeliveryLog.error)
+            .group_by(AdDeliveryLog.error, AdDeliveryLog.telegram_message_id)
             .order_by(desc(func.count(AdDeliveryLog.id)))
-            .limit(5)
         )
+        from app.modules.acquisition.delivery_metrics import pre_request_deferred
         recent_errors = [
-            {"error": (row[0] or "")[:300], "count": int(row[1] or 0)}
+            {"error": (row[0] or "")[:300], "count": int(row[2] or 0)}
             for row in recent_errors_rows.all()
-        ]
+            if not pre_request_deferred(row[0], row[1])
+        ][:5]
         delivery_diagnostic = await _build_ad_delivery_diagnostic(
             db,
             account=account,
@@ -1714,6 +1715,7 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "tier": tier,
                 "success_24h": health["success"],
                 "failed_24h": health["failed"],
+                "deferred_24h": health.get("deferred", 0),
                 "success_rate_24h": round(float(health["success_rate"]), 3),
                 "group_control_failed_24h": health["group_control_failed"],
                 "account_failed_24h": health["account_failed"],

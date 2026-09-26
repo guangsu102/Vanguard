@@ -71,7 +71,7 @@ export interface DynamicCapacitySnapshot {
   used_rolling_24h: Record<string, number>
   remaining: Record<string, number>
   execution?: { state: string; resume_at?: string | null; reason?: string | null }
-  read_rpc?: { state: string; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; limits: Record<string, number> }
+  read_rpc?: { state: string; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; lanes?: Record<string, { remaining: number; retry_after_seconds: number; resume_at?: string | null }>; limits: Record<string, number> }
   quota_remaining?: Record<string, number>
   executable?: Record<string, number>
   executable_now?: Record<string, number>

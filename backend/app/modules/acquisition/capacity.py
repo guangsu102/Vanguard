@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.core.account.models import AccountOperationConfig, TelegramAccount
 from app.core.account.outbound_budget import AccountOutboundBudgetService, effective_capacity_limits
@@ -28,8 +28,10 @@ async def inventory_snapshot(
     now = now or datetime.utcnow()
     members = list(
         (
-            await db.scalars(
-                select(GroupAccountMembership).where(
+            await db.execute(
+                select(*(getattr(GroupAccountMembership, key) for key in (
+                    "id", "joined_at", "review_status", "status"
+                ))).where(
                     GroupAccountMembership.account_id == account_id,
                     GroupAccountMembership.status.in_(["joined", "pending", "leave_failed"]),
                 )
@@ -37,22 +39,19 @@ async def inventory_snapshot(
         ).all()
     )
     ids = {member.id: member for member in members}
-    rows = (
-        list(
-            (
-                await db.scalars(
-                    select(GroupQualificationAudit)
-                    .where(
-                        GroupQualificationAudit.account_id == account_id,
-                        GroupQualificationAudit.membership_id.in_(list(ids)),
-                    )
-                    .order_by(GroupQualificationAudit.id.desc())
-                )
-            ).all()
-        )
-        if ids
-        else []
+    newer = aliased(GroupQualificationAudit)
+    columns = ("id", "membership_id", "membership_joined_at", "state", "decision", "next_retry_at", "expires_at")
+    latest = select(*(getattr(GroupQualificationAudit, key) for key in columns)).where(
+        GroupQualificationAudit.account_id == account_id,
+        GroupQualificationAudit.membership_id.in_(list(ids)),
+        GroupQualificationAudit.state != "cancelled",
+        ~select(newer.id).where(
+            newer.membership_id == GroupQualificationAudit.membership_id,
+            newer.id > GroupQualificationAudit.id,
+            newer.state != "cancelled",
+        ).exists(),
     )
+    rows = (await db.execute(latest)).all() if ids else []
     seen, ready, active, overdue = set(), 0, 0, 0
     review_due = 0
     manual = sum(member.review_status == "manual_required" for member in members)
@@ -363,6 +362,10 @@ async def executable_inventory(
 async def capacity_snapshot(
     db: Any, account_id: int, now: datetime | None = None
 ) -> dict[str, Any]:
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from app.modules.acquisition.capacity_reads import CapacityReads
+    if isinstance(db, AsyncSession):
+        db = CapacityReads(db)
     now = now or datetime.utcnow()
     account = await db.get(TelegramAccount, account_id)
     config = await db.scalar(
@@ -499,7 +502,7 @@ async def capacity_snapshot(
         "enabled": True,
         "execution": {"state": (rpc["state"] if rpc["state"] in {"budget_wait", "unavailable"} else "cooldown") if cooling else "scheduled",
                       "resume_at": pause_until.isoformat() if cooling else None,
-                      "reason": rpc.get("reason") or account.risk_reason},
+                      "reason": (rpc.get("reason") or account.risk_reason) if cooling else None},
         "read_rpc": rpc,
         "configured": {
             "join": config.max_groups_per_day,

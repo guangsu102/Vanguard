@@ -24,6 +24,7 @@ from app.core.automation_settings import (
     get_account_warmup_policy_settings,
 )
 from app.core.group.models import Group, GroupAccountMembership
+from app.modules.acquisition.delivery_metrics import pre_request_deferred
 from app.modules.acquisition.models import (
     AdDeliveryLog,
     AutoJoinAttempt,
@@ -351,7 +352,7 @@ class AccountDynamicFrequencyService:
         probe_success_rate = probe_success / probe_total if probe_total else 1.0
 
         ad_rows = await self.db.execute(
-            select(AdDeliveryLog.status, AdDeliveryLog.error).where(
+            select(AdDeliveryLog.status, AdDeliveryLog.error, AdDeliveryLog.telegram_message_id).where(
                 AdDeliveryLog.account_id == account_id,
                 AdDeliveryLog.created_at >= now - timedelta(hours=24),
                 AdDeliveryLog.status.in_([DeliveryStatus.SUCCESS.value, DeliveryStatus.FAILED.value]),
@@ -359,9 +360,12 @@ class AccountDynamicFrequencyService:
         )
         ad_success = 0
         ad_failed = 0
-        for status, error in ad_rows.all():
+        ad_deferred = 0
+        for status, error, message_id in ad_rows.all():
             if status == DeliveryStatus.SUCCESS.value:
                 ad_success += 1
+            elif pre_request_deferred(error, message_id):
+                ad_deferred += 1
             elif (
                 status == DeliveryStatus.FAILED.value
                 and "risk_guard_blocked:" not in str(error or "").lower()
@@ -386,6 +390,7 @@ class AccountDynamicFrequencyService:
             "probe_success_rate_24h": probe_success_rate,
             "ad_success_24h": ad_success,
             "ad_failed_24h": ad_failed,
+            "ad_deferred_24h": ad_deferred,
             "ad_success_rate_24h": ad_success_rate,
             "joined_groups": joined_groups,
             "average_group_quality_score": average_quality_score,
@@ -465,7 +470,7 @@ class AccountDynamicFrequencyService:
 
     async def ad_delivery_metrics(self, account_id: int, now: datetime) -> dict[str, Any]:
         rows = await self.db.execute(
-            select(AdDeliveryLog.status, AdDeliveryLog.error)
+            select(AdDeliveryLog.status, AdDeliveryLog.error, AdDeliveryLog.telegram_message_id)
             .where(
                 AdDeliveryLog.account_id == account_id,
                 AdDeliveryLog.created_at >= now - timedelta(hours=24),
@@ -479,11 +484,15 @@ class AccountDynamicFrequencyService:
         transient_failed = 0
         peer_flood_failed = 0
         account_restricted_failed = 0
-        for status, error in rows.all():
+        deferred = 0
+        for status, error, message_id in rows.all():
             if status == DeliveryStatus.SUCCESS.value:
                 success += 1
                 continue
             if status != DeliveryStatus.FAILED.value:
+                continue
+            if pre_request_deferred(error, message_id):
+                deferred += 1
                 continue
             text = str(error or "").lower()
             if "risk_guard_blocked:" in text:
@@ -508,6 +517,7 @@ class AccountDynamicFrequencyService:
             "success": success,
             "failed": failed,
             "success_rate": success_rate,
+            "deferred": deferred,
             "group_control_failed": group_control_failed,
             "account_failed": account_failed,
             "transient_failed": transient_failed,
@@ -621,6 +631,7 @@ class AccountDynamicFrequencyService:
             "health_score": health_score,
             "success": ad_metrics["success"],
             "failed": ad_metrics["failed"],
+            "deferred": ad_metrics.get("deferred", 0),
             "success_rate": ad_metrics["success_rate"],
             "group_control_failed": ad_metrics["group_control_failed"],
             "account_failed": ad_metrics["account_failed"],

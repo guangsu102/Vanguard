@@ -16,7 +16,7 @@ import socket
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 import structlog
@@ -530,13 +530,14 @@ class TelegramWorker:
 
     async def _ensure_growth_listeners(self, accounts: list[TelegramAccount]) -> dict[str, Any]:
         if self._account_pool is None:
-            return {"active_listeners": 0, "listeners_started": 0, "listeners_stopped": 0, "listener_errors": []}
+            return {"active_listeners": 0, "listeners_started": 0, "listeners_stopped": 0,
+                    "listener_errors": [], "listeners": []}
+        from app.core.account.rpc_governor import RpcDeferred, check_read_ready
 
         active_account_ids = {account.id for account in accounts}
-        stopped = 0
-        deferred = 0
+        stopped = started = deferred = 0
         errors: list[dict[str, Any]] = []
-
+        listeners = []
         for account_id, session_name in list(self._growth_listener_sessions.items()):
             wrapper = await self._account_pool.get_account_by_id(account_id)
             connected = bool(wrapper and wrapper.client and wrapper.client.is_connected())
@@ -544,63 +545,46 @@ class TelegramWorker:
                 await self._account_pool.set_offline(session_name)
                 self._growth_listener_sessions.pop(account_id, None)
                 stopped += 1
-
-        started = 0
         for account in accounts:
-            from app.core.account.rpc_governor import RpcDeferred, check_read_ready
+            previous = account.id in self._growth_listener_sessions
+            item = {"account_id": account.id, "connected": previous,
+                    "state": "connected" if previous else "disconnected", "reason": None,
+                    "resume_at": None}
+            listeners.append(item)
             try:
                 async with get_db_session() as db:
-                    await check_read_ready(db, account.id)
-            except RpcDeferred:
-                deferred += 1
-                continue
-            if account.id in self._growth_listener_sessions:
-                try:
-                    existing = await self._account_pool.get_account_by_id(account.id)
-                    previous_client = existing.client if existing is not None else None
-                    wrapper = await self._account_pool.connect_by_id(
-                        account.id,
-                        purpose="growth_listener_refresh",
-                        require_session=True,
-                        keep_connected=True,
-                    )
-                    if wrapper is not None and wrapper.client is not None and wrapper.client is not previous_client:
-                        self._attach_growth_event_handlers(wrapper)
-                except RpcDeferred:
-                    deferred += 1
-                except Exception as exc:
-                    await self._account_pool.set_offline(account.session_name)
-                    self._growth_listener_sessions.pop(account.id, None)
-                    errors.append({"account_id": account.id, "error": str(exc)})
-                    stopped += 1
-                    logger.warning("growth_listener_refresh_failed", account_id=account.id, error=str(exc))
-                continue
-            try:
+                    await check_read_ready(db, account.id, purpose="growth_listener")
+                existing = await self._account_pool.get_account_by_id(account.id) if previous else None
+                previous_client = existing.client if existing is not None else None
                 wrapper = await self._account_pool.connect_by_id(
-                    account.id,
-                    purpose="growth_listener",
-                    require_session=True,
-                    keep_connected=True,
+                    account.id, purpose="growth_listener_refresh" if previous else "growth_listener",
+                    require_session=True, keep_connected=True,
                 )
                 if wrapper is None or wrapper.client is None:
+                    item.update(state="disconnected", connected=False, reason="account_not_connectable")
                     errors.append({"account_id": account.id, "error": "account_not_connectable"})
                     continue
-                self._attach_growth_event_handlers(wrapper)
+                if wrapper.client is not previous_client:
+                    self._attach_growth_event_handlers(wrapper)
                 self._growth_listener_sessions[account.id] = wrapper.session_name
-                started += 1
-            except RpcDeferred:
+                item.update(state="connected", connected=True)
+                if not previous:
+                    started += 1
+            except RpcDeferred as exc:
                 deferred += 1
+                item.update(state="connected_wait" if previous else "deferred", reason=exc.reason,
+                            resume_at=(datetime.utcnow() + timedelta(seconds=exc.retry_after_seconds + 1)).isoformat())
             except Exception as exc:
-                errors.append({"account_id": account.id, "error": str(exc)})
-                logger.warning("growth_listener_start_failed", account_id=account.id, error=str(exc))
-
-        return {
-            "active_listeners": len(self._growth_listener_sessions),
-            "listeners_started": started,
-            "listeners_stopped": stopped,
-            "listener_errors": errors[:5],
-            "listeners_deferred": deferred,
-        }
+                if previous:
+                    await self._account_pool.set_offline(account.session_name)
+                    self._growth_listener_sessions.pop(account.id, None)
+                    stopped += 1
+                item.update(state="error", connected=False, reason=type(exc).__name__)
+                errors.append({"account_id": account.id, "error": type(exc).__name__})
+                logger.warning("growth_listener_start_failed", account_id=account.id, error_type=type(exc).__name__)
+        return {"active_listeners": len(self._growth_listener_sessions), "listeners_started": started,
+                "listeners_stopped": stopped, "listener_errors": errors[:5],
+                "listeners_deferred": deferred, "listeners": listeners}
 
     def _attach_growth_event_handlers(self, account: Any) -> None:
         client = account.client

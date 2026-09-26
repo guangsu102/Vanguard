@@ -1599,6 +1599,7 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
         await ensure_system_identities(service)
         config = await policy(service.db, fresh=True)
     await ensure_membership_reviews(service.db, config)
+    suspended_accounts: set[int] = set()
     for _ in range(limit):
         now = datetime.utcnow()
         other = aliased(GroupQualificationAudit)
@@ -1631,6 +1632,8 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
         cooling = [int(item.key[len(PREFIX):]) for item in states
                    if (parse_date(json.loads(item.value).get("pause_until")) or datetime.min) > now]
         query = select(GroupQualificationAudit).where(due, ~busy_account)
+        if suspended_accounts:
+            query = query.where(GroupQualificationAudit.account_id.not_in(suspended_accounts))
         if cooling:
             query = query.where(GroupQualificationAudit.account_id.not_in(cooling))
         # Suspended reads remain due; do not consume attempts or model calls.
@@ -1660,32 +1663,6 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
         )
         if row is None:
             break
-        # Serialize the claim across different memberships of the same account.
-        # The row lock lasts through the durable running-state commit.
-        account_claim = await service.db.scalar(
-            select(TelegramAccount.id)
-            .where(TelegramAccount.id == row.account_id)
-            .with_for_update(skip_locked=True)
-        )
-        if account_claim is None:
-            await service.db.rollback()
-            break
-        concurrent = await service.db.scalar(
-            select(GroupQualificationAudit.id)
-            .where(
-                GroupQualificationAudit.account_id == row.account_id,
-                GroupQualificationAudit.id != row.id,
-                GroupQualificationAudit.state == "running",
-                GroupQualificationAudit.next_retry_at > now,
-            )
-            .limit(1)
-        )
-        if concurrent is not None:
-            await service.db.rollback()
-            break
-        row.state, row.next_retry_at = "running", now + timedelta(minutes=20)
-        row.attempts = (row.attempts or 0) + 1
-        await service.db.commit()
         membership = await service.db.get(
             GroupAccountMembership, row.membership_id, populate_existing=True
         )
@@ -1710,6 +1687,53 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             )
             await service.db.commit()
             continue
+        # Serialize the claim across different memberships of the same account.
+        # The row lock lasts through the durable running-state commit.
+        account_claim = await service.db.scalar(
+            select(TelegramAccount.id)
+            .where(TelegramAccount.id == row.account_id)
+            .with_for_update(skip_locked=True)
+        )
+        if account_claim is None:
+            await service.db.rollback()
+            break
+        concurrent = await service.db.scalar(
+            select(GroupQualificationAudit.id)
+            .where(
+                GroupQualificationAudit.account_id == row.account_id,
+                GroupQualificationAudit.id != row.id,
+                GroupQualificationAudit.state == "running",
+                GroupQualificationAudit.next_retry_at > now,
+            )
+            .limit(1)
+        )
+        if concurrent is not None:
+            await service.db.rollback()
+            break
+        from app.core.account.read_schedule import read_wait
+        pause = await read_wait(service.db, row.account_id, now, purpose="group_qualification")
+        if pause:
+            # Keep evidence, attempts and checked_at unchanged when no read can start.
+            # Older historical rows and running claims must not be rescheduled here.
+            newer = aliased(GroupQualificationAudit)
+            latest_due = select(GroupQualificationAudit.id).where(
+                GroupQualificationAudit.account_id == row.account_id, due,
+                GroupQualificationAudit.state != "running",
+                ~exists(select(newer.id).where(
+                    newer.membership_id == GroupQualificationAudit.membership_id,
+                    newer.id > GroupQualificationAudit.id, newer.state != "cancelled",
+                )),
+            )
+            from sqlalchemy import update
+            await service.db.execute(update(GroupQualificationAudit).where(
+                GroupQualificationAudit.id.in_(latest_due)
+            ).values(next_retry_at=pause[1]))
+            suspended_accounts.add(row.account_id)
+            await service.db.commit()
+            continue
+        row.state, row.next_retry_at = "running", now + timedelta(minutes=20)
+        row.attempts = (row.attempts or 0) + 1
+        await service.db.commit()
         audit = await assess(service, row.account_id, group, row=row)
         # A concurrent requeue or leave cannot be overwritten by a completed old read.
         latest = await latest_review(service.db, membership.id, include_pending=True)
