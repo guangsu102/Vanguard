@@ -1523,7 +1523,9 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
             GroupQualificationAudit.state != "cancelled",
         )),
     ))
-    accounts.update((await db.scalars(select(AdDeliveryScheduleState.account_id).join(
+    due_ads = (await db.execute(select(
+        AdDeliveryScheduleState.account_id, GroupAccountMembership.telegram_group_id,
+    ).join(
         GroupAccountMembership,
         and_(GroupAccountMembership.group_id == AdDeliveryScheduleState.group_id,
              GroupAccountMembership.account_id == AdDeliveryScheduleState.account_id),
@@ -1535,7 +1537,25 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
         GroupAccountMembership.review_status == "approved",
         GroupAccountMembership.ad_status == "active",
         AccountOperationConfig.enabled.is_(True), AccountOperationConfig.auto_ads_enabled.is_(True),
-    ).distinct())).all())
+    ).distinct())).all()
+    # A fresh approval is insufficient: ambiguous identity, a full group quota,
+    # or an unresolved prior delivery may leave this schedule due indefinitely.
+    # Reuse the send path's cached gates before making all reviews yield to it.
+    from types import SimpleNamespace
+    from app.modules.acquisition.automation import AcquisitionAutomationService
+    from app.modules.acquisition.capacity_reads import CapacityReads
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    reads = CapacityReads(db) if isinstance(db, AsyncSession) else db
+    ads = AcquisitionAutomationService(reads, account_pool=SimpleNamespace())
+    for account_id, target in due_ads:
+        if account_id in accounts:
+            continue
+        context, reason = await ads._qualified_ad_context(account_id, target, now)
+        if reason or context is None:
+            continue
+        if await ads._qualification_delivery_quota_reason(context, target, now) is None:
+            accounts.add(account_id)
     # Reserve the scheduler boundary for due joins, without starving review in
     # the four minutes between scans or when a target cannot be found.
     if now.minute % 5 == 0:
