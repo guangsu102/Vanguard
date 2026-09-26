@@ -64,6 +64,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         raise TelegramExecutionError("qualification_protected_membership")
     own = getattr(getattr(current, "participant", None), "banned_rights", None)
     defaults = getattr(entity, "default_banned_rights", None)
+    from app.modules.acquisition.send_restriction import telegram_member
+    is_member = telegram_member(entity, current)
     if (not getattr(current, "has_left", False)
             and any(getattr(own, field, False) for field in ("view_messages", "send_messages", "send_plain"))
             and not getattr(current, "is_admin", False) and not getattr(current, "is_creator", False)):
@@ -81,9 +83,7 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         track_restriction(live, snapshot, observed_at)
         await record_live_mute(db, account_id, group.group_id, live)
     if (
-        getattr(current, "has_left", False)
-        or getattr(current, "is_banned", False)
-        or getattr(entity, "left", False)
+        not is_member
         or any(
             getattr(rights, field, False)
             for rights in (own, defaults)
@@ -637,6 +637,9 @@ async def _run_exits_serialized(service: Any, *, limit: int = 1) -> dict[str, An
             member.account_id, service._discovered_group_from_model(group)
         )
         member.ad_status = "blocked"
+        if error == "qualification_send_restriction_cleared":
+            results.append({"membership_id": member.id, "status": member.review_status, "reason": error})
+            continue
         if error and (str(error) == "account unavailable" or "account operation lease busy" in str(error).lower()):
             # The account was never acquired, so no leave RPC was attempted.
             # Keep the original membership and retry without inventing a failure.

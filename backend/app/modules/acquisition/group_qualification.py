@@ -829,20 +829,10 @@ class EvidenceCollector:
             permissions["is_admin"] = is_admin
             permissions["is_creator"] = bool(getattr(me, "is_creator", False))
             own = getattr(participant, "banned_rights", None)
-            permissions["member"] = not (
-                getattr(me, "has_left", False)
-                or getattr(me, "is_banned", False)
-                or type(participant).__name__.endswith("Left")
-                or getattr(own, "view_messages", False)
-                or getattr(entity, "left", False)
-            )
+            from app.modules.acquisition.send_restriction import telegram_member
+            permissions["member"] = telegram_member(entity, me)
             permissions["membership_state"] = "member" if permissions["member"] else "not_member"
-            permissions["membership_evidence"] = "telegram_permissions" if (
-                getattr(me, "has_left", False)
-                or getattr(me, "is_banned", False)
-                or type(participant).__name__.endswith("Left")
-                or getattr(own, "view_messages", False)
-            ) else None
+            permissions["membership_evidence"] = "telegram_permissions" if not permissions["member"] else None
             for name, fields in {
                 "can_send_text": ("send_messages", "send_plain"),
                 "can_send_photo": ("send_messages", "send_media", "send_photos"),

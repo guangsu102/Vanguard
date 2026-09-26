@@ -35,6 +35,18 @@ def restriction_facts(blocked_rights: list[Any], now: datetime) -> dict[str, Any
     return facts
 
 
+def telegram_member(entity: Any, permission: Any) -> bool:
+    """ChannelParticipantBanned includes muted members, not only expelled users."""
+    participant = getattr(permission, "participant", None)
+    own = getattr(participant, "banned_rights", None) or getattr(entity, "banned_rights", None)
+    return not any((
+        getattr(permission, "has_left", False), getattr(participant, "left", False),
+        type(participant).__name__.endswith("Left"), getattr(entity, "left", False),
+        getattr(own, "view_messages", False),
+        getattr(permission, "is_banned", False) and own is None,
+    ))
+
+
 def confirmed_denial(snapshot: dict, now: datetime) -> bool:
     permission = snapshot.get("permissions") or {}
     if (

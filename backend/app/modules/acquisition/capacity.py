@@ -443,6 +443,10 @@ async def capacity_snapshot(
     join_pause = limits["action_pauses"].get("join")
     if join_pause:
         due = max(filter(None, (due, datetime.fromisoformat(join_pause))))
+    join_read_wait = rpc.get("lanes", {}).get("routine", {})
+    if join_read_wait.get("resume_at"):
+        due = max(filter(None, (due, parse_date(join_read_wait["resume_at"]))))
+        blockers.append("telegram_join_read_budget")
     if due and due > now:
         blockers.append("join_interval")
     ad_remaining = min(

@@ -6,6 +6,7 @@ Only RPC names are recorded: never request arguments, entities or message bodies
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
@@ -15,11 +16,12 @@ from typing import Any
 import structlog
 from sqlalchemy import select
 
+from app.core.account.rpc_budget_policy import WINDOWS, read_lane, window_plan
 from app.core.settings_models import SystemSetting
 
 logger = structlog.get_logger()
 PREFIX = "telegram.rpc.account."
-BACKGROUND = {"join_candidate_preview", "group_metadata_sync", "auto_join_search", "search"}
+
 READ_PREFIXES = ("Get", "Search", "Resolve", "CheckChatInvite")
 
 
@@ -49,6 +51,8 @@ def limits_for(state: dict, now: datetime) -> dict[str, int]:
         "day": max(120, int(2400 * factor)),
         "background_hour": max(10, int(60 * factor)),
         "background_day": max(40, int(480 * factor)),
+        "sync_hour": max(5, int(60 * factor)),
+        "sync_day": max(40, int(600 * factor)),
     }
 
 
@@ -96,8 +100,7 @@ async def record_flood(
 async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dict:
     """Atomic, read-only usage snapshot; never reserves or resets a budget."""
     from app.core.redis import get_redis
-    windows = [("minute", 60), ("hour", 3600), ("day", 86400),
-               ("background_hour", 3600), ("background_day", 86400)]
+    windows = WINDOWS
     cache = await get_redis()
     keys = [f"vanguard:rpc:{account_id}:{name}" for name, _ in windows]
     values = await cache.eval(
@@ -112,11 +115,21 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
         wait = (max(1, ttl) if ttl >= 0 else duration) if exhausted else 0
         usage[name] = {"used": used, "limit": limits[name], "remaining": max(0, limits[name]-used),
                        "retry_after_seconds": wait, "ttl_seconds": ttl}
-        if exhausted and not name.startswith("background_"):
-            blocked.append(name); delay = max(delay, wait)
+        if exhausted and name in {"minute", "hour", "day"}:
+            blocked.append(name)
+            delay = max(delay, wait)
     emergency = max(0, int(await cache.ttl(f"vanguard:rpc:cooldown:{account_id}")))
+    lanes = {}
+    for lane in ("critical", "routine", "background", "sync"):
+        waits, remaining = [], []
+        for name, duration, cap in window_plan(limits, lane):
+            item = usage[name]
+            remaining.append(max(0, cap - item["used"]))
+            if item["used"] >= cap:
+                waits.append(max(1, item["ttl_seconds"]) if item["ttl_seconds"] >= 0 else duration)
+        lanes[lane] = {"remaining": min(remaining), "retry_after_seconds": max([emergency, *waits])}
     return {"usage": usage, "blocked_windows": blocked, "retry_after_seconds": max(delay, emergency),
-            "emergency_cooldown_seconds": emergency}
+            "emergency_cooldown_seconds": emergency, "lanes": lanes}
 
 
 def deferred_error(error: Exception | str) -> tuple[str, int] | None:
@@ -149,11 +162,20 @@ async def snapshot(db: Any, account_id: int, now: datetime) -> dict:
         resume = max(end, parse_date(result.get("resume_at")) or end)
         result.update(state="cooldown", reason="telegram_rpc_cooldown",
                       resume_at=resume.isoformat(), retry_after_seconds=math.ceil((resume-now).total_seconds()))
+    for lane in result.get("lanes", {}).values():
+        delay = max(lane["retry_after_seconds"], result.get("retry_after_seconds", 0))
+        lane["retry_after_seconds"] = delay
+        lane["resume_at"] = (now + timedelta(seconds=delay + 1)).isoformat() if delay else None
     return result
 
 
-async def check_read_ready(db: Any, account_id: int, now: datetime | None = None) -> dict:
+async def check_read_ready(
+    db: Any, account_id: int, now: datetime | None = None, *, purpose: str = "ad_delivery"
+) -> dict:
     result = await snapshot(db, account_id, now or datetime.utcnow())
+    lane = result.get("lanes", {}).get(read_lane([], purpose), {})
+    if lane.get("retry_after_seconds") and result["state"] not in {"cooldown", "unavailable"}:
+        raise RpcDeferred("telegram_read_budget", lane["retry_after_seconds"])
     if result["state"] in {"cooldown", "budget_wait", "unavailable"}:
         raise RpcDeferred(result["reason"], result["retry_after_seconds"])
     return result
@@ -184,7 +206,7 @@ class RpcGovernor:
     def __init__(self, account_id: int, purpose: Any, *, budget_reads: bool = True):
         self.account_id, self.purpose, self.budget_reads = account_id, purpose, budget_reads
 
-    async def before(self, methods: list[str]) -> None:
+    async def before(self, methods: list[str], *, sync: bool = False) -> None:
         from app.core.database import get_db_session
         from app.core.redis import get_redis
 
@@ -203,13 +225,13 @@ class RpcGovernor:
             if not reads or not self.budget_reads:
                 return
             limits = limits_for(state, now)
-            windows = [("minute", 60), ("hour", 3600), ("day", 86400)]
-            if self.purpose() in BACKGROUND:
-                windows += [("background_hour", 3600), ("background_day", 86400)]
-            keys = [f"vanguard:rpc:{self.account_id}:{name}" for name, _ in windows]
+            purpose = str(self.purpose())
+            lane = "sync" if sync else read_lane(methods, purpose)
+            windows = window_plan(limits, lane)
+            keys = [f"vanguard:rpc:{self.account_id}:{name}" for name, _, _ in windows]
             args = [reads]
-            for name, ttl in windows:
-                args.extend([limits[name], ttl])
+            for _name, ttl, cap in windows:
+                args.extend([cap, ttl])
             redis = await get_redis()
             delay = int(await redis.eval(BUDGET_LUA, len(keys), *keys, *args))
             if delay:
@@ -220,6 +242,11 @@ class RpcGovernor:
                 for method in methods:
                     pipe.hincrby(key, method, 1)
                 pipe.expire(key, 7 * 86400)
+                usage_key = f"vanguard:rpc:usage:{self.account_id}:{now:%Y%m%d}"
+                purpose = purpose if re.fullmatch(r"[a-z_]{1,64}", purpose) else "other"
+                for method in methods:
+                    pipe.hincrby(usage_key, f"{lane}|{purpose}|{method}", 1)
+                pipe.expire(usage_key, 7 * 86400)
                 await pipe.execute()
         except RpcDeferred:
             raise
@@ -297,7 +324,21 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             type(item).__module__.rsplit(".", 1)[-1] + "." + type(item).__name__
             for item in requests
         ]
-        await governor.before(methods)
+        internal_sync = bool(methods) and all(method.split(".")[-1].startswith(READ_PREFIXES) for method in methods)
+        internal_sync = internal_sync and asyncio.current_task() is getattr(client, "_updates_handle", None)
+        while True:
+            try:
+                if internal_sync:
+                    await governor.before(methods, sync=True)
+                else:
+                    await governor.before(methods)
+                break
+            except RpcDeferred as exc:
+                if not internal_sync:
+                    raise
+                # This is a pre-RPC wait, never a resend. Cancellation from disconnect()
+                # propagates, and each wake rechecks shared limits and Telegram cooldown.
+                await asyncio.sleep(min(60, exc.retry_after_seconds + 1))
         try:
             result = await original(sender, request, ordered=ordered, flood_sleep_threshold=0)
         except Exception as exc:

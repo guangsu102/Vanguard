@@ -917,22 +917,27 @@ class AccountPool:
                 )
                 return None
 
+            previous_keep_connected = selected.keep_connected
             try:
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 connected_now = False
+                selected.keep_connected = keep_connected
                 if (
                     selected.client is None
                     or not getattr(selected.client, "is_connected", lambda: False)()
                 ):
                     selected.client = await self._create_client(selected)
                     connected_now = True
-                selected.keep_connected = keep_connected
+                elif previous_keep_connected != keep_connected:
+                    await selected.client.set_receive_updates(keep_connected)
                 selected.status = AccountStatus.IDLE
             except RpcDeferred:
                 # Waiting is not a broken session; the listener may reconnect at expiry.
+                selected.keep_connected = previous_keep_connected
                 raise
             except Exception as e:
+                selected.keep_connected = previous_keep_connected
                 selected.status = AccountStatus.ERROR
                 self.logger.warning(
                     "account_connect_by_id_failed",
@@ -1025,6 +1030,7 @@ class AccountPool:
             timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
             base_logger=f"vanguard.telethon.account.{account.account_id}",
             flood_sleep_threshold=0,
+            receive_updates=account.keep_connected,
         )
         install_governor(client, RpcGovernor(
             account.account_id, lambda: account.active_purpose,

@@ -6335,6 +6335,13 @@ class AcquisitionAutomationService:
                 allowed, reason = await authorize_leave(self.db, account_id, db_group, membership)
                 if not allowed:
                     return reason
+                from app.modules.acquisition.qualification_exit_guard import MUTE_REASONS, recheck_mute_exit
+                if reason in MUTE_REASONS:
+                    blocked = await recheck_mute_exit(
+                        self.db, account_id, db_group, membership, entity, permissions, datetime.utcnow()
+                    )
+                    if blocked:
+                        return blocked
             leave_attempted = True
             await self.telegram_execution.leave_group(
                 account, entity, group_id=group.group_id, source="auto_join"

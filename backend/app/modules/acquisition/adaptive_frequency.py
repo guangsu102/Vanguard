@@ -449,6 +449,9 @@ class FrequencyService:
                             )
                         ),
                         GroupAdFrequencyEvent.kind.in_(["deleted", "muted"]),
+                        (GroupAdFrequencyEvent.kind != "muted") | ~GroupAdFrequencyEvent.log_id.in_(
+                            select(GroupAdFrequencyEvent.log_id).where(GroupAdFrequencyEvent.kind == "mute_revoked")
+                        ),
                     )
                 )
             ).all()
@@ -573,6 +576,10 @@ async def run_frequency_exits(service: Any, *, limit: int = 1) -> dict:
         error = await service._leave_group(
             member.account_id, service._discovered_group_from_model(group)
         )
+        if error == "qualification_send_restriction_cleared":
+            # The final live check already queued fresh qualification and revoked the intent.
+            results.append({"membership_id": member.id, "status": member.review_status, "reason": error})
+            continue
         if error is None:
             member.status, member.review_status = "left", "left"
             member.left_at = member.leave_confirmed_at = datetime.utcnow()

@@ -1850,6 +1850,9 @@ async def authorize_leave(
         requested_id = getattr(audit, "id", None)
         if requested_id is not None and requested_id != row.id:
             return False, "qualification_exit_review_superseded"
+    fact = automatic_exit_reason(snapshot)
+    if fact in {"account_permanent_send_restriction", "account_long_send_restriction"}:
+        return True, fact  # The final live guard must see the actual mutable exit condition.
     return True, row.reason or "qualification_rejected"
 
 

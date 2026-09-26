@@ -319,6 +319,7 @@ class AccountOutboundBudgetService:
             }
         limits = await effective_capacity_limits(self.db, account, config, now)
         rows = [r for r in await self._attempts(account_id, now) if r.attempt_key != exclude_key]
+        pacing_rows = rows  # Actual failed RPC attempts still occupy the sending interval.
         if limits.get("adaptive_ads"):
             rows = [r for r in rows if not (r.category == "ad" and r.state == "failed")]
         day, rolling = operating_day_start(now), now - timedelta(hours=24)
@@ -344,14 +345,14 @@ class AccountOutboundBudgetService:
             ad_lanes[lane] = {"effective": cap, "used_today": a, "used_rolling_24h": b,
                               "remaining": max(0, min(cap - a, cap - b, categories["ad"]["remaining"]))}
         last = max(
-            (r.attempted_at for r in rows if r.category == "ad" and r.attempted_at), default=None
+            (r.attempted_at for r in pacing_rows if r.category == "ad" and r.attempted_at), default=None
         )
         due = last + timedelta(seconds=limits["ad_interval_seconds"]) if last else None
         ad_pause = _feedback_time(limits["action_pauses"].get("ad"))
         due = max(filter(None, (due, ad_pause)), default=None)
         for category in CATEGORIES:
             latest = max(
-                (r.attempted_at for r in rows if r.category == category and r.attempted_at),
+                (r.attempted_at for r in pacing_rows if r.category == category and r.attempted_at),
                 default=None,
             )
             next_at = (
