@@ -1735,6 +1735,8 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "writable_rate": round(float(join_metrics["writable_rate"]), 3),
                 "probe_success_rate_24h": round(float(join_metrics["probe_success_rate_24h"]), 3),
                 "ad_success_rate_24h": round(float(join_metrics["ad_success_rate_24h"]), 3),
+                "ad_success_24h": int(join_metrics["ad_success_24h"]),
+                "ad_failed_24h": int(join_metrics["ad_failed_24h"]),
                 "average_group_quality_score": round(
                     float(join_metrics["average_group_quality_score"]), 2
                 ),

@@ -226,7 +226,7 @@ def test_known_wait_can_extend_to_48_hours_but_never_beyond():
 
 
 @pytest.mark.asyncio
-async def test_requeue_invalidates_old_approval_and_preserves_join_version(test_db):
+async def test_requeue_preserves_valid_approval_and_join_version(test_db):
     _, _, member, _ = await setup(test_db)
     joined = member.joined_at
     ids = await service.queue_reviews(test_db, [2], "new-batch")
@@ -235,7 +235,7 @@ async def test_requeue_invalidates_old_approval_and_preserves_join_version(test_
     assert member.review_started_at is None and member.review_deadline_at is None
     assert (
         await service.send_gate(test_db, 2, "@qualification_group", "欢迎查看我的简介", None)
-        == "qualification_review_required"
+        is None
     )
 
 
@@ -284,7 +284,7 @@ async def test_username_and_numeric_target_resolve_same_account_scoped_authoriza
     [
         ("expired", "qualification_expired"),
         ("changed_membership", "qualification_review_required"),
-        ("new_queue", "qualification_review_required"),
+        ("new_queue", None),
         ("restricted", "qualification_account_unavailable"),
         ("media", "qualification_content_scope_changed"),
         ("url", "qualification_content_scope_changed"),
@@ -513,7 +513,7 @@ async def test_queue_retries_due_technical_evidence_three_times_without_exit(tes
         assert outcome["processed"] == 1
         assert row.decision == "technical_wait"
     assert row.state == "completed"
-    assert member.review_status == "review_2h"
+    assert member.review_status == "approved"
     assert member.review_started_at is None
     assert len(json.loads(row.evidence_json)["previous_checks"]) == 2
     assert not (await service.authorize_leave(test_db, 2, group, member))[0]
@@ -635,7 +635,7 @@ def test_approval_is_rechecked_before_evidence_expires():
     now = datetime.utcnow()
     verdict, _, state, retry = service.review_schedule(snapshot("trial"), {}, now)
     assert (verdict, state) == ("trial", "completed")
-    assert retry == now + timedelta(hours=23)
+    assert retry == now + timedelta(hours=696)
 
 
 @pytest.mark.asyncio
@@ -1165,4 +1165,31 @@ async def test_budget_wait_preserves_evidence_and_attempts(test_db, monkeypatch)
     assert result["processed"] == 0
     assert (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at) == previous
     assert row.next_retry_at >= start + timedelta(seconds=600)
+    collect.assert_not_awaited()
+
+
+async def test_qualification_reserve_wait_prevents_claim(test_db, monkeypatch):
+    from app.core.account import rpc_governor as rpc
+    _, _, member, old = await setup(test_db)
+    ids = await service.queue_reviews(test_db, [2], "sync-bootstrap-wait")
+    row = await test_db.get(GroupQualificationAudit, ids[0])
+    row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+    row.checked_at = datetime.utcnow() - timedelta(hours=1)
+    await test_db.commit()
+    previous = (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at)
+    monkeypatch.setattr("app.core.account.read_schedule.check_read_ready", rpc.check_read_ready)
+    monkeypatch.setattr(rpc, "snapshot", AsyncMock(return_value={
+        "state": "recovering", "reason": None, "retry_after_seconds": 0,
+        "lanes": {
+            "routine": {"remaining": 0, "retry_after_seconds": 2400},
+            "sync": {"remaining": 0, "retry_after_seconds": 2400},
+        },
+    }))
+    collect = AsyncMock()
+    monkeypatch.setattr(service, "assess", collect)
+    start = datetime.utcnow()
+    result = await service.run_reviews(SimpleNamespace(db=test_db), limit=3)
+    assert result["processed"] == 0
+    assert (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at) == previous
+    assert row.next_retry_at >= start + timedelta(seconds=2400)
     collect.assert_not_awaited()

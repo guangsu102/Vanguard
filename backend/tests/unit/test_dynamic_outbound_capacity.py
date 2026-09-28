@@ -386,6 +386,9 @@ async def test_inventory_excludes_manual_observe_historical_and_stale_audits(tes
     assert info == {
         "total": 6,
         "qualified": 1,
+        "usable": 0,
+        "identity_blocked": 0,
+        "slots_24h": 0,
         "active_backlog": 2,
         "overdue": 1,
         "manual": 1,
@@ -394,11 +397,11 @@ async def test_inventory_excludes_manual_observe_historical_and_stale_audits(tes
     }
     await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     status = await JoinRequestBudgetService(test_db).status(account.id, now=NOW)
-    assert status.effective_limit == 30
+    assert status.effective_limit == 0  # No active ad rollout/material in this fixture.
     assert "join_review_overdue" not in status.blocked_reasons
     assert "join_review_backlog" not in status.blocked_reasons
     cap = await capacity_snapshot(test_db, account.id, NOW)
-    assert cap["inventory"]["target"] == 60
+    assert cap["inventory"]["target"] == 18
     assert cap["remaining"]["join"] == 30
 
 
@@ -427,7 +430,9 @@ async def test_dynamic_backlog_high_and_low_watermarks(test_db):
     assert "join_review_backlog" not in (await service.status(account.id, now=NOW)).blocked_reasons
 
 
-async def test_dynamic_limits_bypass_legacy_multipliers_but_keep_health(test_db):
+async def test_dynamic_limits_bypass_legacy_multipliers_but_keep_health(test_db, monkeypatch):
+    monkeypatch.setattr("app.modules.acquisition.ad_output_plan.ad_output_plan",
+                        AsyncMock(return_value={"join_blocker":None, "group_deficit":40}))
     account, config = await account_config(test_db)
     service = AccountDynamicFrequencyService(test_db)
     service.account_join_quality_metrics = AsyncMock(
@@ -751,7 +756,7 @@ async def test_capacity_distinguishes_unused_quota_from_executable_material_and_
     assert "qualification_group_daily_cap" in capped["blockers"]
 
 
-async def test_join_executable_requires_candidates_and_verification_budget(test_db):
+async def test_join_executable_requires_candidates_and_verification_budget(test_db, monkeypatch):
     from app.core.settings_models import SystemSetting
 
     test_db.add(SystemSetting(key="automation.group_qualification", value='{"enabled":true}'))
@@ -776,9 +781,79 @@ async def test_join_executable_requires_candidates_and_verification_budget(test_
     ))
     await test_db.commit()
     ready = await capacity_snapshot(test_db, account.id, NOW)
-    assert ready["executable_now"]["join"] == 1, str(ready["workload"])
+    assert ready["executable_now"]["join"] == 0
+    assert "join_ad_delivery_paused" in ready["blockers"]
+    # Isolate candidate/verification behavior after the output gate allows replenishment.
+    monkeypatch.setattr("app.modules.acquisition.ad_output_plan.ad_output_plan", AsyncMock(return_value={
+        "join_blocker":None, "group_deficit":18, "target_groups":18}))
+    ready = await capacity_snapshot(test_db, account.id, NOW)
+    assert ready["executable_now"]["join"] == 1
     config.max_verification_messages_per_day = 0
     await test_db.commit()
     exhausted = await capacity_snapshot(test_db, account.id, NOW)
     assert exhausted["executable_now"]["join"] == 0
     assert "verification_budget_unavailable" in exhausted["blockers"]
+
+
+async def test_capacity_batches_joined_candidates_across_accounts(test_db):
+    from sqlalchemy import event
+    from app.core.settings_models import SystemSetting
+
+    account, _config = await account_config(test_db)
+    other = TelegramAccount(identifier="other-capacity", session_name="other-capacity",
+                            account_type=AccountType.PROMOTER, status=AccountStatus.ONLINE,
+                            risk_level="normal", is_active=True)
+    test_db.add(other)
+    test_db.add(SystemSetting(key="automation.group_qualification", value='{"enabled":true}'))
+    groups = [Group(group_id=-1000000200000-i, username=f"bulk_candidate_{i}",
+                    status="pending_join") for i in range(200)]
+    test_db.add_all(groups)
+    await test_db.flush()
+    # A joined relationship owned by another account must still exclude a target.
+    test_db.add_all([
+        GroupAccountMembership(account_id=other.id, group_id=groups[0].id,
+            telegram_group_id=groups[0].group_id, status="joined", joined_at=NOW),
+        GroupAccountMembership(account_id=account.id, group_id=groups[1].id,
+            telegram_group_id=groups[1].group_id, status="left", ad_status="blocked"),
+    ])
+    account_id = account.id
+    await test_db.commit()
+    test_db.expunge_all()
+    lookups = []
+    def count_candidates(_conn, _cursor, statement, *_args):
+        if statement.lstrip().startswith("SELECT") and "group_account_membership.group_id IN" in statement:
+            lookups.append(statement)
+    engine = test_db.bind.sync_engine
+    event.listen(engine, "before_cursor_execute", count_candidates)
+    try:
+        result = await capacity_snapshot(test_db, account_id, NOW)
+    finally:
+        event.remove(engine, "before_cursor_execute", count_candidates)
+    assert result["workload"]["join_candidates_total"] == 199
+    assert result["workload"]["join_candidates_preview_pending"] == 199
+    assert result["executable_now"]["join"] == 0
+    assert len(lookups) == 1
+
+@pytest.mark.parametrize('global_wait', [0, 120])
+async def test_capacity_ad_deadline_uses_ad_lane_not_earlier_global_reset(test_db, monkeypatch, global_wait):
+    from app.core.account import rpc_governor
+    from app.modules.acquisition import capacity
+    account, config = await account_config(test_db)
+    monkeypatch.setattr(rpc_governor, 'read_budget_state', AsyncMock(return_value={
+        'usage': {}, 'blocked_windows': ['hour'] if global_wait else [],
+        'retry_after_seconds': global_wait, 'emergency_cooldown_seconds': 0,
+        'lanes': {'ad': {'remaining': 0, 'retry_after_seconds': 3600},
+                  'critical': {'remaining': 0, 'retry_after_seconds': 7200},
+                  'routine': {'remaining': 5, 'retry_after_seconds': 0}},
+    }))
+    monkeypatch.setattr(capacity, 'inventory_snapshot', AsyncMock(return_value={
+        'qualified': 10, 'review_due': 0, 'active_backlog': 0, 'total': 10,
+    }))
+    monkeypatch.setattr(capacity, 'executable_inventory', AsyncMock(return_value={
+        'ad_targets': 10, 'join_candidates': 3, 'blocker_counts': {},
+        'ad_next_allowed_at': NOW + timedelta(minutes=20),
+    }))
+    row = await capacity_snapshot(test_db, account.id, NOW)
+    assert row['executable']['ad'] == 0
+    assert row['ad_next_allowed_at'] == (NOW + timedelta(seconds=3601)).isoformat()
+    assert 'telegram_ad_read_budget' in row['blockers']

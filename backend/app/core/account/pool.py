@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 from telethon import TelegramClient
@@ -154,7 +154,10 @@ class TelegramAccountWrapper:
     @property
     def is_available(self) -> bool:
         """Check if account is available for use."""
-        return self.status in [AccountStatus.IDLE, AccountStatus.ONLINE]
+        pause = getattr(self.client, "_vanguard_listener_pause", None)
+        return self.status in [AccountStatus.IDLE, AccountStatus.ONLINE] and not (
+            pause is not None and pause.reason is not None
+        )
 
     @property
     def session_file_path(self) -> Path:
@@ -811,6 +814,13 @@ class AccountPool:
                 )
                 return None
 
+            pause = getattr(selected.client, "_vanguard_listener_pause", None)
+            if pause is not None and pause.reason is not None:
+                pause.check_resume()
+                # Only the listener cycle can resume this retained session after
+                # checking both ordinary and sync budgets.
+                raise RpcDeferred("telegram_read_budget", 5)
+
             if operation_lease is not None:
                 if operation_lease.account_id != account_id:
                     raise ValueError("账号租约与指定账号不匹配")
@@ -877,6 +887,24 @@ class AccountPool:
             )
             return selected
 
+    async def listener_storage_snapshot(self, account_id: int) -> dict[str, Any]:
+        """Inspect the matching durable session even when bootstrap is deferred."""
+        from app.core.account.listener_checkpoint import listener_session_path
+        from app.core.account.listener_storage import read_listener_storage
+
+        wrapper = await self.get_account_by_id(account_id)
+        if wrapper is None:
+            return {"available": False, "source": "disk", "storage_error": None}
+        try:
+            path = wrapper.session_file_path
+            if wrapper.session_string:
+                path = listener_session_path(StringSession(wrapper.session_string), path)
+            if path is None:
+                return {"available": False, "source": "disk", "storage_error": None}
+            return await asyncio.to_thread(read_listener_storage, path)
+        except Exception as exc:
+            return {"available": False, "source": "disk", "storage_error": type(exc).__name__}
+
     async def connect_by_id(
         self,
         account_id: int,
@@ -919,6 +947,9 @@ class AccountPool:
 
             previous_keep_connected = selected.keep_connected
             try:
+                pause = getattr(selected.client, "_vanguard_listener_pause", None)
+                if pause is not None:
+                    pause.check_resume()
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 connected_now = False
@@ -927,7 +958,26 @@ class AccountPool:
                     selected.client is None
                     or not getattr(selected.client, "is_connected", lambda: False)()
                 ):
-                    selected.client = await self._create_client(selected)
+                    previous_purpose = selected.active_purpose
+                    selected.active_purpose = purpose
+                    try:
+                        if pause is not None and selected.client is pause.client:
+                            # Keep session cursors, entity cache, queued updates and
+                            # handlers. StringSession export alone lacks these.
+                            selected.client._catch_up = True
+                            try:
+                                await selected.client.connect()
+                            except BaseException:
+                                # connect() may open its transport before a bootstrap
+                                # read is deferred; do not leave that producer running.
+                                with suppress(Exception):
+                                    await selected.client.disconnect()
+                                raise
+                            pause.resumed()
+                        else:
+                            selected.client = await self._create_client(selected)
+                    finally:
+                        selected.active_purpose = previous_purpose
                     connected_now = True
                 elif previous_keep_connected != keep_connected:
                     await selected.client.set_receive_updates(keep_connected)
@@ -993,6 +1043,10 @@ class AccountPool:
             else (str(session_path) if session_path.exists() else StringSession())
         )
 
+        if account.keep_connected and isinstance(session, StringSession):
+            from app.core.account.listener_checkpoint import listener_session
+            session = listener_session(session, session_path)
+
         profile_key = (
             account.fingerprint_id
             or account.phone
@@ -1031,11 +1085,24 @@ class AccountPool:
             base_logger=f"vanguard.telethon.account.{account.account_id}",
             flood_sleep_threshold=0,
             receive_updates=account.keep_connected,
+            sequential_updates=account.keep_connected,
+            catch_up=account.keep_connected,
         )
         install_governor(client, RpcGovernor(
             account.account_id, lambda: account.active_purpose,
             budget_reads=account.account_type == AccountType.PROMOTER,
         ))
+        if account.keep_connected:
+            from app.core.account.listener_checkpoint import install_listener_checkpoint
+            from app.core.account.listener_pause import ListenerPause
+
+            # Lightweight fake clients used by offline tests have no SDK session.
+            if hasattr(client, "session"):
+                install_listener_checkpoint(client)
+
+            client._vanguard_listener_pause = ListenerPause(
+                client, lambda: self.pause_listener(account, client)
+            )
         try:
             await client._vanguard_governor.before([])
             await client.connect()
@@ -1046,6 +1113,27 @@ class AccountPool:
             with suppress(Exception):
                 await client.disconnect()
             raise
+
+    async def pause_listener(self, account: TelegramAccountWrapper, client: Any) -> None:
+        """Stop the transport when idle, retaining queue/session for recovery."""
+        # Freeze dispatch before draining existing handlers so incoming traffic
+        # cannot keep creating more handlers while we wait for an active write.
+        updates = getattr(client, "_updates_handle", None)
+        if updates is not None and not updates.done():
+            updates.cancel()
+            await asyncio.gather(updates, return_exceptions=True)
+        while True:
+            async with self._lock:
+                if account.client is not client:
+                    return
+                busy = account.status == AccountStatus.WORKING or account.operation_lease is not None
+                handlers = [task for task in client._event_handler_tasks if not task.done()]
+                if not busy and not handlers:
+                    # SDK disconnect saves the message-box cursor and cancels the
+                    # blocked update consumer. Never interrupt an in-flight write.
+                    await client.disconnect()
+                    return
+            await asyncio.sleep(0.25)
 
     def _validate_runtime_environment(self, account: TelegramAccountWrapper) -> None:
         ok, reason = AccountEnvironmentGuard.validate_account_environment(account)
@@ -1082,6 +1170,14 @@ class AccountPool:
         account.current_proxy_country = account.country_code.upper()
 
         if account.client is not None and previous_proxy != proxy:
+            pause = getattr(account.client, "_vanguard_listener_pause", None)
+            if pause is not None and pause.reason is not None and not account.client.is_connected():
+                if proxy is None:
+                    raise RuntimeError("Promoter account proxy is required but no proxy was acquired")
+                # A transport change must not throw away a paused session cursor.
+                account.client.set_proxy((proxy.protocol, proxy.host, proxy.port, True,
+                                          proxy.username, proxy.password))
+                return
             try:
                 if account.client.is_connected():
                     await account.client.disconnect()
@@ -1312,7 +1408,7 @@ class AccountPool:
         accounts = [
             acc
             for acc in self._accounts.values()
-            if acc.status in [AccountStatus.IDLE, AccountStatus.ONLINE]
+            if acc.is_available
         ]
 
         if require_session:

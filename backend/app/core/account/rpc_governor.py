@@ -16,7 +16,14 @@ from typing import Any
 import structlog
 from sqlalchemy import select
 
-from app.core.account.rpc_budget_policy import WINDOWS, read_lane, window_plan
+from app.core.account.rpc_budget_policy import (
+    AD_PURPOSES,
+    LANE_SHARES,
+    LANES,
+    WINDOWS,
+    read_lane,
+    window_plan,
+)
 from app.core.settings_models import SystemSetting
 
 logger = structlog.get_logger()
@@ -45,15 +52,22 @@ def limits_for(state: dict, now: datetime) -> dict[str, int]:
     success = parse_date(state.get("last_success_at"))
     if end and success and success > end and now > end:
         factor = min(1.0, factor + 0.1 * int((now - end).total_seconds() // 86400))
-    return {
+    limits = {
         "minute": max(6, int(120 * factor)),
         "hour": max(30, int(240 * factor)),
         "day": max(120, int(2400 * factor)),
-        "background_hour": max(10, int(60 * factor)),
-        "background_day": max(40, int(480 * factor)),
-        "sync_hour": max(5, int(60 * factor)),
-        "sync_day": max(40, int(600 * factor)),
     }
+    for lane, share in LANE_SHARES.items():
+        for window in ("hour", "day"):
+            # Round the protected allocation up to whole RPCs so recovering
+            # accounts never reserve less than the requested 35 percent.
+            reserve_rounding = 99 if lane in {"ad", "survival"} else 0
+            limits[f"{lane}_{window}"] = max(1, (limits[window] * share + reserve_rounding) // 100)
+    for window in ("hour", "day"):
+        limits[f"non_ad_{window}"] = limits[window] - limits[f"ad_{window}"]
+        limits[f"non_survival_{window}"] = limits[f"non_ad_{window}"] - limits[f"survival_{window}"]
+    return limits
+
 
 
 async def load_state(db: Any, account_id: int) -> dict:
@@ -107,9 +121,20 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
         "local r={} for _,k in ipairs(KEYS) do "
         "table.insert(r,tonumber(redis.call('GET',k) or '0')); "
         "table.insert(r,redis.call('TTL',k)); end return r", len(keys), *keys)
+    raw = {name: (int(values[2*i]), int(values[2*i+1])) for i, (name, _) in enumerate(windows)}
+    # Virtual non-ad consumption retains all existing shared usage. Historical
+    # reads before ad accounting existed are conservatively treated as non-ad.
+    for window in ("hour", "day"):
+        total, ttl = raw[window]
+        ad_used = min(total, raw[f"ad_{window}"][0]) if ttl != -2 else 0
+        raw[f"ad_{window}"] = (ad_used, ttl)
+        raw[f"non_ad_{window}"] = (total - ad_used, ttl)
+        survival_used = min(total - ad_used, raw[f"survival_{window}"][0]) if ttl != -2 else 0
+        raw[f"survival_{window}"] = (survival_used, ttl)
+        raw[f"non_survival_{window}"] = (total - ad_used - survival_used, ttl)
     usage, blocked, delay = {}, [], 0
-    for i, (name, duration) in enumerate(windows):
-        used, ttl = int(values[2*i]), int(values[2*i+1])
+    for name, duration in windows:
+        used, ttl = raw[name]
         exhausted = used >= limits[name]
         # A missing expiry on an exhausted counter is unavailable, never ready.
         wait = (max(1, ttl) if ttl >= 0 else duration) if exhausted else 0
@@ -120,7 +145,7 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
             delay = max(delay, wait)
     emergency = max(0, int(await cache.ttl(f"vanguard:rpc:cooldown:{account_id}")))
     lanes = {}
-    for lane in ("critical", "routine", "background", "sync"):
+    for lane in LANES:
         waits, remaining = [], []
         for name, duration, cap in window_plan(limits, lane):
             item = usage[name]
@@ -170,12 +195,21 @@ async def snapshot(db: Any, account_id: int, now: datetime) -> dict:
 
 
 async def check_read_ready(
-    db: Any, account_id: int, now: datetime | None = None, *, purpose: str = "ad_delivery"
+    db: Any, account_id: int, now: datetime | None = None, *, purpose: str = "ad_delivery",
+    requires_bootstrap: bool = False,
 ) -> dict:
     result = await snapshot(db, account_id, now or datetime.utcnow())
-    lane = result.get("lanes", {}).get(read_lane([], purpose), {})
-    if lane.get("retry_after_seconds") and result["state"] not in {"cooldown", "unavailable"}:
-        raise RpcDeferred("telegram_read_budget", lane["retry_after_seconds"])
+    required_lanes = {read_lane([], purpose)}
+    if requires_bootstrap:
+        # A short connection authorizes via GetState before collecting evidence.
+        # Reuse the RPC policy so critical purposes retain their existing lane.
+        required_lanes.add(read_lane(["updates.GetStateRequest"], purpose))
+    delay = max(
+        result.get("lanes", {}).get(lane, {}).get("retry_after_seconds", 0)
+        for lane in required_lanes
+    )
+    if delay and result["state"] not in {"cooldown", "unavailable"}:
+        raise RpcDeferred("telegram_read_budget", delay)
     if result["state"] in {"cooldown", "budget_wait", "unavailable"}:
         raise RpcDeferred(result["reason"], result["retry_after_seconds"])
     return result
@@ -185,18 +219,74 @@ async def check_read_ready(
 # All windows are checked BEFORE any increment, atomically across every worker.
 BUDGET_LUA = """
 local delay = 0
-for i,key in ipairs(KEYS) do
-  local used = tonumber(redis.call('GET', key) or '0')
-  if used + tonumber(ARGV[1]) > tonumber(ARGV[2*i]) then
-    local ttl = redis.call('TTL', key)
-    if ttl < 1 then ttl = tonumber(ARGV[2*i+1]) end
-    delay = math.max(delay, ttl)
+-- Shared counters remain the original first three windows. The last five keys
+-- are ad-hour/day, survival-hour/day lookups and pacing. No migration reset.
+local windows = #KEYS - 5
+local function protected(parent)
+  local total = tonumber(redis.call('GET', KEYS[parent]) or '0')
+  local offset = parent == 2 and 0 or 1
+  local ad = math.min(total, tonumber(redis.call('GET', KEYS[windows+1+offset]) or '0'))
+  local survival = math.min(total-ad, tonumber(redis.call('GET', KEYS[windows+3+offset]) or '0'))
+  return total, ad, survival
+end
+local function parent_for(key)
+  if string.match(key, '_hour$') then return 2 end
+  return 3
+end
+local function virtual(key)
+  return string.match(key, ':non_ad_') or string.match(key, ':non_survival_')
+end
+local function aligned(key)
+  return virtual(key) or string.match(key, ':ad_') or string.match(key, ':survival_')
+end
+local function used_for(i)
+  local key = KEYS[i]
+  if aligned(key) then
+    local total, ad, survival = protected(parent_for(key))
+    if string.match(key, ':non_ad_') then return total-ad end
+    if string.match(key, ':non_survival_') then return total-ad-survival end
+    if string.match(key, ':survival_') then return survival end
+    return ad
+  end
+  return tonumber(redis.call('GET',key) or '0')
+end
+for i=1,windows do
+  if used_for(i)+tonumber(ARGV[1]) > tonumber(ARGV[2*i+1]) then
+    local key=KEYS[i]
+    local ttl=redis.call('TTL', aligned(key) and KEYS[parent_for(key)] or key)
+    if ttl < 1 then ttl=tonumber(ARGV[2*i+2]) end
+    delay=math.max(delay,ttl)
   end
 end
-if delay > 0 then return delay end
-for i,key in ipairs(KEYS) do
-  local count = redis.call('INCRBY', key, ARGV[1])
-  if count == tonumber(ARGV[1]) then redis.call('EXPIRE', key, ARGV[2*i+1]) end
+if delay > 0 then return delay*1000 end
+local pace=tonumber(ARGV[2])
+local t=redis.call('TIME')
+local now=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000)
+if pace > 0 then
+  local due=tonumber(redis.call('GET',KEYS[#KEYS]) or '0')
+  local burst=tonumber(ARGV[3+windows*2]) or 1
+  local eligible=due-math.max(0,burst-tonumber(ARGV[1]))*pace
+  if eligible > now then return -(eligible-now) end
+end
+for i=1,windows do
+  if not virtual(KEYS[i]) then
+    local count=redis.call('INCRBY',KEYS[i],ARGV[1])
+    if count == tonumber(ARGV[1]) then
+      redis.call('EXPIRE',KEYS[i],ARGV[2*i+2])
+      if i == 2 or i == 3 then
+        local offset=i == 2 and 0 or 1
+        redis.call('DEL',KEYS[windows+1+offset],KEYS[windows+3+offset])
+      end
+    end
+    if aligned(KEYS[i]) then
+      local ttl=redis.call('PTTL',KEYS[parent_for(KEYS[i])])
+      if ttl > 0 then redis.call('PEXPIRE',KEYS[i],ttl) end
+    end
+  end
+end
+if pace > 0 then
+  local due=math.max(now,tonumber(redis.call('GET',KEYS[#KEYS]) or '0'))+pace*tonumber(ARGV[1])
+  redis.call('SET',KEYS[#KEYS],due,'PX',due-now+60000)
 end
 return 0
 """
@@ -226,16 +316,45 @@ class RpcGovernor:
                 return
             limits = limits_for(state, now)
             purpose = str(self.purpose())
+            from app.core.account.event_inbox import current_event_id
+            if current_event_id.get() is not None and not sync and purpose not in (AD_PURPOSES | {"ad_survival_check"}):
+                purpose = "growth_event"
             lane = "sync" if sync else read_lane(methods, purpose)
             windows = window_plan(limits, lane)
             keys = [f"vanguard:rpc:{self.account_id}:{name}" for name, _, _ in windows]
-            args = [reads]
+            keys.extend(f"vanguard:rpc:{self.account_id}:ad_{window}" for window in ("hour", "day"))
+            keys.extend(f"vanguard:rpc:{self.account_id}:survival_{window}" for window in ("hour", "day"))
+            keys.append(f"vanguard:rpc:{self.account_id}:{'sync_pace' if lane == 'sync' else 'scan_pace'}")
+            # A four-read burst permits bootstrap and short differences. The
+            # sustained sync rate fits its day share, not merely its hour peak.
+            pace = (math.ceil(86400000 / limits["sync_day"]) if lane == "sync"
+                    else {"routine": 1500, "background": 3000}.get(lane, 0))
+            args = [reads, pace]
             for _name, ttl, cap in windows:
                 args.extend([cap, ttl])
+            args.append(4 if lane == "sync" else 1)
             redis = await get_redis()
-            delay = int(await redis.eval(BUDGET_LUA, len(keys), *keys, *args))
+            while True:
+                delay = int(await redis.eval(BUDGET_LUA, len(keys), *keys, *args))
+                if delay >= 0:
+                    break
+                if lane == "sync":
+                    raise RpcDeferred("telegram_read_budget", math.ceil(-delay / 1000))
+                # A paced wait never reserves budget or sends an RPC. Shared
+                # Redis time coordinates scans in different worker processes.
+                from app.core.account.read_timeout import paced_sleep
+                await paced_sleep(min(3.0, -delay / 1000))
+                async with get_db_session() as db:
+                    fresh = await load_state(db, self.account_id)
+                until = parse_date(fresh.get("pause_until"))
+                emergency = int(await redis.ttl(f"vanguard:rpc:cooldown:{self.account_id}"))
+                wait = max(emergency, math.ceil((until-datetime.utcnow()).total_seconds()) if until else 0)
+                if wait > 0:
+                    raise RpcDeferred("telegram_rpc_cooldown", wait)
             if delay:
-                raise RpcDeferred("telegram_read_budget", delay)
+                raise RpcDeferred("telegram_read_budget", math.ceil(delay / 1000))
+            from app.modules.acquisition.read_costs import charge_reads
+            charge_reads(self.account_id, reads, lane)
             # Bounded telemetry; count attempts, including failures, never request content.
             key = f"vanguard:rpc:counts:{self.account_id}:{now:%Y%m%d}"
             async with redis.pipeline(transaction=True) as pipe:
@@ -336,14 +455,42 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             except RpcDeferred as exc:
                 if not internal_sync:
                     raise
+                from app.core.account.listener_budget_wait import (
+                    can_receive_while_waiting, can_wait_global, wait_global,
+                    receive_while_waiting,
+                )
+                if exc.reason == "telegram_read_budget" and can_receive_while_waiting(client, requests):
+                    await receive_while_waiting(client, exc)
+                    continue
+                if exc.reason == "telegram_read_budget" and can_wait_global(client, requests):
+                    await wait_global(client, exc)
+                    continue
+                pause = getattr(client, "_vanguard_listener_pause", None)
+                if pause is not None:
+                    # A separate task disconnects and cancels this consumer.
+                    # The client/session and queued updates remain for catch-up.
+                    pause.request(exc)
+                    await asyncio.Future()
                 # This is a pre-RPC wait, never a resend. Cancellation from disconnect()
                 # propagates, and each wake rechecks shared limits and Telegram cooldown.
                 await asyncio.sleep(min(60, exc.retry_after_seconds + 1))
+        if internal_sync:
+            client._vanguard_sync_wait = None
         try:
+            if any(not method.split(".")[-1].startswith(READ_PREFIXES) for method in methods):
+                from app.core.account.event_inbox import mark_external_attempt
+                await mark_external_attempt()
             result = await original(sender, request, ordered=ordered, flood_sleep_threshold=0)
         except Exception as exc:
             await governor.failed(methods, exc)
             raise
+        if internal_sync:
+            if type(result).__name__ in {"DifferenceTooLong", "ChannelDifferenceTooLong"}:
+                journal = getattr(getattr(client, 'session', None), 'journal', None)
+                if journal is not None:
+                    journal.reconciliation_required()
+            from app.core.account.listener_budget_wait import record_sync_result
+            await record_sync_result(governor, requests, result)
         # Never turn a completed write into an error because telemetry failed.
         try:
             await governor.succeeded()

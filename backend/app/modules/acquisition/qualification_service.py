@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, desc, exists, func, or_, select
+from sqlalchemy import and_, case, desc, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 from app.core.account.models import TelegramAccount
@@ -37,6 +37,8 @@ from app.modules.acquisition.qualification_system_identity import covered_system
 from app.modules.acquisition.send_restriction import (
     confirmed_denial, track_restriction, verified_long_restriction,
 )
+
+from app.modules.acquisition.qualification_lifetime import EVIDENCE_TTL, evidence_expiry, renewal_at
 
 SETTING_KEY = "automation.group_qualification"
 AI_REVIEW_INCOMPLETE_REASONS = {
@@ -448,7 +450,8 @@ async def current_authorization(
         target_aliases is not None and member.telegram_group_id not in target_aliases
     ):
         return AuthorizationResolution(reason="qualification_membership_identity_changed")
-    row = await latest_review(db, member.id, include_pending=True)
+    from app.modules.acquisition.qualification_continuity import effective_review
+    row = await effective_review(db, member.id)
     return AuthorizationResolution(
         row, group, member, reason="qualification_review_required" if row is None else None
     )
@@ -640,7 +643,7 @@ def _base_review_schedule(
                 if retry <= now:
                     retry = final
     if verdict in {"allowed", "trial"}:
-        retry = now + timedelta(hours=23)  # Renew evidence before the 24-hour cache expires.
+        retry = renewal_at(_date(snapshot.get("collected_at")) or now, now)
     # Review does not have a human approval lane. Unresolved evidence remains
     # blocked for advertising and is retried automatically.
     if state == "manual_required":
@@ -851,6 +854,28 @@ async def assess(
 
         previous = _payload(row)
         previous = previous.get("pending_collection") or previous
+        from app.modules.acquisition.qualification_continuity import OWN_SOURCE, effective_review, own_proof_valid
+        if row is not None and row.decision == "unknown" and not force_refresh:
+            approved = await effective_review(service.db, membership.id)
+            old = _payload(approved)
+            if (approved is not None and approved.id != row.id
+                    and approved.decision in {"allowed", "trial"}
+                    and approved.expires_at and approved.expires_at > now
+                    and scope_matches(approved, group, membership)
+                    and old.get("authorization_basis") == OWN_SOURCE
+                    and old.get("profile_fingerprint") == profile_fingerprint(account)
+                    and await own_proof_valid(service.db, old, membership, group, now)):
+                row.decision, row.reason = approved.decision, approved.reason
+                row.checked_at, row.expires_at = approved.checked_at, approved.expires_at
+                row.evidence_json, row.evidence_hash = approved.evidence_json, approved.evidence_hash
+                previous = old
+        from app.modules.acquisition.qualification_renewal import try_light_renewal
+        renewed = await try_light_renewal(
+            service, account, group, membership, row, previous,
+            force_refresh=force_refresh or restricted_read,
+        )
+        if renewed is not None:
+            return renewed
         collected_at = _date(previous.get("collected_at"))
         from app.modules.acquisition.evidence_progress import evidence_maturity
         maturity = evidence_maturity(previous, now)
@@ -1152,6 +1177,18 @@ async def assess(
         }
     )
     if membership is not None:
+        # An unsuccessful recheck is a job result, not a revocation of an
+        # existing approval. Preserve its timestamp, deadline and evidence.
+        if (not restricted_read and row is not None and row.decision in {"allowed", "trial"}
+                and (verdict == "technical_wait" or snapshot.get("ai_review_incomplete"))
+                and not exit_reason):
+            previous = _payload(row)
+            previous["last_review_attempt"] = {"at": now.isoformat(), "reason": reason,
+                                               "technical_errors": snapshot.get("technical_errors", [])}
+            row.evidence_json = json.dumps(previous, ensure_ascii=False, default=str)
+            row.state = "completed"
+            row.next_retry_at = now + timedelta(seconds=max(60, int(snapshot.get("retry_after_seconds") or 60)))
+            return JoinedGroupAuditResult(passed=False, reason=reason)
         if row is None:
             row = GroupQualificationAudit(
                 batch_id="automatic-" + uuid4().hex,
@@ -1216,7 +1253,7 @@ async def assess(
         row.decision, row.reason = verdict, reason
         row.evidence_hash = snapshot_hash(snapshot, account_id, row.content_scope)
         row.checked_at = now
-        row.expires_at = min(now, _date(snapshot.get("collected_at")) or now) + timedelta(hours=24)
+        row.expires_at = evidence_expiry(_date(snapshot.get("collected_at")) or now, now)
         await service.db.flush()  # New automatic rows need a durable ID in the history.
         if verdict == "reject" and row.policy_version == POLICY_VERSION:
             exit_history.append(
@@ -1353,6 +1390,14 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
     rows = []
     now = datetime.utcnow()
     for member in members:
+        from app.modules.acquisition.qualification_continuity import effective_review
+        active_authorization = await effective_review(db, member.id)
+        keep_approval = bool(
+            active_authorization and active_authorization.decision in {"allowed", "trial"}
+            and active_authorization.expires_at and active_authorization.expires_at > now
+            and active_authorization.membership_joined_at == member.joined_at
+            and member.review_status == "approved" and member.ad_status == "active"
+        )
         pending = list(
             (
                 await db.scalars(
@@ -1366,6 +1411,8 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
             ).all()
         )
         for old in pending:
+            if keep_approval and old.id == active_authorization.id:
+                continue
             old.state, old.reason, old.next_retry_at = "cancelled", "superseded_by_recheck", None
         row = GroupQualificationAudit(
             batch_id=batch_id,
@@ -1380,7 +1427,8 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
         )
         db.add(row)
         rows.append(row)
-        member.review_status, member.ad_status = "initial_pending", "blocked"
+        if not keep_approval:
+            member.review_status, member.ad_status = "initial_pending", "blocked"
         member.review_started_at = member.review_deadline_at = member.review_next_at = None
         member.review_attempts = 0
     await db.flush()
@@ -1516,7 +1564,7 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
         latest_ad_review.state == "completed",
         latest_ad_review.decision.in_(["allowed", "trial"]),
         latest_ad_review.expires_at > now,
-        latest_ad_review.checked_at >= now - timedelta(hours=24),
+        latest_ad_review.checked_at >= now - EVIDENCE_TTL,
         ~exists(select(GroupQualificationAudit.id).where(
             GroupQualificationAudit.membership_id == latest_ad_review.membership_id,
             GroupQualificationAudit.id > latest_ad_review.id,
@@ -1657,7 +1705,11 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
         if cooling:
             query = query.where(GroupQualificationAudit.account_id.not_in(cooling))
         # Suspended reads remain due; do not consume attempts or model calls.
-        paused_accounts = select(TelegramAccount.id).where(TelegramAccount.risk_pause_until > now)
+        paused_accounts = select(TelegramAccount.id).where(or_(
+            TelegramAccount.risk_pause_until > now,
+            TelegramAccount.risk_level.in_(["quarantined", "frozen"]),
+            TelegramAccount.is_active.is_(False),
+        ))
         query = query.where(GroupQualificationAudit.account_id.not_in(paused_accounts))
         rollout_paused = [int(key) for key, value in (config.get("rollout_accounts") or {}).items()
                           if value.get("phase") == "paused"]
@@ -1676,8 +1728,23 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             )
         if not (config.get("exit_all_accounts") is True) and config.get("account_ids"):
             query = query.where(GroupQualificationAudit.account_id.in_(_ids(config["account_ids"])))
+        joined = exists(select(GroupAccountMembership.id).where(
+            GroupAccountMembership.id == GroupQualificationAudit.membership_id,
+            GroupAccountMembership.status == "joined",
+            GroupAccountMembership.left_at.is_(None),
+        ))
+        successful = exists(select(AdDeliveryLog.id).where(
+            AdDeliveryLog.account_id == GroupQualificationAudit.account_id,
+            AdDeliveryLog.group_id == GroupQualificationAudit.group_id,
+            AdDeliveryLog.status == "success",
+            AdDeliveryLog.telegram_message_id.is_not(None),
+            AdDeliveryLog.created_at >= now - timedelta(days=7),
+        ))
+        renewal_rank = case((and_(joined, or_(
+            GroupQualificationAudit.decision.in_(["allowed", "trial"]), successful,
+        )), 0), else_=1)
         row = await service.db.scalar(
-            query.order_by(GroupQualificationAudit.next_retry_at, GroupQualificationAudit.id)
+            query.order_by(renewal_rank, GroupQualificationAudit.next_retry_at, GroupQualificationAudit.id)
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -1700,6 +1767,12 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             or row.policy_version != POLICY_VERSION
             or row.content_scope != "text_profile"
         ):
+            if (latest is not None and latest.id != row.id
+                    and row.decision in {"allowed", "trial"}
+                    and membership is not None and scope_matches(row, group, membership)):
+                row.state, row.next_retry_at = "completed", None
+                await service.db.commit()
+                continue
             row.state, row.reason, row.next_retry_at = (
                 "cancelled",
                 "membership_or_scope_changed",
@@ -1731,7 +1804,10 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             await service.db.rollback()
             break
         from app.core.account.read_schedule import read_wait
-        pause = await read_wait(service.db, row.account_id, now, purpose="group_qualification")
+        pause = await read_wait(
+            service.db, row.account_id, now, purpose="group_qualification",
+            requires_bootstrap=True,
+        )
         if pause:
             # Keep evidence, attempts and checked_at unchanged when no read can start.
             # Older historical rows and running claims must not be rescheduled here.
@@ -1763,6 +1839,12 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             or latest.id != row.id
             or membership.joined_at != row.membership_joined_at
         ):
+            if (latest is not None and latest.id != row.id
+                    and row.decision in {"allowed", "trial"}
+                    and scope_matches(row, group, membership)):
+                row.state, row.next_retry_at = "completed", None
+                await service.db.commit()
+                continue
             row.state, row.reason, row.next_retry_at = (
                 "cancelled",
                 "superseded_during_collection",
@@ -1772,6 +1854,30 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             continue
         decision = row.decision
         evidence = _payload(row)
+        from app.modules.acquisition.qualification_continuity import effective_review, review_only
+        if review_only(row):
+            approved = await effective_review(service.db, membership.id)
+            if (approved is not None and approved.id != row.id
+                    and approved.decision in {"allowed", "trial"}
+                    and approved.expires_at and approved.expires_at > now
+                    and scope_matches(approved, group, membership)
+                    and membership.ad_status not in {"paused", "blocked"}):
+                membership.review_status = "approved"
+                membership.review_next_at = row.next_retry_at
+                await service.db.commit()
+                result["processed"] += 1
+                result["results"].append({"audit_id": row.id, "decision": decision,
+                                          "reason": row.reason, "approval_retained": approved.id})
+                continue
+        if decision in {"allowed", "trial"} and not audit.passed:
+            # A deferred lightweight renewal retains its previous approval and
+            # ad profile. Only the next review deadline changes.
+            membership.review_next_at = row.next_retry_at
+            await service.db.commit()
+            result["processed"] += 1
+            result["results"].append({"account_id": row.account_id, "group_id": row.group_id,
+                                      "decision": decision, "reason": audit.reason, "deferred": True})
+            continue
         membership.review_started_at = _date(evidence.get("observation_started_at"))
         membership.review_deadline_at = (
             membership.review_started_at + timedelta(hours=24)
@@ -1951,13 +2057,13 @@ async def send_gate(
         or row.membership_joined_at != member.joined_at
     ):
         return "qualification_review_required"
-    if row.decision not in {"allowed", "trial"} or row.state != "completed":
+    if row.decision not in {"allowed", "trial"} or row.state not in {"completed", "running"}:
         return "qualification_not_approved"
     if (
         row.expires_at is None
         or row.expires_at <= now
         or row.checked_at is None
-        or row.checked_at < now - timedelta(hours=24)
+        or row.checked_at < now - EVIDENCE_TTL
     ):
         return "qualification_expired"
     if not scope_matches(row, group, member):
@@ -1979,7 +2085,11 @@ async def send_gate(
     # A verified 24-hour ordinary-member precedent can authorize a trial even
     # when a current or historical group rule prohibits ads. Its original post
     # is rechecked by validate_live_send immediately before the actual send.
-    precedent_authorizes_trial = (
+    from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+    own_authorizes = snapshot.get("authorization_basis") == OWN_SOURCE
+    if own_authorizes and not await own_proof_valid(db, snapshot, member, group, now):
+        return "qualification_own_delivery_unconfirmed"
+    precedent_authorizes_trial = own_authorizes or (
         row.decision == "trial"
         and (snapshot.get("advertising_audit") or {}).get("decision_source")
         == "verified_ordinary_member_precedent"
@@ -2102,7 +2212,7 @@ async def send_gate(
         return "qualification_system_identity_unconfirmed"
     if not snapshot.get("system_identity_coverage"):
         return "qualification_system_identity_unconfirmed"
-    if row.decision == "trial" and not trial_proof(
+    if row.decision == "trial" and not own_authorizes and not trial_proof(
         [item for item in snapshot.get("evidence", []) if item.get("topic_id") is None]
     ):
         return "qualification_ad_precedent_unconfirmed"

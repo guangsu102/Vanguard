@@ -6,6 +6,7 @@ A preview is never a qualification audit and never authorizes advertising.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -14,6 +15,7 @@ from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
 from telethon.tl.types import InputMessagesFilterPinned
 
+from app.core.account.rpc_governor import RpcDeferred
 from app.modules.acquisition.group_qualification import (
     NEGATED_BAN,
     RULE,
@@ -64,6 +66,7 @@ class CandidatePreview:
     member_count: int | None = None
     online_count: int | None = None
     member_count_source: str = "unknown"
+    evidence_collected_at: str | None = None
 
     @property
     def exclusion_reason(self) -> str | None:
@@ -130,6 +133,8 @@ async def public_candidate_preview(
     own_user_ids: set[int],
     identity_coverage: bool,
     now: datetime | None = None,
+    progress: dict | None = None,
+    checkpoint: Callable[[dict], Awaitable[None]] | None = None,
 ) -> CandidatePreview:
     """Read a small public sample; unknown data never becomes a negative fact."""
     now = naive(now) or datetime.utcnow()
@@ -147,62 +152,78 @@ async def public_candidate_preview(
         if not is_joinable_telegram_entity(entity):
             return CandidatePreview(status="not_joinable")
     except Exception as exc:
+        if isinstance(exc, RpcDeferred):
+            raise
         raise_if_flood_wait(exc, operation="join_candidate_preview_entity")
         return CandidatePreview(status="entity_unknown")
 
-    facts = {"peer_namespace": actual[1]}
-    rules_readable = False
-    rule_signal = "unknown"
+    saved = progress or {}
+    checked = saved.get("checked_at")
     try:
-        response = await client(
-            GetFullChannelRequest(entity)
-            if hasattr(entity, "megagroup")
-            else GetFullChatRequest(entity.id)
-        )
-        full = response.full_chat
-        count = getattr(full, "participants_count", None)
-        source = "full_chat.participants_count"
-        if not isinstance(count, int) or isinstance(count, bool):
-            participants = getattr(getattr(full, "participants", None), "participants", None)
-            count = len(participants) if isinstance(participants, list) else None
-            source = "full_chat.participants"
-        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-            facts.update(member_count=count, member_count_source=source)
-        online = getattr(full, "online_count", None)
-        if isinstance(online, int) and not isinstance(online, bool) and online >= 0:
-            facts["online_count"] = online
-        if facts.get("member_count", 50) < 50:
-            return CandidatePreview(status="sampled", **facts)
-        about = str(getattr(full, "about", "") or "").strip()
-        pins = [
-            item
-            async for item in client.iter_messages(
-                entity, filter=InputMessagesFilterPinned(), limit=PREVIEW_PIN_LIMIT
+        valid = checked and now - timedelta(hours=3) <= datetime.fromisoformat(checked) <= now
+    except (TypeError, ValueError):
+        valid = False
+    reusable = bool(valid and saved.get("namespace") == actual[1] and saved.get("entity_id") == actual[0])
+    facts = dict(saved.get("facts") or {}) if reusable else {"peer_namespace": actual[1]}
+    facts["evidence_collected_at"] = saved["checked_at"] if reusable else now.isoformat()
+    rules_readable = bool(saved.get("rules_readable")) if reusable else False
+    rule_signal = saved.get("rule_signal", "unknown") if reusable else "unknown"
+    if not reusable:
+        try:
+            response = await client(
+                GetFullChannelRequest(entity)
+                if hasattr(entity, "megagroup")
+                else GetFullChatRequest(entity.id)
             )
-        ]
-        complete = len(pins) < PREVIEW_PIN_LIMIT and not any(
-            getattr(item, "media", None) and not text_of(item) for item in pins
-        )
-        combined = "\n".join([about, *(text_of(item) for item in pins)])
-        rules_readable = complete and bool(
-            RULE.search(combined)
-            or ALLOW.search(combined)
-            or BAN.search(combined)
-            or APPROVAL.search(combined)
-        )
-        if rules_readable:
-            without_negated_bans = NEGATED_BAN.sub("", combined)
-            if BAN.search(without_negated_bans):
-                rule_signal = "explicit_ban"
-            elif APPROVAL.search(combined) or TOPIC_CONDITION.search(combined):
-                rule_signal = "restriction"
-            elif ALLOW.search(combined):
-                rule_signal = "explicit_allow"
-            else:
-                rule_signal = "no_clear_signal"
-    except Exception as exc:
-        raise_if_flood_wait(exc, operation="join_candidate_preview_rules")
-        rules_readable = False
+            full = response.full_chat
+            count = getattr(full, "participants_count", None)
+            source = "full_chat.participants_count"
+            if not isinstance(count, int) or isinstance(count, bool):
+                participants = getattr(getattr(full, "participants", None), "participants", None)
+                count = len(participants) if isinstance(participants, list) else None
+                source = "full_chat.participants"
+            if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+                facts.update(member_count=count, member_count_source=source)
+            online = getattr(full, "online_count", None)
+            if isinstance(online, int) and not isinstance(online, bool) and online >= 0:
+                facts["online_count"] = online
+            if facts.get("member_count", 50) < 50:
+                return CandidatePreview(status="sampled", **facts)
+            about = str(getattr(full, "about", "") or "").strip()
+            pins = [
+                item
+                async for item in client.iter_messages(
+                    entity, filter=InputMessagesFilterPinned(), limit=PREVIEW_PIN_LIMIT
+                )
+            ]
+            complete = len(pins) < PREVIEW_PIN_LIMIT and not any(
+                getattr(item, "media", None) and not text_of(item) for item in pins
+            )
+            combined = "\n".join([about, *(text_of(item) for item in pins)])
+            rules_readable = complete and bool(
+                RULE.search(combined)
+                or ALLOW.search(combined)
+                or BAN.search(combined)
+                or APPROVAL.search(combined)
+            )
+            if rules_readable:
+                without_negated_bans = NEGATED_BAN.sub("", combined)
+                if BAN.search(without_negated_bans):
+                    rule_signal = "explicit_ban"
+                elif APPROVAL.search(combined) or TOPIC_CONDITION.search(combined):
+                    rule_signal = "restriction"
+                elif ALLOW.search(combined):
+                    rule_signal = "explicit_allow"
+                else:
+                    rule_signal = "no_clear_signal"
+        except Exception as exc:
+            if isinstance(exc, RpcDeferred):
+                raise
+            raise_if_flood_wait(exc, operation="join_candidate_preview_rules")
+            rules_readable = False
+        if checkpoint is not None and rules_readable:
+            await checkpoint({"checked_at": now.isoformat(), "namespace": actual[1], "entity_id": actual[0],
+                              "facts": facts, "rules_readable": rules_readable, "rule_signal": rule_signal})
 
     if not identity_coverage:
         return CandidatePreview(
@@ -222,6 +243,8 @@ async def public_candidate_preview(
             )
         ]
     except Exception as exc:
+        if isinstance(exc, RpcDeferred):
+            raise
         raise_if_flood_wait(exc, operation="join_candidate_preview_history")
         return CandidatePreview(
             status="history_unknown",
@@ -249,6 +272,8 @@ async def public_candidate_preview(
         try:
             role = await collector.role(entity, message)
         except Exception as exc:
+            if isinstance(exc, RpcDeferred):
+                raise
             raise_if_flood_wait(exc, operation="join_candidate_preview_role")
             return CandidatePreview(
                 status="identity_unknown",

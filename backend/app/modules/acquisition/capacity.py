@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import aliased, selectinload
+from sqlalchemy.orm import selectinload
 
 from app.core.account.models import AccountOperationConfig, TelegramAccount
 from app.core.account.outbound_budget import AccountOutboundBudgetService, effective_capacity_limits
@@ -19,6 +19,8 @@ from app.modules.acquisition.models import (
     AdDeliveryLog,
     AdDeliveryScheduleState,
     GroupQualificationAudit,
+    GroupAdFrequency,
+    GroupAdProfile,
 )
 
 
@@ -30,7 +32,8 @@ async def inventory_snapshot(
         (
             await db.execute(
                 select(*(getattr(GroupAccountMembership, key) for key in (
-                    "id", "joined_at", "review_status", "status"
+                    "id", "joined_at", "review_status", "status", "telegram_group_id",
+                    "ad_status", "ad_pause_until", "left_at", "group_id",
                 ))).where(
                     GroupAccountMembership.account_id == account_id,
                     GroupAccountMembership.status.in_(["joined", "pending", "leave_failed"]),
@@ -39,19 +42,33 @@ async def inventory_snapshot(
         ).all()
     )
     ids = {member.id: member for member in members}
-    newer = aliased(GroupQualificationAudit)
-    columns = ("id", "membership_id", "membership_joined_at", "state", "decision", "next_retry_at", "expires_at")
+    columns = ("id", "membership_id", "membership_joined_at", "state", "decision", "reason", "next_retry_at", "expires_at", "evidence_json", "policy_version", "content_scope")
     latest = select(*(getattr(GroupQualificationAudit, key) for key in columns)).where(
         GroupQualificationAudit.account_id == account_id,
         GroupQualificationAudit.membership_id.in_(list(ids)),
         GroupQualificationAudit.state != "cancelled",
-        ~select(newer.id).where(
-            newer.membership_id == GroupQualificationAudit.membership_id,
-            newer.id > GroupQualificationAudit.id,
-            newer.state != "cancelled",
-        ).exists(),
-    )
+    ).order_by(GroupQualificationAudit.id.desc())
     rows = (await db.execute(latest)).all() if ids else []
+    from app.modules.acquisition.qualification_continuity import choose_authorization
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row.membership_id, []).append(row)
+    rows = [choose_authorization(items) for items in grouped.values()]
+    from app.modules.acquisition.adaptive_frequency import FrequencyService, canonical, payload, rule_quota
+    keys = {canonical(ids[row.membership_id].telegram_group_id, payload(row.evidence_json)) for row in rows}
+    frequencies = {row.telegram_group_id: row for row in (await db.execute(
+        select(GroupAdFrequency.telegram_group_id, GroupAdFrequency.quota,
+               GroupAdFrequency.status, GroupAdFrequency.pause_until)
+        .where(GroupAdFrequency.telegram_group_id.in_([key for key in keys if key is not None]))
+    )).all()} if keys else {}
+    from app.modules.acquisition.group_qualification import POLICY_VERSION
+    profiles = {row.group_id: row for row in (await db.execute(select(
+        GroupAdProfile.group_id, GroupAdProfile.paused_until, GroupAdProfile.ad_policy_source,
+        GroupAdProfile.ad_policy_mode, GroupAdProfile.ad_policy_expires_at,
+    ).where(GroupAdProfile.group_id.in_([m.group_id for m in members])))).all()} if members else {}
+    usable_keys: dict[int, int] = {}
+    identity_blocked = 0
+    frequency_service = FrequencyService(db)
     seen, ready, active, overdue = set(), 0, 0, 0
     review_due = 0
     manual = sum(member.review_status == "manual_required" for member in members)
@@ -67,13 +84,40 @@ async def inventory_snapshot(
         if member.status == "joined" and row.next_retry_at and row.next_retry_at <= now:
             review_due += 1
         if (
-            row.state == "completed"
+            row.state in {"completed", "running"}
             and row.decision in {"allowed", "trial"}
             and row.expires_at
             and row.expires_at > now
             and member.status == "joined"
         ):
             ready += 1
+            context = payload(row.evidence_json)
+            key = canonical(member.telegram_group_id, context)
+            frequency = frequencies.get(key)
+            profile = profiles.get(member.group_id)
+            profile_blocked = profile is not None and (
+                (profile.paused_until is not None and profile.paused_until > now)
+                or (profile.ad_policy_source == "manual"
+                    and profile.ad_policy_mode in {"forbidden", "approval_required"}
+                    and (profile.ad_policy_expires_at is None or profile.ad_policy_expires_at > now))
+            )
+            if (key is not None and not profile_blocked
+                    and row.policy_version == POLICY_VERSION and row.content_scope == "text_profile"
+                    and member.review_status == "approved"
+                    and member.ad_status == "active" and member.left_at is None
+                    and (member.ad_pause_until is None or member.ad_pause_until <= now)
+                    and (frequency is None or (frequency.status == "active"
+                         and (frequency.pause_until is None or frequency.pause_until <= now)))):
+                # Use the execution gate's history checks, including legacy
+                # receipts without a proven namespace. Ordinary cooldowns keep
+                # their future daily slots; unresolved identity/results do not.
+                readiness, _ = await frequency_service.readiness(
+                    member.telegram_group_id, now, context=context
+                )
+                if readiness.reason == "qualification_group_identity_unknown":
+                    identity_blocked += 1
+                if readiness.reason in {None, "frequency_group_daily_cap", "frequency_group_interval"}:
+                    usable_keys[key] = min(frequency.quota if frequency else 1, rule_quota(context))
         elif row.state in {"queued", "running", "waiting_ai"} or (
             row.state == "completed"
             and row.decision in {"wait", "technical_wait"}
@@ -87,6 +131,9 @@ async def inventory_snapshot(
     return {
         "total": len(members),
         "qualified": ready,
+        "usable": len(usable_keys),
+        "identity_blocked": identity_blocked,
+        "slots_24h": sum(usable_keys.values()),
         "active_backlog": active,
         "overdue": overdue,
         "manual": manual,
@@ -96,7 +143,7 @@ async def inventory_snapshot(
 
 
 async def executable_inventory(
-    db: Any, account_id: int, config: Any, now: datetime
+    db: Any, account_id: int, config: Any, now: datetime, *, include_candidates: bool = True
 ) -> dict[str, Any]:
     """Project only cached, presently runnable work; this never reserves or sends.
 
@@ -233,9 +280,15 @@ async def executable_inventory(
                     reasons[reason] += 1
                     if reason.startswith("frequency_"):
                         from app.modules.acquisition.adaptive_frequency import FrequencyService
-                        frequency_ready, _ = await FrequencyService(db).readiness(member.telegram_group_id, now)
-                        if frequency_ready.next_allowed_at:
-                            target_deadlines.append(frequency_ready.next_allowed_at)
+                        context, context_reason = await service._qualified_ad_context(
+                            account_id, member.telegram_group_id, now
+                        )
+                        if context is not None and context_reason is None:
+                            frequency_ready, _ = await FrequencyService(db).readiness(
+                                member.telegram_group_id, now, context=context
+                            )
+                            if frequency_ready.next_allowed_at:
+                                target_deadlines.append(frequency_ready.next_allowed_at)
                     if reason in {"qualification_group_daily_cap", "growth_group_global_cooldown"}:
                         from app.core.group.identity import telegram_group_id_aliases
 
@@ -282,6 +335,12 @@ async def executable_inventory(
                     continue
                 eligible_targets.add(member.telegram_group_id)
                 break
+    if not include_candidates:
+        return {
+            "ad_targets": len(eligible_targets) if not throttle.reason else 0,
+            "material_count": len(materials), "blocker_counts": dict(reasons),
+            "rollout_phase": phase,
+        }
     candidate_rows = list(
         (
             await db.scalars(
@@ -297,9 +356,18 @@ async def executable_inventory(
     )
     from app.modules.acquisition import candidate_inventory as preview_inventory
     facts = await preview_inventory.load(db, account_id, [group.id for group in candidate_rows[:300]])
+    # Exclude a group joined by any account, as the execution helper does, but
+    # fetch the bounded candidate set once instead of one query per candidate.
+    candidate_ids = [group.id for group in candidate_rows[:300]]
+    joined_candidate_ids = set((await db.scalars(
+        select(GroupAccountMembership.group_id).where(
+            GroupAccountMembership.group_id.in_(candidate_ids),
+            GroupAccountMembership.status == "joined",
+        ).distinct()
+    )).all()) if candidate_ids else set()
     join_ready = identity_pending = preview_pending = excluded = candidate_total = 0
     for group in candidate_rows[:300]:
-        if await service._joined_membership_account_id_for_group(group) is not None:
+        if group.id in joined_candidate_ids:
             continue
         candidate_total += 1
         fact = facts.get(group.id, {})
@@ -363,6 +431,7 @@ async def capacity_snapshot(
     db: Any, account_id: int, now: datetime | None = None
 ) -> dict[str, Any]:
     from sqlalchemy.ext.asyncio import AsyncSession
+
     from app.modules.acquisition.capacity_reads import CapacityReads
     if isinstance(db, AsyncSession):
         db = CapacityReads(db)
@@ -394,10 +463,12 @@ async def capacity_snapshot(
     limits = await effective_capacity_limits(db, account, config, now)
     inventory = await inventory_snapshot(db, account_id, now)
     inventory["suspended_due"] = inventory["review_due"] if cooling else 0
-    inventory["target"] = min(300, 2 * limits["ad"])
-    inventory["deficit"] = max(
-        0, inventory["target"] - inventory["qualified"] - inventory["active_backlog"]
-    )
+    from app.modules.acquisition.ad_output_plan import ad_output_plan, output_metrics
+    workload = await executable_inventory(db, account_id, config, now)
+    plan = await ad_output_plan(db, account, config, now, inventory=inventory,
+                               rpc=rpc, limits=limits, workload=workload)
+    inventory["target"] = plan["target_groups"]
+    inventory["deficit"] = plan["group_deficit"]
     outbound = await AccountOutboundBudgetService(db).snapshot(account_id, now)
     today, rolling, reservations, last_sent = await JoinRequestBudgetService(db)._request_counts(
         account_id, now
@@ -412,7 +483,10 @@ async def capacity_snapshot(
         ),
     )
     blockers = list(outbound["blockers"])
-    if limits["ad"] > 0 and inventory["deficit"] <= 0:
+    if plan["join_blocker"]:
+        blockers.append(plan["join_blocker"])
+        join_remaining = 0
+    if limits["ad"] > 0 and inventory["deficit"] <= 0 and not plan["join_blocker"]:
         blockers.append("join_inventory_target_met")
     if inventory["total"] >= min(300, int(config.max_groups_total or 300)):
         blockers.append("total_group_quota")
@@ -447,6 +521,8 @@ async def capacity_snapshot(
     if join_pause:
         due = max(filter(None, (due, datetime.fromisoformat(join_pause))))
     join_read_wait = rpc.get("lanes", {}).get("routine", {})
+    ad_read_wait = rpc.get("lanes", {}).get("ad", {})
+    ad_read_due = parse_date(ad_read_wait.get("resume_at"))
     if join_read_wait.get("resume_at"):
         due = max(filter(None, (due, parse_date(join_read_wait["resume_at"]))))
         blockers.append("telegram_join_read_budget")
@@ -459,7 +535,6 @@ async def capacity_snapshot(
         ad_remaining = 0
     if not config.auto_ads_enabled:
         blockers.append("account_auto_ads_disabled")
-    workload = await executable_inventory(db, account_id, config, now)
     quota_remaining = {
         "join": max(
             0, min(limits["join"] - today - reservations, limits["join"] - rolling - reservations)
@@ -476,6 +551,14 @@ async def capacity_snapshot(
         blockers.append("verification_budget_unavailable")
     if due and due > now:
         executable_join = 0
+    if ad_read_due and ad_read_due > now:
+        executable_ad = 0
+        blockers.append("telegram_ad_read_budget")
+    if workload["join_candidates"] == 0:
+        preview_due = parse_date(rpc.get("lanes", {}).get("background", {}).get("resume_at"))
+        if preview_due and preview_due > now:
+            due = max(filter(None, (due, preview_due)))
+            blockers.append("telegram_preview_read_budget")
     if outbound["next_allowed_at"]:
         executable_ad = 0
         blockers.append("outbound_ad_interval")
@@ -490,6 +573,7 @@ async def capacity_snapshot(
             [
                 pause_until if cooling else None,
                 workload.pop("ad_next_allowed_at", None),
+                ad_read_due if ad_read_due and ad_read_due > now else None,
                 datetime.fromisoformat(outbound["next_allowed_at"])
                 if outbound["next_allowed_at"]
                 else None,
@@ -497,12 +581,18 @@ async def capacity_snapshot(
         ),
         default=None,
     )
+    quarantined = str(getattr(account.risk_level, "value", account.risk_level)) == "quarantined"
+    ads_paused = not config.enabled or not config.auto_ads_enabled or limits["ad"] <= 0
+    if quarantined or ads_paused:
+        executable_ad = 0
     return {
         "account_id": account_id,
         "enabled": True,
-        "execution": {"state": (rpc["state"] if rpc["state"] in {"budget_wait", "unavailable"} else "cooldown") if cooling else "scheduled",
+        "execution": {"state": ("quarantined" if str(getattr(account.risk_level, "value", account.risk_level)) == "quarantined"
+                      else "paused" if not config.enabled or not config.auto_ads_enabled or limits["ad"] <= 0
+                      else (rpc["state"] if rpc["state"] in {"budget_wait", "unavailable"} else "cooldown") if cooling else "scheduled"),
                       "resume_at": pause_until.isoformat() if cooling else None,
-                      "reason": (rpc.get("reason") or account.risk_reason) if cooling else None},
+                      "reason": account.risk_reason if quarantined else "join_ad_account_unavailable" if ads_paused else (rpc.get("reason") or account.risk_reason) if cooling else None},
         "read_rpc": rpc,
         "configured": {
             "join": config.max_groups_per_day,
@@ -529,6 +619,8 @@ async def capacity_snapshot(
         "blockers": sorted(set(blockers)),
         "inventory": inventory,
         "workload": workload,
+        "ad_plan": plan,
+        "ad_output": await output_metrics(db, account_id, now),
         "outbound": outbound,
         "group_frequencies": await frequency_inventory(db, account_id, now) if config.adaptive_ads_enabled else [],
         "limits": limits,
@@ -537,7 +629,7 @@ async def capacity_snapshot(
 
 async def frequency_inventory(db: Any, account_id: int, now: datetime) -> list[dict]:
     from app.modules.acquisition.adaptive_frequency import FrequencyService
-    from app.modules.acquisition.qualification_service import current_authorization, _payload
+    from app.modules.acquisition.qualification_service import _payload, current_authorization
     members = list((await db.scalars(select(GroupAccountMembership).where(
         GroupAccountMembership.account_id == account_id,
         GroupAccountMembership.status.in_(["joined", "leave_failed"]),

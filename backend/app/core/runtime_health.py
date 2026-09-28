@@ -58,6 +58,37 @@ async def operational_snapshot(db) -> dict:
             try:
                 runtime = json.loads(worker.metadata_json or "{}").get("runtime", {})
                 listener_rows = {item["account_id"]: item for item in runtime.get("listeners", [])}
+                memory = runtime.get("process_memory", {})
+                workers[role]["process_memory"] = memory
+                inbox = runtime.get("event_inbox", {})
+                workers[role]["event_inbox"] = inbox
+                if inbox.get("states", {}).get("reconciliation_required", 0):
+                    alerts.append({"code": "listener_event_reconciliation_required", "severity": "warning"})
+                if inbox.get("oldest_pending_seconds", 0) >= 120:
+                    alerts.append({"code": "listener_business_backlog", "severity": "warning"})
+                if (memory.get("rss_bytes") or 0) >= 2 * 1024**3:
+                    alerts.append({"code": "growth_memory_high", "severity": "warning"})
+                for item in listener_rows.values():
+                    journal = item.get("raw_journal") or {}
+                    if journal.get("storage_error"):
+                        alerts.append({"code":"listener_raw_storage_failed","severity":"critical","account_id":item["account_id"]})
+                    if journal.get("states",{}).get("reconciliation_required",0):
+                        alerts.append({"code":"listener_event_reconciliation_required","severity":"warning","account_id":item["account_id"]})
+                    disk_pending = journal.get("states", {}).get("pending", 0)
+                    if disk_pending >= 1000 or (
+                        disk_pending > 0 and journal.get("oldest_pending_seconds", 0) >= 120
+                    ) or (item.get("update_queue_size") or 0) >= 1000 or (
+                        (item.get("update_queue_size") or 0) > 0
+                        and (item.get("queue_nonempty_seconds") or 0) >= 120
+                    ):
+                        alerts.append({"code": "listener_update_backlog", "severity": "warning",
+                                       "account_id": item["account_id"]})
+                    if item.get("sync_wait_reason") and (item.get("read_wait_seconds") or 0) >= 120:
+                        alerts.append({"code": "listener_sync_delayed", "severity": "warning",
+                                       "account_id": item["account_id"]})
+                    if item.get("pause_error"):
+                        alerts.append({"code": "listener_pause_failed", "severity": "critical",
+                                       "account_id": item["account_id"]})
             except (ValueError, TypeError, KeyError):
                 listener_rows = {}
     active = (
@@ -84,7 +115,7 @@ async def operational_snapshot(db) -> dict:
             alerts.append({"code": "listener_status_unknown" if listener["state"] == "unknown" else "listener_not_connected",
                            "severity": "warning", "account_id": account.id,
                            "reason": listener.get("reason"), "resume_at": listener.get("resume_at")})
-        elif rpc.get("lanes", {}).get("sync", {}).get("retry_after_seconds"):
+        elif listener.get("state") != "pausing" and rpc.get("lanes", {}).get("sync", {}).get("retry_after_seconds"):
             listener = {**listener, "state": "connected_wait", "reason": "telegram_sync_read_wait",
                         "resume_at": rpc["lanes"]["sync"].get("resume_at")}
         row = {
@@ -94,6 +125,11 @@ async def operational_snapshot(db) -> dict:
             "inventory": inventory,
             "last_ad_at": last_ad.isoformat() if last_ad else None,
         }
+        from app.modules.acquisition.survival_schedule import backlog
+        row["survival"] = await backlog(db, account.id, now)
+        if row["survival"]["survival_oldest_overdue_seconds"] >= 120:
+            alerts.append({"code":"ad_survival_overdue","severity":"warning","account_id":account.id,
+                           "count":row["survival"]["survival_overdue"]})
         accounts.append(row)
         if rpc["state"] == "cooldown":
             alerts.append(
@@ -124,8 +160,8 @@ async def operational_snapshot(db) -> dict:
             {"code": "outbound_reconciliation_required", "severity": "critical", "count": unknown}
         )
     tracking = await db.scalar(select(func.count(AcquisitionTracking.id)))
-    if active and not tracking:
-        alerts.append({"code": "attribution_not_connected", "severity": "warning"})
+    # Campaign operations are measured by confirmed Telegram delivery. Missing
+    # optional downstream attribution is not an advertising runtime failure.
     info = await redis.info("memory")
     maximum = int(info.get("maxmemory") or 0)
     ratio = int(info.get("used_memory") or 0) / maximum if maximum else 0

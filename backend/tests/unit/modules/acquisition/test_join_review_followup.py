@@ -35,6 +35,12 @@ RAW_ID = 700001
 MARKED_ID = -1000000700001
 
 
+@pytest.fixture(autouse=True)
+def available_read_budget(monkeypatch):
+    # Reconciliation scenarios are offline; Redis readiness has separate tests.
+    monkeypatch.setattr("app.core.account.read_schedule.check_read_ready", AsyncMock())
+
+
 async def seed(db, *, membership=False, age_hours=2, raw_id=False, owned=False):
     await save_auto_join_scheduler_settings(db, {"enabled": True})
     account = TelegramAccount(

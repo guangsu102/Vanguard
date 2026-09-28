@@ -350,11 +350,12 @@ const metrics = computed(() => {
   const avgWritable = total
     ? rows.reduce((sum, row) => sum + Number(row.writable_rate || 0), 0) / total
     : 0
-  const avgAdSuccess = total
-    ? rows.reduce((sum, row) => sum + Number(row.ad_success_rate_24h || 0), 0) / total
-    : 0
+  const adSuccess = rows.reduce((sum, row) => sum + Number(row.ad_success_24h || 0), 0)
+  const adAttempts = adSuccess + rows.reduce((sum, row) => sum + Number(row.ad_failed_24h || 0), 0)
+  const hasAdSamples = rows.every((row) => row.ad_success_24h != null && row.ad_failed_24h != null)
+  const avgAdSuccess = hasAdSamples && adAttempts > 0 ? adSuccess / adAttempts : null
 
-  return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess }
+  return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess, hasAdSamples }
 })
 
 const titleBlacklistText = computed({
@@ -806,7 +807,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="metric-cell">
         <span>广告成功率</span>
-        <strong>{{ pct(metrics.avgAdSuccess) }}</strong>
+        <strong>{{ metrics.avgAdSuccess == null ? (metrics.hasAdSamples ? '无尝试' : '暂无数据') : pct(metrics.avgAdSuccess) }}</strong>
       </div>
       <div class="metric-cell">
             <span>账号风控</span>

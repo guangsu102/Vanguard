@@ -25,6 +25,7 @@ from uuid import uuid4
 
 import structlog
 from app.core.account.rpc_governor import RpcDeferred, check_read_ready, deferred_error
+from app.modules.acquisition.survival_reads import SurvivalReadBatch
 from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2672,207 +2673,206 @@ class AcquisitionAutomationService:
         )
         await self._sync_account_pool(accounts)
         accounts_by_id = {item.id: item for item in accounts}
-        for attempt in attempts:
-            started_at = attempt.request_sent_at or attempt.attempted_at
-            target = self._join_target_reference(attempt.target_key)
-            linked_group = await self.db.get(Group, attempt.group_id) if attempt.group_id else None
-            if linked_group is not None:
-                target = f"@{linked_group.username}" if linked_group.username else linked_group.group_id
-            elif target is None and attempt.telegram_group_id:
-                target = attempt.telegram_group_id
-            if target is None:
-                await self._defer_join_reconciliation(attempt, now, "join_reconciliation_target_unresolved", technical=True)
-                result["details"].append({"attempt_id": attempt.id, "status": "pending",
-                                          "reason": "join_reconciliation_target_unresolved"})
-                continue
-            result["checked"] += 1
-            account = accounts_by_id.get(attempt.account_id)
-            from app.core.account.read_schedule import read_wait
-            pause = await read_wait(
-                self.db, attempt.account_id, now, purpose="join_request_reconciliation",
-                risk_pause_until=account.risk_pause_until if account else None,
-            )
-            if pause:
-                await self._defer_join_reconciliation(attempt, now, pause[0], read_wait_until=pause[1])
-                result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
-                                          "status": "pending", "reason": pause[0]})
-                continue
-            if self._join_review_account_block_reason(account, now):
-                await self._defer_join_reconciliation(attempt, now, "account_unavailable_for_join_reconciliation", technical=True)
-                result["details"].append(
-                    {
-                        "attempt_id": attempt.id,
-                        "account_id": attempt.account_id,
-                        "status": "pending",
-                        "reason": "account_unavailable_for_join_reconciliation",
-                    }
-                )
-                continue
-
-            wrapper = None
-            try:
-                wrapper = await self.account_pool.acquire_by_id(
-                    attempt.account_id,
-                    purpose="join_request_reconciliation",
-                    raise_on_lease_failure=True,
-                )
-                if wrapper is None:
-                    raise RuntimeError("account unavailable")
-                resolved = await asyncio.wait_for(
-                    self.telegram_execution.resolve_join_group_by_link_membership(wrapper, target), timeout=60,
-                )
-                attempt.reconciliation_checked_at = now
-            except Exception as exc:
-                from app.core.account.rpc_governor import deferred_error
-                deferred = deferred_error(exc)
-                if deferred:
-                    await self._defer_join_reconciliation(
-                        attempt, now, deferred[0],
-                        read_wait_until=now + timedelta(seconds=deferred[1] + 1),
-                    )
-                    result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
-                                              "status": "pending", "reason": deferred[0]})
+        from app.modules.acquisition.survival_reads import SurvivalReadBatch
+        reads = SurvivalReadBatch(self.account_pool, raise_on_lease_failure=True)
+        try:
+            for attempt in attempts:
+                if reads.key is not None and reads.key[0] != attempt.account_id:
+                    await reads.close()
+                started_at = attempt.request_sent_at or attempt.attempted_at
+                target = self._join_target_reference(attempt.target_key)
+                linked_group = await self.db.get(Group, attempt.group_id) if attempt.group_id else None
+                if linked_group is not None:
+                    target = f"@{linked_group.username}" if linked_group.username else linked_group.group_id
+                elif target is None and attempt.telegram_group_id:
+                    target = attempt.telegram_group_id
+                if target is None:
+                    await self._defer_join_reconciliation(attempt, now, "join_reconciliation_target_unresolved", technical=True)
+                    result["details"].append({"attempt_id": attempt.id, "status": "pending",
+                                              "reason": "join_reconciliation_target_unresolved"})
                     continue
-                wait_seconds = extract_flood_wait_seconds(exc)
-                if wait_seconds:
-                    until = now + timedelta(seconds=wait_seconds)
-                    account.risk_pause_until = max(account.risk_pause_until or until, until)
-                    attempt.reconciliation_next_at = max(attempt.reconciliation_next_at, until)
+                result["checked"] += 1
+                account = accounts_by_id.get(attempt.account_id)
+                from app.core.account.read_schedule import read_wait
+                pause = await read_wait(
+                    self.db, attempt.account_id, now, purpose="join_request_reconciliation",
+                    risk_pause_until=account.risk_pause_until if account else None,
+                )
+                if pause:
+                    await reads.close()
+                    await self._defer_join_reconciliation(attempt, now, pause[0], read_wait_until=pause[1])
+                    result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
+                                              "status": "pending", "reason": pause[0]})
+                    continue
+                if self._join_review_account_block_reason(account, now):
+                    await self._defer_join_reconciliation(attempt, now, "account_unavailable_for_join_reconciliation", technical=True)
+                    result["details"].append(
+                        {
+                            "attempt_id": attempt.id,
+                            "account_id": attempt.account_id,
+                            "status": "pending",
+                            "reason": "account_unavailable_for_join_reconciliation",
+                        }
+                    )
+                    continue
+
+                wrapper = None
+                try:
+                    async with reads.borrow(attempt.account_id, "join_request_reconciliation") as wrapper:
+                        resolved = await asyncio.wait_for(
+                            self.telegram_execution.resolve_join_group_by_link_membership(wrapper, target), timeout=60,
+                        )
+                    attempt.reconciliation_checked_at = now
+                except Exception as exc:
+                    from app.core.account.rpc_governor import deferred_error
+                    deferred = deferred_error(exc)
+                    if deferred:
+                        await self._defer_join_reconciliation(
+                            attempt, now, deferred[0],
+                            read_wait_until=now + timedelta(seconds=deferred[1] + 1),
+                        )
+                        result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
+                                                  "status": "pending", "reason": deferred[0]})
+                        continue
+                    wait_seconds = extract_flood_wait_seconds(exc)
+                    if wait_seconds:
+                        until = now + timedelta(seconds=wait_seconds)
+                        account.risk_pause_until = max(account.risk_pause_until or until, until)
+                        attempt.reconciliation_next_at = max(attempt.reconciliation_next_at, until)
+                        await self.db.commit()
+                    await self._defer_join_reconciliation(
+                        attempt, now, "join_reconciliation_check_failed:" + type(exc).__name__,
+                        technical=not isinstance(exc, (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable)),
+                        contention=isinstance(exc, (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable)),
+                    )
+                    result["details"].append(
+                        {
+                            "attempt_id": attempt.id,
+                            "account_id": attempt.account_id,
+                            "status": attempt.reconciliation_status,
+                            "reason": "join_reconciliation_check_failed",
+                            "error": str(exc)[:500],
+                        }
+                    )
+                    continue
+
+                attempt.reconciliation_failure_count = 0
+                if resolved is None:
+                    await self._defer_join_reconciliation(attempt, now, "join_request_still_pending")
+                    result["details"].append(
+                        {
+                            "attempt_id": attempt.id,
+                            "account_id": attempt.account_id,
+                            "status": "pending",
+                            "reason": "join_request_still_pending",
+                        }
+                    )
+                    continue
+
+                telegram_group_id = int(resolved.get("id") or 0)
+                if not telegram_group_id:
+                    await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_missing", technical=True)
+                    continue
+                now = _now()
+                aliases = telegram_group_id_aliases(telegram_group_id)
+                if linked_group is not None and linked_group.group_id not in aliases:
+                    await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_mismatch", manual=True)
+                    result["details"].append({"attempt_id": attempt.id, "status": "pending",
+                                              "reason": "join_reconciliation_identity_mismatch"})
+                    continue
+                candidates = list((await self.db.scalars(
+                    select(Group).where(Group.group_id.in_(aliases))
+                )).all())
+                if linked_group is None and len(candidates) > 1:
+                    await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_ambiguous", manual=True)
+                    result["details"].append({"attempt_id": attempt.id, "status": "pending",
+                                              "reason": "join_reconciliation_identity_ambiguous"})
+                    continue
+                group = linked_group or (candidates[0] if candidates else None)
+                if group is None:
+                    group = Group(
+                        group_id=telegram_group_id,
+                        title=str(resolved.get("title") or "").strip() or None,
+                        username=str(resolved.get("username") or "").strip().lstrip("@")
+                        or None,
+                        member_count=max(0, int(resolved.get("participants_count") or 0)),
+                        status="pending",
+                        discovery_source="manual_link_join",
+                        level=GroupLevel.UNRATED,
+                    )
+                    self.db.add(group)
+                    await self.db.flush()
+                else:
+                    group.title = str(resolved.get("title") or "").strip() or group.title
+                    group.username = (
+                        str(resolved.get("username") or "").strip().lstrip("@")
+                        or group.username
+                    )
+                    group.member_count = max(
+                        int(group.member_count or 0),
+                        int(resolved.get("participants_count") or 0),
+                    )
+                    if group.status != "active":
+                        group.status = "pending"
+                    group.updated_at = now
+
+                if await self._qualification_workflow_enabled() or await self._dynamic_qualification_mode(attempt.account_id):
+                    await self._persist_join_qualification_result(group, attempt, status="joined")
                     await self.db.commit()
-                await self._defer_join_reconciliation(
-                    attempt, now, "join_reconciliation_check_failed:" + type(exc).__name__,
-                    technical=not isinstance(exc, (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable)),
-                    contention=isinstance(exc, (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable)),
+                    result["updated"] += 1
+                    result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
+                                              "group_id": group.id, "status": "joined_pending_qualification"})
+                    continue
+                join_method = (
+                    "account_handover"
+                    if str(attempt.reason or "").startswith("ad_only_")
+                    else "manual_link_join"
                 )
-                result["details"].append(
-                    {
-                        "attempt_id": attempt.id,
-                        "account_id": attempt.account_id,
-                        "status": attempt.reconciliation_status,
-                        "reason": "join_reconciliation_check_failed",
-                        "error": str(exc)[:500],
-                    }
+                membership = await self._upsert_account_membership(
+                    group,
+                    attempt.account_id,
+                    status="joined",
+                    join_method=join_method,
+                    source_keyword=attempt.source_keyword,
+                    note=json.dumps(
+                        {
+                            "reason": "pending_join_request_approved",
+                            "attempt_id": attempt.id,
+                        },
+                        ensure_ascii=False,
+                    ),
                 )
-                continue
-            finally:
-                if wrapper is not None:
-                    await self.account_pool.release(wrapper)
-
-            attempt.reconciliation_failure_count = 0
-            if resolved is None:
-                await self._defer_join_reconciliation(attempt, now, "join_request_still_pending")
-                result["details"].append(
-                    {
-                        "attempt_id": attempt.id,
-                        "account_id": attempt.account_id,
-                        "status": "pending",
-                        "reason": "join_request_still_pending",
-                    }
+                # _upsert starts a review only for a new/renewed membership. A repeated
+                # reconciliation must not extend the existing fixed deadline.
+                if await is_owned_group_target(self.db, core_group_id=group.id,
+                                               telegram_group_id=group.group_id):
+                    exclude_owned_group_review(membership)
+                await self.join_budget.finalize(
+                    attempt,
+                    status=DeliveryStatus.SUCCESS,
+                    reason="pending_join_request_approved",
+                    joined_at=now,
+                    group_id=group.id,
+                    telegram_group_id=telegram_group_id,
+                    group_username=group.username,
+                    group_title=group.title,
                 )
-                continue
-
-            telegram_group_id = int(resolved.get("id") or 0)
-            if not telegram_group_id:
-                await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_missing", technical=True)
-                continue
-            now = _now()
-            aliases = telegram_group_id_aliases(telegram_group_id)
-            if linked_group is not None and linked_group.group_id not in aliases:
-                await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_mismatch", manual=True)
-                result["details"].append({"attempt_id": attempt.id, "status": "pending",
-                                          "reason": "join_reconciliation_identity_mismatch"})
-                continue
-            candidates = list((await self.db.scalars(
-                select(Group).where(Group.group_id.in_(aliases))
-            )).all())
-            if linked_group is None and len(candidates) > 1:
-                await self._defer_join_reconciliation(attempt, now, "join_reconciliation_identity_ambiguous", manual=True)
-                result["details"].append({"attempt_id": attempt.id, "status": "pending",
-                                          "reason": "join_reconciliation_identity_ambiguous"})
-                continue
-            group = linked_group or (candidates[0] if candidates else None)
-            if group is None:
-                group = Group(
-                    group_id=telegram_group_id,
-                    title=str(resolved.get("title") or "").strip() or None,
-                    username=str(resolved.get("username") or "").strip().lstrip("@")
-                    or None,
-                    member_count=max(0, int(resolved.get("participants_count") or 0)),
-                    status="pending",
-                    discovery_source="manual_link_join",
-                    level=GroupLevel.UNRATED,
-                )
-                self.db.add(group)
-                await self.db.flush()
-            else:
-                group.title = str(resolved.get("title") or "").strip() or group.title
-                group.username = (
-                    str(resolved.get("username") or "").strip().lstrip("@")
-                    or group.username
-                )
-                group.member_count = max(
-                    int(group.member_count or 0),
-                    int(resolved.get("participants_count") or 0),
-                )
-                if group.status != "active":
-                    group.status = "pending"
-                group.updated_at = now
-
-            if await self._qualification_workflow_enabled() or await self._dynamic_qualification_mode(attempt.account_id):
-                await self._persist_join_qualification_result(group, attempt, status="joined")
+                attempt.reconciliation_status = "confirmed"
+                attempt.reconciliation_next_at = None
                 await self.db.commit()
                 result["updated"] += 1
-                result["details"].append({"attempt_id": attempt.id, "account_id": attempt.account_id,
-                                          "group_id": group.id, "status": "joined_pending_qualification"})
-                continue
-            join_method = (
-                "account_handover"
-                if str(attempt.reason or "").startswith("ad_only_")
-                else "manual_link_join"
-            )
-            membership = await self._upsert_account_membership(
-                group,
-                attempt.account_id,
-                status="joined",
-                join_method=join_method,
-                source_keyword=attempt.source_keyword,
-                note=json.dumps(
+                result["details"].append(
                     {
-                        "reason": "pending_join_request_approved",
                         "attempt_id": attempt.id,
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-            # _upsert starts a review only for a new/renewed membership. A repeated
-            # reconciliation must not extend the existing fixed deadline.
-            if await is_owned_group_target(self.db, core_group_id=group.id,
-                                           telegram_group_id=group.group_id):
-                exclude_owned_group_review(membership)
-            await self.join_budget.finalize(
-                attempt,
-                status=DeliveryStatus.SUCCESS,
-                reason="pending_join_request_approved",
-                joined_at=now,
-                group_id=group.id,
-                telegram_group_id=telegram_group_id,
-                group_username=group.username,
-                group_title=group.title,
-            )
-            attempt.reconciliation_status = "confirmed"
-            attempt.reconciliation_next_at = None
-            await self.db.commit()
-            result["updated"] += 1
-            result["details"].append(
-                {
-                    "attempt_id": attempt.id,
-                    "account_id": attempt.account_id,
-                    "group_id": group.id,
-                    "telegram_group_id": telegram_group_id,
-                    "status": "joined_pending_review",
-                }
-            )
-        return result
+                        "account_id": attempt.account_id,
+                        "group_id": group.id,
+                        "telegram_group_id": telegram_group_id,
+                        "status": "joined_pending_review",
+                    }
+                )
+            return result
+        finally:
+            await reads.close()
 
     async def _defer_join_reconciliation(
         self, attempt: AutoJoinAttempt, now: datetime, reason: str, *,
@@ -2891,6 +2891,14 @@ class AcquisitionAutomationService:
         delay = (timedelta(minutes=1) if contention else timedelta(hours=6) if manual
                  else timedelta(minutes=15) if now < started + timedelta(hours=2)
                  else timedelta(hours=2))
+        if (reason == "join_request_still_pending" and attempt.request_state == "sent"
+                and not (technical or manual or contention)):
+            # Only confirmed pending approvals back off; unknown outcomes and
+            # technical failures keep the original cadence and request record.
+            if now >= started + timedelta(days=3):
+                delay = timedelta(hours=12)
+            elif now >= started + timedelta(days=1):
+                delay = timedelta(hours=6)
         attempt.reconciliation_next_at = max(now + delay, attempt.reconciliation_next_at or now)
         if contention:
             attempt.reconciliation_next_at = now + delay
@@ -3511,6 +3519,9 @@ class AcquisitionAutomationService:
     async def _rank_pending_join_candidates(self, account_id: int, groups: list[Group]) -> list[Group]:
         from app.modules.acquisition import candidate_inventory as inventory
         from app.modules.acquisition.candidate_preview import CandidatePreview
+        from app.core.account.rpc_governor import RpcDeferred
+        from app.core.account.read_timeout import read_operation_timeout
+        import time
         from app.modules.acquisition.qualification_service import policy
         from app.modules.acquisition.qualification_system_identity import covered_system_ids
 
@@ -3520,7 +3531,12 @@ class AcquisitionAutomationService:
             return groups
         now = _now()
         facts = await inventory.load(self.db, account_id, [group.id for group in groups])
-        due = [group for group in groups if not inventory.fresh(facts.get(group.id, {}), group, account_id, now)]
+        due = [group for group in groups if inventory.due(facts.get(group.id, {}), group, account_id, now)]
+        ready_count = sum(inventory.fresh(facts.get(group.id, {}), group, account_id, now)
+                          and inventory.ready(facts[group.id]) for group in groups)
+        retry_at = await inventory.account_retry_at(self.db, account_id)
+        if ready_count >= 3 or (retry_at and retry_at > now):
+            due = []
         # Unseen candidates first, then the oldest attempt. Unknown/timeout
         # candidates wait until their own deadline instead of monopolizing six slots.
         due.sort(key=lambda group: inventory.date(facts.get(group.id, {}).get("checked_at")) or datetime.min)
@@ -3528,6 +3544,11 @@ class AcquisitionAutomationService:
         if due:
             try:
                 wrapper = await self.account_pool.acquire_by_id(account_id, purpose="join_candidate_preview")
+            except RpcDeferred as exc:
+                # One account-wide wait must not overwrite candidate evidence.
+                await inventory.defer_account(self.db, account_id,
+                    _now() + timedelta(seconds=exc.retry_after_seconds + 1))
+                await self.db.commit()
             except (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable):
                 pass
             except Exception as exc:
@@ -3541,13 +3562,19 @@ class AcquisitionAutomationService:
             if wrapper is not None and wrapper.client is not None:
                 client = wrapper.client
                 own_ids, fingerprint = set(), None
+                batch_started = time.monotonic()
                 if config.get("system_account_user_ids"):
                     try:
-                        async with asyncio.timeout(5):
+                        async with read_operation_timeout():
                             me = await client.get_me()
                         own_ids, fingerprint = await covered_system_ids(
                             self.db, config, account_id=account_id, live_user_id=getattr(me, "id", None)
                         )
+                    except RpcDeferred as exc:
+                        await inventory.defer_account(self.db, account_id,
+                            _now() + timedelta(seconds=exc.retry_after_seconds + 1))
+                        await self.db.commit()
+                        due = []
                     except Exception as exc:
                         flood_seconds = self._flood_wait_seconds(exc)
                         if flood_seconds is not None:
@@ -3556,16 +3583,41 @@ class AcquisitionAutomationService:
                             ) from exc
                         self.logger.warning("join_candidate_preview_identity_unavailable", error=type(exc).__name__)
                 for group in due[:PREVIEW_GROUP_LIMIT]:
+                    if time.monotonic() - batch_started >= 120 or ready_count >= 3:
+                        break
+                    async def checkpoint(progress):
+                        fact = inventory.deferred_fact(group, account_id, facts.get(group.id, {}), _now(), progress)
+                        facts[group.id] = fact
+                        await inventory.save(self.db, account_id, group.id, fact)
+                        await self.db.commit()
                     try:
-                        async with asyncio.timeout(5):
+                        async with read_operation_timeout(total_seconds=min(90, 120 - (time.monotonic() - batch_started))):
                             hint = await public_candidate_preview(
-                                client, group, own_user_ids=own_ids, identity_coverage=fingerprint is not None
+                                client, group, own_user_ids=own_ids, identity_coverage=fingerprint is not None,
+                                progress=facts.get(group.id, {}).get("progress") if inventory.matches(facts.get(group.id, {}), group, account_id) else None,
+                                checkpoint=checkpoint
                             )
                     except TelegramFloodWaitError:
                         raise
+                    except (RpcDeferred, TimeoutError) as exc:
+                        delay = exc.retry_after_seconds if isinstance(exc, RpcDeferred) else 60
+                        fact = inventory.deferred_fact(group, account_id, facts.get(group.id, {}),
+                                                       _now() + timedelta(seconds=delay + 1))
+                        facts[group.id] = fact
+                        await inventory.save(self.db, account_id, group.id, fact)
+                        await self.db.commit()
+                        if isinstance(exc, RpcDeferred):
+                            await inventory.defer_account(self.db, account_id,
+                                _now() + timedelta(seconds=exc.retry_after_seconds + 1))
+                            await self.db.commit()
+                            break
+                        continue
                     except Exception as exc:
                         hint = CandidatePreview(status="preview_" + type(exc).__name__)
+                    if hint.status in {"entity_unknown", "history_unknown", "identity_unknown", "identity_unconfirmed"} and inventory.fresh(facts.get(group.id, {}), group, account_id, _now()):
+                        continue
                     fact = inventory.record(group, account_id, hint, _now())
+                    ready_count += int(inventory.ready(fact))
                     facts[group.id] = fact
                     await inventory.save(self.db, account_id, group.id, fact)
                     await self.db.commit()
@@ -8825,6 +8877,7 @@ class AcquisitionAutomationService:
         self, account_id: int, target: int, now: datetime,
     ) -> tuple[dict[str, Any] | None, str | None]:
         from app.modules.acquisition.group_qualification import POLICY_VERSION
+        from app.modules.acquisition.qualification_lifetime import EVIDENCE_TTL
         from app.modules.acquisition.qualification_service import (
             _date, _payload, current_authorization, policy, scope_matches,
         )
@@ -8842,16 +8895,19 @@ class AcquisitionAutomationService:
         row, group, member = resolution
         if row is None or group is None or member is None:
             return None, getattr(resolution, "reason", None) or "qualification_review_required"
-        if (row.state != "completed" or row.decision not in {"allowed", "trial"}
+        if (row.state not in {"completed", "running"} or row.decision not in {"allowed", "trial"}
                 or row.policy_version != POLICY_VERSION or row.membership_joined_at != member.joined_at
                 or not scope_matches(row, group, member) or member.status != "joined"
                 or member.review_status != "approved" or member.ad_status in {"blocked", "paused"}):
             return None, "qualification_review_required"
-        if row.expires_at is None or row.expires_at <= now or row.checked_at is None or row.checked_at < now - timedelta(hours=24):
+        if row.expires_at is None or row.expires_at <= now or row.checked_at is None or row.checked_at < now - EVIDENCE_TTL:
             return None, "qualification_expired"
         snapshot = _payload(row)
         if snapshot.get("protected") or snapshot.get("technical_errors"):
             return None, "qualification_not_approved"
+        from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+        if snapshot.get("authorization_basis") == OWN_SOURCE and not await own_proof_valid(self.db, snapshot, member, group, now):
+            return None, "qualification_own_delivery_unconfirmed"
         permissions = snapshot.get("permissions") or {}
         for key in ("slowmode_until", "newcomer_until", "temporary_until", "newcomer_wait_until", "restricted_until", "wait_until"):
             deadline = _date(permissions.get(key))
@@ -8942,12 +8998,13 @@ class AcquisitionAutomationService:
             # current_authorization refreshes membership rows while filtering and
             # can unload their group relationship. Reload it after the last check
             # so the dispatcher never attempts an async lazy load at member.group.
-            return list((await self.db.scalars(select(GroupAccountMembership)
+            members = list((await self.db.scalars(select(GroupAccountMembership)
                 .options(selectinload(GroupAccountMembership.group))
                 .where(GroupAccountMembership.id.in_(eligible_ids))
-                .order_by(GroupAccountMembership.joined_at.asc().nullsfirst(), GroupAccountMembership.id)
                 .execution_options(populate_existing=True)
             )).all())
+            from app.modules.acquisition.ad_output_plan import prioritize_deliveries
+            return await prioritize_deliveries(self.db, members, campaign_id, now)
         last_sent_at = (
             select(
                 AdDeliveryLog.telegram_group_id.label("telegram_group_id"),
@@ -11314,7 +11371,7 @@ class AcquisitionAutomationService:
         return profile
 
     async def _sync_group_ad_policy_from_audit(
-        self, group: Group, audit: JoinedGroupAuditResult
+        self, group: Group, audit: JoinedGroupAuditResult, *, commit: bool = True
     ) -> GroupAdProfile:
         now = _now()
         capacity = await get_ad_capacity_settings(self.db)
@@ -11398,7 +11455,10 @@ class AcquisitionAutomationService:
                     evidence=json.dumps(audit.ad_rule_details or {}, ensure_ascii=False)[:8000],
                 )
             )
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         return profile
 
     async def _refresh_group_ad_profile_tier(
@@ -12163,6 +12223,20 @@ class AcquisitionAutomationService:
         return telegram_group_id
 
     async def _send_ad(
+        self, account_id: int, telegram_group_id: int, creative: AdCreative, *,
+        delivery_policy: str = AdDeliveryPolicy.GROWTH.value,
+        reservation_token: Optional[str] = None,
+    ) -> Optional[int]:
+        from app.modules.acquisition.read_costs import measure
+        async with measure(account_id, "delivery") as cost:
+            result = await self._send_ad_measured(
+                account_id, telegram_group_id, creative,
+                delivery_policy=delivery_policy, reservation_token=reservation_token,
+            )
+            cost.complete = result is not None and result > 0
+            return result
+
+    async def _send_ad_measured(
         self,
         account_id: int,
         telegram_group_id: int,
@@ -12793,6 +12867,9 @@ class AcquisitionAutomationService:
             elif membership.ad_status != MEMBERSHIP_AD_STATUS_BLOCKED:
                 membership.ad_status = MEMBERSHIP_AD_STATUS_ACTIVE
             membership.updated_at = now
+            await self.db.flush()
+            from app.modules.acquisition.qualification_continuity import restore_own_authorization
+            await restore_own_authorization(self.db, membership.id, apply=True, log_id=log.id)
         await self.db.commit()
 
     async def _mark_ad_survival_checkpoint(self, log: AdDeliveryLog, now: datetime) -> str:
@@ -13037,6 +13114,8 @@ class AcquisitionAutomationService:
 
     async def _claim_survival_check(self, log_id: int, now: datetime, *, reconciliation: bool = False) -> tuple[str, int, str] | None:
         token = uuid4().hex
+        from app.modules.acquisition.survival_schedule import eligible_check
+        capacity = await get_ad_capacity_settings(self.db)
         eligible = [
             AdDeliveryLog.status.in_(["pending", "unknown", "sending", "reconciliation_required"]),
             AdDeliveryLog.telegram_message_id.is_not(None),
@@ -13045,7 +13124,7 @@ class AcquisitionAutomationService:
         ] if reconciliation else [
             AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
             AdDeliveryLog.survival_status == AdSurvivalStatus.PENDING.value,
-            AdDeliveryLog.survival_check_due_at <= now,
+            eligible_check(now, capacity),
         ]
         result = await self.db.execute(update(AdDeliveryLog).where(
             AdDeliveryLog.id == log_id,
@@ -13166,7 +13245,34 @@ class AcquisitionAutomationService:
             return "message_missing_auto_delete_possible"
         return "message_missing_cause_unconfirmed"
 
-    async def _check_one_ad_survival(self, log: AdDeliveryLog, now: datetime) -> str:
+    async def _read_survival_facts(
+        self, log: AdDeliveryLog, purpose: str, reads: SurvivalReadBatch | None = None,
+    ) -> dict[str, Any]:
+        from app.modules.acquisition.read_costs import measure
+        kind = log.survival_stage if purpose == "ad_survival_check" else "reconciliation"
+        async with measure(log.account_id, kind) as cost:
+            facts = await self._read_survival_facts_measured(log, purpose, reads)
+            cost.complete = not facts.get("errors")
+            return facts
+
+    async def _read_survival_facts_measured(
+        self, log: AdDeliveryLog, purpose: str, reads: SurvivalReadBatch | None = None,
+    ) -> dict[str, Any]:
+        owned = reads is None
+        reads = reads or SurvivalReadBatch(self.account_pool)
+        try:
+            async with reads.borrow(log.account_id, purpose) as wrapper:
+                facts = await asyncio.wait_for(self._inspect_ad_survival_facts(wrapper, log), timeout=60)
+                if facts.get("errors"):
+                    await reads.close()
+                return facts
+        finally:
+            if owned:
+                await reads.close()
+
+    async def _check_one_ad_survival(
+        self, log: AdDeliveryLog, now: datetime, *, reads: SurvivalReadBatch | None = None,
+    ) -> str:
         log_id = int(log.id)
         claim = await self._claim_survival_check(log_id, now)
         if claim is None:
@@ -13182,25 +13288,18 @@ class AcquisitionAutomationService:
         facts: dict[str, Any] = {}
         reason = None
         rpc_defer = None
-        wrapper = None
         if current.telegram_message_id is None or current.sent_at is None:
             reason = "survival_send_confirmation_missing"
         elif deadline is None:
             reason = "survival_stage_unknown"
         elif now >= deadline:
             try:
-                wrapper = await self.account_pool.acquire_by_id(current.account_id, purpose="ad_survival_check")
-                if wrapper is None:
-                    raise RuntimeError("account_unavailable")
-                facts = await asyncio.wait_for(self._inspect_ad_survival_facts(wrapper, current), timeout=60)
+                facts = await self._read_survival_facts(current, "ad_survival_check", reads)
                 reason = self._survival_unknown_reason(facts, current, _now())
             except RpcDeferred as exc:
                 rpc_defer = (exc.reason, exc.retry_after_seconds)
             except Exception as exc:
                 reason = "survival_read_unknown:" + type(exc).__name__
-            finally:
-                if wrapper is not None:
-                    await self.account_pool.release(wrapper)
         checked_at = _now()
         # Fence old workers after expiry/reclaim and stale stages before any statistics mutation.
         updated = await self.db.execute(update(AdDeliveryLog).where(
@@ -13265,7 +13364,9 @@ class AcquisitionAutomationService:
                 message_id=int(log.telegram_message_id), confirmed=True,
             )
 
-    async def _reconcile_one_ad_delivery(self, log: AdDeliveryLog, now: datetime) -> str:
+    async def _reconcile_one_ad_delivery(
+        self, log: AdDeliveryLog, now: datetime, *, reads: SurvivalReadBatch | None = None,
+    ) -> str:
         """Reconcile only an original returned ID; no search-by-content and no resend."""
         claim = await self._claim_survival_check(log.id, now, reconciliation=True)
         if claim is None:
@@ -13274,18 +13375,11 @@ class AcquisitionAutomationService:
         current = (await self.db.execute(select(AdDeliveryLog).where(AdDeliveryLog.id == log_id)
             .options(selectinload(AdDeliveryLog.group)).execution_options(populate_existing=True))).scalar_one()
         await self.db.commit()
-        wrapper = None
         facts: dict[str, Any] = {}
         try:
-            wrapper = await self.account_pool.acquire_by_id(current.account_id, purpose="ad_result_reconciliation")
-            if wrapper is None:
-                raise RuntimeError("account_unavailable")
-            facts = await asyncio.wait_for(self._inspect_ad_survival_facts(wrapper, current), timeout=60)
+            facts = await self._read_survival_facts(current, "ad_result_reconciliation", reads)
         except Exception as exc:
             facts = {"errors": ["reconciliation:" + type(exc).__name__]}
-        finally:
-            if wrapper is not None:
-                await self.account_pool.release(wrapper)
         checked = _now()
         updated = await self.db.execute(update(AdDeliveryLog).where(
             AdDeliveryLog.id == log_id, AdDeliveryLog.survival_claim_token == token,
@@ -13330,6 +13424,7 @@ class AcquisitionAutomationService:
         capacity = await get_ad_capacity_settings(self.db)
         batch_size = max(1, int(limit or capacity.get("survival_check_batch_size") or 50))
         now = _now()
+        from app.modules.acquisition.survival_schedule import eligible_check
         rows = await self.db.execute(
             select(AdDeliveryLog.id, AdDeliveryLog.account_id)
             .where(
@@ -13337,7 +13432,7 @@ class AcquisitionAutomationService:
                 or_(
                     and_(AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
                          AdDeliveryLog.survival_status == AdSurvivalStatus.PENDING.value,
-                         AdDeliveryLog.survival_check_due_at <= now),
+                         eligible_check(now, capacity)),
                     and_(AdDeliveryLog.status.in_(["pending", "unknown", "sending", "reconciliation_required"]),
                          AdDeliveryLog.telegram_message_id.is_not(None),
                          AdDeliveryLog.survival_status != AdSurvivalStatus.CHECK_FAILED.value,
@@ -13358,29 +13453,34 @@ class AcquisitionAutomationService:
         await self._sync_account_pool(list(accounts.scalars().all()))
 
         result = {"processed": 0, "survived": 0, "deleted": 0, "check_failed": 0, "not_required": 0}
-        for log_id, _account_id in candidates:
-            try:
-                log = (
-                    await self.db.execute(
-                        select(AdDeliveryLog)
-                        .options(selectinload(AdDeliveryLog.group))
-                        .where(AdDeliveryLog.id == log_id)
+        reads = SurvivalReadBatch(self.account_pool)
+        try:
+            for log_id, _account_id in candidates:
+                try:
+                    log = (
+                        await self.db.execute(
+                            select(AdDeliveryLog)
+                            .options(selectinload(AdDeliveryLog.group))
+                            .where(AdDeliveryLog.id == log_id)
+                        )
+                    ).scalar_one_or_none()
+                    if log is None:
+                        continue
+                    status = (await self._check_one_ad_survival(log, now, reads=reads) if log.status == DeliveryStatus.SUCCESS.value
+                              else await self._reconcile_one_ad_delivery(log, now, reads=reads))
+                except Exception as exc:
+                    await reads.close()
+                    await self.db.rollback()
+                    logger.exception(
+                        "ad_survival_record_failed",
+                        ad_delivery_log_id=log_id,
+                        error=str(exc),
                     )
-                ).scalar_one_or_none()
-                if log is None:
-                    continue
-                status = (await self._check_one_ad_survival(log, now) if log.status == DeliveryStatus.SUCCESS.value
-                          else await self._reconcile_one_ad_delivery(log, now))
-            except Exception as exc:
-                await self.db.rollback()
-                logger.exception(
-                    "ad_survival_record_failed",
-                    ad_delivery_log_id=log_id,
-                    error=str(exc),
-                )
-                status = "check_failed"
-            result["processed"] += 1
-            result[status] = int(result.get(status, 0)) + 1
+                    status = "check_failed"
+                result["processed"] += 1
+                result[status] = int(result.get(status, 0)) + 1
+        finally:
+            await reads.close()
         return result
 
     def _render_ad_content(self, creative: AdCreative) -> str:

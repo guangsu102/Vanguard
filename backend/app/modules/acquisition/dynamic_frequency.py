@@ -778,14 +778,14 @@ class AccountDynamicFrequencyService:
         if getattr(config, "dynamic_capacity_enabled", False):
             from app.core.account.age import account_age_eligibility_reason
             from app.core.account.outbound_budget import effective_capacity_limits
-            from app.modules.acquisition.capacity import inventory_snapshot
+            from app.modules.acquisition.ad_output_plan import ad_output_plan
             if account_age_eligibility_reason(account, now):
                 return 0
             limits = await effective_capacity_limits(self.db, account, config, now)
-            inventory = await inventory_snapshot(self.db, config.account_id, now)
-            if inventory["qualified"] + inventory["active_backlog"] >= 2 * limits["ad"]:
+            plan = await ad_output_plan(self.db, account, config, now, limits=limits)
+            if plan["join_blocker"]:
                 return 0
-            return limits["join"]
+            return min(limits["join"], plan["group_deficit"])
         configured_limit = max(0, int(config.max_groups_per_day or 0))
         if configured_limit <= 0:
             return 0

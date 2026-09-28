@@ -24,20 +24,20 @@ def ready_usage():
 async def test_read_only_budget_snapshot_blocks_hour_and_recovers_without_reservation(monkeypatch,test_db):
     from app.core import redis as redis_module
     now=datetime.utcnow()
-    cache=Obj(eval=AsyncMock(return_value=[1,30,240,2300,498,70000,0,-2,23,70000,0,-2,0,-2]),ttl=AsyncMock(return_value=-2))
+    cache=Obj(eval=AsyncMock(return_value=[1,30,240,2300,498,70000,0,-2,23,70000,0,-2,0,-2,0,-2,0,-2,0,-2,0,-2]+[0,-2]*8),ttl=AsyncMock(return_value=-2))
     monkeypatch.setattr(redis_module,'get_redis',AsyncMock(return_value=cache))
     state=await rpc.snapshot(test_db,3,now)
     assert state['state']=='budget_wait' and state['reason']=='telegram_read_budget'
     assert state['usage']['hour']['remaining']==0
     assert state['resume_at']==(now+timedelta(seconds=2301)).isoformat()
     assert 'INCR' not in cache.eval.await_args.args[0] and 'SET' not in cache.eval.await_args.args[0]
-    cache.eval.return_value=[0,-2,0,-2,498,70000,0,-2,23,70000,0,-2,0,-2]
+    cache.eval.return_value=[0,-2,0,-2,498,70000,0,-2,23,70000,0,-2,0,-2,0,-2,0,-2,0,-2,0,-2]+[0,-2]*8
     assert (await rpc.snapshot(test_db,3,now))['state']=='ready'
 
 
 async def test_background_exhaustion_does_not_block_foreground(monkeypatch,test_db):
     from app.core import redis as redis_module
-    cache=Obj(eval=AsyncMock(return_value=[0,-2,10,10,100,100,60,3000,480,70000,0,-2,0,-2]),ttl=AsyncMock(return_value=-2))
+    cache=Obj(eval=AsyncMock(return_value=[0,-2,10,10,100,100,60,3000,480,70000,0,-2,0,-2,0,-2,0,-2,0,-2,0,-2]+[0,-2]*8),ttl=AsyncMock(return_value=-2))
     monkeypatch.setattr(redis_module,'get_redis',AsyncMock(return_value=cache))
     assert (await rpc.snapshot(test_db,3,datetime.utcnow()))['state']=='ready'
 
@@ -110,7 +110,7 @@ async def test_listener_defers_without_connecting_or_marking_error(monkeypatch):
     monkeypatch.setattr(module,'get_db_session',db)
     monkeypatch.setattr(rpc,'check_read_ready',AsyncMock(side_effect=rpc.RpcDeferred('telegram_read_budget',2000)))
     worker=module.TelegramWorker(role=TelegramWorkerRole.GROWTH_USER)
-    worker._account_pool=Obj(connect_by_id=AsyncMock())
+    worker._account_pool=Obj(connect_by_id=AsyncMock(), get_account_by_id=AsyncMock(return_value=None))
     result=await worker._ensure_growth_listeners([Obj(id=3)])
     assert result['listeners_deferred']==1 and result['listener_errors']==[]
     worker._account_pool.connect_by_id.assert_not_awaited()

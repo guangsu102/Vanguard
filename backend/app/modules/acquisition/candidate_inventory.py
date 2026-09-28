@@ -26,7 +26,7 @@ def matches(fact: dict, group: Any, account_id: int) -> bool:
 
 
 def fresh(fact: dict, group: Any, account_id: int, now: datetime) -> bool:
-    checked, expires = date(fact.get("checked_at")), date(fact.get("next_preview_at"))
+    checked, expires = date(fact.get("checked_at")), date(fact.get("expires_at", fact.get("next_preview_at")))
     return bool(
         matches(fact, group, account_id)
         and checked
@@ -50,6 +50,7 @@ def ready(fact: dict) -> bool:
 
 
 def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime) -> dict:
+    collected = min(now, date(hint.evidence_collected_at) or now)
     fact = {
         **asdict(hint),
         "version": 1,
@@ -59,14 +60,35 @@ def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime) -
         "namespace": hint.peer_namespace,
         "preview_exclusion": hint.exclusion_reason,
         "score": hint.score,
-        "checked_at": now.isoformat(),
+        "checked_at": collected.isoformat(),
     }
     ttl = (
         timedelta(hours=6)
         if hint.exclusion_reason
-        else timedelta(minutes=30 if ready(fact) else 15)
+        else timedelta(hours=3) if ready(fact) else timedelta(minutes=15)
     )
-    fact["next_preview_at"] = (now + ttl).isoformat()
+    fact["expires_at"] = (collected + ttl).isoformat()
+    fact["next_preview_at"] = fact["expires_at"]
+    return fact
+
+
+def due(fact: dict, group: Any, account_id: int, now: datetime) -> bool:
+    if fresh(fact, group, account_id, now):
+        return False
+    retry = date(fact.get("next_preview_at")) if matches(fact, group, account_id) else None
+    return retry is None or retry <= now
+
+
+def deferred_fact(group: Any, account_id: int, previous: dict, retry_at: datetime, progress: dict | None = None) -> dict:
+    fact = dict(previous) if matches(previous, group, account_id) else {
+        "version": 1, "account_id": account_id, "telegram_group_id": group.group_id,
+        "username": group.username, "status": "deferred", "expires_at": None,
+    }
+    # Retry timing must never extend the validity of previously sampled facts.
+    fact.setdefault("expires_at", fact.get("next_preview_at"))
+    fact["next_preview_at"] = retry_at.isoformat()
+    if progress is not None:
+        fact["progress"] = progress
     return fact
 
 
@@ -101,3 +123,16 @@ async def save(db: Any, account_id: int, group_id: int, fact: dict) -> None:
                 index_elements=[SystemSetting.key], set_={"value": json.dumps(fact)}
             )
         )
+
+async def account_retry_at(db: Any, account_id: int) -> datetime | None:
+    row = await db.get(SystemSetting, f"qualification.candidate_retry.{account_id}")
+    return date(row.value) if row else None
+
+
+async def defer_account(db: Any, account_id: int, retry_at: datetime) -> None:
+    if db.get_bind().dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+    statement = insert(SystemSetting).values(key=f"qualification.candidate_retry.{account_id}", value=retry_at.isoformat())
+    await db.execute(statement.on_conflict_do_update(index_elements=[SystemSetting.key], set_={"value": retry_at.isoformat()}))

@@ -12,6 +12,7 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import select, text
 
 from app.core.account.models import TelegramAccount
+from app.core.account.rpc_governor import RpcDeferred
 from app.core.account.telegram_execution import TelegramExecutionError
 from app.core.config import get_settings
 from app.core.group.models import Group, GroupAccountMembership
@@ -51,6 +52,10 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
     if row is None or group is None or member is None:
         raise TelegramExecutionError("qualification_review_required")
     snapshot = json.loads(row.evidence_json or "{}")
+    from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+    established = snapshot.get("authorization_basis") == OWN_SOURCE
+    if established and not await own_proof_valid(db, snapshot, member, group):
+        raise TelegramExecutionError("qualification_own_delivery_unconfirmed")
     entity = await client.get_entity(target)
     if (
         identity_relation(entity_identity(entity), peer_identity(group.group_id, snapshot))
@@ -106,6 +111,9 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
     if getattr(full, "send_paid_messages_stars", 0):
         raise TelegramExecutionError("qualification_paid_messages_not_authorized")
     async def invalidate(reason: str, *, unknown: bool = False, retry_after: int = 0) -> None:
+        if unknown and ("read_failed" in reason or "identity_failed" in reason):
+            # Transport/lookup failures do not prove that previous facts changed.
+            raise TelegramExecutionError(reason, retry_after_seconds=retry_after or 60)
         row.expires_at = now
         row.reason = reason
         row.state, row.decision = "completed", "observe"
@@ -129,6 +137,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         if not isinstance(online_count, int) or online_count < 0:
             try:
                 online_count = getattr(await client(GetOnlinesRequest(entity)), "onlines", None)
+            except RpcDeferred:
+                raise
             except Exception as exc:
                 if "Flood" in type(exc).__name__:
                     raise
@@ -146,6 +156,10 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         or any(type(value) is not int or value <= 0 for value in own_ids)
     ):
         await invalidate("system_account_identity_unconfirmed_before_send", unknown=True)
+    if established:
+        # Already verified own 24h survival is local evidence. No repeated history,
+        # third-party post or AI reads; live identity/rights/slowmode checks above remain.
+        return
     # Trial authorization is based on an observed ordinary-member precedent.
     # Explicit group-rule permission is a separate route and needs no such post.
     if getattr(row, "decision", None) != "allowed":
@@ -156,6 +170,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             await invalidate("advertising_precedent_unconfirmed_before_send", unknown=True)
         try:
             present = await client.get_messages(entity, ids=[item["message_id"] for item in proof])
+        except RpcDeferred:
+            raise
         except Exception as exc:
             await invalidate(
                 "advertising_precedent_read_failed_before_send:" + type(exc).__name__,
@@ -189,6 +205,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
                 await invalidate("advertising_precedent_changed_before_send")
             try:
                 role = await proof_collector.role(entity, message)
+            except RpcDeferred:
+                raise
             except Exception as exc:
                 await invalidate(
                     "advertising_precedent_identity_failed_before_send:" + type(exc).__name__,
@@ -230,6 +248,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         ]
         latest = [message async for message in client.iter_messages(entity, limit=100)]
         current_admin = await client.get_messages(entity, ids=list(old_admin)) if old_admin else []
+    except RpcDeferred:
+        raise
     except Exception as exc:
         await invalidate(
             "rules_read_failed_before_send:" + type(exc).__name__,
@@ -284,6 +304,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             continue
         try:
             role = await collector.role(entity, message)
+        except RpcDeferred:
+            raise
         except Exception as exc:
             await invalidate(
                 "admin_identity_read_failed_before_send:" + type(exc).__name__,

@@ -211,7 +211,8 @@ def test_candidate_expiry_account_and_group_binding():
     assert inventory.ready(fact) and inventory.fresh(fact, group, 2, NOW)
     assert not inventory.fresh(fact, group, 3, NOW)
     assert not inventory.fresh(fact, Obj(**{**vars(group), "username": "b"}), 2, NOW)
-    assert not inventory.fresh(fact, group, 2, NOW + timedelta(minutes=30))
+    assert inventory.fresh(fact, group, 2, NOW + timedelta(minutes=48))
+    assert not inventory.fresh(fact, group, 2, NOW + timedelta(hours=3))
 
 
 @pytest.mark.asyncio

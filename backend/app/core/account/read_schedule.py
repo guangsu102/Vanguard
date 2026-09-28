@@ -12,11 +12,14 @@ async def read_wait(
     now: datetime,
     *,
     purpose: str,
+    requires_bootstrap: bool = False,
     risk_pause_until: datetime | None = None,
 ) -> tuple[str, datetime] | None:
     wait = None
     try:
-        await check_read_ready(db, account_id, now, purpose=purpose)
+        await check_read_ready(
+            db, account_id, now, purpose=purpose, requires_bootstrap=requires_bootstrap
+        )
     except RpcDeferred as exc:
         wait = (exc.reason, now + timedelta(seconds=exc.retry_after_seconds + 1))
     if risk_pause_until and risk_pause_until > now:

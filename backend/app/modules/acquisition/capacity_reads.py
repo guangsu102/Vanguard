@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from sqlalchemy.orm import raiseload
+
 
 class CapacityReads:
     """Reuse buffered results only within one read-only capacity calculation.
@@ -18,6 +20,10 @@ class CapacityReads:
     async def execute(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
         if not statement.is_select or statement._for_update_arg is not None:
             raise RuntimeError("capacity_projection_requires_unlocked_select")
+        # Projection helpers explicitly load the relationships they need. Avoid
+        # model-default joins/select-in cascades (account -> proxy/config etc.).
+        # Unexpected relationship access fails rather than issuing hidden reads.
+        statement = statement.options(raiseload("*"))
         shape = statement._generate_cache_key()
         if shape is None:
             return await self.db.execute(statement, *args, **kwargs)
@@ -45,7 +51,10 @@ class CapacityReads:
             raise RuntimeError("capacity_projection_requires_unlocked_select")
         key = (entity, repr(ident), repr(kwargs.get("options")))
         if key not in self.objects:
-            self.objects[key] = await self.db.get(entity, ident, **kwargs)
+            options = [raiseload("*"), *(kwargs.get("options") or ())]
+            self.objects[key] = await self.db.get(
+                entity, ident, **{**kwargs, "options": options}
+            )
         return self.objects[key]
 
     async def flush(self, *args: Any, **kwargs: Any) -> None:

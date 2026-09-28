@@ -188,6 +188,11 @@ class JoinRequestBudgetService:
                 return "join_flood_wait"
         if await self._is_owned_group_owner(account.id):
             return "owned_group_owner_protected"
+        if getattr(config, "dynamic_capacity_enabled", False):
+            from app.modules.acquisition.ad_output_plan import ad_output_plan
+            plan = await ad_output_plan(self.db, account, config, now)
+            if plan["join_blocker"]:
+                return plan["join_blocker"]
         return None
 
     @staticmethod

@@ -26,6 +26,13 @@ from app.modules.guardian.models import (
 logger = structlog.get_logger()
 
 
+def _escape_markdown_display_name(value: str) -> str:
+    """Escape only interpolated names; keep the configured legacy Markdown."""
+    for char in ("\\", "_", "*", "`", "["):
+        value = value.replace(char, "\\" + char)
+    return value
+
+
 @dataclass
 class JoinResult:
     """Result of join verification check."""
@@ -216,7 +223,7 @@ class VerificationManager:
         should_verify, reason = await self.should_verify(user_id, chat_id)
         
         if not should_verify:
-            display_name = username or f"User_{user_id}"
+            display_name = _escape_markdown_display_name(username or f"User_{user_id}")
             
             config = await self.get_verification_config(chat_id)
             welcome_msg = config.welcome_message if config else "欢迎 {username} 加入群聊！"

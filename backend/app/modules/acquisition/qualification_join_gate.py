@@ -8,7 +8,7 @@ all advertising still requires the separate account-scoped send gate.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from app.core.group.models import Group
@@ -19,6 +19,7 @@ from app.modules.acquisition.group_qualification import (
     trial_evidence,
 )
 from app.modules.acquisition.models import GroupQualificationAudit
+from app.modules.acquisition.qualification_lifetime import EVIDENCE_TTL
 from app.modules.acquisition.qualification_identity import (
     entity_identity,
     identity_relation,
@@ -89,7 +90,7 @@ def _fresh_review(row: GroupQualificationAudit, group: Group, now: datetime) -> 
         row.policy_version == POLICY_VERSION
         and row.state in {"completed", "manual_required"}
         and row.checked_at is not None
-        and now - timedelta(hours=24) <= row.checked_at <= now
+        and now - EVIDENCE_TTL <= row.checked_at <= now
         and row.expires_at is not None
         and row.expires_at > now
         and row.evidence_hash
