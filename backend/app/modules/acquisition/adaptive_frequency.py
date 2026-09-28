@@ -22,7 +22,7 @@ from app.modules.acquisition.qualification_identity import (
     peer_identity,
 )
 
-STEPS = (1, 2, 3, 5, 8, 12, 18, 24, 30)
+STEPS = (1, 2, 4, 8, 16, 30)
 DAY = timedelta(hours=24)
 
 
@@ -61,7 +61,7 @@ def interval_seconds(quota: int) -> int:
 
 
 def next_quota(quota: int) -> int:
-    return next((step for step in STEPS if step > quota), 30)
+    return min(30, max(1, quota) * 2)
 
 
 def rule_quota(context: dict | None) -> int:
@@ -202,6 +202,7 @@ class FrequencyService:
                     select(AdDeliveryLog)
                     .where(AdDeliveryLog.telegram_group_id.in_(identity_aliases(identity)))
                     .order_by(AdDeliveryLog.created_at, AdDeliveryLog.id)
+                    .execution_options(populate_existing=True)
                 )
             ).all()
         )
@@ -229,7 +230,7 @@ class FrequencyService:
                 await self.db.scalars(
                     select(GroupAdFrequencyEvent).where(
                         GroupAdFrequencyEvent.telegram_group_id == key,
-                        GroupAdFrequencyEvent.kind.in_(["deleted", "muted"]),
+                        GroupAdFrequencyEvent.kind.in_(["deleted", "muted", "daily_deleted", "daily_muted", "daily_survived"]),
                     )
                 )
             ).all()
@@ -245,7 +246,7 @@ class FrequencyService:
                 if log.status != "success" or log.sent_at is None:
                     return AdReadiness("qualification_delivery_reconciliation_required"), state
                 exposures.append(log)
-                if log.id in resolved:
+                if log.id in resolved or frequency_context(log).get("version") == 2:
                     continue
                 if log.survival_status in {"deleted", "check_failed"} or log.survival_error:
                     return AdReadiness("frequency_survival_unresolved"), state
@@ -273,6 +274,19 @@ class FrequencyService:
                         return AdReadiness("frequency_reservation_stale"), state
                     continue
                 return AdReadiness("frequency_group_inflight"), state
+        if state:
+            from app.modules.acquisition.daily_frequency import DailyFrequencyService
+
+            review_logs = [log for log in logs if not (
+                log.status == "pending" and reservation_token
+                and log.reservation_token == reservation_token
+            )]
+            review = await DailyFrequencyService(self.db).plan(state, logs=review_logs)
+            if review.reason:
+                return AdReadiness(review.reason), state
+            if review.due_at and review.due_at <= now:
+                reason = "frequency_daily_review_unknown" if state.daily_review_error else "frequency_daily_review_due"
+                return AdReadiness(reason, state.daily_review_retry_at or review.due_at), state
         quota = min(state.quota if state else 1, rule_quota(context))
         if quota <= 0:
             return AdReadiness("frequency_group_rule_limit"), state
@@ -285,7 +299,7 @@ class FrequencyService:
             due = latest.sent_at + timedelta(seconds=interval_seconds(quota))
             if due > now:
                 return AdReadiness("frequency_group_interval", due), state
-            if latest.id not in resolved:
+            if latest.id not in resolved and frequency_context(latest).get("version") != 2:
                 if latest.survived_two_minute_at is None:
                     return AdReadiness("frequency_first_checkpoint_required"), state
                 if not (state and state.mature) and latest.survival_status != "survived":
@@ -299,7 +313,7 @@ class FrequencyService:
             "quota": state.quota,
             "lane": "mature" if state.mature else "probe",
             "telegram_group_id": state.telegram_group_id,
-            "version": 1,
+            "version": 2,
         }
 
     async def observe(
@@ -333,30 +347,9 @@ class FrequencyService:
                 and log.survival_status == "survived"
             ):
                 return state
-        else:
-            previous_negative = await self.db.scalar(
-                select(GroupAdFrequencyEvent.id)
-                .where(
-                    GroupAdFrequencyEvent.telegram_group_id == state.telegram_group_id,
-                    GroupAdFrequencyEvent.epoch == epoch,
-                    GroupAdFrequencyEvent.kind.in_(["deleted", "muted"]),
-                )
-                .limit(1)
-            )
-            state.pause_until = max(state.pause_until or now, now + DAY)
-            state.promote_after = max(state.promote_after or now, now + timedelta(hours=72))
-            if kind == "muted" or (
-                int(fc.get("sent_quota", fc["quota"])) == 1 and epoch == state.epoch
-            ):
-                state.status = "exit_pending"
-                state.reason = (
-                    "frequency_muted" if kind == "muted" else "frequency_deleted_at_minimum"
-                )
-            elif previous_negative is None and state.status == "active":
-                state.quota = max(1, min(state.quota, int(fc.get("sent_quota", fc["quota"])) // 2))
-                state.epoch += 1
-                state.epoch_started_at = now
-                state.reason = "frequency_deleted_cooldown"
+        elif kind == "muted":
+            state.status = "exit_pending"
+            state.reason = "frequency_muted"
         self.db.add(
             GroupAdFrequencyEvent(
                 telegram_group_id=state.telegram_group_id,
@@ -369,56 +362,8 @@ class FrequencyService:
             )
         )
         await self.db.flush()
-        if (
-            kind == "survived"
-            and epoch == state.epoch
-            and state.status == "active"
-            and now >= state.epoch_started_at + DAY
-            and (state.promote_after is None or now >= state.promote_after)
-        ):
-            successes = list(
-                (
-                    await self.db.scalars(
-                        select(GroupAdFrequencyEvent).where(
-                            GroupAdFrequencyEvent.telegram_group_id == state.telegram_group_id,
-                            GroupAdFrequencyEvent.epoch == state.epoch,
-                            GroupAdFrequencyEvent.kind == "survived",
-                        )
-                    )
-                ).all()
-            )
-            logs = await self.logs(log.telegram_group_id, context)
-            handled = set(
-                (
-                    await self.db.scalars(
-                        select(GroupAdFrequencyEvent.log_id).where(
-                            GroupAdFrequencyEvent.telegram_group_id == state.telegram_group_id,
-                            GroupAdFrequencyEvent.kind.in_(["deleted", "muted"]),
-                        )
-                    )
-                ).all()
-            )
-            bad = any(
-                item.survival_status in {"deleted", "check_failed"}
-                or item.survival_error
-                or (
-                    item.survival_status == "pending"
-                    and (item.survival_check_due_at is None or item.survival_check_due_at <= now)
-                )
-                for item in logs
-                if item.id not in handled
-            )
-            if (
-                len(successes) >= 3
-                and not bad
-                and (not state.mature or state.quota < rule_quota(context))
-            ):
-                state.mature = True
-                state.quota = max(1, min(next_quota(state.quota), rule_quota(context)))
-                state.epoch += 1
-                state.epoch_started_at = now
-                state.promote_after = now + DAY
-                state.reason = None
+        # Per-message checkpoints retain evidence; only the daily last-message review
+        # changes the quota. Late callbacks cannot adjust a newer cycle.
         state.updated_at = now
         return state
 
@@ -448,7 +393,7 @@ class FrequencyService:
                                 & (AdDeliveryLog.created_at >= member.joined_at)
                             )
                         ),
-                        GroupAdFrequencyEvent.kind.in_(["deleted", "muted"]),
+                        GroupAdFrequencyEvent.kind.in_(["deleted", "muted", "daily_deleted"]),
                         (GroupAdFrequencyEvent.kind != "muted") | ~GroupAdFrequencyEvent.log_id.in_(
                             select(GroupAdFrequencyEvent.log_id).where(GroupAdFrequencyEvent.kind == "mute_revoked")
                         ),
@@ -472,24 +417,30 @@ class FrequencyService:
 
     async def summary(self, target: int, now: datetime, context: dict | None = None) -> dict:
         ready, state = await self.readiness(target, now, context=context)
-        successes = []
+        from app.modules.acquisition.daily_frequency import DailyFrequencyService, DailyReviewPlan
+
+        review = await DailyFrequencyService(self.db).plan(state) if state else DailyReviewPlan()
+        review_status = "idle"
         if state:
-            successes = list(
-                (
-                    await self.db.scalars(
-                        select(GroupAdFrequencyEvent.id).where(
-                            GroupAdFrequencyEvent.telegram_group_id == state.telegram_group_id,
-                            GroupAdFrequencyEvent.epoch == state.epoch,
-                            GroupAdFrequencyEvent.kind == "survived",
-                        )
-                    )
-                ).all()
-            )
+            if state.status != "active":
+                review_status = "blocked"
+            elif state.daily_review_error or review.reason:
+                review_status = "retry"
+            elif state.daily_review_token and state.daily_review_expires_at and state.daily_review_expires_at > now:
+                review_status = "checking"
+            elif review.due_at:
+                review_status = "due" if review.due_at <= now else "waiting"
         return {
             "telegram_group_id": canonical(target, context),
             "quota": min(state.quota if state else 1, rule_quota(context)),
             "mature": bool(state and state.mature),
-            "successes": min(3, len(successes)),
+            "successes": 0,
+            "frequency_policy": "daily_last_message",
+            "daily_review_status": review_status,
+            "daily_review_due_at": review.due_at.isoformat() if review.due_at else None,
+            "daily_review_log_id": review.log.id if review.log else None,
+            "daily_review_checked_at": state.daily_review_checked_at.isoformat() if state and state.daily_review_checked_at else None,
+            "daily_review_error": (state.daily_review_error if state else None) or review.reason,
             "status": state.status if state else "active",
             "reason": ready.reason,
             "next_allowed_at": ready.next_allowed_at.isoformat() if ready.next_allowed_at else None,

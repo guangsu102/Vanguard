@@ -13416,6 +13416,9 @@ class AcquisitionAutomationService:
         current.survival_check_due_at = max(checked, created + timedelta(seconds=120))
         current.survival_retry_count = 0
         current.survival_error = None
+        from app.modules.acquisition.daily_frequency import DailyFrequencyService
+
+        await DailyFrequencyService(self.db).note_sent(current)
         await self.db.commit()
         await self._reconcile_observed_ad_budget(current)
         return "send_reconciled"
@@ -13423,6 +13426,12 @@ class AcquisitionAutomationService:
     async def check_ad_survival(self, *, limit: Optional[int] = None) -> dict[str, Any]:
         capacity = await get_ad_capacity_settings(self.db)
         batch_size = max(1, int(limit or capacity.get("survival_check_batch_size") or 50))
+        from app.modules.acquisition.daily_frequency import run_daily_frequency_reviews
+
+        daily = await run_daily_frequency_reviews(self, limit=batch_size)
+        batch_size -= daily["daily_processed"]
+        if batch_size <= 0:
+            return {"processed": 0, "survived": 0, "deleted": 0, "check_failed": 0, **daily}
         now = _now()
         from app.modules.acquisition.survival_schedule import eligible_check
         rows = await self.db.execute(
@@ -13444,7 +13453,7 @@ class AcquisitionAutomationService:
         )
         candidates = [(int(row[0]), int(row[1])) for row in rows.all()]
         if not candidates:
-            return {"processed": 0, "survived": 0, "deleted": 0, "check_failed": 0}
+            return {"processed": 0, "survived": 0, "deleted": 0, "check_failed": 0, **daily}
 
         account_ids = sorted({account_id for _, account_id in candidates})
         accounts = await self.db.execute(
@@ -13481,7 +13490,7 @@ class AcquisitionAutomationService:
                 result[status] = int(result.get(status, 0)) + 1
         finally:
             await reads.close()
-        return result
+        return {**result, **daily}
 
     def _render_ad_content(self, creative: AdCreative) -> str:
         content = creative.content
@@ -13524,6 +13533,10 @@ class AcquisitionAutomationService:
             log.survival_status = AdSurvivalStatus.NOT_REQUIRED.value
             log.survival_stage = "complete"
             log.survival_check_due_at = None
+        if status == DeliveryStatus.SUCCESS:
+            from app.modules.acquisition.daily_frequency import DailyFrequencyService
+
+            await DailyFrequencyService(self.db).note_sent(log)
         await self.db.commit()
         return log
 
@@ -13571,6 +13584,10 @@ class AcquisitionAutomationService:
             sent_at=delivery_sent_at if status == DeliveryStatus.SUCCESS else sent_at,
         )
         self.db.add(log)
+        if status == DeliveryStatus.SUCCESS:
+            from app.modules.acquisition.daily_frequency import DailyFrequencyService
+
+            await DailyFrequencyService(self.db).note_sent(log)
         await self.db.commit()
         return log
 

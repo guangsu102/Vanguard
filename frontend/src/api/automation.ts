@@ -82,7 +82,7 @@ export interface DynamicCapacitySnapshot {
   ad_output?: { sent_24h: number; confirmed_1h: number; deleted: number; unresolved: number; matured_sends_72h: number; confirmed_24h: number; matured_unresolved: number; survival_pending?: number; survival_overdue?: number; survival_deferred_overdue?: number; survival_oldest_overdue_seconds?: number; survival_next_attempt_at?: string | null }
   inventory: Record<string, number>
   workload?: { rollout_phase?: string; blocker_counts?: Record<string, number>; [key: string]: unknown }
-  group_frequencies?: { group_id: number; title?: string; telegram_group_id?: number; quota: number; mature: boolean; successes: number; status: string; reason?: string; next_allowed_at?: string | null }[]
+  group_frequencies?: { group_id: number; title?: string; telegram_group_id?: number; quota: number; mature: boolean; successes: number; status: string; reason?: string; next_allowed_at?: string | null; frequency_policy?: string; daily_review_status?: string; daily_review_due_at?: string | null; daily_review_log_id?: number | null; daily_review_checked_at?: string | null; daily_review_error?: string | null }[]
   outbound?: { categories?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }>; ad_lanes?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }> | null; unknown_count?: number }
 }
 

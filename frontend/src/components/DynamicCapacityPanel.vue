@@ -27,7 +27,9 @@ const reasons: Record<string, string> = {
   frequency_survival_unresolved: '存活结果待核实，暂停续发', frequency_survival_due: '等待到期存活检测',
   frequency_first_checkpoint_required: '等待前条广告通过 2 分钟检测', frequency_group_inflight: '该群已有在途发送',
   frequency_reservation_stale: '频率已变化，等待重新调度', frequency_deleted_cooldown: '删帖降频，冷却后再复核',
-  frequency_muted: '永久或超过 3 天禁言，等待退群', frequency_deleted_at_minimum: '最低频率仍删帖，等待退群',
+  frequency_daily_review_due: '等待核验上一周期最后一条广告', frequency_daily_review_unknown: '日核验结果待确认，暂停续发',
+  frequency_daily_deleted: '上一周期最后一条已确认不存在，额度减半', frequency_daily_target_changed: '日核验目标变化，等待重新核验',
+  frequency_muted: '永久或超过 3 天禁言，等待退群', frequency_deleted_at_minimum: '最低频率下仍确认不存在，等待退群',
   frequency_rejoin_blocked: '已禁止自动重加', outbound_ad_probe_budget: '试投额度用尽，成熟投放独立计算',
   outbound_ad_mature_budget: '账号本轮成熟投放额度用尽',
   telegram_ad_read_budget: '广告专属读取份额等待恢复',
@@ -53,6 +55,7 @@ const reasons: Record<string, string> = {
   outbound_total_budget: '总外发额度用尽', rollout_paused: '尚未启用试投',
 }
 const time = (value?: string | null) => value ? new Date(value.endsWith('Z') || /[+-]\d\d:\d\d$/.test(value) ? value : value + 'Z').toLocaleString('zh-CN') : '暂无确定时间，见阻挡原因'
+const dailyReviewNames: Record<string, string> = { idle: '等待本周期首次发送', waiting: '等待周期结束', due: '等待日核验', checking: '正在核验', retry: '待核实，暂停续发', blocked: '已停止投放' }
 async function refresh() {
   busy.value = true; error.value = ''
   try {
@@ -97,11 +100,12 @@ onMounted(refresh)
           <div v-if="row.outbound?.ad_lanes">
             <strong>试投与成熟投放分账</strong>
             <div>试投：滚动 24 小时 {{ row.outbound.ad_lanes.probe.used_rolling_24h }} / {{ row.outbound.ad_lanes.probe.effective }} 条；成熟：{{ row.outbound.ad_lanes.mature.used_rolling_24h }} 条。两者均做存活检测并共用账号发送节奏。</div>
+            <p>每 24 小时核验上一周期最后一条广告：存活则额度翻倍，最高 30；确认不存在则减半，最低 1；最低频率下仍不存在则退群；结果未知先等待核实。</p>
             <el-table :data="row.group_frequencies || []" size="small" row-key="group_id">
               <el-table-column prop="title" label="群" min-width="150" />
               <el-table-column label="阶段" width="90"><template #default="{ row: group }">{{ group.mature ? '成熟' : '试投' }}</template></el-table-column>
               <el-table-column label="单群上限" width="140"><template #default="{ row: group }">{{ group.quota }} 条 / 24 小时</template></el-table-column>
-              <el-table-column label="本档存活进度" width="140"><template #default="{ row: group }">{{ group.quota === 30 ? '已达最高档' : group.successes + ' / 3' }}</template></el-table-column>
+              <el-table-column label="每日最后一条核验" min-width="190"><template #default="{ row: group }">{{ dailyReviewNames[group.daily_review_status] || '等待日核验状态' }}<div v-if="group.daily_review_due_at">{{ time(group.daily_review_due_at) }}</div></template></el-table-column>
               <el-table-column label="下次最早发送" min-width="190"><template #default="{ row: group }">{{ group.next_allowed_at ? time(group.next_allowed_at) : (group.reason ? '等待条件恢复' : '等待账号调度') }}</template></el-table-column>
               <el-table-column label="状态原因" min-width="180"><template #default="{ row: group }">{{ reasons[group.reason] || group.reason || '当前群条件允许' }}</template></el-table-column>
             </el-table>
