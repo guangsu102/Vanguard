@@ -734,23 +734,45 @@ def review_schedule(
             reason=original_reason or "group_rules_ai_unknown",
         )
         return "observe", snapshot["reason"], "completed", now + timedelta(hours=2)
-    # AI is a binary fail-closed gate. Unknown, timeout, provider rejection,
-    # and every other incomplete outcome terminate the current material.
+    # AI is a binary fail-closed gate for a *determinative* verdict, but an
+    # inconclusive outcome (provider outage, unresolved evidence conflict) is
+    # a measurement failure, not a group-quality verdict. Fail closed only
+    # after the same material produced three inconclusive attempts; until
+    # then keep the membership under a degraded observation window — ads stay
+    # blocked (observe never authorizes sends) while fresh evidence
+    # accumulates for a new recognition attempt.
     if ai_incomplete and not (
         snapshot.get("ai_final") and snapshot.get("ai_decision") == "fail"
     ):
+        streak = (int(previous.get("unchanged_rejection_count", 0)) + 1
+                  if previous.get("rejection_fingerprint") == current_fingerprint else 1)
+        if streak >= 3:
+            snapshot.update(
+                ai_pending=False,
+                ai_review_incomplete=False,
+                ai_final=True,
+                ai_decision="fail",
+                decision="reject",
+                reason=original_reason or "group_rules_ai_unknown",
+                rejection_fingerprint=current_fingerprint,
+                unchanged_rejection_count=streak,
+                review_trigger="ai_terminal_failure",
+            )
+            return "reject", snapshot["reason"], "completed", None
         snapshot.update(
             ai_pending=False,
             ai_review_incomplete=False,
-            ai_final=True,
-            ai_decision="fail",
-            decision="reject",
+            decision="observe",
             reason=original_reason or "group_rules_ai_unknown",
             rejection_fingerprint=current_fingerprint,
-            unchanged_rejection_count=1,
-            review_trigger="ai_terminal_failure",
+            unchanged_rejection_count=streak,
+            review_trigger="ai_incomplete_observation",
         )
-        return "reject", snapshot["reason"], "completed", None
+        retry = now + timedelta(hours=12 * streak)
+        maturity = evidence_maturity(snapshot, now)
+        if maturity and maturity < retry:
+            retry = maturity
+        return "observe", snapshot["reason"], "completed", retry
     if snapshot.get("ai_final") and snapshot.get("ai_decision") == "fail":
         snapshot.update(ai_pending=False, ai_review_incomplete=False, review_trigger="evidence_changed")
         snapshot["decision"] = "reject"

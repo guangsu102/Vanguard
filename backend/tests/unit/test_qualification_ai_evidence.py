@@ -327,7 +327,20 @@ async def test_provider_content_rejection_defers_without_authorizing_ads():
         "ai_review_incomplete": True,
         "permissions": {},
     }
-    verdict, reason, state, retry = review_schedule(snapshot, {}, datetime(2026, 9, 24, 13))
-    assert (verdict, reason, state, retry) == (
-        "reject", "group_rules_ai_provider_content_rejected", "completed", None
+    now = datetime(2026, 9, 24, 13)
+    verdict, reason, state, retry = review_schedule(snapshot, {}, now)
+    # An inconclusive provider rejection observes under degraded pacing (ads
+    # stay unauthorized) instead of failing closed on the first attempt.
+    assert (verdict, reason, state) == (
+        "observe", "group_rules_ai_provider_content_rejected", "completed"
     )
+    assert snapshot.get("ai_final") is not True
+    # Third consecutive inconclusive attempt on the same material fails closed.
+    from app.modules.acquisition.qualification_retry import rule_retry_fingerprint
+    fingerprint = rule_retry_fingerprint(snapshot)
+    verdict, _, _, retry = review_schedule(
+        dict(snapshot),
+        {"rejection_fingerprint": fingerprint, "unchanged_rejection_count": 2},
+        now,
+    )
+    assert (verdict, retry) == ("reject", None)
