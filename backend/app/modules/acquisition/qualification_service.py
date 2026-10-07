@@ -2222,8 +2222,19 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
             .with_for_update(skip_locked=True)
         )
         if account_claim is None:
-            await service.db.rollback()
-            break
+            # Listener/event and pool-sync transactions hold the account row
+            # for seconds at a time.  Breaking silently here starves the whole
+            # review lane while those transactions dominate the row and leaves
+            # every due timer frozen with no scheduling signal.  Defer this row
+            # briefly instead so a later quantum claims it once the lock frees.
+            if row.state in {"running", "reviewing_ai"}:
+                row.state = "completed" if row.decision in {"allowed", "trial"} else "queued"
+            row.next_retry_at = now + timedelta(seconds=120)
+            from app.modules.acquisition.review_waits import record
+            await record(service.db, row.id, "account_row_lock_busy", 0, row.next_retry_at, now)
+            deferred_review_ids.add(row.id)
+            await service.db.commit()
+            continue
         concurrent = await service.db.scalar(
             select(GroupQualificationAudit.id)
             .where(
