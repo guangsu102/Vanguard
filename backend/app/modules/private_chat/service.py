@@ -21,6 +21,29 @@ PRIVATE_CHAT_WS_CHANNEL = "telegram:private-chats"
 logger = structlog.get_logger()
 
 
+async def mark_all_conversations_read(
+    db: AsyncSession,
+    *,
+    account_id: int | None = None,
+) -> int:
+    """Clear persisted unread counters for a bounded administrative cleanup.
+
+    This only changes the local inbox cursor. Telegram history and message rows
+    remain intact, so the operation is safe to run after a backlog cleanup and
+    does not issue any Telegram reads.
+    """
+    filters = [PrivateChatConversation.unread_count > 0]
+    if account_id is not None:
+        filters.append(PrivateChatConversation.account_id == account_id)
+    result = await db.execute(
+        update(PrivateChatConversation)
+        .where(*filters)
+        .values(unread_count=0)
+        .execution_options(synchronize_session=False)
+    )
+    return int(result.rowcount or 0)
+
+
 @dataclass(slots=True)
 class IncomingPrivateMessage:
     account_id: int

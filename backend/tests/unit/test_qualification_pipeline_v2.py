@@ -105,7 +105,7 @@ def test_semantic_cache_changes_with_required_facts(change):
         original[1]["age_hours"] = 23
     else:
         setattr(account, change, datetime.utcnow())
-    assert ai.semantic_key(snapshot, ai.anonymize_evidence(original), account, limits) != before
+    assert (ai.semantic_key(snapshot, ai.anonymize_evidence(original), account, limits) != before) == (change in {"bio", "edit"})
 
 
 @pytest.mark.asyncio
@@ -125,7 +125,7 @@ async def test_global_two_slots_and_old_holder_cannot_release_successor(test_db)
 
 
 @pytest.mark.asyncio
-async def test_completed_semantics_cache_24_hours_and_profile_invalidates(test_db):
+async def test_completed_semantics_never_expires_and_new_profile_is_new_material(test_db):
     account = Obj(id=2, profile_bio="old")
     snapshot = {
         "raw_peer_id": 42,
@@ -151,18 +151,18 @@ async def test_completed_semantics_cache_24_hours_and_profile_invalidates(test_d
     )
     assert cached.cache_hit and service._evaluate_group_ad_rules_with_ai.await_count == 1
     row = await test_db.scalar(
-        select(SystemSetting).where(SystemSetting.key.like("qualification.ai.cache.%"))
+        select(SystemSetting).where(SystemSetting.key.like("qualification.ai.once.%"))
     )
     data = json.loads(row.value)
-    assert datetime.fromisoformat(data["expires_at"]) <= datetime.utcnow() + timedelta(hours=24)
+    assert "expires_at" not in data
     data["expires_at"] = (datetime.utcnow() - timedelta(seconds=1)).isoformat()
     row.value = json.dumps(data)
     await test_db.commit()
     await ai.review_semantics(service, snapshot, account, GroupAdRulesAuditResult(), limits)
-    assert service._evaluate_group_ad_rules_with_ai.await_count == 2
+    assert service._evaluate_group_ad_rules_with_ai.await_count == 1
     account.profile_bio = "new"
     await ai.review_semantics(service, snapshot, account, GroupAdRulesAuditResult(), limits)
-    assert service._evaluate_group_ad_rules_with_ai.await_count == 3
+    assert service._evaluate_group_ad_rules_with_ai.await_count == 2
 
 
 def test_waiting_ai_does_not_consume_group_errors_or_force_exit():
@@ -389,8 +389,9 @@ async def test_model_wait_reuses_collection_without_occupying_telegram(monkeypat
         test_db, "允许普通成员文字广告", [TimeoutError(), TimeoutError()],
         assess_runs=2, ad_count=1, ad_age_hours=1
     )
-    assert len(calls) == 1 and llm.generate.await_count == 2
-    assert row.state == "waiting_ai" and json.loads(row.evidence_json)["technical_failures"] == 0
+    assert len(calls) == 1 and llm.generate.await_count == 1
+    assert row.state == "completed" and row.decision == "reject"
+    assert json.loads(row.evidence_json)["review_trigger"] == "ordinary_ad_maturity"
 
 
 @pytest.mark.asyncio
@@ -436,7 +437,7 @@ async def test_unapproved_real_llm_destination_never_receives_evidence(test_db):
         {"ad_policy_ai_enabled": True},
     )
     assert result.reason == "group_rules_ai_destination_unapproved"
-    assert snapshot["ai_pending"] is True
+    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
 
 
@@ -569,8 +570,8 @@ async def test_approved_ark_coding_destination_reaches_ai_queue(test_db, monkeyp
         GroupAdRulesAuditResult(),
         {"ad_policy_ai_enabled": True, "ad_policy_ai_model": "glm-5.3-flash"},
     )
-    assert result.reason == "group_rules_ai_queued"
-    assert snapshot["ai_pending"] is True
+    assert result.reason == "group_rules_ai_capacity_unavailable"
+    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
 
 

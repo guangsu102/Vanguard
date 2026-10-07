@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telethon.tl.types import InputPeerChannel
 
 from app.core.account.telegram_execution import TelegramExecutionService
 
@@ -12,7 +13,8 @@ def approved_ad(monkeypatch):
     monkeypatch.setattr(qualification_service, "send_gate", AsyncMock(return_value=None))
     monkeypatch.setattr(qualification_actions, "validate_live_send", AsyncMock())
     monkeypatch.setattr(qualification_service, "current_authorization", AsyncMock(return_value=(
-        SimpleNamespace(id=1, evidence_hash="h", content_scope="text_profile", policy_version="test"),
+        SimpleNamespace(id=1, evidence_hash="h", content_scope="text_profile", policy_version="test",
+                        evidence_json='{"group_type":"supergroup"}'),
         SimpleNamespace(group_id=123), SimpleNamespace(id=1))))
 
 
@@ -22,6 +24,11 @@ class FakeClient:
         self.send_file_calls = []
         self.request_calls = []
         self.get_entity_called = False
+        self.ad_peer = InputPeerChannel(123, 987)
+
+    async def get_input_entity(self, target):
+        assert target == -1000000000123
+        return self.ad_peer
 
     async def send_message(self, *args, **kwargs):
         self.send_message_calls.append((args, kwargs))
@@ -172,7 +179,7 @@ async def test_ad_delivery_marks_attempt_at_telegram_call_boundary(approved_ad):
 
     assert message_id == 321
     assert attempted == [True]
-    assert client.send_message_calls == [((123, "hello"), {"link_preview": False})]
+    assert client.send_message_calls == [((client.ad_peer, "hello"), {"link_preview": False})]
 
 
 @pytest.mark.asyncio

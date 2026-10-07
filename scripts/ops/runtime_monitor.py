@@ -24,8 +24,9 @@ def inspect():
     age = time.time() - backup.get('completed_at', 0)
     if age > 30 * 3600:
         alerts.append({'code': 'backup_stale', 'severity': 'critical'})
-    names = ['vanguard-' + name for name in ('backend', 'frontend', 'postgres', 'redis', 'celery-worker',
+    names = ['vanguard-' + name for name in ('backend', 'frontend', 'redis', 'celery-worker',
              'celery-beat', 'resource-search-worker', 'telegram-growth-worker', 'telegram-guardian-worker')]
+    names += ['sub2api-dr-postgres', 'oracle-shared-postgres-gateway']
     rows = json.loads(subprocess.check_output(['docker', 'inspect', *names], text=True, timeout=20))
     for row in rows:
         state = row['State']

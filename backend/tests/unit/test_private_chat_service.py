@@ -13,6 +13,7 @@ from app.modules.private_chat.service import (
     claim_pending_outbound_message,
     finalize_outbound_private_message,
     is_conversation_auto_reply_enabled,
+    mark_all_conversations_read,
     persist_incoming_private_message,
     queue_outbound_private_message,
 )
@@ -94,6 +95,33 @@ async def test_same_peer_on_two_accounts_creates_two_conversations(test_db):
         first_account.id,
         second_account.id,
     }
+
+
+@pytest.mark.asyncio
+async def test_bulk_read_clears_only_selected_account_without_telegram_reads(test_db):
+    first_account = await _account(test_db, "bulk-first")
+    second_account = await _account(test_db, "bulk-second")
+    for account, message_id in ((first_account, 1), (second_account, 2)):
+        await persist_incoming_private_message(
+            test_db,
+            IncomingPrivateMessage(
+                account_id=account.id,
+                peer_telegram_id=1000 + account.id,
+                telegram_message_id=message_id,
+                content="old message",
+                occurred_at=datetime(2026, 8, 26, 9, account.id, 0),
+            ),
+        )
+    await test_db.commit()
+
+    assert await mark_all_conversations_read(test_db, account_id=first_account.id) == 1
+    await test_db.commit()
+    rows = (
+        await test_db.execute(
+            select(PrivateChatConversation).order_by(PrivateChatConversation.account_id)
+        )
+    ).scalars().all()
+    assert [row.unread_count for row in rows] == [0, 1]
 
 
 @pytest.mark.asyncio

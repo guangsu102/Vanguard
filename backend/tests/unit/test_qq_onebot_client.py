@@ -122,3 +122,26 @@ async def test_onebot_recall_accepts_signed_message_ids() -> None:
         await http_client.aclose()
 
     assert deleted == [{"message_id": -9001}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [None, {"status": "async", "retcode": 1, "data": None}])
+async def test_invalid_or_async_write_reply_is_not_proof_of_non_delivery(body) -> None:
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OneBotClient(
+        account_id="10001",
+        http_url="http://napcat.test",
+        access_token="token-1",
+        http_client=http_client,
+    )
+    try:
+        with pytest.raises(OneBotAPIError) as caught:
+            await client.send_group_segments(
+                "123456789", [{"type": "text", "data": {"text": "hello"}}]
+            )
+        assert caught.value.uncertain
+    finally:
+        await http_client.aclose()

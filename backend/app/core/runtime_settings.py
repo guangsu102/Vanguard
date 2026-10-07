@@ -60,7 +60,7 @@ DEFAULT_AUTO_JOIN_SCHEDULER_SETTINGS: dict[str, Any] = {
         "ai_enabled": True,
         "confidence_threshold": 0.72,
         "post_action_wait_seconds": 8,
-        "post_action_recheck_attempts": 3,
+        "post_action_recheck_attempts": 1,
         "post_action_extra_wait_seconds": 12,
         "message_limit": 100,
         "ai_timeout_seconds": 45,

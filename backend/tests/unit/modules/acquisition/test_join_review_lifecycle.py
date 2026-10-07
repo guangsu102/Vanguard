@@ -134,7 +134,12 @@ async def test_review_runs_even_when_no_account_can_add_new_groups(test_db):
     assert result["updated"] == 1
 
 
-async def test_pending_link_request_is_reconciled_without_resending_join(test_db):
+async def test_pending_link_request_is_reconciled_without_resending_join(test_db, monkeypatch):
+    from app.core.account import read_schedule
+
+    # The reconciliation read gate has dedicated coverage; keep this test on
+    # the membership-resolution semantics it exists for.
+    monkeypatch.setattr(read_schedule, "read_wait", AsyncMock(return_value=None))
     now = datetime.utcnow()
     await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     account = TelegramAccount(

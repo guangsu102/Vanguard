@@ -128,7 +128,7 @@ async def test_two_runners_only_one_enters_body_even_after_commits(pg, monkeypat
     finally:
         release.set()
         result = await first
-    assert result == {"processed": 1, "limit": 3, "membership_reconciliation": {"checked": 0}}
+    assert result == {"processed": 1, "membership_reconciliation": {"checked": 0}, "results": []}
     assert server.owner is None
     assert all(connection.closed for connection in server.connections)
     assert sum("pg_advisory_unlock(" in query for connection in server.connections
@@ -146,7 +146,7 @@ async def test_body_exception_releases_lock_and_propagates(pg, monkeypatch):
     assert server.connections[0].closed
     body.side_effect = None
     body.return_value = {"processed": 0}
-    assert await actions.run_exits(SimpleNamespace(db=database(engine))) == {"processed": 0, "membership_reconciliation": {"checked": 0}}
+    assert await actions.run_exits(SimpleNamespace(db=database(engine))) == {"processed": 0, "membership_reconciliation": {"checked": 0}, "results": []}
 
 
 @pytest.mark.asyncio

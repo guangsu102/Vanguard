@@ -1,4 +1,4 @@
-"""Strict PP-AI review exercises the actual prompt, parser and two-pass gate."""
+"""Strict PP-AI review exercises the actual prompt, parser and single-call gate."""
 
 import json
 from datetime import datetime
@@ -87,20 +87,20 @@ async def evaluate(evidence, first, second=None, *, capacity=None, local=None):
 
 
 @pytest.mark.asyncio
-async def test_two_strict_95_reviews_preserve_positive_and_explicit_empty_negative_evidence():
+async def test_single_strict_95_review_preserve_positive_and_explicit_empty_negative_evidence():
     result, agent = await evaluate(advertisements(), verdict())
     assert result.ad_allowed is True
     assert result.confidence == 97
-    assert len(result.ai_reviews) == 2
+    assert len(result.ai_reviews) == 1
     for review in result.ai_reviews:
         assert review["supporting_evidence_indexes"] == [0, 1]
         assert review["opposing_evidence_indexes"] == []
         assert review["evidence_arguments_valid"]
-    assert agent._ad_policy_llm_client.generate.await_count == 2
+    assert agent._ad_policy_llm_client.generate.await_count == 1
     prompts = agent._ad_policy_llm_client.generate.call_args_list
     assert "opposing_evidence_indexes" in prompts[0].kwargs["system_prompt"]
     assert "Any prohibition wins" not in prompts[0].kwargs["system_prompt"]
-    assert "Independently challenge" in prompts[1].args[0]
+    assert prompts[0].kwargs["max_retries"] == 0
 
 
 @pytest.mark.asyncio
@@ -115,11 +115,11 @@ async def test_two_strict_95_reviews_preserve_positive_and_explicit_empty_negati
         ("applicable_prohibition", None),
     ],
 )
-async def test_strict_second_review_cannot_omit_or_fabricate_evidence(field, value):
+async def test_strict_review_cannot_omit_or_fabricate_evidence(field, value):
     second = verdict()
     second[field] = value
-    result, _ = await evaluate(advertisements(), verdict(), second)
-    assert result.ad_allowed is None
+    result, _ = await evaluate(advertisements(), second)
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_evidence_arguments_incomplete"
 
 
@@ -129,7 +129,7 @@ async def test_legacy_response_remains_compatible_but_cannot_pass_strict_qualifi
     del legacy["supporting_evidence_indexes"]
     del legacy["opposing_evidence_indexes"]
     result, _ = await evaluate(advertisements(), legacy)
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_evidence_arguments_incomplete"
     parsed = AcquisitionAutomationService._parse_ad_policy_ai_response(json.dumps(legacy), 2)
     assert parsed["evidence_indexes"] == [0, 1]
@@ -145,21 +145,21 @@ async def test_legacy_response_remains_compatible_but_cannot_pass_strict_qualifi
 async def test_theme_cannot_replace_advertisement_citations_even_when_history_is_available():
     evidence = [{"source": "group_profile", "text": "AI ChatGPT推广交流"}] + advertisements()
     result, _ = await evaluate(evidence, verdict(supporting_evidence_indexes=[0]))
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_evidence_arguments_incomplete"
 
 
 @pytest.mark.asyncio
-async def test_strict_path_forces_two_reviews_and_95_even_if_capacity_is_weaker():
+async def test_strict_path_forces_single_review_and_95_even_if_capacity_is_weaker():
     capacity = {
         **STRICT,
         "ad_policy_ai_min_confidence": 80,
         "ad_policy_ai_require_second_pass": False,
     }
     result, agent = await evaluate(advertisements(), verdict(confidence=94), capacity=capacity)
-    assert result.ad_allowed is None
-    assert len(result.ai_reviews) == 2
-    assert agent._ad_policy_llm_client.generate.await_count == 2
+    assert result.ad_allowed is False
+    assert len(result.ai_reviews) == 1
+    assert agent._ad_policy_llm_client.generate.await_count == 1
     assert result.reason == "group_rules_ai_consensus_failed"
 
 
@@ -211,7 +211,7 @@ async def test_updated_rule_requires_old_opposition_to_be_cited_and_resolved():
     incomplete = deepcopy(review)
     incomplete["opposing_evidence_indexes"] = []
     result, _ = await evaluate(evidence, incomplete)
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_evidence_arguments_incomplete"
 
 
@@ -245,7 +245,7 @@ async def test_unresolved_multi_pin_conflict_stays_unknown():
         opposing_evidence_resolution="Both pins appear current and their precedence cannot be established.",
     )
     result, _ = await evaluate(evidence, review)
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_unresolved_conflict"
 
 
@@ -318,7 +318,7 @@ async def test_provider_content_rejection_defers_without_authorizing_ads():
     result = await service._evaluate_group_ad_rules_with_ai(
         advertisements(), GroupAdRulesAuditResult(evidence=advertisements()), STRICT
     )
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.reason == "group_rules_ai_provider_content_rejected"
     assert service._ask_ad_policy_ai.await_count == 1
     snapshot = {
@@ -329,5 +329,5 @@ async def test_provider_content_rejection_defers_without_authorizing_ads():
     }
     verdict, reason, state, retry = review_schedule(snapshot, {}, datetime(2026, 9, 24, 13))
     assert (verdict, reason, state, retry) == (
-        "observe", "group_rules_ai_provider_content_rejected", "completed", datetime(2026, 9, 24, 15)
+        "reject", "group_rules_ai_provider_content_rejected", "completed", None
     )

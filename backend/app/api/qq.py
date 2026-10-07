@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.qq_automation import router as qq_automation_router
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -25,6 +26,7 @@ from app.modules.qq.service import QQEventProcessor, ensure_qq_connection
 from app.modules.qq.tasks import execute_qq_command
 
 router = APIRouter()
+router.include_router(qq_automation_router)
 
 
 class QQGroupCreate(BaseModel):
@@ -59,11 +61,7 @@ class QQDataResponse(BaseModel):
 
 async def _configured_connection(db: AsyncSession) -> QQBotConnection:
     account_id = (settings.QQ_ONEBOT_ACCOUNT_ID or "").strip()
-    if (
-        not settings.QQ_ONEBOT_ENABLED
-        or not account_id
-        or not settings.QQ_ONEBOT_ACCESS_TOKEN
-    ):
+    if not settings.QQ_ONEBOT_ENABLED or not account_id or not settings.QQ_ONEBOT_ACCESS_TOKEN:
         raise HTTPException(status_code=503, detail="NapCat OneBot is not configured")
     return await ensure_qq_connection(db, account_id)
 
@@ -169,9 +167,7 @@ async def list_groups(
     account_id = (settings.QQ_ONEBOT_ACCOUNT_ID or "").strip()
     if account_id:
         query = query.join(QQBotConnection).where(QQBotConnection.app_id == account_id)
-        count_query = count_query.join(QQBotConnection).where(
-            QQBotConnection.app_id == account_id
-        )
+        count_query = count_query.join(QQBotConnection).where(QQBotConnection.app_id == account_id)
     else:
         query = query.where(QQManagedGroup.id < 0)
         count_query = count_query.where(QQManagedGroup.id < 0)
@@ -290,9 +286,7 @@ async def list_group_messages(
 ) -> QQGroupListResponse:
     group = await _configured_group(db, group_id)
     query = select(QQGroupMessage).where(QQGroupMessage.group_id == group_id)
-    count_query = select(func.count(QQGroupMessage.id)).where(
-        QQGroupMessage.group_id == group_id
-    )
+    count_query = select(func.count(QQGroupMessage.id)).where(QQGroupMessage.group_id == group_id)
     if member_qq:
         query = query.where(QQGroupMessage.member_openid == member_qq)
         count_query = count_query.where(QQGroupMessage.member_openid == member_qq)
@@ -306,8 +300,7 @@ async def list_group_messages(
     total = (await db.execute(count_query)).scalar() or 0
     return QQGroupListResponse(
         data=[
-            QQEventProcessor.serialize_message(message, group)
-            for message in rows.scalars().all()
+            QQEventProcessor.serialize_message(message, group) for message in rows.scalars().all()
         ],
         total=total,
     )
@@ -394,11 +387,15 @@ async def list_commands(
     db: AsyncSession = Depends(get_db),
 ) -> QQGroupListResponse:
     connection = await _configured_connection(db)
-    query = select(QQGroupCommand).join(QQManagedGroup).where(
-        QQManagedGroup.connection_id == connection.id
+    query = (
+        select(QQGroupCommand)
+        .join(QQManagedGroup)
+        .where(QQManagedGroup.connection_id == connection.id)
     )
-    count_query = select(func.count(QQGroupCommand.id)).join(QQManagedGroup).where(
-        QQManagedGroup.connection_id == connection.id
+    count_query = (
+        select(func.count(QQGroupCommand.id))
+        .join(QQManagedGroup)
+        .where(QQManagedGroup.connection_id == connection.id)
     )
     if group_id is not None:
         query = query.where(QQGroupCommand.group_id == group_id)

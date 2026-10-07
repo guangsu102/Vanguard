@@ -80,28 +80,30 @@ async def test_same_read_in_business_task_propagates_wait_without_hidden_retry()
 
 async def test_sync_cannot_inherit_critical_advertising_priority():
     limits = rpc.limits_for({}, datetime.utcnow())
-    assert read_lane(["updates.GetStateRequest"], "ad_delivery") == "critical"
+    assert read_lane(["updates.GetStateRequest"], "ad_delivery") == "ad"
     routine = {name: cap for name, _, cap in window_plan(limits, "routine")}
     critical = {name: cap for name, _, cap in window_plan(limits, "critical")}
-    assert (routine["hour"], critical["hour"]) == (180, 240)
-    assert (routine["day"], critical["day"]) == (1800, 2400)
+    assert (routine["hour"], critical["hour"]) == (240, 240)
+    assert (routine["routine_hour"], critical["critical_hour"]) == (12, 60)
+    assert (routine["day"], critical["day"]) == (2400, 2400)
+    assert (routine["routine_day"], critical["critical_day"]) == (120, 600)
     sync = {name: cap for name, _, cap in window_plan(limits, "sync")}
-    assert sync["sync_hour"] == 60 and sync["sync_day"] == 600
+    assert sync["sync_hour"] == 48 and sync["sync_day"] == 480
 
 
 async def test_snapshot_exposes_lane_wait_without_blocking_critical_reads(monkeypatch, test_db):
     from app.core import redis as redis_module
 
     cache = Obj(
-        eval=AsyncMock(return_value=[0, -2, 180, 100, 180, 1000, 0, -2, 0, -2, 60, 200, 60, 1000]),
+        eval=AsyncMock(return_value=[value for name, _ in rpc.WINDOWS for value in ({"hour": (120, 100), "day": (120, 1000), "sync_hour": (60, 200), "sync_day": (60, 1000), "routine_hour": (24, 100), "routine_day": (24, 1000)}.get(name, (0, -2)))]),
         ttl=AsyncMock(return_value=-2),
     )
     monkeypatch.setattr(redis_module, "get_redis", AsyncMock(return_value=cache))
     now = datetime.utcnow()
     state = await rpc.check_read_ready(test_db, 3, now, purpose="ad_survival_check")
-    assert state["state"] == "ready" and state["lanes"]["critical"]["remaining"] == 60
+    assert state["state"] == "ready" and state["lanes"]["survival"]["remaining"] == 31
     assert state["lanes"]["routine"]["retry_after_seconds"] == 100
-    assert state["lanes"]["sync"]["retry_after_seconds"] == 200
+    assert state["lanes"]["sync"]["retry_after_seconds"] == 100
     with pytest.raises(rpc.RpcDeferred):
         await rpc.check_read_ready(test_db, 3, now, purpose="group_qualification")
 
@@ -129,8 +131,14 @@ async def test_governor_atomically_charges_shared_and_sync_windows_and_records_p
         ["updates.GetChannelDifferenceRequest"], sync=True
     )
     args = cache.eval.await_args.args
-    assert args[1] == 5
-    assert "vanguard:rpc:3:hour" in args and "vanguard:rpc:3:sync_hour" in args
+    keys = args[2:2 + args[1]]
+    assert len(keys) == len(set(keys))
+    assert {
+        f"vanguard:rpc:3:critical_{kind}_{window}"
+        for kind in ("join", "review") for window in ("hour", "day")
+    }.issubset(keys)
+    assert "vanguard:rpc:3:hour" in args and "vanguard:rpc:3:sync_reserved_hour" in args
+    assert "vanguard:rpc:3:survival_lent_hour" in args
     assert any(
         "sync|ad_delivery|updates.GetChannelDifferenceRequest" in call.args
         for call in pipe.hincrby.call_args_list
@@ -188,3 +196,42 @@ async def test_listener_flag_is_set_before_creation_and_restored_on_failure():
     with pytest.raises(rpc.RpcDeferred):
         await pool.connect_by_id(account.account_id, require_session=False, keep_connected=True)
     assert account.keep_connected is False
+
+
+@pytest.mark.parametrize("retained", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_listener_bootstrap_uses_control_lane_and_restores_purpose(retained, deferred):
+    from app.core.account.pool import AccountPool
+    from app.core.account.listener_pause import ListenerPause
+
+    pool = AccountPool()
+    account = await pool.add_account(account_id=995, phone="+10000000995",
+        session_name="offline-bootstrap-lane", country_code="US", api_id="1",
+        api_hash="offline-test-placeholder")
+    pool._assert_proxy_policy_current = AsyncMock()
+    pool._ensure_proxy = AsyncMock()
+    previous = account.active_purpose
+    client = Obj(is_connected=Mock(return_value=False), disconnect=AsyncMock(),
+                 _vanguard_governor=Obj(bootstrapping=False))
+    async def bootstrap(*args):
+        lane = read_lane(["users.GetUsersRequest"], account.active_purpose)
+        assert lane == "listener"
+        caps = dict((name, cap) for name, _, cap in window_plan(rpc.limits_for({}, datetime.utcnow()), lane))
+        # Routine may be exhausted; bounded bootstrap retains its control reserve.
+        assert caps["day"] > 2000
+        if deferred:
+            raise rpc.RpcDeferred("telegram_read_budget", 60)
+        return client
+    if retained:
+        client.connect = bootstrap
+        client._vanguard_listener_pause = ListenerPause(client, AsyncMock())
+        account.client = client
+    else:
+        pool._create_client = bootstrap
+    if deferred:
+        with pytest.raises(rpc.RpcDeferred):
+            await pool.connect_by_id(995, purpose="growth_listener", require_session=False)
+    else:
+        assert await pool.connect_by_id(995, purpose="growth_listener", require_session=False) is account
+    assert account.active_purpose == previous
+    assert client._vanguard_governor.bootstrapping is False

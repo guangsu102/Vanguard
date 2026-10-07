@@ -21,7 +21,9 @@ def schedule_readiness(state: AdDeliveryScheduleState | None, now: datetime) -> 
     if state.status == "paused":
         return AdReadiness(state.last_reason or "delivery_schedule_paused")
     if state.status == "sending" and state.lease_expires_at and state.lease_expires_at > now:
-        return AdReadiness("delivery_tuple_inflight", state.lease_expires_at)
+        return AdReadiness(
+            "delivery_tuple_inflight", max(state.lease_expires_at, state.next_due_at)
+        )
     if state.next_due_at > now:
         return AdReadiness("delivery_schedule_not_due", state.next_due_at)
     return AdReadiness()

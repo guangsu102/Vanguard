@@ -34,10 +34,12 @@ def evidence(age=23):
 
 
 def snapshot(**kwargs):
+    # AI-incomplete material now terminates immediately (single-shot fail
+    # closed), so the observation-lane snapshots carry no AI markers.
     return dict(
         decision="observe",
-        reason="group_rules_ai_consensus_failed",
-        ai_review_incomplete=True,
+        reason="advertising_evidence_insufficient",
+        ai_review_incomplete=False,
         quality_status="qualified",
         evidence=[evidence()],
         collected_at=NOW.isoformat(),
@@ -170,7 +172,7 @@ async def test_budget_unfinished_sender_is_read_first_next_time(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_permission_failures_are_bounded_and_cache_is_sender_scoped():
+async def test_repeated_permission_failure_has_group_capability_backoff():
     history = [message(20 - i, sender=100 + i) for i in range(10)]
     client = ResumeClient(history)
     client.role_exception = ChatAdminRequiredError(request=None)
@@ -182,7 +184,12 @@ async def test_permission_failures_are_bounded_and_cache_is_sender_scoped():
     result = await collector.collect(ENTITY, now=NOW + timedelta(minutes=15))
     denied = set(map(int, first["collection_progress"]["permission_failures"]))
     assert not denied.intersection(value for value in client2.permission_calls if value != "me")
-    assert result["roles"]["109"] == "ordinary"
+    assert result["roles"]["109"] == "unknown"
+    assert result["permission_queries"] == 0
+    recovered = EvidenceCollector(ResumeClient(history))
+    recovered.previous = result
+    fresh = await recovered.collect(ENTITY, now=NOW + timedelta(hours=3))
+    assert fresh["roles"]["109"] == "ordinary"
 
 
 @pytest.mark.asyncio
@@ -211,7 +218,8 @@ def test_candidate_expiry_account_and_group_binding():
     assert inventory.ready(fact) and inventory.fresh(fact, group, 2, NOW)
     assert not inventory.fresh(fact, group, 3, NOW)
     assert not inventory.fresh(fact, Obj(**{**vars(group), "username": "b"}), 2, NOW)
-    assert not inventory.fresh(fact, group, 2, NOW + timedelta(minutes=30))
+    assert inventory.fresh(fact, group, 2, NOW + timedelta(minutes=48))
+    assert not inventory.fresh(fact, group, 2, NOW + timedelta(hours=3))
 
 
 @pytest.mark.asyncio

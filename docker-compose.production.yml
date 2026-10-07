@@ -1,8 +1,9 @@
+# Oracle shared PostgreSQL 2026-09-30: add the shared-postgres override; see docs/ORACLE_SHARED_POSTGRES.md.
 # ===========================================
 # Vanguard Production Docker Compose
 # Target: oracle4c24g / vanguard.pipenai.xyz
-# This stack owns its PostgreSQL and Redis volumes and does not touch the
-# co-located Sub2API stack.
+# Oracle uses shared PostgreSQL and dedicated Redis; apply the shared-postgres override.
+# Project deployments must not recreate the shared PostgreSQL instance.
 # ===========================================
 
 name: vanguard
@@ -66,6 +67,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
@@ -106,6 +108,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       CELERY_WORKER_CONCURRENCY: "2"
       CELERY_MULTI_WORKER_MAX_CONCURRENCY: "2"
       CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
@@ -143,6 +146,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       CELERY_WORKER_CONCURRENCY: "1"
       CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
       CELERY_WORKER_MAX_TASKS_PER_CHILD: "20"
@@ -170,6 +174,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
@@ -201,6 +206,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
       OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
     restart: unless-stopped
@@ -227,6 +233,7 @@ services:
     env_file:
       - .env.production
     environment:
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
       OWNED_GROUP_GOVERNANCE_ENABLED: ${OWNED_GROUP_GOVERNANCE_ENABLED:-false}
     restart: unless-stopped
     command:

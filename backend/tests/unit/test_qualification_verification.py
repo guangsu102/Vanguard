@@ -21,6 +21,7 @@ from app.modules.acquisition.qualification_verification import (
     run_verifications,
     targeted_recent_prompt,
 )
+from app.modules.acquisition import qualification_verification as verification_module
 
 
 def message(**changes):
@@ -145,6 +146,19 @@ async def test_disabled_action_queue_does_not_even_acquire_client(test_db):
     service, _, _, _ = await setup(test_db, enabled=False)
     assert (await run_verifications(service))["attempted"] == 0
     service.account_pool.acquire_by_id.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_listener_owned_session_defers_without_acquiring_or_reading(test_db, monkeypatch):
+    service, client, _, _ = await setup(test_db)
+    monkeypatch.setattr(verification_module, "_session_lease_active", AsyncMock(return_value=True))
+
+    result = await run_verifications(service)
+
+    assert result["attempted"] == 0
+    assert result["details"][0]["status"] == "session_lease_busy"
+    service.account_pool.acquire_by_id.assert_not_called()
+    client.get_entity.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -4,14 +4,14 @@ import apiClient from '@/api/client'
 type Audit = {
   id: number; account_id: number; group_id: number; state: string; decision: string;
   reason: string; checked_at: string | null; expires_at: string | null;
-  evidence: Record<string, any>
+  evidence: Record<string, any>; wait?: Record<string, any>
 }
 const rows = ref<Audit[]>([])
 const loading = ref(false)
 const selected = ref<Audit | null>(null)
 const error = ref('')
 const labels: Record<string, string> = {
-  waiting_membership: '等待入群审批', waiting_ai: '等待模型恢复', queued: '排队', running: '检测中', completed: '已检测', manual_required: '待处理',
+  waiting_membership: '等待入群审批', waiting_ai: '审核未通过', queued: '排队', running: '检测中', completed: '已检测', manual_required: '待处理',
   allowed: '明确许可', trial: '普通成员证据', reject: '不合格', observe: '观察中',
   technical_wait: '技术等待', wait: '等待条件', protected: '保护对象', unknown: '待检测',
 }
@@ -52,6 +52,9 @@ onMounted(refresh)
       <el-table-column label="结论" width="120">
         <template #default="{ row }">{{ labels[row.decision] || row.decision }}</template>
       </el-table-column>
+      <el-table-column label="广告审核" width="100">
+        <template #default="{ row }">{{ row.evidence.advertising_audit?.ad_allowed === true ? '通过' : '不通过' }}</template>
+      </el-table-column>
       <el-table-column label="状态" width="100">
         <template #default="{ row }">{{ labels[row.state] || row.state }}</template>
       </el-table-column>
@@ -66,6 +69,8 @@ onMounted(refresh)
           <el-descriptions-item label="账号">{{ selected.account_id }}</el-descriptions-item>
           <el-descriptions-item label="结论">{{ labels[selected.decision] || selected.decision }}</el-descriptions-item>
           <el-descriptions-item label="原因">{{ selected.reason }}</el-descriptions-item>
+          <el-descriptions-item v-if="selected.wait?.first_blocked_at" label="首次等待">{{ selected.wait.first_blocked_at }}</el-descriptions-item>
+          <el-descriptions-item v-if="selected.wait?.required_reads" label="本次所需读取">{{ selected.wait.required_reads }} 次；预计可重试：{{ selected.wait.retry_at }}</el-descriptions-item>
           <el-descriptions-item label="检测时间">{{ selected.checked_at || '尚未完成' }}</el-descriptions-item>
           <el-descriptions-item label="实际采样范围">{{ selected.evidence.observed_oldest || '未知' }} — {{ selected.evidence.observed_newest || '未知' }}</el-descriptions-item>
           <el-descriptions-item label="在线人数采集">{{ selected.evidence.online_count_source || '未知' }} · {{ selected.evidence.online_count_checked_at || '未知' }}</el-descriptions-item>
@@ -80,7 +85,8 @@ onMounted(refresh)
           <el-table-column prop="age_hours" label="存留小时" width="100" />
           <el-table-column prop="text" label="内容" min-width="240" />
         </el-table>
-        <h4>广告判定</h4><pre>{{ JSON.stringify(selected.evidence.advertising_audit, null, 2) }}</pre>
+        <p>广告审核：{{ selected.evidence.advertising_audit?.ad_allowed === true ? '通过' : '不通过' }}。同一材料只识别一次，未知或识别失败不通过。</p>
+        <h4>广告判定依据</h4><pre>{{ JSON.stringify(selected.evidence.advertising_audit, null, 2) }}</pre>
       </template>
     </el-drawer>
   </el-card>

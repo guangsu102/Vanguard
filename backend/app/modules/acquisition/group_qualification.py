@@ -337,7 +337,10 @@ def append_rule(
 class EvidenceCollector:
     """Uses an already leased AccountPool client; never sends, joins or leaves."""
 
-    def __init__(self, client: Any, *, own_user_ids: set[int] | None = None) -> None:
+    def __init__(
+        self, client: Any, *, own_user_ids: set[int] | None = None,
+        identity_limit: int | None = None, priority_identities: int | None = None,
+    ) -> None:
         self.client = client
         self.own_user_ids = own_user_ids or set()
         self.roles: dict[int, str] = {}
@@ -345,11 +348,18 @@ class EvidenceCollector:
         self.permission_queries = 0
         self.sender_resolution_queries = 0
         self.previous: dict[str, Any] = {}
+        self.callback_message_ids: list[int] = []
         self.collection_now = datetime.utcnow()
         self.message_senders: dict[int, int] = {}
         self.progress_attempted_ids: set[int] = set()
         self.permission_failures: dict[str, dict[str, Any]] = {}
         self.permission_denials = 0
+        self.permission_capability_retry_at: datetime | None = None
+        self.history_progress: list[dict[str, Any]] = []
+        self.history_pending_ids: list[int] = []
+        self.full_chat: Any = None
+        self.identity_limit = min(MAX_IDENTITIES, max(1, identity_limit)) if identity_limit is not None else MAX_IDENTITIES
+        self.priority_identities = min(MAX_PRIORITY_IDENTITIES, max(0, priority_identities)) if priority_identities is not None else MAX_PRIORITY_IDENTITIES
 
     async def _resume_messages(self, entity: Any, result: dict[str, Any], now: datetime) -> list[Any]:
         """Resume by message ID, always fetching the current message and role."""
@@ -366,12 +376,25 @@ class EvidenceCollector:
             and item["message_id"] > 0
         ][:6]
         pending = (self.previous.get("collection_progress") or {}).get("pending_message_ids", [])
-        ids = list(dict.fromkeys([*anchors, *[value for value in pending if type(value) is int and value > 0]]))[:12]
+        hints = [value for value in self.callback_message_ids if type(value) is int and value > 0][:6]
+        rule_ids = list(dict.fromkeys(
+            item["message_id"] for item in self.previous.get("evidence", [])
+            if item.get("source") in {"admin_rule", "unverified_rule_message", "moderation_feedback"}
+            and type(item.get("message_id")) is int and item["message_id"] > 0
+        ))
+        ids = list(dict.fromkeys([*rule_ids, *anchors, *hints, *[value for value in pending if type(value) is int and value > 0]]))[:12]
+        if any(value not in ids for value in rule_ids):
+            result["rules_incomplete"] = True
+            result["unknowns"].append("prior_rule_revalidation_incomplete")
         if not ids:
             return []
         try:
             async with asyncio.timeout(15):
                 messages = await self.client.get_messages(entity, ids=ids)
+            returned = {getattr(item, "id", None) for item in (messages or []) if item is not None}
+            if any(value in ids and value not in returned for value in rule_ids):
+                result["rules_incomplete"] = True
+                result["unknowns"].append("prior_rule_revalidation_unavailable")
             self.progress_attempted_ids.update(ids)
             result["targeted_progress_checked"] = len(ids)
             return [
@@ -396,7 +419,7 @@ class EvidenceCollector:
         if type(message_id) is int and message_id > 0:
             self.message_senders[message_id] = sender_id
         priority_rule = possible_rule(text_of(message))
-        identity_limit = MAX_IDENTITIES + (MAX_PRIORITY_IDENTITIES if priority_rule else 0)
+        identity_limit = self.identity_limit + (self.priority_identities if priority_rule else 0)
         sender = getattr(message, "sender", None)
         # Telegram already supplied this identity with the message. Known bots
         # need no participant RPC and must not consume the human lookup budget.
@@ -414,6 +437,9 @@ class EvidenceCollector:
             return cached
         self.roles[sender_id] = "unknown"
         from app.modules.acquisition.evidence_progress import date
+        if self.permission_capability_retry_at and self.permission_capability_retry_at > self.collection_now:
+            self.role_errors[sender_id] = "ChatAdminRequiredError"
+            return "unknown"
         prior_failure = self.permission_failures.get(str(sender_id), {})
         retry_at = date(prior_failure.get("retry_at"))
         if retry_at and retry_at > self.collection_now:
@@ -451,7 +477,8 @@ class EvidenceCollector:
                 self.role_errors[sender_id] = "identity_budget_exhausted"
                 return "unknown"
             self.permission_queries += 1
-            permission = await self.client.get_permissions(entity, sender)
+            from app.modules.acquisition.qualification_reads import current_permissions
+            permission = await current_permissions(self.client, entity, sender, full_chat=self.full_chat)
             if permission is None or not hasattr(permission, "is_admin"):
                 raise ValueError("participant_permission_unavailable")
             participant = getattr(permission, "participant", None)
@@ -475,6 +502,8 @@ class EvidenceCollector:
             self.role_errors[sender_id] = type(exc).__name__
             if type(exc).__name__ == "ChatAdminRequiredError":
                 self.permission_denials += 1
+                if self.permission_denials >= 3:
+                    self.permission_capability_retry_at = self.collection_now + timedelta(hours=2)
                 failures = min(4, int(prior_failure.get("attempts") or 0) + 1)
                 self.permission_failures[str(sender_id)] = {
                     "attempts": failures,
@@ -506,18 +535,20 @@ class EvidenceCollector:
         pending = [
             value for value in old_pending
             if type(value) is int and value > 0 and value not in self.progress_attempted_ids
-            and value not in self.message_senders
         ]
-        budget_errors = {"identity_budget_exhausted", "sender_resolution_budget_exhausted"}
+        budget_errors = {"identity_budget_exhausted", "sender_resolution_budget_exhausted", "RpcDeferred"}
         pending_senders = set()
         for message_id, sender_id in self.message_senders.items():
             if self.role_errors.get(sender_id) in budget_errors and sender_id not in pending_senders:
                 pending.append(message_id)
                 pending_senders.add(sender_id)
+        pending.extend(self.history_pending_ids)
         result["collection_progress"] = {
             "version": 1,
             "pending_message_ids": list(dict.fromkeys(pending))[:100],
             "permission_failures": dict(list(self.permission_failures.items())[-100:]),
+            "permission_capability_retry_at": self.permission_capability_retry_at.isoformat() if self.permission_capability_retry_at else None,
+            "history_cursors": self.history_progress or (self.previous.get("collection_progress") or {}).get("history_cursors", []),
         }
         result["roles"] = {str(key): value for key, value in self.roles.items()}
         result["identity_errors"] = {str(key): value for key, value in self.role_errors.items()}
@@ -557,17 +588,27 @@ class EvidenceCollector:
             segment["attempted"] = True
             batch = []
             # Count each observed item before the iterator can fail mid-page.
-            async for item in self.client.iter_messages(
-                entity,
-                limit=limit,
-                offset_id=segment["offset_id"],
-                offset_date=(segment["end"] + timedelta(microseconds=1)).replace(tzinfo=UTC),
-            ):
-                batch.append(item)
-                total += 1
-                segment["sample_count"] += 1
-                if len(batch) >= limit:
-                    break
+            try:
+                async for item in self.client.iter_messages(
+                    entity,
+                    limit=limit,
+                    offset_id=segment["offset_id"],
+                    offset_date=(segment["end"] + timedelta(microseconds=1)).replace(tzinfo=UTC),
+                ):
+                    batch.append(item)
+                    total += 1
+                    segment["sample_count"] += 1
+                    if len(batch) >= limit:
+                        break
+            except Exception:
+                # Preserve delivered items even if the iterator failed mid-page.
+                for item in batch:
+                    observed = naive(getattr(item, "date", None))
+                    if type(getattr(item, "id", None)) is int and observed is not None and segment["start"] <= observed <= segment["end"]:
+                        messages[item.id] = item
+                if batch:
+                    segment["offset_id"] = int(batch[-1].id)
+                raise
             if not batch:
                 segment["complete"] = True
                 return
@@ -598,6 +639,7 @@ class EvidenceCollector:
                 result["unknowns"].append("history_pagination_stalled")
 
         halted = False
+        resumed_cursors = False
         # Each round grants at most 100 per day. The first round is capped at 300.
         while total < MAX_MESSAGES:
             pending = [
@@ -639,24 +681,40 @@ class EvidenceCollector:
                     missing.append("rules_or_identity")
                 result["sampling_missing_facts"] = missing
                 if probe.get("collection_halted"):
-                    result.update(
-                        {
-                            key: probe[key]
-                            for key in (
-                                "collection_halted",
-                                "retry_after_seconds",
-                                "technical_errors",
-                            )
-                            if key in probe
-                        }
-                    )
+                    # A budget boundary must not discard already collected rules
+                    # or the IDs needed for the next fresh identity lookup.
+                    result.update(probe)
+                    break
+                if self.permission_denials >= 3:
+                    # More history cannot restore participant lookup rights.
+                    # Keep the three-day sample, rule evidence and sender-specific
+                    # retry deadlines, without claiming complete coverage.
+                    result["sampling_stopped_reason"] = "member_identity_unavailable"
+                    break
+                if any(error in {"identity_budget_exhausted", "sender_resolution_budget_exhausted"}
+                       for error in self.role_errors.values()):
+                    # This collection has used its identity slice. Persist exact
+                    # message hints so the next pass starts with unfinished work.
+                    result["sampling_stopped_reason"] = "identity_read_slice_exhausted"
                     break
                 if not missing:
                     result["sampling_stopped_reason"] = "ordinary_member_advertising_found"
                     break
+                if not resumed_cursors:
+                    resumed_cursors = True
+                    from app.modules.acquisition.evidence_progress import date
+                    old = (self.previous.get("collection_progress") or {}).get("history_cursors", [])
+                    for segment, cursor in zip(segments, old):
+                        anchor = date(cursor.get("window_end")) if isinstance(cursor, dict) else None
+                        offset = cursor.get("offset_id") if isinstance(cursor, dict) else None
+                        if (anchor and 0 <= (segment["end"] - anchor).total_seconds() <= 86400
+                                and type(offset) is int and 0 < offset < segment["offset_id"]
+                                and not segment["complete"] and not cursor.get("complete")):
+                            segment["offset_id"] = offset
+                            segment["resumed_hint"] = True
         coverage = []
         for segment in segments:
-            complete = segment["complete"] and not hidden and not segment.get("error")
+            complete = segment["complete"] and not hidden and not segment.get("error") and not segment.get("resumed_hint")
             coverage.append(
                 {
                     "window_start": segment["start"].isoformat(),
@@ -673,7 +731,7 @@ class EvidenceCollector:
                     "unknown_reason": (
                         "history_hidden"
                         if hidden
-                        else segment.get("error")
+                        else segment.get("error") or ("resumed_history_hint" if segment.get("resumed_hint") else None)
                         or (
                             "pagination_stalled"
                             if segment.get("stalled")
@@ -682,7 +740,9 @@ class EvidenceCollector:
                                 if not complete and total >= MAX_MESSAGES
                                 else (
                                     (
-                                        "minimum_evidence_sampled"
+                                        result.get("sampling_stopped_reason")
+                                        if result.get("sampling_stopped_reason") not in {None, "ordinary_member_advertising_found"}
+                                        else "minimum_evidence_sampled"
                                         if result.get("sampling_stopped_reason")
                                         else "collection_halted"
                                     )
@@ -695,6 +755,18 @@ class EvidenceCollector:
                 }
             )
         result["coverage"] = coverage
+        self.history_progress = [
+            {"window_end": segment["end"].isoformat(), "offset_id": segment["offset_id"],
+             "complete": segment["complete"] and not segment.get("resumed_hint")}
+            for segment in segments
+        ]
+        self.history_pending_ids = [
+            message_id for message_id, message in messages.items()
+            if getattr(message, "sender_id", None) not in self.roles
+            or self.role_errors.get(getattr(message, "sender_id", None)) in {
+                "identity_budget_exhausted", "sender_resolution_budget_exhausted", "RpcDeferred"
+            }
+        ]
         result["history_complete"] = all(item["complete"] for item in coverage)
         result["sample_count"] = total
         result["unique_sample_count"] = len(messages)
@@ -715,6 +787,7 @@ class EvidenceCollector:
 
         now = naive(now) or datetime.utcnow()
         self.collection_now = now
+        self.full_chat = None
         from app.modules.acquisition.evidence_progress import date
         prior_date = date(self.previous.get("collected_at")) or date(self.previous.get("checked_at"))
         if prior_date is None or not now - timedelta(hours=24) <= prior_date <= now:
@@ -726,6 +799,9 @@ class EvidenceCollector:
             and date(value.get("retry_at")) is not None
             and date(value.get("retry_at")) <= now + timedelta(hours=12)
         }
+        capability_retry = date((self.previous.get("collection_progress") or {}).get("permission_capability_retry_at"))
+        self.permission_capability_retry_at = (capability_retry if capability_retry and
+                                               now < capability_retry <= now + timedelta(hours=2) else None)
         cutoff = now - timedelta(hours=WINDOW_HOURS)
         result: dict[str, Any] = {
             "policy_version": POLICY_VERSION,
@@ -770,6 +846,7 @@ class EvidenceCollector:
             )
             response = await self.client(request)
             full = response.full_chat
+            self.full_chat = full
             count = getattr(full, "participants_count", None)
             if count is not None:
                 result["member_count_source"] = "full_chat.participants_count"
@@ -820,7 +897,8 @@ class EvidenceCollector:
         rights = getattr(entity, "default_banned_rights", None)
         permissions: dict[str, Any] = {"member": None, "can_send_text": None}
         try:
-            me = await self.client.get_permissions(entity, "me")
+            from app.modules.acquisition.qualification_reads import current_permissions
+            me = await current_permissions(self.client, entity, "me", full_chat=full)
             if me is None or not hasattr(me, "is_admin"):
                 raise ValueError("self_permission_unavailable")
             participant = getattr(me, "participant", None)

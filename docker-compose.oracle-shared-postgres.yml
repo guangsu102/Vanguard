@@ -1,0 +1,47 @@
+# Last override for Oracle releases. Live runtime: /opt/shared-postgres/stacks/vanguard/compose.json
+x-shared-postgres: &shared-postgres
+  DATABASE_URL: ${SHARED_POSTGRES_URL:?Set the private asyncpg URL for vanguard_app}
+  DATABASE_POOL_SIZE: "2"
+  DATABASE_MAX_OVERFLOW: "1"
+services:
+  postgres:
+    profiles: [legacy-database]
+    restart: "no"
+  backend:
+    environment:
+      <<: *shared-postgres
+    depends_on: !override
+      redis:
+        condition: service_healthy
+  celery-worker:
+    environment:
+      <<: *shared-postgres
+  celery-beat:
+    environment:
+      <<: *shared-postgres
+  resource-search-worker:
+    environment:
+      <<: *shared-postgres
+  telegram-growth-worker:
+    environment:
+      <<: *shared-postgres
+  telegram-guardian-worker:
+    environment:
+      <<: *shared-postgres
+  qq-onebot-worker:
+    environment:
+      <<: *shared-postgres
+  bot:
+    environment:
+      <<: *shared-postgres
+  db-init:
+    environment:
+      <<: *shared-postgres
+    depends_on: !reset {}
+  admin-init:
+    environment:
+      <<: *shared-postgres
+networks:
+  vanguard-internal: !override
+    name: vanguard_vanguard-internal
+    external: true

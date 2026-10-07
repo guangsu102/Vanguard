@@ -172,7 +172,7 @@ def test_unknown_facts_at_deadline_require_handling_not_exit(incomplete):
         },
         now,
     )
-    assert (verdict, state, retry) == ("observe", "completed", now + timedelta(hours=2))
+    assert (verdict, state, retry) == ("observe", "completed", None)
 
 
 def test_three_technical_failures_do_not_start_observation_or_authorize_exit():
@@ -226,7 +226,7 @@ def test_known_wait_can_extend_to_48_hours_but_never_beyond():
 
 
 @pytest.mark.asyncio
-async def test_requeue_invalidates_old_approval_and_preserves_join_version(test_db):
+async def test_requeue_preserves_valid_approval_and_join_version(test_db):
     _, _, member, _ = await setup(test_db)
     joined = member.joined_at
     ids = await service.queue_reviews(test_db, [2], "new-batch")
@@ -235,7 +235,7 @@ async def test_requeue_invalidates_old_approval_and_preserves_join_version(test_
     assert member.review_started_at is None and member.review_deadline_at is None
     assert (
         await service.send_gate(test_db, 2, "@qualification_group", "欢迎查看我的简介", None)
-        == "qualification_review_required"
+        is None
     )
 
 
@@ -284,7 +284,7 @@ async def test_username_and_numeric_target_resolve_same_account_scoped_authoriza
     [
         ("expired", "qualification_expired"),
         ("changed_membership", "qualification_review_required"),
-        ("new_queue", "qualification_review_required"),
+        ("new_queue", None),
         ("restricted", "qualification_account_unavailable"),
         ("media", "qualification_content_scope_changed"),
         ("url", "qualification_content_scope_changed"),
@@ -513,26 +513,74 @@ async def test_queue_retries_due_technical_evidence_three_times_without_exit(tes
         assert outcome["processed"] == 1
         assert row.decision == "technical_wait"
     assert row.state == "completed"
-    assert member.review_status == "review_2h"
+    assert member.review_status == "approved"
     assert member.review_started_at is None
     assert len(json.loads(row.evidence_json)["previous_checks"]) == 2
     assert not (await service.authorize_leave(test_db, 2, group, member))[0]
 
 
 @pytest.mark.asyncio
-async def test_queue_does_not_execute_future_reviews_or_changed_memberships(test_db):
+async def test_queue_does_not_execute_future_reviews_or_changed_memberships(test_db, monkeypatch):
     _, _, member, _ = await setup(test_db)
     ids = await service.queue_reviews(test_db, [2], "future-batch")
     row = await test_db.get(GroupQualificationAudit, ids[0])
     row.next_retry_at = datetime.utcnow() + timedelta(hours=2)
     await test_db.commit()
     fake_service = SimpleNamespace(db=test_db)
+    assessed = []
+
+    async def assess_current(actor, account_id, group, *, row):
+        assert row.membership_joined_at == member.joined_at
+        assessed.append(row.id)
+        row.state, row.decision, row.next_retry_at = "completed", "observe", None
+        return SimpleNamespace(passed=False, reason="checked_current_membership")
+
+    monkeypatch.setattr(service, "assess", assess_current)
     assert (await service.run_reviews(fake_service))["processed"] == 0
+    assert assessed == []
     row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
     member.joined_at = datetime.utcnow()
     await test_db.commit()
-    assert (await service.run_reviews(fake_service))["processed"] == 0
+    # Cancelling the obsolete scope no longer consumes the execution quantum;
+    # missing-membership recovery creates a new row for the current join.
+    assert (await service.run_reviews(fake_service))["processed"] == 1
     assert row.state == "cancelled"
+    assert len(assessed) == 1 and assessed[0] != row.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["allowed", "observe"])
+async def test_expired_review_read_wait_releases_account_for_other_due_work(test_db, monkeypatch, decision):
+    _, _, member, row = await setup(test_db, decision=decision)
+    now = datetime.utcnow()
+    row.state = "running"
+    row.next_retry_at = now - timedelta(minutes=1)
+    row.expires_at = now - timedelta(minutes=1)
+    original_evidence = row.evidence_json
+    other_group = Group(id=41, group_id=1234567891, title="second")
+    other_member = GroupAccountMembership(id=61, group_id=41, telegram_group_id=other_group.group_id,
+        account_id=2, status="joined", joined_at=member.joined_at, review_status="pending")
+    other = GroupQualificationAudit(batch_id="second", membership_id=61, account_id=2, group_id=41,
+        policy_version=POLICY_VERSION, content_scope="text_profile", state="queued",
+        decision="observe", membership_joined_at=member.joined_at, next_retry_at=now)
+    test_db.add_all([other_group, other_member, other])
+    await test_db.commit()
+    monkeypatch.setattr(service, "ensure_membership_reviews", AsyncMock())
+    monkeypatch.setattr(service, "ai_evidence_reusable", lambda *args: False)
+    wait_until = now + timedelta(minutes=35)
+    monkeypatch.setattr("app.core.account.read_schedule.read_wait",
+                        AsyncMock(return_value=("telegram_read_budget", wait_until)))
+    assess = AsyncMock()
+    monkeypatch.setattr(service, "assess", assess)
+    await service.run_reviews(SimpleNamespace(db=test_db), account_id=2, limit=2)
+    await test_db.refresh(row)
+    await test_db.refresh(other)
+    assert row.state == ("completed" if decision == "allowed" else "queued")
+    assert row.evidence_json == original_evidence and row.decision == decision
+    assert row.next_retry_at == wait_until
+    assert other.next_retry_at == wait_until  # The second row was not excluded by a false claim.
+    assert row.attempts == other.attempts == 0
+    assess.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -631,11 +679,11 @@ async def test_rule_only_allowed_group_passes_send_gate_without_ordinary_ad(test
     )
 
 
-def test_approval_is_rechecked_before_evidence_expires():
+def test_approval_has_no_calendar_only_recheck():
     now = datetime.utcnow()
     verdict, _, state, retry = service.review_schedule(snapshot("trial"), {}, now)
     assert (verdict, state) == ("trial", "completed")
-    assert retry == now + timedelta(hours=23)
+    assert retry is None
 
 
 @pytest.mark.asyncio
@@ -1165,4 +1213,32 @@ async def test_budget_wait_preserves_evidence_and_attempts(test_db, monkeypatch)
     assert result["processed"] == 0
     assert (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at) == previous
     assert row.next_retry_at >= start + timedelta(seconds=600)
+    collect.assert_not_awaited()
+
+
+async def test_qualification_reserve_wait_prevents_claim(test_db, monkeypatch):
+    from app.core.account import rpc_governor as rpc
+    _, _, member, old = await setup(test_db)
+    ids = await service.queue_reviews(test_db, [2], "sync-bootstrap-wait")
+    row = await test_db.get(GroupQualificationAudit, ids[0])
+    row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+    row.checked_at = datetime.utcnow() - timedelta(hours=1)
+    await test_db.commit()
+    previous = (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at)
+    monkeypatch.setattr("app.core.account.read_schedule.check_read_ready", rpc.check_read_ready)
+    monkeypatch.setattr(rpc, "snapshot", AsyncMock(return_value={
+        "state": "recovering", "reason": None, "retry_after_seconds": 0,
+        "lanes": {
+            "routine": {"remaining": 0, "retry_after_seconds": 2400},
+            "critical": {"remaining": 0, "retry_after_seconds": 2400},
+            "sync": {"remaining": 0, "retry_after_seconds": 2400},
+        },
+    }))
+    collect = AsyncMock()
+    monkeypatch.setattr(service, "assess", collect)
+    start = datetime.utcnow()
+    result = await service.run_reviews(SimpleNamespace(db=test_db), limit=3)
+    assert result["processed"] == 0
+    assert (row.attempts, row.checked_at, row.evidence_json, old.next_retry_at) == previous
+    assert row.next_retry_at >= start + timedelta(seconds=2400)
     collect.assert_not_awaited()

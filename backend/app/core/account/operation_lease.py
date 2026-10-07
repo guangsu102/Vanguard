@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
 import structlog
 
+from app.core.account.rpc_budget_policy import AD_PURPOSES, BACKGROUND
 from app.core.redis import RedisCache
 from app.modules.owned_group.security import safe_exception_message
 
@@ -24,6 +26,18 @@ if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
 end
 return 0
+"""
+
+
+# The priority marker only covers a bounded pre-acquisition wait. It never
+# interrupts a running operation, extends an existing lease or retries an RPC.
+_AD_WAIT_TTL_SECONDS = 12
+_AD_WAIT_ATTEMPTS = 40
+_DEFER_TO_AD = BACKGROUND | {"group_qualification", "auto_join", "ad_survival_check", "ad_qualification_refresh"}
+_ACQUIRE_WITH_AD_PRIORITY_LUA = """
+local pending = redis.call('GET', KEYS[2])
+if pending and pending ~= ARGV[1] then return 0 end
+return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) and 1 or 0
 """
 
 
@@ -83,7 +97,52 @@ class AccountOperationLeaseManager:
         key = f"{self.key_prefix}:{int(account_id)}"
         token = f"{owner}:{uuid.uuid4().hex}"
         try:
-            acquired = await client.set(key, token, nx=True, ex=ttl)
+            purpose = (
+                owner.removeprefix("account-pool:") if owner.startswith("account-pool:") else None
+            )
+            pending_key = key + ":ad-waiting"
+            if purpose in ((AD_PURPOSES - {"ad_qualification_refresh"}) | {"ad_survival_check"}):
+                registered = await client.set(pending_key, token, nx=True, ex=_AD_WAIT_TTL_SECONDS)
+                if not registered:
+                    return None
+                try:
+                    acquired = False
+                    try:
+                        async with asyncio.timeout(10):
+                            for attempt in range(_AD_WAIT_ATTEMPTS + 1):
+                                acquired = await client.eval(
+                                    _ACQUIRE_WITH_AD_PRIORITY_LUA, 2, key, pending_key, token, ttl
+                                )
+                                if acquired or attempt == _AD_WAIT_ATTEMPTS:
+                                    break
+                                await asyncio.sleep(0.25)
+                    except TimeoutError:
+                        acquired = False
+                finally:
+                    # Best effort cleanup must never hide an acquired lease.
+                    # A crashed/cancelled waiter also expires after 12 seconds.
+                    try:
+                        if not acquired:
+                            # A timed-out Redis response may already have created
+                            # our lease. Only release this exact unreturned token.
+                            await client.eval(_RELEASE_LEASE_LUA, 1, key, token)
+                        await client.eval(_RELEASE_LEASE_LUA, 1, pending_key, token)
+                    except asyncio.CancelledError:
+                        # Cancellation while clearing priority must not strand
+                        # a lease whose handle has not reached the caller.
+                        try:
+                            await client.eval(_RELEASE_LEASE_LUA, 1, key, token)
+                        except Exception:
+                            pass
+                        raise
+                    except Exception:
+                        pass
+            elif purpose in _DEFER_TO_AD:
+                acquired = await client.eval(
+                    _ACQUIRE_WITH_AD_PRIORITY_LUA, 2, key, pending_key, token, ttl
+                )
+            else:
+                acquired = await client.set(key, token, nx=True, ex=ttl)
         except Exception as exc:
             raise AccountOperationLeaseUnavailable(f"Redis 账号锁不可用: {exc}") from exc
         if not acquired:

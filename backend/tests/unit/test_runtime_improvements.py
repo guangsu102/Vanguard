@@ -143,8 +143,12 @@ async def test_preview_count_live_source_beats_cached_count():
     )
 
 
-async def test_sync_live_refresh_and_skip_fresh(test_db):
-    account, _ = await account_config(test_db)
+async def test_sync_live_refresh_and_skip_fresh(test_db, monkeypatch):
+    from app.modules.acquisition import ad_output_plan
+    monkeypatch.setattr(ad_output_plan, "ad_output_plan", AsyncMock(
+        return_value={"group_deficit": 0, "join_blocker": None}))
+    account, config = await account_config(test_db)
+    config.auto_join_enabled = False  # No replenishment task competing with metadata.
     member, _ = await add_member(test_db, account.id, 51, decision="allowed", review="approved")
     g = await test_db.get(Group, member.group_id)
     from app.modules.acquisition.qualification_identity import peer_identity

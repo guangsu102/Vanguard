@@ -89,14 +89,14 @@ async def delivery(db, account, campaign, state, at, *, status="survived", epoch
     return log
 
 
-async def test_three_distinct_24h_successes_promote_once(test_db):
+async def test_individual_24h_successes_only_record_evidence_once(test_db):
     a, c, camp, svc, state = await setup(test_db)
     for i in range(3):
         log = await delivery(test_db, a, camp, state, NOW - timedelta(days=4 - i))
         await svc.observe(log, "survived", NOW)
         await svc.observe(log, "survived", NOW)
-        assert state.quota == (2 if i == 2 else 1)
-    assert state.mature and state.epoch == 2
+        assert state.quota == 1
+    assert not state.mature and state.epoch == 1
     assert len(list((await test_db.scalars(select(GroupAdFrequencyEvent))).all())) == 3
 
 
@@ -134,26 +134,26 @@ async def test_mature_pending_not_due_allows_next_send(test_db):
     assert ready.reason is None
 
 
-async def test_overdue_or_unknown_checkpoint_blocks(test_db):
+async def test_daily_review_local_grace_does_not_cover_actual_read_failure(test_db):
     a, c, camp, svc, state = await setup(test_db, 30, True)
     log = await delivery(test_db, a, camp, state, NOW - timedelta(hours=25), status="pending")
-    assert (await svc.readiness(TARGET, NOW))[0].reason == "frequency_survival_due"
+    assert (await svc.readiness(TARGET, NOW))[0].reason is None
     log.survival_check_due_at = NOW + timedelta(minutes=5)
     log.survival_error = "timeout"
-    assert (await svc.readiness(TARGET, NOW))[0].reason == "frequency_survival_unresolved"
+    assert (await svc.readiness(TARGET, NOW))[0].reason == "frequency_daily_review_due"
 
 
-async def test_delete_halves_once_per_epoch_and_cannot_fake_low_rate_failure(test_db):
+async def test_individual_delete_feedback_does_not_adjust_daily_quota(test_db):
     a, c, camp, svc, state = await setup(test_db, 3, True)
     one = await delivery(test_db, a, camp, state, NOW - timedelta(hours=3))
     two = await delivery(test_db, a, camp, state, NOW - timedelta(hours=2))
     await svc.observe(one, "deleted", NOW)
-    assert state.quota == 1 and state.status == "active"
+    assert state.quota == 3 and state.status == "active"
     await svc.observe(two, "deleted", NOW)
-    assert state.quota == 1 and state.status == "active" and state.epoch == 2
+    assert state.quota == 3 and state.status == "active" and state.epoch == 1
     new = await delivery(test_db, a, camp, state, NOW + timedelta(days=2))
     await svc.observe(new, "deleted", NOW + timedelta(days=2, minutes=5))
-    assert state.status == "exit_pending"
+    assert state.status == "active"
 
 
 async def test_muted_exits_without_gradual_reduction(test_db):
@@ -265,14 +265,13 @@ async def test_rule_frequency_limit_caps_current_scheduling_and_ignores_member_c
     ].reason == "frequency_group_interval"
 
 
-async def test_group_stays_at_thirty_and_does_not_skip_freeze(test_db):
+async def test_individual_callbacks_cannot_adjust_daily_quota(test_db):
     a, c, camp, svc, state = await setup(test_db, 30, True)
     for i in range(4):
         log = await delivery(test_db, a, camp, state, NOW - timedelta(days=2, hours=i))
         await svc.observe(log, "survived", NOW)
     assert state.quota == 30
     state.quota = 3
-    state.promote_after = NOW + timedelta(hours=72)
     log = await delivery(test_db, a, camp, state, NOW - timedelta(days=1))
     await svc.observe(log, "survived", NOW)
     assert state.quota == 3
@@ -379,7 +378,7 @@ async def test_late_deleted_event_reopens_check_and_unknown_peer_is_ignored(test
     assert log.survival_error == "deletion_event_requires_confirmation"
     assert (await svc.readiness(TARGET, NOW + timedelta(days=1)))[
         0
-    ].reason == "frequency_survival_unresolved"
+    ].reason == "frequency_daily_review_due"
 
 
 async def test_pending_live_mute_has_exit_evidence_and_blocks_rejoin(test_db):
@@ -443,6 +442,21 @@ async def test_exit_unknown_must_reconcile_before_repeating(test_db, monkeypatch
     log.group_id = group.id
     await svc.observe(log, "deleted", NOW)
     await test_db.commit()
+    from app.modules.acquisition.daily_frequency import DailyFrequencyService
+    from tests.unit.test_daily_group_frequency import facts
+
+    context = json.loads(log.qualification_context_json)
+    context["daily_frequency_observations"] = [{
+        "checked_at": (NOW - timedelta(minutes=2)).isoformat(),
+        "facts": facts(log, exists=False),
+    }]
+    log.qualification_context_json = json.dumps(context)
+    await test_db.commit()
+    daily = DailyFrequencyService(test_db)
+    claim = await daily.claim(TARGET, NOW)
+    await test_db.commit()
+    assert await daily.finish(claim, facts(log, exists=False), None, NOW) == "daily_deleted"
+    await test_db.commit()
     monkeypatch.setattr(
         qualification_service,
         "authorize_leave",
@@ -482,12 +496,15 @@ async def test_old_epoch_overdue_evidence_blocks_promotion(test_db):
 
 async def test_rule_limited_group_can_mature_without_increasing_rate(test_db):
     a, c, camp, svc, state = await setup(test_db)
-    for i in range(3):
-        log = await delivery(test_db, a, camp, state, NOW - timedelta(days=4 - i))
-        context = json.loads(log.qualification_context_json)
-        context["frequency_rule_quota"] = 1
-        log.qualification_context_json = json.dumps(context)
-        await svc.observe(log, "survived", NOW)
+    log = await delivery(test_db, a, camp, state, NOW - timedelta(days=1))
+    context = json.loads(log.qualification_context_json)
+    context["frequency_rule_quota"] = 1
+    log.qualification_context_json = json.dumps(context)
+    await test_db.commit()
+    from app.modules.acquisition.daily_frequency import DailyFrequencyService
+    from tests.unit.test_daily_group_frequency import check
+
+    await check(test_db, DailyFrequencyService(test_db), log, NOW)
     assert state.quota == 1 and state.mature
 
 
@@ -562,9 +579,8 @@ async def test_dispatcher_reservation_and_next_schedule_use_mature_group_quota(
         schedule.id, "lock", campaign=camp, succeeded=True, reason=None, completed_at=NOW
     )
     assert schedule.next_due_at == NOW + timedelta(hours=8)
-    assert log.survival_status == "pending" and log.survival_check_due_at >= NOW + timedelta(
-        minutes=2
-    )
+    assert log.survival_status == "not_required" and log.survival_stage == "daily"
+    assert log.survival_check_due_at is None
 
 
 async def test_survival_worker_requires_two_confirmed_reads_before_downshift(test_db, monkeypatch):
@@ -594,13 +610,20 @@ async def test_survival_worker_requires_two_confirmed_reads_before_downshift(tes
     monkeypatch.setattr(module, "_now", lambda: NOW)
     assert await worker._check_one_ad_survival(log, NOW) == "retry_scheduled"
     assert state.quota == 8 and state.status == "active"
-    assert (await service.readiness(TARGET, NOW))[0].reason == "frequency_survival_unresolved"
+    assert (await service.readiness(TARGET, NOW))[0].reason == "frequency_daily_review_due"
     again = log.survival_check_due_at
     monkeypatch.setattr(module, "_now", lambda: again)
     assert await worker._check_one_ad_survival(log, again) == "deleted"
-    assert state.quota == 4 and state.epoch == 2 and log.survival_status == "deleted"
-    assert state.pause_until == again + timedelta(days=1)
+    assert state.quota == 8 and state.epoch == 1 and log.survival_status == "deleted"
     assert worker._inspect_ad_survival_facts.await_count == 2
+    from app.modules.acquisition.daily_frequency import DailyFrequencyService
+
+    daily = DailyFrequencyService(test_db)
+    claim = await daily.claim(TARGET, again)
+    await test_db.commit()
+    missing = worker._inspect_ad_survival_facts.return_value
+    assert await daily.finish(claim, missing, None, again) == "daily_deleted"
+    assert state.quota == 4 and state.epoch == 2
 
 
 async def test_mature_sends_do_not_consume_thirty_probe_allowance(test_db):

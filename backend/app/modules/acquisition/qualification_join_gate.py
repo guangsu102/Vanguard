@@ -8,7 +8,7 @@ all advertising still requires the separate account-scoped send gate.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from app.core.group.models import Group
@@ -19,6 +19,7 @@ from app.modules.acquisition.group_qualification import (
     trial_evidence,
 )
 from app.modules.acquisition.models import GroupQualificationAudit
+from app.modules.acquisition.qualification_lifetime import EVIDENCE_TTL
 from app.modules.acquisition.qualification_identity import (
     entity_identity,
     identity_relation,
@@ -28,6 +29,7 @@ from app.modules.acquisition.qualification_service import (
     SETTING_KEY,
     _date,
     _payload,
+    ai_failure_without_exit_evidence,
     authoritative_rule_fingerprint,
     confirmed_group_bans,
     group_ban_cleared,
@@ -47,7 +49,7 @@ def rejection_facts(row: GroupQualificationAudit) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         decision = row.decision if index == 0 else item.get("decision")
-        if decision != "reject":
+        if decision != "reject" or ai_failure_without_exit_evidence(item):
             continue
         checked_at = row.checked_at if index == 0 else _date(item.get("checked_at"))
         if checked_at is None:
@@ -75,6 +77,9 @@ def rejection_facts(row: GroupQualificationAudit) -> list[dict[str, Any]]:
     # A single rejection may appear both in the exit record and the review history.
     unique = {}
     for fact in facts:
+        if (not fact.get("exit_confirmed_at")
+                and ai_failure_without_exit_evidence(fact.get("snapshot") or {})):
+            continue
         version = fact.get("policy_version", fact.get("snapshot", {}).get("policy_version"))
         if version not in {None, "pp-ai-qualification-v1", "pp-ai-qualification-v2", POLICY_VERSION}:
             continue
@@ -89,7 +94,7 @@ def _fresh_review(row: GroupQualificationAudit, group: Group, now: datetime) -> 
         row.policy_version == POLICY_VERSION
         and row.state in {"completed", "manual_required"}
         and row.checked_at is not None
-        and now - timedelta(hours=24) <= row.checked_at <= now
+        and now - EVIDENCE_TTL <= row.checked_at <= now
         and row.expires_at is not None
         and row.expires_at > now
         and row.evidence_hash

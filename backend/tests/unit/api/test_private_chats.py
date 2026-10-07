@@ -132,6 +132,22 @@ async def test_private_chat_read_takeover_and_close(
 
 
 @pytest.mark.asyncio
+async def test_private_chat_bulk_read_clears_historical_unread(client, test_db):
+    _, second_conversation = await _seed_private_chats(test_db)
+    app.dependency_overrides[get_current_user] = lambda: {
+        "id": 99,
+        "username": "admin",
+        "role": "admin",
+    }
+
+    response = await client.post("/api/private-chats/conversations/read-all")
+    assert response.status_code == 200
+    assert response.json()["data"]["cleared"] == 2
+    await test_db.refresh(second_conversation)
+    assert second_conversation.unread_count == 0
+
+
+@pytest.mark.asyncio
 async def test_private_chat_manual_reply_is_queued_idempotently(
     client,
     test_db,

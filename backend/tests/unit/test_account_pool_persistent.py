@@ -187,6 +187,74 @@ async def test_sync_from_db_preserves_connected_listener_runtime_status():
 
 
 @pytest.mark.asyncio
+async def test_sync_from_db_report_distinguishes_refresh_from_new_account():
+    """A zero new-account count must not hide a successful refresh."""
+    pool = AccountPool()
+    account = await pool.add_account(
+        account_id=31,
+        phone="+10000000031",
+        session_name="refresh_report",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+    )
+    db_account = SimpleNamespace(
+        id=31,
+        phone="+10000000031",
+        session_name="refresh_report",
+        country_code="US",
+        api_config=SimpleNamespace(api_id="12345", api_hash="hash"),
+        api_config_name="default",
+        fingerprint_id=None,
+        session_string="session-2",
+        account_type=AccountType.PROMOTER,
+        proxy_mode=ProxyMode.DYNAMIC,
+        static_proxy_id=None,
+        device_model=None,
+        system_version=None,
+        app_version=None,
+        status=AccountStatus.ONLINE,
+    )
+
+    assert await pool.sync_from_db([db_account]) == 0
+    assert pool.last_sync_report == {
+        "database_candidates": 1,
+        "sync_candidates": 1,
+        "new_accounts": 0,
+        "updated_accounts": 1,
+        "filtered_accounts": 0,
+        "filtered_by_proxy_policy": 0,
+        "filtered_by_static_proxy": 0,
+        "filtered_by_status": 0,
+        "filtered_by_credentials": 0,
+        "pool_total_accounts": 1,
+    }
+    assert account.session_string == "session-2"
+
+
+@pytest.mark.asyncio
+async def test_sync_from_db_report_includes_pre_sync_filters():
+    pool = AccountPool()
+
+    assert await pool.sync_from_db(
+        [],
+        candidate_stats={
+            "database_candidates": 4,
+            "filtered_by_status": 2,
+            "filtered_by_credentials": 1,
+        },
+    ) == 0
+    report = pool.last_sync_report
+    assert report["database_candidates"] == 4
+    assert report["sync_candidates"] == 0
+    assert report["filtered_accounts"] == 3
+    assert report["filtered_by_status"] == 2
+    assert report["filtered_by_credentials"] == 1
+    assert report["pool_total_accounts"] == 0
+
+
+@pytest.mark.asyncio
 async def test_invalidate_account_disconnects_and_evicts_every_local_pool():
     pool = AccountPool()
     account = await pool.add_account(

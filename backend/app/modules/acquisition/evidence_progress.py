@@ -50,8 +50,9 @@ def evidence_maturity(snapshot: dict, now: datetime) -> datetime | None:
 
 def progress_retry(snapshot: dict, now: datetime) -> tuple[str, datetime] | None:
     progress = snapshot.get("collection_progress") or {}
-    if progress.get("pending_message_ids"):
-        return "identity_budget_resume", now + timedelta(minutes=15)
+    capability = date(progress.get("permission_capability_retry_at"))
+    if capability and capability > now:
+        return "identity_permission_backoff", capability
     deadlines = [
         date(item.get("retry_at"))
         for sender, item in progress.get("permission_failures", {}).items()
@@ -61,4 +62,6 @@ def progress_retry(snapshot: dict, now: datetime) -> tuple[str, datetime] | None
     deadlines = [item for item in deadlines if item and item > now]
     if deadlines:
         return "identity_permission_backoff", min(deadlines)
+    if progress.get("pending_message_ids"):
+        return "identity_budget_resume", now + timedelta(minutes=15)
     return None

@@ -43,9 +43,7 @@ async def ensure_qq_connection(
     *,
     display_name: str | None = None,
 ) -> QQBotConnection:
-    result = await db.execute(
-        select(QQBotConnection).where(QQBotConnection.app_id == account_id)
-    )
+    result = await db.execute(select(QQBotConnection).where(QQBotConnection.app_id == account_id))
     connection = result.scalar_one_or_none()
     if connection is None:
         connection = QQBotConnection(
@@ -84,12 +82,17 @@ class QQEventProcessor:
         self,
         connection: QQBotConnection,
         onebot_groups: list[dict[str, Any]],
+        *,
+        verified_at: datetime | None = None,
     ) -> list[QQManagedGroup]:
         synced: list[QQManagedGroup] = []
+        now = verified_at or datetime.now(UTC).replace(tzinfo=None)
+        seen: set[str] = set()
         for item in onebot_groups:
             group_number = str(item.get("group_id") or "").strip()
             if not group_number.isdigit():
                 continue
+            seen.add(group_number)
             group_name = str(item.get("group_name") or "").strip() or None
             group = await self._get_or_create_group(
                 connection,
@@ -101,7 +104,20 @@ class QQEventProcessor:
                 group.bot_removed_at = None
             group.receive_all_messages_enabled = True
             group.proactive_messages_enabled = True
+            if group.membership_status != "member":
+                group.bot_added_at = now
+            group.membership_status = "member"
+            group.membership_verified_at = now
             synced.append(group)
+        existing = await self.db.scalars(
+            select(QQManagedGroup).where(QQManagedGroup.connection_id == connection.id)
+        )
+        for group in existing:
+            if group.group_openid not in seen and group.membership_status == "member":
+                group.membership_status = "left"
+                group.membership_verified_at = now
+                group.bot_removed_at = now
+                group.status = "removed"
         return synced
 
     async def handle_onebot_event(
@@ -147,9 +163,7 @@ class QQEventProcessor:
             )
             self.db.add(group)
             await self.db.flush()
-        elif group_name and (
-            not group.local_name or group.local_name == f"QQ 群 {group_number}"
-        ):
+        elif group_name and (not group.local_name or group.local_name == f"QQ 群 {group_number}"):
             group.local_name = group_name
         return group
 
@@ -217,9 +231,13 @@ class QQEventProcessor:
         target_id = str(payload.get("user_id") or "")
 
         if notice_type == "group_increase":
-            event_type = "GROUP_ADD_ACCOUNT" if target_id == connection.app_id else "GROUP_MEMBER_ADD"
+            event_type = (
+                "GROUP_ADD_ACCOUNT" if target_id == connection.app_id else "GROUP_MEMBER_ADD"
+            )
             if target_id == connection.app_id:
                 group.status = "active"
+                group.membership_status = "member"
+                group.membership_verified_at = occurred_at
                 group.bot_added_at = occurred_at
                 group.bot_removed_at = None
         elif notice_type == "group_decrease":
@@ -228,6 +246,8 @@ class QQEventProcessor:
             )
             if target_id == connection.app_id:
                 group.status = "removed"
+                group.membership_status = "left"
+                group.membership_verified_at = occurred_at
                 group.bot_removed_at = occurred_at
         elif notice_type == "group_recall":
             event_type = "GROUP_MESSAGE_RECALL"

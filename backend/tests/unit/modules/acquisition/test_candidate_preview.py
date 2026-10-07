@@ -60,17 +60,13 @@ def message(sender_id, target, now):
 
 
 @pytest.mark.asyncio
-async def test_preview_prioritizes_readable_rules_and_two_ordinary_independent_ads(monkeypatch):
+async def test_preview_only_reads_identity_and_metadata_not_pins_history_or_senders(monkeypatch):
     now = datetime.now(UTC)
     client = FakeClient(
         about="允许广告推广",
         messages=[message(21, "seller_one", now), message(22, "seller_two", now)],
     )
 
-    async def role(_self, _entity, _message):
-        return "ordinary"
-
-    monkeypatch.setattr(candidate_preview.EvidenceCollector, "role", role)
     result = await public_candidate_preview(
         client,
         SimpleNamespace(username="a", group_id=-1000000000123),
@@ -78,13 +74,13 @@ async def test_preview_prioritizes_readable_rules_and_two_ordinary_independent_a
         identity_coverage=True,
         now=now,
     )
-    assert result.status == "sampled"
+    assert result.status == "metadata_checked"
     assert result.rules_readable
     assert result.rule_signal == "explicit_allow"
-    assert result.ordinary_advertisers == 2
-    assert result.independent_ads
-    assert result.score == 10
-    assert {name for name, _ in client.calls} == {"entity", "full", "history"}
+    assert result.ordinary_advertisers == 0
+    assert not result.independent_ads
+    assert result.score == 5
+    assert {name for name, _ in client.calls} == {"entity", "full"}
 
 
 @pytest.mark.asyncio
@@ -101,11 +97,11 @@ async def test_preview_without_complete_own_account_coverage_never_counts_ads():
         identity_coverage=False,
         now=now,
     )
-    assert result.status == "identity_unconfirmed"
+    assert result.status == "metadata_checked"
     assert result.rule_signal == "explicit_ban"
     assert result.ordinary_advertisers == 0
     assert not result.independent_ads
-    assert sum(name == "history" for name, _ in client.calls) == 1
+    assert sum(name == "history" for name, _ in client.calls) == 0
 
 
 @pytest.mark.asyncio

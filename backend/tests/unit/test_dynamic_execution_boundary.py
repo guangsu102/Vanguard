@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 from telethon.errors import FloodWaitError
+from telethon.tl.types import InputPeerChannel
 
 from app.core.account.models import TelegramAccount, AccountOperationConfig, AccountOutboundAttempt, AccountStatus
 from app.core.account.telegram_execution import TelegramExecutionService, TelegramSendOutcomeUnknownError, TelegramSendPreflightError
@@ -22,11 +23,23 @@ async def setup(db, monkeypatch, failure=None):
     monkeypatch.setattr(qualification_service, "send_gate", gate)
     monkeypatch.setattr(qualification_actions, "validate_live_send", AsyncMock())
     monkeypatch.setattr(qualification_service, "current_authorization", AsyncMock(return_value=(
-        Obj(id=1, evidence_hash="h", policy_version="pp-ai-qualification-v2", content_scope="text_profile"),
+        Obj(id=1, evidence_hash="h", policy_version="pp-ai-qualification-v2", content_scope="text_profile", evidence_json='{}'),
         Obj(group_id=-1001111222233), Obj(id=1))))
     risk = Obj(db=db, check_and_reserve=AsyncMock(return_value=Obj(allowed=True)), record_failure=AsyncMock(), record_success=AsyncMock())
-    wrapper = Obj(account_id=account.id, client=Obj(send_message=AsyncMock(side_effect=failure, return_value=Obj(id=99))))
+    wrapper = Obj(account_id=account.id, client=Obj(
+        get_input_entity=AsyncMock(return_value=InputPeerChannel(1111222233, 987)),
+        send_message=AsyncMock(side_effect=failure, return_value=Obj(id=99))))
     return TelegramExecutionService(risk), wrapper, gate, risk
+
+
+@pytest.mark.asyncio
+async def test_resolution_failure_does_not_create_outbound_attempt(test_db, monkeypatch):
+    execution, account, _, _ = await setup(test_db, monkeypatch)
+    account.client.get_input_entity.side_effect = ValueError("missing entity")
+    with pytest.raises(TelegramSendPreflightError, match="qualification_entity_unavailable"):
+        await execution.send_ad(account, -1001111222233, "文字简介", reservation_token="unresolved")
+    assert await test_db.scalar(select(AccountOutboundAttempt)) is None
+    account.client.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -265,10 +265,16 @@ async def test_unknown_delivery_reconciles_only_original_id_and_never_releases_m
         assert ledger.state == 'succeeded'
         assert ledger.message_id == 19
     else:
-        assert result['retry_scheduled'] == 1
-        assert log.status == 'pending'
-        assert ledger.state == 'unknown'
+        # One-shot receipt verification: an unprovable send closes terminally,
+        # never schedules another retry and never invents a new message id.
+        assert result['manual_evidence_required'] == 1
+        assert log.status == 'failed'
+        assert log.error.startswith('manual_evidence_required:')
+        assert log.survival_stage == 'complete'
+        assert log.survival_check_due_at is None
         assert log.telegram_message_id == 19
+        assert ledger.state == 'unknown'
+        assert ledger.message_id is None
     service.account_pool.release.assert_awaited_once()
 
 

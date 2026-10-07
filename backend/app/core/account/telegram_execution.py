@@ -596,7 +596,12 @@ class TelegramExecutionService:
                     await budget.mark_attempted(attempt_key, account_id=account.account_id)
                 attempted = True
                 try:
-                    result = await write()
+                    from app.core.account.send_receipts import receipt_scope
+                    receipt_token = receipt_scope.set((account.account_id, attempt_key) if category == "ad" and attempt_key else None)
+                    try:
+                        result = await write()
+                    finally:
+                        receipt_scope.reset(receipt_token)
                 except RPCError as exc:
                     rpc_error = exc
                     raise
@@ -661,12 +666,39 @@ class TelegramExecutionService:
         audit, group, membership = await current_authorization(self.risk_guard.db, account.account_id, target)
         if not audit or not group or not membership:
             raise TelegramSendPreflightError("qualification_review_required")
+        from billiard.exceptions import SoftTimeLimitExceeded
+        from telethon.errors import RPCError
+        from app.core.account.rpc_governor import RpcDeferred
+        from app.modules.acquisition.adaptive_frequency import canonical, enabled, frequency_context, payload
+        from app.modules.acquisition.qualification_identity import entity_identity, identity_relation, peer_identity
+
+        snapshot = payload(audit.evidence_json)
+        marked_target = canonical(group.group_id, snapshot)
+        if marked_target is None:
+            raise TelegramSendPreflightError("qualification_group_identity_unknown", retry_after_seconds=300)
+        # Resolve before recording a write attempt. Bare positive legacy IDs are
+        # PeerUser to Telethon, and username lookups must retain the proven identity.
+        try:
+            try:
+                peer = await client.get_input_entity(marked_target)
+            except ValueError:
+                username = (getattr(group, "username", None) or "").strip()
+                if not username:
+                    raise
+                peer = await client.get_input_entity(username)
+        except (SoftTimeLimitExceeded, RPCError, RpcDeferred):
+            raise
+        except Exception as exc:
+            raise TelegramSendPreflightError(
+                "qualification_entity_unavailable:" + type(exc).__name__, retry_after_seconds=300
+            ) from exc
+        if identity_relation(entity_identity(peer), peer_identity(group.group_id, snapshot)) != "same":
+            raise TelegramSendPreflightError("qualification_identity_changed", retry_after_seconds=300)
         import hashlib
         context = {"content_hash": hashlib.sha256(content.encode()).hexdigest(),
                    "qualification_audit_id": audit.id, "evidence_hash": audit.evidence_hash,
                    "content_scope": audit.content_scope, "policy_version": audit.policy_version,
                    "telegram_group_id": group.group_id, "membership_id": membership.id}
-        from app.modules.acquisition.adaptive_frequency import enabled, frequency_context
         if await enabled(self.risk_guard.db, account.account_id):
             from sqlalchemy import select
             from app.modules.acquisition.models import AdDeliveryLog
@@ -680,8 +712,8 @@ class TelegramExecutionService:
             context["frequency"] = frequency_context(reserved)
         async def write():
             if media_url:
-                return await client.send_file(group.group_id, media_url, caption=content)
-            return await client.send_message(group.group_id, content, link_preview=False)
+                return await client.send_file(peer, media_url, caption=content)
+            return await client.send_message(peer, content, link_preview=False)
         result = await self._budgeted_write(account, AccountRiskAction.AD_DELIVERY,
             target=group.group_id, category="ad", attempt_key="ad:" + reservation_token if reservation_token else "",
             context=context, details={"source": source, "content": content, "media_url": media_url,

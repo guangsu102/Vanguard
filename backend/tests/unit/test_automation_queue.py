@@ -267,7 +267,7 @@ async def test_group_ai_warmup_marks_ad_interaction_start(test_db):
 async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(test_db, monkeypatch):
     from app.modules.acquisition import automation as dispatch_module
     # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
-    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
+    monkeypatch.setattr("app.core.account.rpc_governor.check_dispatch_ready", AsyncMock(return_value={"state": "ready"}))
     service = AcquisitionAutomationService(test_db)
     campaign = SimpleNamespace(id=701)
     binding = SimpleNamespace(id=702, account_id=703, campaign=campaign)
@@ -317,7 +317,7 @@ async def test_ad_dispatcher_excludes_owned_group_before_creative_or_delivery_st
 ):
     from app.modules.acquisition import automation as dispatch_module
     # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
-    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
+    monkeypatch.setattr("app.core.account.rpc_governor.check_dispatch_ready", AsyncMock(return_value={"state": "ready"}))
     account = TelegramAccount(
         identifier="owned-group-ad-exclusion",
         session_name="owned-group-ad-exclusion",
@@ -403,7 +403,7 @@ async def test_ad_dispatcher_final_owned_group_recheck_runs_inside_chat_lock(
 ):
     from app.modules.acquisition import automation as dispatch_module
     # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
-    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
+    monkeypatch.setattr("app.core.account.rpc_governor.check_dispatch_ready", AsyncMock(return_value={"state": "ready"}))
     group = SimpleNamespace(id=920021, group_id=920022)
     membership = SimpleNamespace(
         group_id=group.id,

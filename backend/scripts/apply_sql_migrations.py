@@ -47,6 +47,9 @@ DEFAULT_MIGRATIONS = [
     "060_add_group_qualification_audit.sql",
     "061_add_dynamic_growth_capacity.sql",
     "062_add_adaptive_group_frequency.sql",
+    "063_listener_inbox_qualification_lifetime.sql",
+    "064_daily_group_frequency.sql",
+    "065_qq_growth_automation.sql",
 ]
 
 

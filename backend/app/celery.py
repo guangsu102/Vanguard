@@ -30,7 +30,9 @@ celery_app = Celery(
     backend=settings.CELERY_RESULT_BACKEND,
     include=[
         "app.core.scheduler.tasks",
+        "app.core.scheduler.growth_dispatch",
         "app.modules.qq.tasks",
+        "app.modules.qq.automation_tasks",
         "app.modules.account_spam.tasks",
         "app.modules.account_profile_update.tasks",
         "app.modules.managed_bot_provision.tasks",
@@ -63,6 +65,9 @@ TASK_CONCURRENCY = {
 # Celery Configuration
 # =============================================================================
 celery_app.conf.update(
+    task_default_queue="default",
+    task_default_exchange="default",
+    task_default_routing_key="default",
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",
@@ -76,6 +81,7 @@ celery_app.conf.update(
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     result_expires=21600,
+    beat_scheduler="app.core.scheduler.bounded_beat:BoundedGrowthScheduler",
 )
 
 # =============================================================================
@@ -264,6 +270,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=3, minute=30),
         "options": {"queue": "qq_commands"},
     },
+    "qq-growth-automation-every-minute": {
+        "task": "app.modules.qq.automation_tasks.qq_automation_tick",
+        "schedule": 60.0,
+        "options": {"queue": "qq_commands", "expires": 55},
+    },
     "account-spam-worker-every-30s": {
         "task": "app.modules.account_spam.tasks.account_spam_check_tick",
         "schedule": 30.0,
@@ -308,7 +319,25 @@ celery_app.conf.beat_schedule = {
 # =============================================================================
 # Task Routing to Queues
 # =============================================================================
+# Business state is polled once and coalesced into bounded account quanta.
+# Keep the old task entry points callable for explicit/manual operations only.
+for _entry in (
+    "runtime-recovery-every-minute",
+    "group-qualification-every-minute", "qualification-verification-every-minute",
+    "join-reconciliation-every-minute", "qualification-exits-every-two-minutes",
+    "auto-join-groups-dispatcher-every-5min", "deliver-ads-dispatcher-every-minute",
+    "check-ad-survival-every-2min",
+    "auto-probe-unknown-ad-policies-every-5min",
+):
+    celery_app.conf.beat_schedule.pop(_entry)
+celery_app.conf.beat_schedule["growth-account-dispatch-every-15s"] = {
+    "task": "app.core.scheduler.growth_dispatch.dispatch_growth_task",
+    "schedule": 15.0,
+    "options": {"queue": "growth_dispatch", "expires": 30},
+}
 celery_app.conf.task_routes = {
+    "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task": {"queue": "automation"},
+    "app.core.scheduler.growth_dispatch.dispatch_growth_task": {"queue": "growth_dispatch"},
     "app.core.scheduler.tasks.group_qualification_task": {"queue": "qualification"},
     "app.core.scheduler.tasks.group_verification_task": {"queue": "growth_maintenance"},
     "app.core.scheduler.tasks.reconcile_join_requests_task": {"queue": "growth_maintenance"},
@@ -386,6 +415,9 @@ celery_app.conf.task_queues = {
         "routing_key": "broadcast",
     },
     "qualification": {"exchange": "qualification", "routing_key": "qualification"},
+    "growth_ads": {"exchange": "growth_ads", "routing_key": "growth_ads"},
+    "growth_join": {"exchange": "growth_join", "routing_key": "growth_join"},
+    "growth_dispatch": {"exchange": "growth_dispatch", "routing_key": "growth_dispatch"},
     "growth_maintenance": {"exchange": "growth_maintenance", "routing_key": "growth_maintenance"},
     "automation": {
         "exchange": "automation",

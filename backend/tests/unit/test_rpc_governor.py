@@ -1,3 +1,4 @@
+from tests.unit.test_ad_read_reserve import empty_usage
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ pytestmark = pytest.mark.asyncio
 
 async def test_flood_persists_and_does_not_shorten_or_double_penalize(test_db, monkeypatch):
     from app.core.account import rpc_governor
-    monkeypatch.setattr(rpc_governor, 'read_budget_state', AsyncMock(return_value={'usage': {}, 'blocked_windows': [], 'retry_after_seconds': 0, 'emergency_cooldown_seconds': 0}))
+    monkeypatch.setattr(rpc_governor, 'read_budget_state', AsyncMock(return_value={'usage': empty_usage(), 'blocked_windows': [], 'retry_after_seconds': 0, 'emergency_cooldown_seconds': 0}))
     await record_flood(
         test_db, 2, 100, "contacts.ResolveUsernameRequest", "join_candidate_preview", NOW
     )

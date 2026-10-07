@@ -1,3 +1,6 @@
+<!-- oracle-shared-postgres-20260930 -->
+> **Oracle 部署（2026-09-30）：共用 PostgreSQL 18 实例，业务分库分账号。** 先阅读 [共享数据库与部署边界](docs/ORACLE_SHARED_POSTGRES.md)，不要在 Oracle 常规发布时启动旧独立 PG。Redis 保持现状。
+
 # =============================================================================
 # Vanguard Project
 # XBoard Telegram Bot Matrix

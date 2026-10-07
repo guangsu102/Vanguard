@@ -350,11 +350,12 @@ const metrics = computed(() => {
   const avgWritable = total
     ? rows.reduce((sum, row) => sum + Number(row.writable_rate || 0), 0) / total
     : 0
-  const avgAdSuccess = total
-    ? rows.reduce((sum, row) => sum + Number(row.ad_success_rate_24h || 0), 0) / total
-    : 0
+  const adSuccess = rows.reduce((sum, row) => sum + Number(row.ad_success_24h || 0), 0)
+  const adAttempts = adSuccess + rows.reduce((sum, row) => sum + Number(row.ad_failed_24h || 0), 0)
+  const hasAdSamples = rows.every((row) => row.ad_success_24h != null && row.ad_failed_24h != null)
+  const avgAdSuccess = hasAdSamples && adAttempts > 0 ? adSuccess / adAttempts : null
 
-  return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess }
+  return { total, activeAds, activeJoin, paused, eligibleGroups, avgWritable, avgAdSuccess, hasAdSamples }
 })
 
 const titleBlacklistText = computed({
@@ -806,7 +807,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="metric-cell">
         <span>广告成功率</span>
-        <strong>{{ pct(metrics.avgAdSuccess) }}</strong>
+        <strong>{{ metrics.avgAdSuccess == null ? (metrics.hasAdSamples ? '无尝试' : '暂无数据') : pct(metrics.avgAdSuccess) }}</strong>
       </div>
       <div class="metric-cell">
             <span>账号风控</span>
@@ -1336,8 +1337,8 @@ onBeforeUnmount(() => {
               <el-form-item label="Growth最小间隔秒">
                 <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="600" :max="86400" />
               </el-form-item>
-              <el-form-item label="Growth最大间隔秒">
-                <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="600" :max="86400" />
+              <el-form-item label="历史随机上限（停用）">
+                <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="600" :max="86400" disabled />
               </el-form-item>
             </el-form>
             <el-form label-width="150px" size="small">
@@ -1407,10 +1408,8 @@ onBeforeUnmount(() => {
               <el-form-item label="许可最低置信度">
                 <el-input-number v-model="adCapacityForm.ad_policy_ai_min_confidence" :min="90" :max="100" />
               </el-form-item>
-              <el-form-item label="可投放结论二次AI复核">
-                <span title="只使用第二个对抗式 AI 复核，不进入人工审核；任何可能投放的结论必须两次 AI 一致">
-                  <el-switch v-model="adCapacityForm.ad_policy_ai_require_second_pass" />
-                </span>
+              <el-form-item label="AI 审核规则">
+                <span>同一材料只识别一次；结果为通过或不通过，未知及识别失败均不通过。</span>
               </el-form-item>
               <el-form-item label="未知群自动广告探针">
                 <el-switch v-model="adCapacityForm.ad_policy_auto_probe_enabled" />

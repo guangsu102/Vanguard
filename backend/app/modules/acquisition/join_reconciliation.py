@@ -1,10 +1,12 @@
 """Reconcile completed join approvals without making Telegram requests."""
 
 import json
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.group.models import GroupAccountMembership
 from app.modules.acquisition.models import AutoJoinAttempt, DeliveryStatus
@@ -209,3 +211,14 @@ async def reconcile_joined_auto_join_attempts(
     if result["updated"] and not dry_run:
         await db.commit()
     return result
+
+
+def unresolved_join_request_due(now: datetime) -> ColumnElement[bool]:
+    return and_(
+        AutoJoinAttempt.target_key.is_not(None),
+        AutoJoinAttempt.reconciliation_status.not_in(["confirmed", "resolved"]),
+        or_(AutoJoinAttempt.reconciliation_next_at.is_(None),
+            AutoJoinAttempt.reconciliation_next_at <= now),
+        or_(AutoJoinAttempt.request_state == "outcome_unknown",
+            and_(AutoJoinAttempt.request_state == "sent", AutoJoinAttempt.status == "pending")),
+    )

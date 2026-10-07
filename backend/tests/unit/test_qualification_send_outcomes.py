@@ -1,3 +1,4 @@
+from tests.unit.test_ad_read_reserve import empty_usage
 """Reservation ownership and ambiguous Telegram writes must never cause blind retries."""
 
 import asyncio
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from sqlalchemy import select
 from telethon.errors import ChatWriteForbiddenError, FloodWaitError
+from telethon.tl.types import InputPeerChannel, InputPeerChat, InputPeerUser
 
 from app.core.account.models import AccountStatus, TelegramAccount
 from app.core.account.telegram_execution import (
@@ -36,7 +38,7 @@ from app.modules.acquisition.models import (
 def approved_rpc_boundary(request, monkeypatch):
     from app.core.account import rpc_governor
     monkeypatch.setattr(rpc_governor, "read_budget_state", AsyncMock(return_value={
-        "usage": {}, "blocked_windows": [], "retry_after_seconds": 0, "emergency_cooldown_seconds": 0,
+        "usage": empty_usage(), "blocked_windows": [], "retry_after_seconds": 0, "emergency_cooldown_seconds": 0,
     }))
     # Only transport unit tests use a qualified stub. The real dispatcher test
     # below keeps the actual persisted send gate and profile/version checks.
@@ -45,12 +47,14 @@ def approved_rpc_boundary(request, monkeypatch):
     monkeypatch.setattr(qualification_service, "send_gate", AsyncMock(return_value=None))
     monkeypatch.setattr(qualification_actions, "validate_live_send", AsyncMock())
     monkeypatch.setattr(qualification_service, "current_authorization", AsyncMock(return_value=(
-        Obj(id=1, evidence_hash="h", content_scope="text_profile", policy_version=POLICY_VERSION),
+        Obj(id=1, evidence_hash="h", content_scope="text_profile", policy_version=POLICY_VERSION,
+            evidence_json='{"telegram_group_id":42,"group_type":"supergroup"}'),
         Obj(group_id=42), Obj(id=1))))
 
 
 def execution_fixture(*, failure=None, result=None):
     client = Obj(
+        get_input_entity=AsyncMock(return_value=InputPeerChannel(42, 987)),
         send_message=AsyncMock(side_effect=failure, return_value=result or Obj(id=123)),
         send_file=AsyncMock(side_effect=failure, return_value=result or Obj(id=124)),
     )
@@ -62,6 +66,94 @@ def execution_fixture(*, failure=None, result=None):
         record_failure=AsyncMock(),
     )
     return TelegramExecutionService(risk), account, risk
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media", [None, "https://asset.example/banner.png"])
+async def test_positive_legacy_channel_resolved_before_write_attempt(media):
+    execution, account, _ = execution_fixture()
+    peer = account.client.get_input_entity.return_value
+    attempted = []
+
+    def mark_attempt():
+        account.client.get_input_entity.assert_awaited_once_with(-1000000000042)
+        account.client.send_message.assert_not_awaited()
+        account.client.send_file.assert_not_awaited()
+        attempted.append(True)
+
+    await execution.send_ad(account, 42, "hello", media_url=media, on_send_attempted=mark_attempt)
+    assert attempted == [True]
+    if media:
+        account.client.send_file.assert_awaited_once_with(peer, media, caption="hello")
+    else:
+        account.client.send_message.assert_awaited_once_with(peer, "hello", link_preview=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ValueError("cache miss"), TimeoutError()])
+async def test_entity_resolution_failure_never_marks_a_write(failure):
+    execution, account, risk = execution_fixture()
+    account.client.get_input_entity.side_effect = failure
+    attempted = Mock()
+    with pytest.raises(TelegramSendPreflightError, match="qualification_entity_unavailable") as caught:
+        await execution.send_ad(account, 42, "hello", on_send_attempted=attempted)
+    assert caught.value.retry_after_seconds == 300
+    attempted.assert_not_called()
+    risk.check_and_reserve.assert_not_awaited()
+    account.client.send_message.assert_not_awaited()
+    account.client.send_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer", [InputPeerChat(42), InputPeerUser(42, 123), InputPeerChannel(43, 123)])
+async def test_wrong_peer_or_namespace_never_sends(peer):
+    execution, account, risk = execution_fixture()
+    account.client.get_input_entity.return_value = peer
+    with pytest.raises(TelegramSendPreflightError, match="qualification_identity_changed"):
+        await execution.send_ad(account, 42, "hello")
+    risk.check_and_reserve.assert_not_awaited()
+    account.client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_legacy_namespace_does_not_resolve_or_send():
+    execution, account, _ = execution_fixture()
+    audit, _, _ = qualification_service.current_authorization.return_value
+    audit.evidence_json = '{}'
+    with pytest.raises(TelegramSendPreflightError, match="qualification_group_identity_unknown"):
+        await execution.send_ad(account, 42, "hello")
+    account.client.get_input_entity.assert_not_awaited()
+    account.client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("valid", [True, False])
+async def test_username_cache_fallback_still_validates_identity(valid):
+    execution, account, _ = execution_fixture()
+    _, group, _ = qualification_service.current_authorization.return_value
+    group.username = "known_group"
+    peer = InputPeerChannel(42 if valid else 43, 987)
+    account.client.get_input_entity.side_effect = [ValueError("cache miss"), peer]
+    if valid:
+        assert await execution.send_ad(account, "@known_group", "hello") == 123
+        account.client.send_message.assert_awaited_once_with(peer, "hello", link_preview=False)
+    else:
+        with pytest.raises(TelegramSendPreflightError, match="qualification_identity_changed"):
+            await execution.send_ad(account, "@known_group", "hello")
+        account.client.send_message.assert_not_awaited()
+    assert [call.args[0] for call in account.client.get_input_entity.await_args_list] == [-1000000000042, "known_group"]
+
+
+@pytest.mark.asyncio
+async def test_basic_group_uses_chat_namespace_from_qualification():
+    execution, account, _ = execution_fixture()
+    audit, _, _ = qualification_service.current_authorization.return_value
+    audit.evidence_json = '{"telegram_group_id":42,"group_type":"basic_group"}'
+    peer = InputPeerChat(42)
+    account.client.get_input_entity.return_value = peer
+    assert await execution.send_ad(account, 42, "hello") == 123
+    account.client.get_input_entity.assert_awaited_once_with(-42)
+    account.client.send_message.assert_awaited_once_with(peer, "hello", link_preview=False)
 
 
 @pytest.mark.asyncio

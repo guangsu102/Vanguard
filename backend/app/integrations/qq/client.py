@@ -40,10 +40,14 @@ class OneBotClient:
         timeout: float | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.account_id = (account_id or settings.QQ_ONEBOT_ACCOUNT_ID or "").strip()
-        self.http_url = (http_url or settings.QQ_ONEBOT_HTTP_URL).rstrip("/")
-        self.websocket_url = websocket_url or settings.QQ_ONEBOT_WS_URL
-        self.access_token = access_token or settings.QQ_ONEBOT_ACCESS_TOKEN or ""
+        self.account_id = (
+            settings.QQ_ONEBOT_ACCOUNT_ID or "" if account_id is None else account_id
+        ).strip()
+        self.http_url = (settings.QQ_ONEBOT_HTTP_URL if http_url is None else http_url).rstrip("/")
+        self.websocket_url = settings.QQ_ONEBOT_WS_URL if websocket_url is None else websocket_url
+        self.access_token = (
+            (settings.QQ_ONEBOT_ACCESS_TOKEN or "") if access_token is None else access_token
+        )
         self.timeout = timeout or settings.QQ_ONEBOT_REQUEST_TIMEOUT_SECONDS
         self._client = http_client or httpx.AsyncClient(timeout=self.timeout)
         self._owns_client = http_client is None
@@ -68,6 +72,11 @@ class OneBotClient:
         data = await self._call("get_group_list", {"no_cache": True})
         if not isinstance(data, list):
             raise OneBotAPIError("NapCat get_group_list returned invalid data")
+        if any(
+            not isinstance(item, dict) or not str(item.get("group_id") or "").isdigit()
+            for item in data
+        ):
+            raise OneBotAPIError("NapCat group list cannot establish account membership")
         return [item for item in data if isinstance(item, dict)]
 
     async def send_group_message(self, group_id: str, content: str) -> dict[str, Any]:
@@ -91,6 +100,29 @@ class OneBotClient:
             {"message_id": self._integer_id(message_id, "OneBot message ID")},
             write_operation=True,
         )
+
+    async def send_group_segments(
+        self, group_id: str, segments: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        data = await self._call(
+            "send_group_msg",
+            {"group_id": self._numeric_id(group_id, "QQ group number"), "message": segments},
+            write_operation=True,
+        )
+        if not isinstance(data, dict) or not data.get("message_id"):
+            raise OneBotAPIError("QQ send returned no message receipt", uncertain=True)
+        return data
+
+    async def get_group_member_info(self, group_id: str) -> dict[str, Any]:
+        data = await self._call(
+            "get_group_member_info",
+            {
+                "group_id": self._numeric_id(group_id, "QQ group number"),
+                "user_id": self._numeric_id(self.account_id, "QQ account number"),
+                "no_cache": True,
+            },
+        )
+        return self._expect_object(data, "get_group_member_info")
 
     async def _call(
         self,
@@ -132,7 +164,10 @@ class OneBotClient:
                 uncertain=write_operation and response.status_code >= 500,
             )
         if not isinstance(body, dict):
-            raise OneBotAPIError(f"NapCat OneBot action {action} returned invalid JSON")
+            raise OneBotAPIError(
+                f"NapCat OneBot action {action} returned invalid JSON",
+                uncertain=write_operation,
+            )
 
         retcode = self._retcode(body.get("retcode"))
         if body.get("status") != "ok" or retcode != 0:
@@ -140,6 +175,8 @@ class OneBotClient:
                 self._error_message(body, response.text, action),
                 status_code=response.status_code,
                 retcode=retcode,
+                uncertain=write_operation
+                and (retcode is None or retcode == 1 or body.get("status") == "async"),
             )
         return body.get("data")
 

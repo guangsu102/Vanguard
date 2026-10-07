@@ -147,6 +147,23 @@ async def _claim(db: Any, membership_id: int) -> tuple[str, dict[str, Any]] | No
     return token, ledger
 
 
+async def _session_lease_active(account_id: int) -> bool:
+    """Return whether the listener currently owns the account session.
+
+    Verification must not repeatedly contend with a connected listener.  This
+    is only a Redis metadata check; it never opens Telegram or consumes read
+    budget.  Redis failures fail open so the normal durable lease path remains
+    the safety boundary.
+    """
+    try:
+        from app.core.redis import get_redis
+
+        redis = await get_redis()
+        return bool(await redis.exists(f"vanguard:telegram:lease:{int(account_id)}"))
+    except Exception:
+        return False
+
+
 async def _save_claim(
     db: Any, membership_id: int, token: str, ledger: dict, *, release: bool = False
 ) -> bool:
@@ -455,7 +472,7 @@ async def _run_second_hop(
     return answer
 
 
-async def run_verifications(service: Any, *, limit: int = 1) -> dict[str, Any]:
+async def run_verifications(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
     """Claim durably before acquiring Telegram; re-read state before every action."""
     config = await policy(service.db, fresh=True)
     result: dict[str, Any] = {"checked": 0, "attempted": 0, "details": []}
@@ -485,6 +502,8 @@ async def run_verifications(service: Any, *, limit: int = 1) -> dict[str, Any]:
         .order_by(GroupQualificationAudit.id)
     )
     verification_ids = config.get("verification_account_ids", config.get("account_ids"))
+    if account_id is not None:
+        query = query.where(GroupQualificationAudit.account_id == account_id)
     if verification_ids is not None:
         if not isinstance(verification_ids, list) or any(
             type(value) is not int or value <= 0 for value in verification_ids
@@ -499,6 +518,11 @@ async def run_verifications(service: Any, *, limit: int = 1) -> dict[str, Any]:
             TelegramAccount, candidate.account_id, populate_existing=True
         )
         if account_block_reason(account, datetime.utcnow()):
+            continue
+        if await _session_lease_active(candidate.account_id):
+            result["details"].append(
+                {"audit_id": candidate.id, "status": "session_lease_busy"}
+            )
             continue
         claimed = await _claim(service.db, candidate.membership_id)
         if claimed is None:
@@ -551,22 +575,27 @@ async def run_verifications(service: Any, *, limit: int = 1) -> dict[str, Any]:
                 "account_not_participant",
             }:
                 continue
+            # ``_read_join_audit_snapshot`` already returned the complete
+            # recent-message batch.  Fetching each candidate again by ID was
+            # the main source of duplicate Telegram reads in this lane.  Keep
+            # one permission result per sender for this snapshot as well.
+            sender_permissions: dict[int, Any] = {}
             for old_message in messages:
                 if not targeted_recent_prompt(
                     old_message, me, membership.joined_at, datetime.utcnow()
                 ):
                     continue
-                message = await client.get_messages(entity, ids=old_message.id)
-                if isinstance(message, list):
-                    message = message[0] if message else None
-                if message is None or not targeted_recent_prompt(
-                    message, me, membership.joined_at, datetime.utcnow()
-                ):
-                    continue
+                # Use the object from the single bounded snapshot read.  A
+                # durable event or later scheduled pass gets a new evidence
+                # version and therefore a new snapshot; it never re-reads the
+                # same message within this pass.
+                message = old_message
                 sender_id = getattr(message, "sender_id", None)
                 if not isinstance(sender_id, int) or sender_id <= 0:
                     continue
-                sender = await client.get_permissions(entity, sender_id)
+                if sender_id not in sender_permissions:
+                    sender_permissions[sender_id] = await client.get_permissions(entity, sender_id)
+                sender = sender_permissions[sender_id]
                 if not (getattr(sender, "is_admin", False) or getattr(sender, "is_creator", False)):
                     continue
                 decision = service._local_join_verification_decision(

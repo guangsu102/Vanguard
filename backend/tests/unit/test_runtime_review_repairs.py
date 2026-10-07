@@ -171,7 +171,11 @@ async def test_fresh_worker_heartbeat_does_not_imply_connected_listener(test_db,
         "app.core.redis.get_redis",
         AsyncMock(
             return_value=SimpleNamespace(
-                get=AsyncMock(return_value=None), info=AsyncMock(return_value={})
+                get=AsyncMock(return_value=None),
+                info=AsyncMock(return_value={}),
+                zrangebyscore=AsyncMock(return_value=[]),
+                zcount=AsyncMock(return_value=0),
+                hgetall=AsyncMock(return_value={}),
             )
         ),
     )

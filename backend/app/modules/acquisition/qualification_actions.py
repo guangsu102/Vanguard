@@ -12,6 +12,7 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import select, text
 
 from app.core.account.models import TelegramAccount
+from app.core.account.rpc_governor import RpcDeferred
 from app.core.account.telegram_execution import TelegramExecutionError
 from app.core.config import get_settings
 from app.core.group.models import Group, GroupAccountMembership
@@ -27,17 +28,48 @@ from app.modules.acquisition.qualification_service import (
 
 
 async def validate_live_send(db: Any, client: Any, account_id: int, target: int | str) -> None:
-    """A cached review never substitutes for present rights, rules or slow mode."""
+    """The send boundary consumes local authorization; callbacks schedule any reads."""
+    from app.modules.acquisition.qualification_events import pending
+    from app.modules.acquisition.qualification_lifetime import authorization_current
+
+    row, group, member = await current_authorization(db, account_id, target)
+    now = datetime.utcnow()
+    if (member is None or group is None or not authorization_current(row, now)
+            or member.status != "joined" or member.review_status != "approved"
+            or member.ad_status in {"blocked", "paused"}):
+        raise TelegramExecutionError("qualification_review_required")
+    if await pending(db, member):
+        raise TelegramExecutionError("qualification_event_pending", retry_after_seconds=60)
+    snapshot = json.loads(row.evidence_json or "{}")
+    if snapshot.get("invalidated_at") or snapshot.get("protected"):
+        raise TelegramExecutionError("qualification_review_required")
+    permissions = snapshot.get("permissions") or {}
+    if permissions.get("member") is False or permissions.get("can_send_text") is False:
+        raise TelegramExecutionError("qualification_current_permission_changed")
+    if permissions.get("paid_messages"):
+        raise TelegramExecutionError("qualification_paid_messages_not_authorized")
+    for field in ("slowmode_until", "temporary_until", "newcomer_until", "restricted_until"):
+        deadline = _date(permissions.get(field))
+        if deadline and deadline > now:
+            raise TelegramExecutionError("qualification_wait_condition")
+
+
+async def refresh_live_authorization(
+    db: Any, client: Any, account_id: int, target: int | str,
+    *, permissions_only: bool = False, message_ids: list[int] | None = None,
+    recheck_rules: bool = False, progress: dict | None = None,
+) -> None:
+    """Bounded repair after a concrete change/gap, never a per-send precheck."""
     from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.functions.messages import GetFullChatRequest, GetOnlinesRequest
     from telethon.tl.types import InputMessagesFilterPinned
 
     from app.modules.acquisition.group_qualification import (
-        RULE,
         WARNING,
         EvidenceCollector,
         evidence_age,
         naive,
+        possible_rule,
         text_of,
         trial_proof,
     )
@@ -51,13 +83,33 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
     if row is None or group is None or member is None:
         raise TelegramExecutionError("qualification_review_required")
     snapshot = json.loads(row.evidence_json or "{}")
-    entity = await client.get_entity(target)
+    from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+    established = snapshot.get("authorization_basis") == OWN_SOURCE
+    if established and not await own_proof_valid(db, snapshot, member, group):
+        raise TelegramExecutionError("qualification_own_delivery_unconfirmed")
+    from app.modules.acquisition.adaptive_frequency import canonical
+    marked_target = canonical(group.group_id, snapshot)
+    if marked_target is None:
+        raise TelegramExecutionError("qualification_group_identity_unknown", retry_after_seconds=300)
+    # A bare positive legacy group ID is a PeerUser to Telethon. Resolve only
+    # the namespace proved by the saved group evidence, then recheck identity.
+    try:
+        entity = await client.get_entity(getattr(group, "username", None) or marked_target)
+    except ValueError as exc:
+        raise TelegramExecutionError("qualification_entity_unavailable", retry_after_seconds=300) from exc
     if (
         identity_relation(entity_identity(entity), peer_identity(group.group_id, snapshot))
         != "same"
     ):
         raise TelegramExecutionError("qualification_identity_changed")
-    current = await client.get_permissions(entity, "me")
+    response = await client(
+        GetFullChannelRequest(entity)
+        if hasattr(entity, "megagroup")
+        else GetFullChatRequest(entity.id)
+    )
+    full = response.full_chat
+    from app.modules.acquisition.qualification_reads import current_permissions
+    current = await current_permissions(client, entity, "me", full_chat=full)
     if current is None or not hasattr(current, "is_admin"):
         raise TelegramExecutionError("qualification_current_permission_unknown")
     if getattr(current, "is_admin", False) or getattr(current, "is_creator", False):
@@ -91,12 +143,6 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         )
     ):
         raise TelegramExecutionError("qualification_current_permission_changed")
-    response = await client(
-        GetFullChannelRequest(entity)
-        if hasattr(entity, "megagroup")
-        else GetFullChatRequest(entity.id)
-    )
-    full = response.full_chat
     now = datetime.utcnow()
     slow = getattr(full, "slowmode_next_send_date", None)
     if isinstance(slow, int):
@@ -105,7 +151,17 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         raise TelegramExecutionError("qualification_slowmode_wait")
     if getattr(full, "send_paid_messages_stars", 0):
         raise TelegramExecutionError("qualification_paid_messages_not_authorized")
+    snapshot["permissions"] = {**snapshot.get("permissions", {}),
+                               "member": True, "can_send_text": True,
+                               "paid_messages": False,
+                               "slowmode_until": None, "temporary_until": None}
+    row.evidence_json = json.dumps(snapshot, ensure_ascii=False)
+    if permissions_only:
+        return
     async def invalidate(reason: str, *, unknown: bool = False, retry_after: int = 0) -> None:
+        if unknown and ("read_failed" in reason or "identity_failed" in reason):
+            # Transport/lookup failures do not prove that previous facts changed.
+            raise TelegramExecutionError(reason, retry_after_seconds=retry_after or 60)
         row.expires_at = now
         row.reason = reason
         row.state, row.decision = "completed", "observe"
@@ -129,6 +185,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         if not isinstance(online_count, int) or online_count < 0:
             try:
                 online_count = getattr(await client(GetOnlinesRequest(entity)), "onlines", None)
+            except RpcDeferred:
+                raise
             except Exception as exc:
                 if "Flood" in type(exc).__name__:
                     raise
@@ -146,9 +204,13 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         or any(type(value) is not int or value <= 0 for value in own_ids)
     ):
         await invalidate("system_account_identity_unconfirmed_before_send", unknown=True)
+    if established and not recheck_rules:
+        # Already verified own 24h survival is local evidence. No repeated history,
+        # third-party post or AI reads; live identity/rights/slowmode checks above remain.
+        return
     # Trial authorization is based on an observed ordinary-member precedent.
     # Explicit group-rule permission is a separate route and needs no such post.
-    if getattr(row, "decision", None) != "allowed":
+    if getattr(row, "decision", None) != "allowed" and not established:
         proof = trial_proof(
             [item for item in snapshot.get("evidence", []) if item.get("topic_id") is None]
         )
@@ -156,6 +218,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             await invalidate("advertising_precedent_unconfirmed_before_send", unknown=True)
         try:
             present = await client.get_messages(entity, ids=[item["message_id"] for item in proof])
+        except RpcDeferred:
+            raise
         except Exception as exc:
             await invalidate(
                 "advertising_precedent_read_failed_before_send:" + type(exc).__name__,
@@ -169,6 +233,7 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             if message is not None
         }
         proof_collector = EvidenceCollector(client, own_user_ids=set(own_ids))
+        proof_collector.full_chat = full
         for prior in proof:
             message = current_ads.get(prior["message_id"])
             if message is None:
@@ -189,6 +254,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
                 await invalidate("advertising_precedent_changed_before_send")
             try:
                 role = await proof_collector.role(entity, message)
+            except RpcDeferred:
+                raise
             except Exception as exc:
                 await invalidate(
                     "advertising_precedent_identity_failed_before_send:" + type(exc).__name__,
@@ -199,7 +266,7 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             if role != "ordinary":
                 await invalidate("advertising_precedent_identity_changed_before_send", unknown=True)
 
-    if getattr(row, "decision", None) == "trial":
+    if getattr(row, "decision", None) == "trial" and not recheck_rules:
         # The retained ordinary-member ad was re-read and its sender verified above.
         # Group-rule permission is a separate fallback route, not a second veto.
         return
@@ -228,8 +295,13 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
                 entity, filter=InputMessagesFilterPinned(), limit=201
             )
         ]
-        latest = [message async for message in client.iter_messages(entity, limit=100)]
+        latest = (
+            [item for item in await client.get_messages(entity, ids=message_ids) if item is not None]
+            if message_ids else []
+        )
         current_admin = await client.get_messages(entity, ids=list(old_admin)) if old_admin else []
+    except RpcDeferred:
+        raise
     except Exception as exc:
         await invalidate(
             "rules_read_failed_before_send:" + type(exc).__name__,
@@ -242,6 +314,8 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
         await invalidate("pinned_coverage_unknown_before_send", unknown=True)
     if any(getattr(message, "media", None) and not text_of(message) for message in pins):
         await invalidate("pinned_media_unknown_before_send", unknown=True)
+    if message_ids and not set(message_ids) <= {getattr(message, "id", None) for message in latest}:
+        await invalidate("event_rules_unavailable", unknown=True)
     new_pins = {
         (
             getattr(message, "id", None),
@@ -270,20 +344,38 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
 
     since = naive(getattr(row, "checked_at", None)) or now - timedelta(hours=24)
     dates = [naive(getattr(message, "date", None)) for message in latest]
-    if any(date is None for date in dates) or (
-        len(latest) >= 100 and all(date > since for date in dates)
-    ):
+    if any(date is None for date in dates):
         await invalidate("recent_rules_coverage_unknown_before_send", unknown=True)
     collector = EvidenceCollector(client, own_user_ids=set(own_ids))
+    collector.full_chat = full
+    from app.modules.acquisition.renewal_progress import administrator_ids, signature
+    checked = progress.setdefault('checked', {}) if progress is not None else {}
+    candidates = [message for message, date in zip(latest, dates, strict=True)
+                  if max(date, naive(getattr(message, 'edit_date', None)) or date) > since
+                  and possible_rule(text_of(message))]
+    # With a complete list each pass rechecks roles against today's admins,
+    # including authors previously observed in an interrupted continuation.
+    admins = await administrator_ids(client, entity, progress) if len(candidates) >= 3 else None
     for message, date in zip(latest, dates, strict=True):
         edited = naive(getattr(message, "edit_date", None))
         if max(date, edited or date) <= since:
             continue
         text = text_of(message)
-        if not (RULE.search(text) or WARNING.search(text)):
+        if not possible_rule(text):
+            continue
+        digest = signature(message)
+        if admins is None and checked.get(str(message.id)) == digest:
             continue
         try:
-            role = await collector.role(entity, message)
+            sender = getattr(message, 'sender', None)
+            if admins is not None and getattr(message, 'sender_id', None) in admins:
+                role = 'admin'
+            elif admins is not None and sender is not None and getattr(message, 'sender_id', 0) > 0:
+                role = 'bot' if getattr(sender, 'bot', False) else 'ordinary'
+            else:
+                role = await collector.role(entity, message)
+        except RpcDeferred:
+            raise
         except Exception as exc:
             await invalidate(
                 "admin_identity_read_failed_before_send:" + type(exc).__name__,
@@ -297,6 +389,7 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             # A new administrative statement is a new rule version even when
             # the same words previously appeared in ordinary members' messages.
             await invalidate("admin_rules_or_feedback_changed_before_send")
+        checked[str(message.id)] = digest
 
 
 async def reconcile_exit(service: Any, member: GroupAccountMembership, group: Group, *, read_only_recovery: bool = False) -> str:
@@ -440,7 +533,7 @@ async def exit_serialization_lock(db: Any):
             await connection.close()
 
 
-async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit: int = 1) -> dict[str, int]:
+async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit: int = 1, account_id: int | None = None) -> dict[str, int]:
     """Read old non-joined relations in a separate lane; never consume a leave slot."""
     from app.core.account.models import TelegramAccount
     from app.modules.acquisition.qualification_service import enqueue_membership_review, manually_protected
@@ -452,6 +545,8 @@ async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit:
     )
     if not config.get("exit_all_accounts"):
         query = query.where(GroupAccountMembership.account_id.in_(config.get("account_ids") or []))
+    if account_id is not None:
+        query = query.where(GroupAccountMembership.account_id == account_id)
     members = (await service.db.scalars(query.order_by(GroupAccountMembership.review_next_at).limit(limit))).all()
     result = {"checked": 0, "restored": 0, "confirmed_absent": 0}
     for member in members:
@@ -499,7 +594,7 @@ async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit:
     return result
 
 
-async def run_exits(service: Any, *, limit: int = 1) -> dict[str, Any]:
+async def run_exits(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
     config = await policy(service.db, fresh=True)
     if not config.get("enabled") or not config.get("execute_exits"):
         return {"processed": 0, "reason": "exits_paused"}
@@ -513,14 +608,18 @@ async def run_exits(service: Any, *, limit: int = 1) -> dict[str, Any]:
         if blocked_reason:
             return {"processed": 0, "reason": blocked_reason}
         from app.modules.acquisition.adaptive_frequency import run_frequency_exits
-        result = await run_frequency_exits(service, limit=limit)
-        if not result["processed"]:
-            result = await _run_exits_serialized(service, limit=limit)
-        result["membership_reconciliation"] = await reconcile_stale_exit_memberships(service, config)
+        # Each class has its own small quantum. An unexecutable frequency exit
+        # must never suppress ordinary exits, including for the same account.
+        scoped = {"account_id": account_id} if account_id is not None else {}
+        result = await run_frequency_exits(service, limit=limit, **scoped)
+        ordinary = await _run_exits_serialized(service, limit=limit, **scoped)
+        result["processed"] += ordinary["processed"]
+        result.setdefault("results", []).extend(ordinary.get("results", []))
+        result["membership_reconciliation"] = await reconcile_stale_exit_memberships(service, config, **scoped)
         return result
 
 
-async def _run_exits_serialized(service: Any, *, limit: int = 1) -> dict[str, Any]:
+async def _run_exits_serialized(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
     config = await policy(service.db, fresh=True)
     if not config.get("enabled") or not config.get("execute_exits"):
         return {"processed": 0, "reason": "exits_paused"}
@@ -540,6 +639,10 @@ async def _run_exits_serialized(service: Any, *, limit: int = 1) -> dict[str, An
         query = query.where(GroupAccountMembership.account_id.in_(config.get("account_ids") or []))
     if membership_ids is not None:
         query = query.where(GroupAccountMembership.id.in_(membership_ids))
+    from app.core.scheduler.growth_dispatch import eligible_accounts
+    query = query.where(GroupAccountMembership.account_id.in_(eligible_accounts(now)))
+    if account_id is not None:
+        query = query.where(GroupAccountMembership.account_id == account_id)
     members = list(
         (
             await service.db.scalars(

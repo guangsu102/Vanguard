@@ -14,6 +14,7 @@ from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
 from app.modules.private_chat.models import PrivateChatConversation, PrivateChatMessage
 from app.modules.private_chat.service import (
+    mark_all_conversations_read,
     publish_private_chat_event,
     queue_outbound_private_message,
     serialize_conversation,
@@ -232,6 +233,24 @@ async def mark_conversation_read(
     data = serialize_conversation(conversation)
     await publish_private_chat_event("telegram:private-conversation", data)
     return PrivateChatDataResponse(message="Conversation marked as read", data=data)
+
+
+@router.post(
+    "/conversations/read-all",
+    response_model=PrivateChatDataResponse,
+)
+async def mark_all_conversations_read_endpoint(
+    account_id: int | None = Query(default=None, ge=1),
+    _current_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> PrivateChatDataResponse:
+    """Clear historical unread counters without touching Telegram."""
+    cleared = await mark_all_conversations_read(db, account_id=account_id)
+    await db.commit()
+    return PrivateChatDataResponse(
+        message="Historical private conversations marked as read",
+        data={"cleared": cleared, "account_id": account_id},
+    )
 
 
 @router.patch(

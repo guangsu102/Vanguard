@@ -731,6 +731,7 @@ class LLMClient:
         temperature: float = 0.7,
         max_tokens: int = 500,
         system_prompt: Optional[str] = None,  # noqa: UP045 - preserve public signature
+        *, max_retries: int | None = None,
     ) -> str:
         """
         Generate content using LLM.
@@ -762,7 +763,8 @@ class LLMClient:
 
         try:
             if self.provider == LLMProvider.OPENAI:
-                response = await self._call_openai(messages, model, temperature, max_tokens)
+                response = await self._call_openai(messages, model, temperature, max_tokens,
+                                                   **({"max_retries": max_retries} if max_retries is not None else {}))
             elif self.provider == LLMProvider.ANTHROPIC:
                 response = await self._call_anthropic(messages, model, temperature, max_tokens)
             else:
@@ -797,6 +799,7 @@ class LLMClient:
         model: str,
         temperature: float,
         max_tokens: int,
+        *, max_retries: int | None = None,
     ) -> str:
         """Call OpenAI API."""
         model = self._effective_model(model)
@@ -808,7 +811,7 @@ class LLMClient:
             client_kwargs: dict[str, Any] = {
                 "api_key": self.api_key,
                 "timeout": Timeout(self.OPENAI_REQUEST_TIMEOUT_SECONDS, connect=5.0),
-                "max_retries": self.OPENAI_MAX_RETRIES,
+                "max_retries": self.OPENAI_MAX_RETRIES if max_retries is None else max(0, max_retries),
             }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url

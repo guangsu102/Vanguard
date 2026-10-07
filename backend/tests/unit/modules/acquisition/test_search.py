@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 import app.modules.acquisition.automation as acquisition_automation
+import app.core.campaign.models  # noqa: F401  register Campaign mapper for isolated runs
 from app.core.account.models import (
     AccountAssetTier,
     AccountOperationConfig,
@@ -591,6 +592,7 @@ class TestAutoJoinAudit:
             ad_allowed=False,
             ad_rule_reason="group_rules_disallow_ads",
             ad_rule_details={
+                "policy_mode": GroupAdPolicyMode.FORBIDDEN.value,
                 "deny_matches": [
                     {"source": "about", "text": "本群禁止广告推广"},
                 ],
@@ -883,6 +885,8 @@ class TestAutoJoinStateHandling:
     async def test_account_lease_busy_keeps_queued_group_retryable(self):
         account, config, group = self._queued_join_fixture()
         service = AcquisitionAutomationService(db=MagicMock())
+        service._qualification_workflow_enabled = AsyncMock(return_value=False)
+        service._dynamic_qualification_mode = AsyncMock(return_value=False)
         service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
         service.dynamic_frequency.join_candidate_decision = AsyncMock(
             return_value={"allowed": True}
@@ -934,6 +938,8 @@ class TestAutoJoinStateHandling:
     async def test_account_lease_unavailable_keeps_queued_group_retryable(self):
         account, config, group = self._queued_join_fixture()
         service = AcquisitionAutomationService(db=MagicMock())
+        service._qualification_workflow_enabled = AsyncMock(return_value=False)
+        service._dynamic_qualification_mode = AsyncMock(return_value=False)
         service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
         service.dynamic_frequency.join_candidate_decision = AsyncMock(
             return_value={"allowed": True}
@@ -985,6 +991,8 @@ class TestAutoJoinStateHandling:
     async def test_non_lease_account_unavailable_still_fails_closed(self):
         account, config, group = self._queued_join_fixture()
         service = AcquisitionAutomationService(db=MagicMock())
+        service._qualification_workflow_enabled = AsyncMock(return_value=False)
+        service._dynamic_qualification_mode = AsyncMock(return_value=False)
         service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
         service.dynamic_frequency.join_candidate_decision = AsyncMock(
             return_value={"allowed": True}
@@ -2954,9 +2962,9 @@ class TestAdDeliveryFailureHandling:
         ]
         ads = MagicMock()
         ads.all.return_value = [
-            (DeliveryStatus.SUCCESS.value, None),
-            (DeliveryStatus.FAILED.value, "risk_guard_blocked:ad_delivery_cooldown"),
-            (DeliveryStatus.FAILED.value, "group_control:write forbidden"),
+            (DeliveryStatus.SUCCESS.value, None, None),
+            (DeliveryStatus.FAILED.value, "risk_guard_blocked:ad_delivery_cooldown", None),
+            (DeliveryStatus.FAILED.value, "group_control:write forbidden", None),
         ]
         db.execute = AsyncMock(side_effect=[memberships, probes, ads])
         service = AccountDynamicFrequencyService(db)
@@ -3001,9 +3009,9 @@ class TestAdDeliveryFailureHandling:
         db = MagicMock()
         rows = MagicMock()
         rows.all.return_value = [
-            (DeliveryStatus.SUCCESS.value, None),
-            (DeliveryStatus.FAILED.value, "risk_guard_blocked:risk_budget_unavailable"),
-            (DeliveryStatus.FAILED.value, "unknown:telegram request failed"),
+            (DeliveryStatus.SUCCESS.value, None, None),
+            (DeliveryStatus.FAILED.value, "risk_guard_blocked:risk_budget_unavailable", None),
+            (DeliveryStatus.FAILED.value, "unknown:telegram request failed", None),
         ]
         db.execute = AsyncMock(return_value=rows)
         service = AccountDynamicFrequencyService(db)
@@ -3093,9 +3101,9 @@ class TestAdDeliveryFailureHandling:
 
     @pytest.mark.asyncio
     async def test_ad_delivery_continues_after_failed_group(self, test_db, monkeypatch):
-        from app.modules.acquisition import automation as dispatch_module
+        from app.core.account import rpc_governor
         # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
-        monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
+        monkeypatch.setattr(rpc_governor, "check_dispatch_ready", AsyncMock(return_value={"state": "ready"}))
         account = TelegramAccount(
             phone="+15550000002",
             identifier="+15550000002",

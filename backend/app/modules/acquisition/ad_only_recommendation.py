@@ -107,6 +107,7 @@ class AdOnlyWorkflowError(ValueError):
 _JOIN_COOLDOWN_RETRY_SECONDS = 660
 _TRANSIENT_ACCOUNT_RETRY_SECONDS = 900
 _RISK_RETRY_BUFFER_SECONDS = 30
+_MAX_TRANSIENT_ACCOUNT_RETRIES = 3
 
 
 def _now() -> datetime:
@@ -2690,11 +2691,44 @@ class AdOnlyRecommendationService:
                     )
             if retry_after_seconds is not None:
                 cooldown_deadline = _now() + timedelta(seconds=retry_after_seconds)
-                failed.status = "queued"
                 failed.last_error = error
                 failed.retry_count = int(failed.retry_count or 0) + 1
-                failed.next_attempt_at = cooldown_deadline
                 failed.updated_at = _now()
+                if (
+                    error == "target_account_unavailable"
+                    and failed.retry_count > _MAX_TRANSIENT_ACCOUNT_RETRIES
+                ):
+                    failed.status = "failed"
+                    failed.current_step = "blocked_target_account"
+                    failed.failed_at = failed.updated_at
+                    failed.next_attempt_at = None
+                    await self._add_event(
+                        group_id=failed.group_id,
+                        assessment_id=failed.assessment_id,
+                        handover_id=failed.id,
+                        event_type="handover_blocked",
+                        step=failed.current_step,
+                        status="failed",
+                        message="Target account remained unavailable; automatic retries stopped",
+                        payload={
+                            "error": error,
+                            "retry_count": failed.retry_count,
+                            "max_retries": _MAX_TRANSIENT_ACCOUNT_RETRIES,
+                        },
+                    )
+                    if failed.batch_id:
+                        await self._schedule_next_join_queue_item(
+                            failed.target_ad_only_account_id,
+                            now=failed.updated_at,
+                        )
+                    await self.db.commit()
+                    return {
+                        "status": "failed",
+                        "error": "target_account_unavailable_retry_exhausted",
+                        "handover": self.handover_payload(failed),
+                    }
+                failed.status = "queued"
+                failed.next_attempt_at = cooldown_deadline
                 await self._add_event(
                     group_id=failed.group_id,
                     assessment_id=failed.assessment_id,

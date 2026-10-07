@@ -34,6 +34,7 @@ const menuItems = [
       { path: '/keywords', title: '关键词管理', icon: Key },
       { path: '/campaigns', title: '活动管理', icon: Present },
       { path: '/automation', title: '自动化管理', icon: Promotion },
+      { path: '/qq-automation', title: 'QQ 自动化', icon: ChatLineSquare, adminOnly: true },
       { path: '/workers', title: '执行器状态', icon: Monitor },
     ],
   },

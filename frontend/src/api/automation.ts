@@ -71,6 +71,7 @@ export interface DynamicCapacitySnapshot {
   used_rolling_24h: Record<string, number>
   remaining: Record<string, number>
   execution?: { state: string; resume_at?: string | null; reason?: string | null }
+  business_execution?: Record<string, { state: string; resume_at?: string | null; reason?: string | null }>
   read_rpc?: { state: string; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; lanes?: Record<string, { remaining: number; retry_after_seconds: number; resume_at?: string | null }>; limits: Record<string, number> }
   quota_remaining?: Record<string, number>
   executable?: Record<string, number>
@@ -78,10 +79,12 @@ export interface DynamicCapacitySnapshot {
   next_allowed_at?: string | null
   ad_next_allowed_at?: string | null
   blockers: string[]
+  ad_plan?: { sustainable_ads_24h: number; planned_ads_24h: number; available_slots_24h: number; usable_groups: number; probe_usable_groups?: number; mature_usable_groups?: number; probe_daily_limit?: number; group_limit?: number; group_headroom?: number; target_groups: number; group_deficit: number; qualified_group_deficit?: number; pending_review_groups?: number; stalled_review_groups?: number; ad_due: number; probe_ad_due?: number; survival_due: number; probe_survival_due?: number; unresolved_sends: number; probe_unresolved_sends?: number; join_blocker?: string | null; read_cost_source: string; delivery_read_cost: number; survival_read_cost: number; daily_review_read_cost?: number; read_cost_samples?: Record<string, number> }
+  ad_output?: { sent_24h: number; confirmed_1h: number; deleted: number; unresolved: number; matured_sends_72h: number; confirmed_24h: number; matured_unresolved: number; survival_pending?: number; survival_overdue?: number; survival_deferred_overdue?: number; survival_oldest_overdue_seconds?: number; survival_next_attempt_at?: string | null }
   inventory: Record<string, number>
   workload?: { rollout_phase?: string; blocker_counts?: Record<string, number>; [key: string]: unknown }
-  group_frequencies?: { group_id: number; title?: string; telegram_group_id?: number; quota: number; mature: boolean; successes: number; status: string; reason?: string; next_allowed_at?: string | null }[]
-  outbound?: { categories?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }>; ad_lanes?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }> | null; unknown_count?: number }
+  group_frequencies?: { group_id: number; title?: string; telegram_group_id?: number; quota: number; mature: boolean; successes: number; status: string; reason?: string; next_allowed_at?: string | null; frequency_policy?: string; daily_review_status?: string; daily_review_due_at?: string | null; daily_review_log_id?: number | null; daily_review_checked_at?: string | null; daily_review_error?: string | null }[]
+  outbound?: { categories?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number }>; ad_lanes?: Record<string, { effective: number; used_today: number; used_rolling_24h: number; remaining: number; executable_remaining?: number; inflight?: number }> | null; unknown_count?: number }
 }
 
 export interface AccountOperationConfig {
@@ -444,6 +447,8 @@ export interface AdDynamicStatus {
   writable_rate: number
   probe_success_rate_24h: number
   ad_success_rate_24h: number
+  ad_success_24h?: number
+  ad_failed_24h?: number
   average_group_quality_score: number
   warmup_summary: Array<{
     warmup_status: string

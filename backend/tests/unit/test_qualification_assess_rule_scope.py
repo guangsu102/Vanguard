@@ -1,4 +1,4 @@
-"""Real assess/collection/JSON parsing/two-review policy flow with no Telegram writes."""
+"""Real assess/collection/JSON parsing/single-review policy flow with no Telegram writes."""
 
 import json
 from datetime import datetime, timedelta
@@ -242,18 +242,18 @@ async def test_applicable_prohibition_precedes_topic_link_and_delivery_observati
 @pytest.mark.parametrize(
     "mode,expected", [("soft_ad_allowed", "allowed"), ("soft_ad_trial", "trial")]
 )
-async def test_two_strict_reviews_can_allow_url_free_profile_scope_under_link_only_ban(
+async def test_single_strict_review_can_allow_url_free_profile_scope_under_link_only_ban(
     test_db, mode, expected
 ):
     result, row, llm = await assess(
         test_db, "禁止直接链接，但允许普通成员文字广告及简介引导。", [answer(mode), answer(mode)], ad_age_hours=1 if mode == "soft_ad_allowed" else 30
     )
     assert row.decision == expected and result.passed and not result.should_leave
-    assert llm.generate.await_count == (2 if mode == "soft_ad_allowed" else 0)
+    assert llm.generate.await_count == (1 if mode == "soft_ad_allowed" else 0)
     data = json.loads(row.evidence_json)
     if mode == "soft_ad_allowed":
         reviews = data["advertising_audit"]["ai_reviews"]
-        assert len(reviews) == 2 and all(review["confidence"] >= 95 for review in reviews)
+        assert len(reviews) == 1 and all(review["confidence"] >= 95 for review in reviews)
     assert not data["group_level_advertising_ban"]
 
 
@@ -284,11 +284,11 @@ async def test_incomplete_or_failed_link_scope_review_stays_paused(test_db, fail
     else:
         del second["applicable_prohibition"]
     result, row, llm = await assess(
-        test_db, "禁止直接链接，但允许普通成员文字广告及简介引导。", [first, second], ad_age_hours=1
+        test_db, "禁止直接链接，但允许普通成员文字广告及简介引导。", [second], ad_age_hours=1
     )
-    assert row.decision == "observe" and not result.passed and not result.should_leave
-    assert row.reason == "link_or_profile_cta_scope_unconfirmed"
-    assert llm.generate.await_count == 2
+    assert row.decision == "reject" and not result.passed and not result.should_leave
+    assert row.reason.startswith("group_rules_ai_")
+    assert llm.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -301,12 +301,14 @@ async def test_each_link_restriction_must_be_cited_even_if_legacy_deny_regex_mis
         [answer(opposing_evidence_indexes=[]), answer(opposing_evidence_indexes=[])],
         pins=["no links"], ad_age_hours=1
     )
-    assert row.decision == "observe" and not result.passed
+    # Fail-closed contract: an uncited link restriction can no longer settle
+    # for observation; the row rejects with the same unconfirmed-scope reason.
+    assert row.decision == "reject" and not result.passed
     assert row.reason == "link_or_profile_cta_scope_unconfirmed"
 
 
 @pytest.mark.asyncio
-async def test_topic_route_stays_paused_even_when_both_reviews_allow_profile_scope(test_db):
+async def test_topic_route_stays_paused_even_when_single_review_allows_profile_scope(test_db):
     result, row, llm = await assess(
         test_db,
         "禁止直接链接，但允许普通成员文字广告及简介引导；仅指定话题允许广告。",
@@ -314,7 +316,7 @@ async def test_topic_route_stays_paused_even_when_both_reviews_allow_profile_sco
     )
     assert row.decision == "observe" and not result.passed
     assert row.reason == "topic_route_requires_review"
-    assert llm.generate.await_count == 2
+    assert llm.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -322,12 +324,12 @@ async def test_unconfirmed_link_scope_cannot_become_exit_at_observation_deadline
     result, row, _ = await assess(
         test_db,
         "禁止直接链接，但允许普通成员文字广告及简介引导。",
-        [answer(), TimeoutError("test")],
+        [TimeoutError("test")],
         observation_age_hours=25, ad_age_hours=1
     )
-    assert row.decision == "observe" and row.state == "waiting_ai"
+    assert row.decision == "reject" and row.state == "completed"
     assert not result.should_leave
-    assert "link_or_profile_cta_scope_unconfirmed" in json.loads(row.evidence_json)["unknowns"]
+    assert json.loads(row.evidence_json)["ai_decision"] == "fail"
 
 
 @pytest.mark.asyncio
@@ -346,7 +348,7 @@ async def test_ai_incomplete_reviews_stop_after_three_without_manufacturing_reje
             second["conflict"] = True
         else:
             second["mode"] = "unknown"
-        responses = [first, second] * 3
+        responses = [second]
     result, row, llm = await assess(
         test_db,
         "允许普通成员发布文字广告与简介引导。",
@@ -356,18 +358,12 @@ async def test_ai_incomplete_reviews_stop_after_three_without_manufacturing_reje
         ad_age_hours=1,
     )
     data = json.loads(row.evidence_json)
-    assert row.decision == "observe" and not result.should_leave
-    if failure == "unavailable":
-        assert row.state == "waiting_ai" and row.next_retry_at is not None
-        assert data["ai_review_failures"] == 0 and data["technical_failures"] == 0
-        assert data["collection_reused_for_ai"]
-    else:
-        assert row.state == "completed" and row.next_retry_at is not None
-        assert data["ai_review_failures"] == 3
-    assert data["ai_review_incomplete"]
-    assert row.reason in data["unknowns"]
+    assert row.decision == "reject" and not result.should_leave
+    assert row.state == "completed" and data["ai_final"]
+    assert data["ai_decision"] == "fail" and not data["ai_pending"]
     assert not data["qualification_exit_history"]
-    assert llm.generate.await_count == (3 if failure == "unavailable" else 6)
+    assert llm.generate.await_count == 1
+
 
 
 @pytest.mark.asyncio
@@ -384,10 +380,10 @@ async def test_recent_ad_evidence_keeps_maturity_retry_after_observation_deadlin
         ad_count=1, ad_age_hours=1
     )
     data = json.loads(row.evidence_json)
-    assert row.decision == "observe" and not result.passed and not result.should_leave
+    assert row.decision == "reject" and not result.passed and not result.should_leave
     assert datetime.fromisoformat(data["next_evidence_maturity_at"]) == row.next_retry_at
     assert datetime.utcnow() + timedelta(hours=22) < row.next_retry_at <= datetime.utcnow() + timedelta(hours=24)
-    assert data["ai_review_failures"] == 0 and not data.get("ai_review_incomplete")
+    assert data["ai_decision"] == "fail" and not data.get("ai_review_incomplete")
 
 
 @pytest.mark.asyncio
@@ -415,7 +411,7 @@ async def test_unrouted_topic_cannot_become_exit_at_observation_deadline(test_db
 async def test_topic_only_ai_denial_is_unsupported_capability_not_group_ban(test_db, rule):
     result, row, _ = await assess(test_db, rule, [answer("forbidden")], observation_age_hours=60, ad_age_hours=1)
     data = json.loads(row.evidence_json)
-    assert row.decision == "observe" and row.state == "completed"
+    assert row.decision == "reject" and row.state == "completed"
     assert row.reason == "topic_route_requires_review" and not result.should_leave
     assert not data["group_level_advertising_ban"] and not data["confirmed_group_bans"]
     assert not data["qualification_exit_history"]
@@ -588,4 +584,4 @@ async def test_explicit_permission_still_exits_when_a_alone_holds(test_db):
     )
     assert row.decision == "reject" and row.reason == "no_ordinary_member_ad_48h"
     assert not result.passed and result.should_leave
-    assert llm.generate.await_count == 2
+    assert llm.generate.await_count == 1

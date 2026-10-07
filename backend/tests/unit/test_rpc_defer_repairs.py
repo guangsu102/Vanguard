@@ -1,3 +1,4 @@
+from tests.unit.test_ad_read_reserve import empty_usage
 import asyncio
 import json
 from datetime import datetime, timedelta
@@ -13,32 +14,31 @@ from app.modules.acquisition.capacity import capacity_snapshot
 from app.modules.acquisition.models import AdCampaign, AdDeliveryScheduleState
 from tests.unit.test_qualification_automation_lifecycle import case
 from tests.unit.test_dynamic_outbound_capacity import account_config
+from tests.unit.test_ad_read_reserve import mock_usage
 
 pytestmark = pytest.mark.asyncio
 
 
 def ready_usage():
-    return {'usage': {}, 'blocked_windows': [], 'retry_after_seconds': 0, 'emergency_cooldown_seconds': 0}
+    return {'usage': empty_usage(), 'blocked_windows': [], 'retry_after_seconds': 0, 'emergency_cooldown_seconds': 0}
 
 
 async def test_read_only_budget_snapshot_blocks_hour_and_recovers_without_reservation(monkeypatch,test_db):
     from app.core import redis as redis_module
     now=datetime.utcnow()
-    cache=Obj(eval=AsyncMock(return_value=[1,30,240,2300,498,70000,0,-2,23,70000,0,-2,0,-2]),ttl=AsyncMock(return_value=-2))
-    monkeypatch.setattr(redis_module,'get_redis',AsyncMock(return_value=cache))
+    cache=mock_usage(monkeypatch, {'minute': (1,30), 'hour': (240,2300), 'day': (498,70000), 'background_day': (23,70000)})
     state=await rpc.snapshot(test_db,3,now)
     assert state['state']=='budget_wait' and state['reason']=='telegram_read_budget'
     assert state['usage']['hour']['remaining']==0
     assert state['resume_at']==(now+timedelta(seconds=2301)).isoformat()
     assert 'INCR' not in cache.eval.await_args.args[0] and 'SET' not in cache.eval.await_args.args[0]
-    cache.eval.return_value=[0,-2,0,-2,498,70000,0,-2,23,70000,0,-2,0,-2]
+    mock_usage(monkeypatch, {'day': (498,70000), 'background_day': (23,70000)})
     assert (await rpc.snapshot(test_db,3,now))['state']=='ready'
 
 
 async def test_background_exhaustion_does_not_block_foreground(monkeypatch,test_db):
     from app.core import redis as redis_module
-    cache=Obj(eval=AsyncMock(return_value=[0,-2,10,10,100,100,60,3000,480,70000,0,-2,0,-2]),ttl=AsyncMock(return_value=-2))
-    monkeypatch.setattr(redis_module,'get_redis',AsyncMock(return_value=cache))
+    mock_usage(monkeypatch, {'hour': (10,10), 'day': (100,100), 'background_hour': (60,3000), 'background_day': (480,70000)})
     assert (await rpc.snapshot(test_db,3,datetime.utcnow()))['state']=='ready'
 
 
@@ -59,13 +59,32 @@ async def test_capacity_disables_execution_but_preserves_unused_daily_allowance(
     assert cap['ad_next_allowed_at'] and 'telegram_read_budget' in cap['blockers']
 
 
-async def test_ad_dispatch_does_not_walk_groups_or_create_failure_rows_when_budget_exhausted(monkeypatch,test_db):
+async def test_ad_dispatch_does_not_walk_groups_or_create_failure_rows_during_cooldown(monkeypatch,test_db):
     service,account,*_=await case(test_db)
-    monkeypatch.setattr(automation,'check_read_ready',AsyncMock(side_effect=rpc.RpcDeferred('telegram_read_budget',2000)))
+    monkeypatch.setattr(rpc,'check_dispatch_ready',AsyncMock(side_effect=rpc.RpcDeferred('telegram_rpc_cooldown',2000)))
     service._list_enabled_ad_bindings_for_account=AsyncMock()
     result=await service._run_ad_delivery_for_account(account.id,binding_ids=[],dry_run=False,delivery_budget={'remaining':1},delivery_budget_lock=asyncio.Lock(),reserved_ad_targets=set(),ad_target_lock=asyncio.Lock(),max_deliveries_per_account=1,stop_after_success=False,stop_after_failure=False)
     assert result.failed==0 and result.skipped==1
     service._list_enabled_ad_bindings_for_account.assert_not_awaited()
+    service.account_pool.acquire_by_id.assert_not_awaited()
+
+
+async def test_exhausted_reads_allow_local_dispatch_without_acquiring_telegram(monkeypatch,test_db):
+    service,account,*_=await case(test_db)
+    snapshot = AsyncMock(return_value={
+        'state': 'budget_wait', 'reason': 'telegram_read_budget', 'retry_after_seconds': 2000,
+    })
+    monkeypatch.setattr(rpc, 'snapshot', snapshot)
+    service._list_enabled_ad_bindings_for_account = AsyncMock(return_value=[])
+    result = await service._run_ad_delivery_for_account(
+        account.id, binding_ids=[], dry_run=False, delivery_budget={'remaining': 1},
+        delivery_budget_lock=asyncio.Lock(), reserved_ad_targets=set(),
+        ad_target_lock=asyncio.Lock(), max_deliveries_per_account=1,
+        stop_after_success=False, stop_after_failure=False,
+    )
+    assert result.failed == 0 and result.skipped == 0
+    snapshot.assert_awaited_once()
+    service._list_enabled_ad_bindings_for_account.assert_awaited_once_with(account.id, [])
     service.account_pool.acquire_by_id.assert_not_awaited()
 
 
@@ -110,7 +129,7 @@ async def test_listener_defers_without_connecting_or_marking_error(monkeypatch):
     monkeypatch.setattr(module,'get_db_session',db)
     monkeypatch.setattr(rpc,'check_read_ready',AsyncMock(side_effect=rpc.RpcDeferred('telegram_read_budget',2000)))
     worker=module.TelegramWorker(role=TelegramWorkerRole.GROWTH_USER)
-    worker._account_pool=Obj(connect_by_id=AsyncMock())
+    worker._account_pool=Obj(connect_by_id=AsyncMock(), get_account_by_id=AsyncMock(return_value=None))
     result=await worker._ensure_growth_listeners([Obj(id=3)])
     assert result['listeners_deferred']==1 and result['listener_errors']==[]
     worker._account_pool.connect_by_id.assert_not_awaited()

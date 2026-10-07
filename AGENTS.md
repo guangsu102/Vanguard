@@ -1,3 +1,8 @@
+<!-- oracle-shared-postgres-20260930 -->
+## Oracle shared PostgreSQL deployment rule
+
+Since 2026-09-30, oracle4c24g uses the shared PG18 primary `sub2api-dr-postgres` (8 GiB limit) through `oracle-shared-postgres:5432`. Each business keeps a separate database/account. Read [docs/ORACLE_SHARED_POSTGRES.md](docs/ORACLE_SHARED_POSTGRES.md). Use the canonical per-project runtime Compose under `/opt/shared-postgres/stacks/`; do not stop/recreate shared PostgreSQL or start the old standalone database during project deployment. Preserve Redis, application authorization settings and unrelated working-tree changes.
+
 # AGENTS.md
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
@@ -107,7 +112,7 @@ docker-compose up -d --build
 docker-compose down
 
 # Production deployment
-docker-compose -f docker-compose.production.yml up -d
+docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-deps backend
 ```
 
 ## Architecture
@@ -284,7 +289,7 @@ When displaying data in tables, always use optional chaining for potentially und
 If you see "connection pool exhausted" errors, check for:
 - Unclosed database sessions (always use `async with get_db()`)
 - Long-running queries blocking connections
-- Insufficient pool size in `DATABASE_URL` (add `?pool_size=20&max_overflow=10`)
+- Check shared-instance limits before changing pools. Oracle uses `DATABASE_POOL_SIZE=2` and `DATABASE_MAX_OVERFLOW=1` per process, with a 25-connection cap for vanguard_app.
 
 ### Bot: Session Files
 Telegram session files (`.session`) are stored in `backend/sessions/` or `bot-matrix/sessions/`. These contain authentication credentials and should never be committed to git. If a session becomes invalid, delete the file and re-authenticate.
@@ -305,7 +310,7 @@ If Telegram accounts fail to connect:
 - **Public domain**: https://vanguard.pipenai.xyz
 - **Backend**: host Nginx proxies `/api`, `/api/ws`, and `/health` to the loopback backend port `127.0.0.1:18080`.
 - **Frontend**: host Nginx proxies the public site to the loopback frontend port `127.0.0.1:13000`.
-- **Database**: isolated `vanguard-postgres` service and `./data/postgres` volume from `docker-compose.production.yml`.
+- **Database**: shared PG18 `sub2api-dr-postgres`; database `vanguard`, account `vanguard_app`, endpoint `oracle-shared-postgres:5432`. See `docs/ORACLE_SHARED_POSTGRES.md`.
 - **Cache**: isolated `vanguard-redis` service and `./data/redis` volume from `docker-compose.production.yml`.
 - **TLS/Nginx**: host configuration is `/etc/nginx/conf.d/vanguard.conf`; use the existing Cloudflare Origin wildcard certificate for `*.pipenai.xyz` only after verifying its dates and key permissions on the target host.
 
@@ -315,7 +320,7 @@ If Telegram accounts fail to connect:
 ```bash
 # On server
 cd /opt/vanguard
-docker compose -f docker-compose.production.yml up -d --build
+docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-deps backend
 ```
 
 **Frontend**:
@@ -329,7 +334,7 @@ tar -czf dist.tar.gz -C dist .
 scp dist.tar.gz oracle4c24g:/tmp/
 ssh oracle4c24g
 cd /opt/vanguard
-docker compose -f docker-compose.production.yml up -d --build frontend
+docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-deps frontend
 ```
 
 ### Health Checks

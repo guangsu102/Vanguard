@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.security import require_admin
+from app.core.settings_models import SystemSetting
 from app.modules.acquisition.models import GroupQualificationAudit
 from app.modules.acquisition.qualification_service import queue_reviews
 
@@ -51,11 +52,15 @@ async def list_reviews(account_id: int | None = None, batch_id: str | None = Non
     if batch_id:
         statement = statement.where(GroupQualificationAudit.batch_id == batch_id)
     rows = (await db.scalars(statement.order_by(desc(GroupQualificationAudit.id)).limit(limit))).all()
-    return {"code": 0, "data": [serialize(row) for row in rows]}
+    waits = dict((await db.execute(select(SystemSetting.key, SystemSetting.value).where(
+        SystemSetting.key.in_([f"qualification.wait.{row.id}" for row in rows])
+    ))).all()) if rows else {}
+    return {"code": 0, "data": [{**serialize(row), "wait": json.loads(waits.get(f"qualification.wait.{row.id}", "{}"))} for row in rows]}
 
 @router.get("/{audit_id:int}")
 async def get_review(audit_id: int, db: AsyncSession = Depends(get_db)) -> dict:
     row = await db.get(GroupQualificationAudit, audit_id)
     if row is None:
         raise HTTPException(404, "Review not found")
-    return {"code": 0, "data": serialize(row)}
+    wait = await db.get(SystemSetting, f"qualification.wait.{row.id}")
+    return {"code": 0, "data": {**serialize(row), "wait": json.loads(wait.value or "{}") if wait else {}}}

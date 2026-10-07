@@ -1115,6 +1115,13 @@ class GroupAdFrequency(Base):
     pause_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
     promote_after: Mapped[Optional[datetime]] = mapped_column(DateTime)
     reason: Mapped[Optional[str]] = mapped_column(String(160))
+    daily_review_due_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    daily_review_log_id: Mapped[Optional[int]] = mapped_column(Integer)
+    daily_review_token: Mapped[Optional[str]] = mapped_column(String(64))
+    daily_review_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    daily_review_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    daily_review_error: Mapped[Optional[str]] = mapped_column(String(160))
+    daily_review_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     __table_args__ = (CheckConstraint("quota >= 1 AND quota <= 30", name="frequency_quota_range"),)
 

@@ -1,4 +1,4 @@
-"""Scoped semantic review cache and two durable, bounded AI slots."""
+"""Durable, single-attempt semantic decisions with two bounded AI slots."""
 
 from __future__ import annotations
 
@@ -16,13 +16,15 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.settings_models import SystemSetting
-from app.modules.acquisition.group_qualification import POLICY_VERSION, URL
+from app.modules.acquisition.group_qualification import URL
 
-SEMANTIC_VERSION = "text-profile-redacted-v5-one-ad"
+SEMANTIC_VERSION = "text-profile-redacted-v6-once"
 PHONE = re.compile(r"(?<![\w])\+?\d[\d ()-]{5,}\d(?![\w])")
 HANDLE = re.compile(r"(?<![\w/])@[a-zA-Z0-9_]{4,}")
 EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
 SECRET = re.compile(r"(?:sk-[a-zA-Z0-9_-]{12,}|\b\d{6,}:[a-zA-Z0-9_-]{20,})")
+MATERIAL_COLUMNS = {"source", "text", "sender_id", "sender_role", "message_id", "topic_id",
+                    "reply_to_message_id", "system_account", "forwarded", "scope"}
 
 
 def _json(value: Any) -> str:
@@ -112,44 +114,18 @@ def anonymize_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def semantic_key(snapshot: dict, evidence: list[dict], account: Any, limits: dict) -> str:
-    semantic = []
-    for item in evidence:
-        semantic.append(
-            {
-                key: (float(value or 0) >= 24 if key == "age_hours" else value)
-                for key, value in item.items()
-                if key not in {"observed_at", "age_hours"}
-            }
-            | {"retained_24h": float(item.get("age_hours") or 0) >= 24}
-        )
+    # Live rights, retention, model configuration and observation timestamps are
+    # independent gates. Refreshing them must not purchase another recognition.
+    semantic = [{key: value for key, value in item.items() if key in MATERIAL_COLUMNS}
+                for item in snapshot.get("evidence", evidence)]
     value = {
-        "version": POLICY_VERSION,
-        "semantic_version": SEMANTIC_VERSION,
+        "key_version": "material-once-v1",
         "account": account.id,
         "bio": profile_fingerprint(account),
-        "risk_version": {
-            field: str(getattr(account, field, None))
-            for field in (
-                "last_risk_event_at",
-                "spam_checked_at",
-                "restriction_detected_at",
-                "risk_pause_until",
-            )
-        },
-        "account_status": str(getattr(account, "status", None)),
-        "risk_level": str(getattr(account, "risk_level", None)),
         "group": snapshot.get("raw_peer_id"),
         "group_type": snapshot.get("group_type"),
-        "permissions": snapshot.get("permissions"),
         "scope": "text_profile",
-        "model": limits.get("ad_policy_ai_model"),
-        "threshold": limits.get("ad_policy_ai_min_confidence"),
-        "evidence": semantic,
-        "rule_edits": [
-            (e.get("message_id"), e.get("edited_at"))
-            for e in snapshot.get("evidence", [])
-            if e.get("source") in {"pinned_message", "admin_rule"}
-        ],
+        "evidence": sorted(semantic, key=_json),
     }
     return hashlib.sha256(_json(value).encode()).hexdigest()
 
@@ -200,24 +176,79 @@ async def release_slot(db: Any, claim: tuple[str, str]) -> None:
     await db.commit()
 
 
+def binary_result(result: Any, limits: dict) -> Any:
+    passed = (result.ad_allowed is True
+              and result.policy_mode in {"soft_ad_allowed", "soft_ad_trial"}
+              and result.confidence >= max(95, int(limits.get("ad_policy_ai_min_confidence") or 95)))
+    result.ad_allowed = bool(passed)
+    if not passed:
+        result.reason = result.reason or "group_rules_ai_not_passed"
+        # A failed recognition is not proof of an actual group-wide prohibition.
+        if result.policy_mode not in {"forbidden", "approval_required"}:
+            result.policy_mode = "unknown"
+    return result
+
+
+def saved_result(result: Any) -> dict:
+    return {field.name: getattr(result, field.name) for field in fields(result)
+            if field.name not in {"evidence", "cache_hit"}}
+
+
 async def review_semantics(
-    service: Any, snapshot: dict, account: Any, local: Any, limits: dict
+    service: Any, snapshot: dict, account: Any, local: Any, limits: dict,
+    *, previous: dict | None = None,
 ) -> Any:
     from app.core.ai.llm_client import LLMClient
     from app.modules.acquisition.automation import GroupAdRulesAuditResult
 
     original = snapshot["evidence"]
+    # Cached review indexes always refer to this stable order, including when
+    # Telegram returns the same materials in a different order on the next read.
+    source_order = {"full_about": 0, "pinned_message": 1, "admin_rule": 2, "group_profile": 3}
+    original.sort(key=lambda item: (source_order.get(item.get("source"), 4),
+                                   _json({k: v for k, v in item.items() if k in MATERIAL_COLUMNS})))
     safe = anonymize_evidence(original)
     snapshot["ai_redaction_version"] = SEMANTIC_VERSION
     snapshot["profile_fingerprint"] = profile_fingerprint(account)
+    material = semantic_key(snapshot, safe, account, limits)
+    snapshot.update(ai_material_key=material, ai_final=True, ai_pending=False, ai_decision="fail")
+    cache_key = "qualification.ai.once." + material
+    # Commit the terminal fail-closed attempt BEFORE any external call. A crash,
+    # timeout or concurrent reader cannot reclaim it or invoke the provider again.
+    failed = GroupAdRulesAuditResult(ad_allowed=False, reason="group_rules_ai_attempt_interrupted")
+    old = (previous or {}).get("advertising_audit") or {}
+    attempted = old.get("ai_reviews") or str(old.get("reason") or "").startswith("group_rules_ai_")
+    reuse_old = bool(attempted and previous.get("profile_fingerprint") == profile_fingerprint(account)
+                     and semantic_key(previous, [], account, limits) == material)
+    if reuse_old:
+        accepted = {field.name for field in fields(failed)} - {"evidence", "cache_hit"}
+        failed = binary_result(GroupAdRulesAuditResult(**{k: v for k, v in old.items() if k in accepted}), limits)
+    value = _json({"at": datetime.utcnow().isoformat(), "result": saved_result(failed),
+                   "legacy_import": reuse_old})
+    cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
+    if cache is None:
+        try:
+            async with service.db.begin_nested():
+                service.db.add(SystemSetting(key=cache_key, value=value))
+                await service.db.flush()
+            await service.db.commit()
+        except IntegrityError:
+            # Another worker won the unique insert.  Its fail-closed marker
+            # already owns this material, so reload and reuse it; never call
+            # the provider from the losing worker.
+            cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
+    if cache is not None or reuse_old:
+        try:
+            data = json.loads(cache.value if cache is not None else value)
+            result = binary_result(GroupAdRulesAuditResult(**data["result"]), limits)
+        except (ValueError, TypeError, KeyError):
+            result = failed
+        result.evidence, result.cache_hit = original, True
+        snapshot["ai_decision"] = "pass" if result.ad_allowed else "fail"
+        return result
     if not limits.get("ad_policy_ai_enabled", True):
-        local.ad_allowed, local.policy_mode, local.reason = (
-            None,
-            "unknown",
-            "group_rules_ai_disabled",
-        )
-        snapshot["ai_pending"] = True
-        return local
+        failed.reason = "group_rules_ai_disabled"
+        return await finish_once(service.db, cache_key, failed, snapshot, original)
     llm = service._ad_policy_llm()
     # Scope actual configured clients to the one user-authorized destination.
     endpoint = urlsplit(str(getattr(llm, "base_url", "") or ""))
@@ -229,73 +260,80 @@ async def review_semantics(
         )
     )
     if isinstance(llm, LLMClient) and not approved_endpoint:
-        local.ad_allowed, local.policy_mode, local.reason = (
-            None,
-            "unknown",
-            "group_rules_ai_destination_unapproved",
-        )
-        snapshot["ai_pending"] = True
-        return local
-    cache_key = "qualification.ai.cache." + semantic_key(snapshot, safe, account, limits)
-    cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
-    now = datetime.utcnow()
-    if cache:
-        try:
-            cached = json.loads(cache.value)
-            if datetime.fromisoformat(cached["expires_at"]) > now:
-                result = GroupAdRulesAuditResult(**cached["result"])
-                result.evidence, result.cache_hit = original, True
-                snapshot["ai_pending"] = False
-                return result
-        except (ValueError, TypeError, KeyError):
-            pass
+        failed.reason = "group_rules_ai_destination_unapproved"
+        return await finish_once(service.db, cache_key, failed, snapshot, original)
     claim = await claim_slot(service.db)
     if claim is None:
-        local.ad_allowed, local.policy_mode, local.reason = None, "unknown", "group_rules_ai_queued"
-        snapshot["ai_pending"] = True
-        return local
+        failed.reason = "group_rules_ai_capacity_unavailable"
+        return await finish_once(service.db, cache_key, failed, snapshot, original)
     try:
         async with asyncio.timeout(240):
             result = await service._evaluate_group_ad_rules_with_ai(safe, local, limits)
-        result.evidence = original
-        pending = result.reason in {
-            "group_rules_ai_unavailable",
-            "group_rules_ai_disabled",
-            "group_rules_ai_queued",
-        }
-        snapshot["ai_pending"] = pending
-        if (
-            not pending
-            and result.ai_reviews
-            and result.confidence >= 95
-            and result.policy_mode
-            in {"soft_ad_allowed", "soft_ad_trial", "forbidden", "approval_required"}
-        ):
-            saved = {
-                field.name: getattr(result, field.name)
-                for field in fields(result)
-                if field.name not in {"evidence", "cache_hit"}
-            }
-            value = _json({"expires_at": (now + timedelta(hours=24)).isoformat(), "result": saved})
-            cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
-            if cache is None:
-                try:
-                    async with service.db.begin_nested():
-                        service.db.add(SystemSetting(key=cache_key, value=value))
-                        await service.db.flush()
-                except IntegrityError:
-                    pass
-            else:
-                cache.value = value
-            await service.db.commit()
-        return result
+        return await finish_once(service.db, cache_key, binary_result(result, limits), snapshot, original)
     except Exception:
-        local.ad_allowed, local.policy_mode, local.reason = (
-            None,
-            "unknown",
-            "group_rules_ai_unavailable",
-        )
-        snapshot["ai_pending"] = True
-        return local
+        failed.reason = "group_rules_ai_unavailable"
+        return await finish_once(service.db, cache_key, failed, snapshot, original)
     finally:
         await release_slot(service.db, claim)
+
+
+async def finish_once(db: Any, key: str, result: Any, snapshot: dict, evidence: list) -> Any:
+    await db.execute(update(SystemSetting).where(SystemSetting.key == key).values(
+        value=_json({"at": datetime.utcnow().isoformat(), "result": saved_result(result)})
+    ).execution_options(synchronize_session=False))
+    await db.commit()
+    result.evidence = evidence
+    snapshot["ai_decision"] = "pass" if result.ad_allowed is True else "fail"
+    return result
+
+
+async def retire_failed_retries(db: Any) -> dict:
+    """Import existing failed recognitions without any external recognition/read."""
+    from sqlalchemy import func, select
+
+    from app.core.account.models import TelegramAccount
+    from app.core.group.models import GroupAccountMembership as Member
+    from app.modules.acquisition.adaptive_frequency import payload
+    from app.modules.acquisition.automation import GroupAdRulesAuditResult
+    from app.modules.acquisition.models import GroupQualificationAudit as Audit
+    latest = select(func.max(Audit.id)).where(Audit.membership_id == Member.id,
+        Audit.membership_joined_at == Member.joined_at, Audit.state != "cancelled").correlate(Member).scalar_subquery()
+    rows = (await db.execute(select(Member, Audit).join(Audit, Audit.id == latest).where(
+        Member.status == "joined", Member.left_at.is_(None),
+        Audit.decision.notin_(["allowed", "trial", "protected"]),
+    ).with_for_update(of=Audit, skip_locked=True).limit(500))).all()
+    retired = []
+    for member, row in rows:
+        snapshot = payload(row.evidence_json)
+        material = snapshot.get("pending_collection") or snapshot
+        old = material.get("advertising_audit") or snapshot.get("advertising_audit") or {}
+        reason = str(old.get("reason") or material.get("reason") or row.reason or "")
+        if not reason.startswith("group_rules_ai_") or old.get("ad_allowed") is True:
+            continue
+        account = await db.get(TelegramAccount, row.account_id)
+        if account is None or not material.get("evidence"):
+            continue
+        key = semantic_key(material, [], account, {})
+        result = GroupAdRulesAuditResult(ad_allowed=False, reason=reason,
+                                        decision_source="existing_recognition")
+        if await db.get(SystemSetting, "qualification.ai.once." + key) is None:
+            db.add(SystemSetting(key="qualification.ai.once." + key,
+                value=_json({"at": datetime.utcnow().isoformat(), "result": saved_result(result), "legacy_import": True})))
+        snapshot = {**snapshot, **material}
+        snapshot.update(ai_final=True, ai_decision="fail", ai_pending=False, ai_review_incomplete=False,
+                        ai_material_key=key, decision="reject", reason=reason, review_trigger="evidence_changed")
+        snapshot["advertising_audit"] = {**old, "ad_allowed": False, "ai_decision": "fail"}
+        # Preserve real Telegram exit facts; the negative AI result adds none.
+        snapshot.pop("pending_collection", None)
+        row.evidence_json = _json(snapshot)
+        from app.modules.acquisition.evidence_progress import evidence_maturity
+        maturity = evidence_maturity(snapshot, datetime.utcnow())
+        if maturity:
+            snapshot.update(next_evidence_maturity_at=maturity.isoformat(), review_trigger="ordinary_ad_maturity")
+            row.evidence_json = _json(snapshot)
+        row.decision, row.reason, row.state, row.next_retry_at = "reject", reason, "completed", maturity
+        if member.review_status != "exit_pending":
+            member.ad_status, member.review_next_at = "blocked", maturity
+        retired.append(row.id)
+    await db.commit()
+    return {"retired_ai_retries": retired}

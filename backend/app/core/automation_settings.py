@@ -365,7 +365,10 @@ def normalize_auto_join_scheduler_settings(payload: dict[str, Any] | None) -> di
                 ),
                 default_verification["post_action_recheck_attempts"],
                 min_value=1,
-                max_value=10,
+                # One action gets one post-action snapshot. A second pass
+                # re-reads the same evidence and consumes the account's
+                # qualification budget without changing the decision.
+                max_value=1,
             ),
             "post_action_extra_wait_seconds": _float_setting(
                 verification.get(

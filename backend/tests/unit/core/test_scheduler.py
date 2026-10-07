@@ -207,38 +207,18 @@ class TestCeleryConfig:
         # Check for 30-second task
         assert "campaign-check-every-30s" in beat_schedule
         assert beat_schedule["campaign-check-every-30s"]["schedule"] == 30.0
-        assert "auto-join-groups-dispatcher-every-5min" in beat_schedule
-        auto_join_schedule = beat_schedule["auto-join-groups-dispatcher-every-5min"]
-        assert str(auto_join_schedule["schedule"]) == "<crontab: */5 * * * * (m/h/dM/MY/d)>"
-        assert set(auto_join_schedule["schedule"].minute) == set(range(0, 60, 5))
-        assert auto_join_schedule["kwargs"] == {
-            "scheduled": True,
-            "max_accounts": 26,
-            "keywords_per_account": 30,
-            "max_groups_per_keyword": 50,
-        }
-        deliver_ads_schedule = beat_schedule["deliver-ads-dispatcher-every-minute"]
-        assert deliver_ads_schedule["schedule"] == 60.0
-        assert deliver_ads_schedule["options"]["rate_limit"] == "60/h"
-        assert beat_schedule["check-ad-survival-every-2min"]["schedule"] == 120.0
+        growth = beat_schedule["growth-account-dispatch-every-15s"]
+        assert growth["schedule"] == 15.0
+        assert growth["options"]["queue"] == "growth_dispatch"
+        assert growth["options"]["expires"] == 30
+        for old in ("auto-join-groups-dispatcher-every-5min", "deliver-ads-dispatcher-every-minute",
+                    "check-ad-survival-every-2min", "group-qualification-every-minute",
+                    "auto-probe-unknown-ad-policies-every-5min"):
+            assert old not in beat_schedule  # No second producer of unbounded global batches.
         assert "group-ai-warmup-dispatcher-every-30min" in beat_schedule
         ad_policy_audit_schedule = beat_schedule["audit-group-ad-policies-hourly"]
-        ad_policy_probe_schedule = beat_schedule["auto-probe-unknown-ad-policies-every-5min"]
-        assert set(ad_policy_probe_schedule["schedule"].minute) == set(range(2, 60, 5))
         assert set(ad_policy_audit_schedule["schedule"].minute) == {19}
-        assert {
-            str(schedule["schedule"].tz)
-            for schedule in (
-                auto_join_schedule,
-                ad_policy_probe_schedule,
-                ad_policy_audit_schedule,
-            )
-        } == {"Asia/Shanghai"}
-        assert set(auto_join_schedule["schedule"].minute).isdisjoint(
-            ad_policy_probe_schedule["schedule"].minute
-        )
-        assert 19 not in auto_join_schedule["schedule"].minute
-        assert 19 not in ad_policy_probe_schedule["schedule"].minute
+        assert str(ad_policy_audit_schedule["schedule"].tz) == "Asia/Shanghai"
         assert ad_policy_audit_schedule["kwargs"] == {"limit": 20}
         assert ad_policy_audit_schedule["options"]["rate_limit"] == "1/h"
 

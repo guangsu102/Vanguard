@@ -116,6 +116,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '自动化管理', icon: 'Promotion' },
       },
       {
+        path: 'qq-automation',
+        name: 'QQAutomation',
+        component: () => import('@/views/QQAutomation.vue'),
+        meta: { title: 'QQ 自动化', icon: 'ChatLineSquare' },
+      },
+      {
         path: 'workers',
         name: 'WorkerStatus',
         component: () => import('@/views/WorkerStatus.vue'),

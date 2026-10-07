@@ -173,6 +173,41 @@ async def sync_stale_groups(
                 await record_snapshot(db, group, {}, source="sync", error="account_unavailable")
                 await db.commit()
                 continue
+            from app.core.account.models import AccountOperationConfig
+            operation = await db.scalar(select(AccountOperationConfig).where(
+                AccountOperationConfig.account_id == account.id))
+            if operation is not None and operation.dynamic_capacity_enabled:
+                from app.modules.acquisition.ad_output_plan import ad_output_plan
+                plan = await ad_output_plan(db, account, operation, now)
+                # Waiting for probe replenishment must never freeze refreshes
+                # forever: when joins are themselves blocked the deficit stays
+                # positive indefinitely, and stale group metadata then feeds
+                # observe/evidence_incomplete review verdicts.  Past the cap the
+                # refresh runs anyway.
+                setting = await db.get(SystemSetting, PREFIX + str(group.group_id))
+                metadata_age = (
+                    now - setting.updated_at if setting is not None and setting.updated_at else None
+                )
+                if (
+                    operation.auto_join_enabled
+                    and plan.get("group_deficit", 0) > 0
+                    and metadata_age is not None
+                    and metadata_age < timedelta(hours=24)
+                ):
+                    counts["skipped"] += 1
+                    counts["details"].append({"group_id": group.id, "result": "deferred",
+                                               "reason": "metadata_wait_probe_replenishment"})
+                    continue
+                if plan["join_blocker"] in {
+                    "join_wait_ad_delivery", "join_wait_ad_survival", "join_wait_ad_reconciliation",
+                    "account_risk_quarantined", "join_ad_account_unavailable",
+                    "telegram_read_budget", "telegram_rpc_cooldown", "telegram_rpc_guard_unavailable",
+                }:
+                    counts["skipped"] += 1
+                    counts["details"].append({"group_id": group.id, "result": "deferred",
+                                               "reason": plan["join_blocker"]})
+                    # A scheduling deferral must not overwrite fresh group evidence.
+                    continue
             await pool.sync_from_db([account])
             wrapper = await pool.acquire_by_id(
                 account.id, purpose="group_metadata_sync", raise_on_lease_failure=True

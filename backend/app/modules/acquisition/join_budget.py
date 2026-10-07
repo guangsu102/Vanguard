@@ -188,6 +188,15 @@ class JoinRequestBudgetService:
                 return "join_flood_wait"
         if await self._is_owned_group_owner(account.id):
             return "owned_group_owner_protected"
+        if getattr(config, "dynamic_capacity_enabled", False):
+            from app.modules.acquisition.ad_output_plan import ad_output_plan
+            plan = await ad_output_plan(self.db, account, config, now)
+            if plan["join_blocker"]:
+                return plan["join_blocker"]
+            from app.modules.acquisition.growth_admission import admission_plan
+            admission = await admission_plan(self.db, account.id, now)
+            if admission['reason']:
+                return admission['reason']
         return None
 
     @staticmethod
@@ -433,7 +442,10 @@ class JoinRequestBudgetService:
         if config is not None and getattr(config, "dynamic_capacity_enabled", False):
             from app.modules.acquisition.capacity import inventory_snapshot
             inventory = await inventory_snapshot(self.db, account_id, now)
-            return inventory["active_backlog"], inventory["overdue"]
+            return (
+                inventory.get("probe_review_pressure", inventory.get("probe_active_backlog", inventory["active_backlog"])),
+                inventory.get("probe_pressure_overdue", inventory.get("probe_overdue", inventory["overdue"])),
+            )
         rows = await self.db.execute(
             select(
                 GroupAccountMembership.review_status,

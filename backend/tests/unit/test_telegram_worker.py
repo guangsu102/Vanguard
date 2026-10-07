@@ -131,6 +131,40 @@ def test_growth_worker_status_online_with_enabled_account():
     assert worker._status_for_snapshot({"enabled_accounts": 1}) == TelegramWorkerStatusValue.ONLINE.value
 
 
+def test_growth_worker_classifies_full_account_inventory_before_runtime_filtering():
+    def account(account_id, *, status=AccountStatus.ONLINE, active=True, enabled=True, credentials=True):
+        return SimpleNamespace(
+            id=account_id,
+            is_active=active,
+            status=status,
+            phone=f"+1555000{account_id:04d}" if credentials else None,
+            api_config=SimpleNamespace(
+                api_id="12345" if credentials else None,
+                api_hash="hash" if credentials else None,
+            ),
+            operation_config=SimpleNamespace(enabled=enabled),
+        )
+
+    accounts = [
+        account(1),
+        account(2, status=AccountStatus.RESTRICTED),
+        account(3, enabled=False),
+        account(4, credentials=False),
+        account(5, active=False),
+    ]
+
+    inventory = TelegramWorker._classify_growth_accounts(accounts)
+
+    assert inventory["database_candidates"] == 5
+    assert inventory["operation_enabled_accounts"] == 3
+    assert inventory["runtime_capable_accounts"] == 1
+    assert inventory["restricted_accounts"] == 1
+    assert inventory["disabled_accounts"] == 2
+    assert inventory["status_filtered_accounts"] == 1
+    assert inventory["credential_filtered_accounts"] == 1
+    assert [item.id for item in inventory["runtime_accounts"]] == [1]
+
+
 def test_growth_worker_uses_snapshot_for_handler_initialization():
     worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
 

@@ -109,6 +109,18 @@ class Settings(BaseSettings):
     BOT_TOKEN: str | None = Field(default=None, description="Telegram bot token")
     TELEGRAM_SESSION_DIR: str = Field(default="./sessions", description="Telegram session files directory")
     TELEGRAM_SESSION_ENCRYPTION_KEY: str | None = Field(default=None, description="Encryption key for Telegram StringSession values")
+    TELEGRAM_READ_BUDGET_PERCENT: int = Field(
+        default=100,
+        ge=100,
+        le=1000,
+        description="Scale local minute/hour/day read budgets; 150 adds 50%, preserving account cooldowns",
+    )
+    SESSION_EXEC_CONCURRENCY: int = Field(
+        default=2,
+        ge=1,
+        le=8,
+        description="Concurrent forwarded stage executions in the session-owner worker; different accounts run in parallel, one account stays serial. Bounded by the database pool.",
+    )
     APP_VERSION_ROLL_ENABLED: bool = Field(
         default=True,
         description="Daily roll of outdated declared Telegram app versions onto the current pool",

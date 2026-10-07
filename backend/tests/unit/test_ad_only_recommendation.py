@@ -1089,6 +1089,38 @@ async def test_handover_frozen_account_requeues_until_risk_pause_expires(
     assert handover.next_attempt_at == fixed_now + timedelta(hours=2, seconds=30)
 
 
+@pytest.mark.asyncio
+async def test_handover_target_unavailable_stops_after_bounded_retries(
+    test_db,
+    monkeypatch,
+):
+    seeded = await _seed_direct_target(test_db, suffix="retry-exhausted")
+    _allow_direct_capacity(monkeypatch)
+    service = AdOnlyRecommendationService(test_db)
+    handover = await _create_direct_assignment(
+        service,
+        seeded,
+        suffix="retry-exhausted",
+        invite_link="https://t.me/+RetryExhausted123",
+    )
+    handover.retry_count = 3
+    await test_db.commit()
+    monkeypatch.setattr(
+        service,
+        "_runtime_direct_values",
+        AsyncMock(side_effect=AdOnlyWorkflowError("target_account_unavailable")),
+    )
+
+    result = await service.execute_handover(handover.id)
+    await test_db.refresh(handover)
+
+    assert result["status"] == "failed"
+    assert result["error"] == "target_account_unavailable_retry_exhausted"
+    assert handover.status == "failed"
+    assert handover.current_step == "blocked_target_account"
+    assert handover.next_attempt_at is None
+
+
 def test_runtime_health_consistency_sql_migration_is_registered_and_parseable():
     migration_name = "039_repair_runtime_health_consistency.sql"
     migrations_dir = Path(__file__).parents[2] / "migrations"

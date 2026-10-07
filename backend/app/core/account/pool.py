@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import structlog
 from telethon import TelegramClient
@@ -37,9 +37,10 @@ from app.core.account.operation_lease import (
 )
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
-from app.core.account.session_crypto import decrypt_session_string
 from app.core.account.rpc_governor import RpcDeferred, RpcGovernor, install_governor
+from app.core.account.session_crypto import decrypt_session_string
 from app.core.account.session_files import resolve_telegram_session_file
+from app.core.account.session_guard import AccountSessionGuard
 from app.core.network.fingerprint import FingerprintManager
 from app.modules.owned_group.security import safe_exception_message
 
@@ -121,6 +122,7 @@ class TelegramAccountWrapper:
     operation_lease: Optional[AccountOperationLeaseHandle] = field(default=None, repr=False)
     operation_lease_renewal_task: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     operation_lease_lost: bool = field(default=False, repr=False)
+    session_guard: Optional[AccountSessionGuard] = field(default=None, repr=False)
     release_status_override: Optional[AccountStatus] = field(default=None, repr=False)
     active_purpose: str = field(default="listener", repr=False)
 
@@ -154,7 +156,10 @@ class TelegramAccountWrapper:
     @property
     def is_available(self) -> bool:
         """Check if account is available for use."""
-        return self.status in [AccountStatus.IDLE, AccountStatus.ONLINE]
+        pause = getattr(self.client, "_vanguard_listener_pause", None)
+        return self.status in [AccountStatus.IDLE, AccountStatus.ONLINE] and not (
+            pause is not None and pause.reason is not None
+        )
 
     @property
     def session_file_path(self) -> Path:
@@ -223,6 +228,21 @@ class AccountPool:
         self._static_proxy_resolver = static_proxy_resolver
         self._operation_lease_manager = operation_lease_manager or AccountOperationLeaseManager()
         self.logger = logger.bind(module="account_pool")
+        # A sync returning zero only means that no new wrapper was created in
+        # that pass.  Keep a structured report so callers can distinguish a
+        # healthy refresh from a failed/filtered database load.
+        self._last_sync_report: dict[str, Any] = {
+            "database_candidates": 0,
+            "sync_candidates": 0,
+            "new_accounts": 0,
+            "updated_accounts": 0,
+            "filtered_accounts": 0,
+            "filtered_by_proxy_policy": 0,
+            "filtered_by_static_proxy": 0,
+            "filtered_by_status": 0,
+            "filtered_by_credentials": 0,
+            "pool_total_accounts": 0,
+        }
         _ACCOUNT_POOLS.add(self)
 
     async def _claim_operation_lease(
@@ -388,6 +408,11 @@ class AccountPool:
                     reason=reason,
                     error=safe_exception_message(exc, max_length=500),
                 )
+        guard = account.session_guard
+        account.session_guard = None
+        if guard is not None:
+            with suppress(Exception):
+                await guard.close()
 
     async def _assert_proxy_policy_current(self, account: TelegramAccountWrapper) -> None:
         state = await get_account_proxy_policy_state(account.account_id)
@@ -753,6 +778,22 @@ class AccountPool:
 
             return selected
 
+    def peek_connected(self, account_id: int) -> bool:
+        """True when this pool already holds a connected client for the account.
+
+        Used by the session-owner executor to decide whether an execution
+        request can be served locally without creating a new client (which
+        would contend for the distributed session lease).
+        """
+        for account in self._accounts.values():
+            if account.account_id != account_id:
+                continue
+            client = account.client
+            if client is None:
+                return False
+            return bool(getattr(client, "is_connected", lambda: False)())
+        return False
+
     async def acquire_by_id(
         self,
         account_id: int,
@@ -810,6 +851,13 @@ class AccountPool:
                     "account_session_missing", account_id=account_id, purpose=purpose
                 )
                 return None
+
+            pause = getattr(selected.client, "_vanguard_listener_pause", None)
+            if pause is not None and pause.reason is not None:
+                pause.check_resume()
+                # Only the listener cycle can resume this retained session after
+                # checking both ordinary and sync budgets.
+                raise RpcDeferred("telegram_read_budget", 5)
 
             if operation_lease is not None:
                 if operation_lease.account_id != account_id:
@@ -877,6 +925,38 @@ class AccountPool:
             )
             return selected
 
+    async def listener_storage_snapshot(self, account_id: int) -> dict[str, Any]:
+        """Inspect the matching durable session even when bootstrap is deferred."""
+        from app.core.account.listener_checkpoint import listener_session_path
+        from app.core.account.listener_storage import read_listener_storage
+
+        wrapper = await self.get_account_by_id(account_id)
+        if wrapper is None:
+            return {"available": False, "source": "disk", "storage_error": None}
+        try:
+            path = wrapper.session_file_path
+            if wrapper.session_string:
+                path = listener_session_path(StringSession(wrapper.session_string), path)
+            if path is None:
+                return {"available": False, "source": "disk", "storage_error": None}
+            return await asyncio.to_thread(read_listener_storage, path)
+        except Exception as exc:
+            return {"available": False, "source": "disk", "storage_error": type(exc).__name__}
+
+    async def listener_stored_facts(self, account_id: int, *, acknowledge=None) -> list[tuple[str, str]]:
+        from app.core.account.listener_checkpoint import listener_session_path
+        from app.core.account.listener_storage import stored_facts
+
+        wrapper = await self.get_account_by_id(account_id)
+        if wrapper is None:
+            return []
+        path = wrapper.session_file_path
+        if wrapper.session_string:
+            path = listener_session_path(StringSession(wrapper.session_string), path)
+        if path is None:
+            return []
+        return await asyncio.to_thread(stored_facts, path, acknowledge=acknowledge)
+
     async def connect_by_id(
         self,
         account_id: int,
@@ -919,6 +999,9 @@ class AccountPool:
 
             previous_keep_connected = selected.keep_connected
             try:
+                pause = getattr(selected.client, "_vanguard_listener_pause", None)
+                if pause is not None:
+                    pause.check_resume()
                 await self._assert_proxy_policy_current(selected)
                 await self._ensure_proxy(selected)
                 connected_now = False
@@ -927,7 +1010,29 @@ class AccountPool:
                     selected.client is None
                     or not getattr(selected.client, "is_connected", lambda: False)()
                 ):
-                    selected.client = await self._create_client(selected)
+                    previous_purpose = selected.active_purpose
+                    selected.active_purpose = purpose
+                    try:
+                        if pause is not None and selected.client is pause.client:
+                            # Keep session cursors, entity cache, queued updates and
+                            # handlers. StringSession export alone lacks these.
+                            selected.client._catch_up = True
+                            selected.client._vanguard_governor.bootstrapping = True
+                            try:
+                                await selected.client.connect()
+                            except BaseException:
+                                # connect() may open its transport before a bootstrap
+                                # read is deferred; do not leave that producer running.
+                                with suppress(Exception):
+                                    await selected.client.disconnect()
+                                raise
+                            finally:
+                                selected.client._vanguard_governor.bootstrapping = False
+                            pause.resumed()
+                        else:
+                            selected.client = await self._create_client(selected)
+                    finally:
+                        selected.active_purpose = previous_purpose
                     connected_now = True
                 elif previous_keep_connected != keep_connected:
                     await selected.client.set_receive_updates(keep_connected)
@@ -959,6 +1064,7 @@ class AccountPool:
 
     async def _create_client(self, account: TelegramAccountWrapper) -> TelegramClient:
         """Create a Telethon client bound to the account session."""
+        session_guard: AccountSessionGuard | None = None
         api_id = str(account.api_id or "").strip()
         api_hash = str(account.api_hash or "").strip()
         if not api_id or not api_hash:
@@ -993,6 +1099,10 @@ class AccountPool:
             else (str(session_path) if session_path.exists() else StringSession())
         )
 
+        if account.keep_connected and isinstance(session, StringSession):
+            from app.core.account.listener_checkpoint import listener_session
+            session = listener_session(session, session_path)
+
         profile_key = (
             account.fingerprint_id
             or account.phone
@@ -1014,6 +1124,30 @@ class AccountPool:
         system_version = telegram_profile["system_version"]
         app_version = telegram_profile["app_version"]
         lang_code = telegram_profile["lang_code"]
+        # Claim the distributed auth-key lease only after all local validation
+        # has succeeded, so every failure path below can release it safely.
+        try:
+            from app.core.redis import redis_client
+            if redis_client is not None:
+                session_guard = AccountSessionGuard(
+                    redis=redis_client,
+                    account_id=account.account_id,
+                    on_quarantine=lambda account_id, error: self._quarantine_session(
+                        account_id, error
+                    ),
+                )
+                if not await session_guard.acquire():
+                    raise RuntimeError(
+                        f"Telegram session lease is busy for account {account.account_id}"
+                    )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                "telegram_session_lease_unavailable",
+                account_id=account.account_id,
+                error=safe_exception_message(exc, max_length=300),
+            )
         client = TelegramClient(
             session,
             api_id_int,
@@ -1031,13 +1165,31 @@ class AccountPool:
             base_logger=f"vanguard.telethon.account.{account.account_id}",
             flood_sleep_threshold=0,
             receive_updates=account.keep_connected,
+            sequential_updates=account.keep_connected,
+            catch_up=account.keep_connected,
         )
+        if session_guard is not None:
+            session_guard.client = client
+            account.session_guard = session_guard
+            client._vanguard_session_guard = session_guard
         install_governor(client, RpcGovernor(
             account.account_id, lambda: account.active_purpose,
             budget_reads=account.account_type == AccountType.PROMOTER,
         ))
+        if account.keep_connected:
+            from app.core.account.listener_checkpoint import install_listener_checkpoint
+            from app.core.account.listener_pause import ListenerPause
+
+            # Lightweight fake clients used by offline tests have no SDK session.
+            if hasattr(client, "session"):
+                install_listener_checkpoint(client)
+
+            client._vanguard_listener_pause = ListenerPause(
+                client, lambda: self.pause_listener(account, client)
+            )
         try:
             await client._vanguard_governor.before([])
+            client._vanguard_governor.bootstrapping = account.keep_connected
             await client.connect()
             if not await client.is_user_authorized():
                 raise RuntimeError(f"account {account.session_name} is not authorized")
@@ -1045,7 +1197,52 @@ class AccountPool:
         except BaseException:
             with suppress(Exception):
                 await client.disconnect()
+            if session_guard is not None:
+                with suppress(Exception):
+                    await session_guard.close()
+                if account.session_guard is session_guard:
+                    account.session_guard = None
             raise
+        finally:
+            client._vanguard_governor.bootstrapping = False
+
+    async def _quarantine_session(self, account_id: int | str, error: BaseException) -> None:
+        """Mark a wrong-session account unavailable without replaying work."""
+        account = next(
+            (item for item in self._accounts.values() if item.account_id == int(account_id)),
+            None,
+        )
+        if account is None:
+            return
+        account.release_status_override = AccountStatus.ERROR
+        account.status = AccountStatus.ERROR
+        account.operation_lease_lost = True
+        self.logger.error(
+            "telegram_session_quarantined",
+            account_id=account.account_id,
+            error=safe_exception_message(error, max_length=500),
+        )
+
+    async def pause_listener(self, account: TelegramAccountWrapper, client: Any) -> None:
+        """Stop the transport when idle, retaining queue/session for recovery."""
+        # Freeze dispatch before draining existing handlers so incoming traffic
+        # cannot keep creating more handlers while we wait for an active write.
+        updates = getattr(client, "_updates_handle", None)
+        if updates is not None and not updates.done():
+            updates.cancel()
+            await asyncio.gather(updates, return_exceptions=True)
+        while True:
+            async with self._lock:
+                if account.client is not client:
+                    return
+                busy = account.status == AccountStatus.WORKING or account.operation_lease is not None
+                handlers = [task for task in client._event_handler_tasks if not task.done()]
+                if not busy and not handlers:
+                    # SDK disconnect saves the message-box cursor and cancels the
+                    # blocked update consumer. Never interrupt an in-flight write.
+                    await client.disconnect()
+                    return
+            await asyncio.sleep(0.25)
 
     def _validate_runtime_environment(self, account: TelegramAccountWrapper) -> None:
         ok, reason = AccountEnvironmentGuard.validate_account_environment(account)
@@ -1082,6 +1279,14 @@ class AccountPool:
         account.current_proxy_country = account.country_code.upper()
 
         if account.client is not None and previous_proxy != proxy:
+            pause = getattr(account.client, "_vanguard_listener_pause", None)
+            if pause is not None and pause.reason is not None and not account.client.is_connected():
+                if proxy is None:
+                    raise RuntimeError("Promoter account proxy is required but no proxy was acquired")
+                # A transport change must not throw away a paused session cursor.
+                account.client.set_proxy((proxy.protocol, proxy.host, proxy.port, True,
+                                          proxy.username, proxy.password))
+                return
             try:
                 if account.client.is_connected():
                     await account.client.disconnect()
@@ -1198,6 +1403,11 @@ class AccountPool:
                     )
             if not account.keep_connected:
                 account.client = None
+                guard = account.session_guard
+                account.session_guard = None
+                if guard is not None:
+                    with suppress(Exception):
+                        await guard.close()
             await self._release_operation_lease(account)
             account.status = (
                 AccountStatus.ERROR
@@ -1312,7 +1522,7 @@ class AccountPool:
         accounts = [
             acc
             for acc in self._accounts.values()
-            if acc.status in [AccountStatus.IDLE, AccountStatus.ONLINE]
+            if acc.is_available
         ]
 
         if require_session:
@@ -1425,17 +1635,31 @@ class AccountPool:
                 ],
             }
 
-    async def sync_from_db(self, accounts: list["TelegramAccount"]) -> int:
+    async def sync_from_db(
+        self,
+        accounts: list["TelegramAccount"],
+        *,
+        candidate_stats: Optional[dict[str, int]] = None,
+    ) -> int:
         """
         Sync accounts from database to pool.
 
         Args:
             accounts: List of TelegramAccount models from database
 
+        ``candidate_stats`` is supplied by a caller that queried a wider
+        database population before applying operation/status/credential
+        policy.  It is deliberately optional so the pool remains compatible
+        with the smaller account refreshes used by API and task handlers.
+
         Returns:
-            Number of accounts synced
+            Number of newly added accounts.  See ``last_sync_report`` for the
+            complete result, including updates and filtered candidates.
         """
         synced = 0
+        updated = 0
+        filtered_by_proxy_policy = 0
+        filtered_by_static_proxy = 0
         for account in accounts:
             new_proxy_mode = normalize_proxy_mode(getattr(account, "proxy_mode", ProxyMode.DYNAMIC))
             new_static_proxy_id = getattr(account, "static_proxy_id", None)
@@ -1456,6 +1680,7 @@ class AccountPool:
                     published_mode=policy_state.proxy_mode,
                     published_static_proxy_id=policy_state.static_proxy_id,
                 )
+                filtered_by_proxy_policy += 1
                 continue
 
             existing = self._accounts.get(account.session_name)
@@ -1499,6 +1724,7 @@ class AccountPool:
                         static_proxy_id=new_static_proxy_id,
                         error=safe_exception_message(exc, max_length=500),
                     )
+                    filtered_by_static_proxy += 1
                     continue
                 proxy_policy_changed = (
                     existing.proxy_mode != new_proxy_mode
@@ -1530,6 +1756,7 @@ class AccountPool:
                 existing.device_model = account.device_model
                 existing.system_version = account.system_version
                 existing.app_version = account.app_version
+                updated += 1
             else:
                 try:
                     await self.add_account_from_db(account)
@@ -1540,11 +1767,38 @@ class AccountPool:
                         static_proxy_id=new_static_proxy_id,
                         error=safe_exception_message(exc, max_length=500),
                     )
+                    filtered_by_static_proxy += 1
                     continue
                 synced += 1
 
-        self.logger.info("accounts_synced_from_db", count=synced)
+        supplied_stats = candidate_stats or {}
+        filtered_by_status = int(supplied_stats.get("filtered_by_status", 0))
+        filtered_by_credentials = int(supplied_stats.get("filtered_by_credentials", 0))
+        filtered = (
+            filtered_by_proxy_policy
+            + filtered_by_static_proxy
+            + filtered_by_status
+            + filtered_by_credentials
+        )
+        self._last_sync_report = {
+            "database_candidates": int(supplied_stats.get("database_candidates", len(accounts))),
+            "sync_candidates": len(accounts),
+            "new_accounts": synced,
+            "updated_accounts": updated,
+            "filtered_accounts": filtered,
+            "filtered_by_proxy_policy": filtered_by_proxy_policy,
+            "filtered_by_static_proxy": filtered_by_static_proxy,
+            "filtered_by_status": filtered_by_status,
+            "filtered_by_credentials": filtered_by_credentials,
+            "pool_total_accounts": len(self._accounts),
+        }
+        self.logger.info("accounts_synced_from_db", **self._last_sync_report)
         return synced
+
+    @property
+    def last_sync_report(self) -> dict[str, Any]:
+        """Return a copy of the most recent database synchronization report."""
+        return dict(self._last_sync_report)
 
     async def close_all(self) -> None:
         """Close all account connections and clear the pool."""
@@ -1562,6 +1816,11 @@ class AccountPool:
                         )
                     finally:
                         account.client = None
+                guard = account.session_guard
+                account.session_guard = None
+                if guard is not None:
+                    with suppress(Exception):
+                        await guard.close()
                 await self._release_operation_lease(account)
 
             self._accounts.clear()

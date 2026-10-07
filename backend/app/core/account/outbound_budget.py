@@ -339,11 +339,26 @@ class AccountOutboundBudgetService:
             }
         ad_lanes = {}
         for lane in ("probe", "mature"):
-            a = sum(r.category == "ad" and ad_lane(r) == lane and r.state != "failed" for r in today)
-            b = sum(r.category == "ad" and ad_lane(r) == lane and r.state != "failed" for r in window)
+            # Trial quota measures confirmed successes. In-flight/unknown writes
+            # keep their ledger and reconciliation guards, but spend no trial slot.
+            def counted(r: Any, selected_lane: str = lane) -> bool:
+                return r.category == "ad" and ad_lane(r) == selected_lane and (
+                    r.state == "succeeded" if selected_lane == "probe" else r.state != "failed"
+                )
+            a = sum(counted(r) for r in today)
+            b = sum(counted(r) for r in window)
             cap = limits.get("ad_probe", limits["ad"]) if lane == "probe" else limits["ad"]
             ad_lanes[lane] = {"effective": cap, "used_today": a, "used_rolling_24h": b,
-                              "remaining": max(0, min(cap - a, cap - b, categories["ad"]["remaining"]))}
+                              "remaining": max(0, min(cap - a, cap - b))}
+            ad_lanes[lane]["executable_remaining"] = min(
+                ad_lanes[lane]["remaining"], categories["ad"]["remaining"]
+            )
+            ad_lanes[lane]["inflight"] = sum(
+                r.category == "ad" and ad_lane(r) == lane
+                and bool(r.state in {"attempted", "unknown"}
+                         or (r.state == "reserved" and r.lease_expires_at and r.lease_expires_at > now))
+                for r in rows
+            )
         last = max(
             (r.attempted_at for r in pacing_rows if r.category == "ad" and r.attempted_at), default=None
         )
@@ -484,7 +499,13 @@ class AccountOutboundBudgetService:
                 raise OutboundBudgetBlocked("outbound_ad_reconciliation_required")
 
     async def _frequency_receipt(self, account_id: int, key: str, target: str, context: dict, now: datetime) -> None:
-        from app.modules.acquisition.adaptive_frequency import FrequencyService, canonical, enabled, frequency_context, payload
+        from app.modules.acquisition.adaptive_frequency import (
+            FrequencyService,
+            canonical,
+            enabled,
+            frequency_context,
+            payload,
+        )
         from app.modules.acquisition.models import AdDeliveryLog
         if not await enabled(self.db, account_id):
             return

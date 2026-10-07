@@ -926,6 +926,9 @@ class AccountRiskGuard:
             if reason in {"account_banned", "platform_group_write_banned"}:
                 await self._disable_account_automation(account_id, now=now)
             await self.db.commit()
+            from app.core.account.backlog_discard import discard_account_backlog
+
+            await discard_account_backlog(self.db, account_id, reason=reason)
         await self.record_event(
             account,
             AccountRiskAction(action),
@@ -1608,6 +1611,9 @@ class AccountRiskGuard:
         account.last_risk_decay_at = now
         self.db.add(account)
         await self._disable_account_automation(account.id, now=now)
+        from app.core.account.backlog_discard import discard_account_backlog
+
+        await discard_account_backlog(self.db, account.id, reason="account_banned")
         await self.record_event(
             account,
             AccountRiskAction.JOIN,
@@ -1712,6 +1718,15 @@ class AccountRiskGuard:
         if changed and commit:
             self.db.add(account)
             await self.db.commit()
+            if (
+                account.risk_level == AccountRiskLevel.QUARANTINED.value
+                and before_level != AccountRiskLevel.QUARANTINED.value
+            ):
+                from app.core.account.backlog_discard import discard_account_backlog
+
+                await discard_account_backlog(
+                    self.db, account.id, reason=account.risk_reason or "risk_score_escalated"
+                )
         return changed
 
     def _sync_risk_level(

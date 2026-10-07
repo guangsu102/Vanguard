@@ -1735,6 +1735,8 @@ async def get_ad_dynamic_status(db: AsyncSession = Depends(get_db)) -> dict:
                 "writable_rate": round(float(join_metrics["writable_rate"]), 3),
                 "probe_success_rate_24h": round(float(join_metrics["probe_success_rate_24h"]), 3),
                 "ad_success_rate_24h": round(float(join_metrics["ad_success_rate_24h"]), 3),
+                "ad_success_24h": int(join_metrics["ad_success_24h"]),
+                "ad_failed_24h": int(join_metrics["ad_failed_24h"]),
                 "average_group_quality_score": round(
                     float(join_metrics["average_group_quality_score"]), 2
                 ),
@@ -2325,7 +2327,10 @@ async def run_ad_delivery(request: AdDeliveryRunRequest) -> dict:
 
 
 @router.post("/ads/auto-policy-probe/run", status_code=status.HTTP_202_ACCEPTED)
-async def run_auto_group_ad_policy_probe(request: AdPolicyAutoProbeRunRequest) -> dict:
+async def run_auto_group_ad_policy_probe(request: AdPolicyAutoProbeRunRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    from app.modules.acquisition.qualification_service import policy
+    if (await policy(db)).get("enabled"):
+        return {"code": 0, "message": "success", "data": {"reason": "qualification_probe_disabled", "processed": 0}}
     result = _enqueue_automation_task(
         auto_probe_unknown_group_ad_policies_task,
         "auto_probe_unknown_group_ad_policies_task",

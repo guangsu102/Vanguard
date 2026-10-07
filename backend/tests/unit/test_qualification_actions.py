@@ -63,7 +63,7 @@ class Client:
     async def get_messages(self, entity, *, ids):
         if set(ids) & {101, 102}:
             return [item for item in self.precedents if item.id in ids]
-        return self.old_admin
+        return [item for item in [*self.old_admin, *self.history] if item is None or item.id in ids]
 
     async def __call__(self, request):
         return Obj(full_chat=self.full)
@@ -71,6 +71,56 @@ class Client:
     async def iter_messages(self, entity, **kwargs):
         for item in (self.pins if "filter" in kwargs else self.history)[: kwargs.get("limit", 100)]:
             yield item
+
+
+@pytest.mark.asyncio
+async def test_legacy_positive_id_resolves_as_proven_channel_not_user(live_auth):
+    _, _, db = live_auth
+    client = Client()
+    client.get_entity = AsyncMock(return_value=client.entity)
+    await actions.refresh_live_authorization(db, client, 2, 456)
+    client.get_entity.assert_awaited_once_with(-1000000000456)
+    client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_renewal_uses_one_entity_read_with_real_telethon(live_auth):
+    from datetime import UTC
+    from telethon import TelegramClient, types
+    from telethon.sessions import MemorySession
+    from telethon.tl.functions.channels import GetChannelsRequest, GetFullChannelRequest, GetParticipantRequest
+
+    _, _, db = live_auth
+    now = datetime.now(UTC)
+    entity = types.Channel(id=456, title="test", photo=types.ChatPhotoEmpty(),
+                           date=now, megagroup=True, access_hash=123)
+    client = TelegramClient(MemorySession(), 123, "test")
+    client.session.process_entities(Obj(users=[], chats=[entity]))
+    calls = []
+
+    async def dispatch(sender, rpc, **kwargs):
+        calls.append(type(rpc).__name__)
+        if isinstance(rpc, GetChannelsRequest):
+            return Obj(chats=[entity])
+        if isinstance(rpc, GetFullChannelRequest):
+            return Obj(full_chat=Obj(about="", participants_count=100))
+        assert isinstance(rpc, GetParticipantRequest)
+        return Obj(participant=types.ChannelParticipant(user_id=200, date=now))
+
+    client._call = dispatch
+    await actions.refresh_live_authorization(db, client, 2, 456, permissions_only=True)
+    assert calls == ["GetChannelsRequest", "GetFullChannelRequest", "GetParticipantRequest"]
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_peer_is_a_bounded_retry(live_auth):
+    _, _, db = live_auth
+    client = Client()
+    client.get_entity = AsyncMock(side_effect=ValueError("missing input entity"))
+    with pytest.raises(TelegramExecutionError, match="qualification_entity_unavailable") as error:
+        await actions.refresh_live_authorization(db, client, 2, 456)
+    assert error.value.retry_after_seconds == 300
+    client.send_message.assert_not_awaited()
 
 
 @pytest.fixture
@@ -123,7 +173,7 @@ async def test_current_rules_invalidate_before_send(live_auth):
     row, member, db = live_auth
     client = Client(about="禁止推广")
     with pytest.raises(TelegramExecutionError, match="rules_changed"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     assert member.review_status == "initial_pending"
     assert row.expires_at <= datetime.utcnow()
     db.commit.assert_awaited_once()
@@ -137,7 +187,7 @@ async def test_unchanged_ad_ban_with_verified_precedent_passes_live_read(live_au
     snapshot["evidence"][0]["text"] = "本群禁止任何广告和推广。"
     row.evidence_json = json.dumps(snapshot)
     client = Client(about="本群禁止任何广告和推广。")
-    await actions.validate_live_send(db, client, 2, 456)
+    await actions.refresh_live_authorization(db, client, 2, 456)
     client.send_message.assert_not_called()
 
 
@@ -163,7 +213,7 @@ async def test_current_sending_conditions(live_auth, change, reason):
     else:
         client.entity.default_banned_rights = Obj(send_plain=True)
     with pytest.raises(TelegramExecutionError, match=reason):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     client.send_message.assert_not_called()
 
 
@@ -172,7 +222,7 @@ async def test_preview_restriction_does_not_block_plain_text(live_auth):
     _, _, db = live_auth
     client = Client()
     client.entity.default_banned_rights = Obj(embed_links=True)
-    await actions.validate_live_send(db, client, 2, 456)
+    await actions.refresh_live_authorization(db, client, 2, 456)
 
 
 @pytest.mark.asyncio
@@ -184,7 +234,7 @@ async def test_explicit_rule_permission_needs_no_ordinary_ad_precedent(live_auth
     row.evidence_json = json.dumps(data)
     client = Client()
     client.precedents = []
-    await actions.validate_live_send(db, client, 2, 456)
+    await actions.refresh_live_authorization(db, client, 2, 456)
     client.send_message.assert_not_called()
 
 
@@ -195,7 +245,7 @@ async def test_trial_without_original_ordinary_ad_is_invalidated(live_auth):
     data["evidence"] = [item for item in data["evidence"] if item["source"] == "full_about"]
     row.evidence_json = json.dumps(data)
     with pytest.raises(TelegramExecutionError, match="rules_unknown"):
-        await actions.validate_live_send(db, Client(), 2, 456)
+        await actions.refresh_live_authorization(db, Client(), 2, 456)
     db.commit.assert_awaited_once()
 
 
@@ -219,13 +269,16 @@ async def test_ad_without_message_id_is_unknown_and_recorded_as_failure(monkeypa
         "current_authorization",
         AsyncMock(
             return_value=(
-                Obj(id=1, evidence_hash="proof", content_scope="text_profile", policy_version="v2"),
+                Obj(id=1, evidence_hash="proof", content_scope="text_profile", policy_version="v2",
+                    evidence_json='{"group_type":"supergroup"}'),
                 Obj(group_id=456),
                 Obj(id=1),
             )
         ),
     )
     execution = TelegramExecutionService(guard)
+    from telethon.tl.types import InputPeerChannel
+    client.get_input_entity = AsyncMock(return_value=InputPeerChannel(456, 987))
     monkeypatch.setattr(execution, "_outbound_service", AsyncMock(return_value=None))
     with pytest.raises(TelegramSendOutcomeUnknownError):
         await execution.send_ad(Obj(account_id=2, client=client), 456, "广告")
@@ -252,7 +305,7 @@ async def test_missing_self_permission_never_allows_send(live_auth):
     client = Client()
     client.permissions = None
     with pytest.raises(TelegramExecutionError, match="permission_unknown"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     client.send_message.assert_not_awaited()
 
 
@@ -266,7 +319,7 @@ async def test_new_potential_rule_with_unknown_author_pauses(live_auth, sender_i
     if error:
         client.sender_permissions[sender_id] = error
     with pytest.raises(TelegramExecutionError, match="rules_unknown"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456, message_ids=[10])
     assert row.decision == "observe"
     assert member.review_status == "initial_pending"
     db.commit.assert_awaited_once()
@@ -283,7 +336,7 @@ async def test_new_admin_rule_is_not_hidden_by_same_text_in_ordinary_evidence(li
     client.history = [rule_message()]
     client.sender_permissions[8] = Obj(is_admin=True, is_creator=False)
     with pytest.raises(TelegramExecutionError, match="rules_changed"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456, message_ids=[10])
 
 
 @pytest.mark.asyncio
@@ -297,7 +350,7 @@ async def test_old_admin_rule_omitted_from_response_invalidates(live_auth, missi
     client = Client()
     client.old_admin = missing
     with pytest.raises(TelegramExecutionError, match="rules_unknown"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     assert row.reason == "admin_rule_unavailable_before_send"
 
 
@@ -322,21 +375,21 @@ async def test_edit_of_old_admin_rule_invalidates_even_when_text_is_identical(li
         )
     ]
     with pytest.raises(TelegramExecutionError, match="rules_changed"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("missing_dates", [False, True])
-async def test_new_message_range_must_be_covered_before_send(live_auth, missing_dates):
+async def test_requested_rule_event_must_have_message_and_date(live_auth, missing_dates):
     live_auth[0].decision = "allowed"  # Group-rule fallback must still track rule changes.
     row, _, db = live_auth
     client = Client()
-    client.history = [rule_message(i, text="普通聊天") for i in range(100)]
+    client.history = []
     if missing_dates:
         client.history = [Obj(id=1, message="普通聊天", date=None)]
     with pytest.raises(TelegramExecutionError, match="rules_unknown"):
-        await actions.validate_live_send(db, client, 2, 456)
-    assert row.reason == "recent_rules_coverage_unknown_before_send"
+        await actions.refresh_live_authorization(db, client, 2, 456, message_ids=[1])
+    assert row.reason == ("recent_rules_coverage_unknown_before_send" if missing_dates else "event_rules_unavailable")
 
 
 def exit_fixture():
@@ -588,7 +641,7 @@ async def test_precedent_send_does_not_require_another_member_online(live_auth, 
     row, member, db = live_auth
     client = Client()
     client.full.online_count = online_count
-    await actions.validate_live_send(db, client, 2, 456)
+    await actions.refresh_live_authorization(db, client, 2, 456)
     assert member.review_status == "approved"
     assert row.expires_at > datetime.utcnow()
     db.commit.assert_not_awaited()
@@ -601,7 +654,7 @@ async def test_deleted_ad_precedent_invalidates_before_send(live_auth):
     client = Client()
     client.precedents.pop(0)
     with pytest.raises(TelegramExecutionError, match="rules_changed"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     assert row.reason == "advertising_precedent_disappeared_before_send"
     assert member.review_status == "initial_pending"
     client.send_message.assert_not_awaited()
@@ -613,7 +666,7 @@ async def test_edited_ad_precedent_invalidates_before_send(live_auth):
     client = Client()
     client.precedents[0].edit_date = datetime.utcnow()
     with pytest.raises(TelegramExecutionError, match="rules_changed"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     assert row.reason == "advertising_precedent_changed_before_send"
 
 
@@ -623,5 +676,5 @@ async def test_ad_precedent_sender_becomes_admin_before_send(live_auth):
     client = Client()
     client.sender_permissions[501] = Obj(is_admin=True, is_creator=False)
     with pytest.raises(TelegramExecutionError, match="rules_unknown"):
-        await actions.validate_live_send(db, client, 2, 456)
+        await actions.refresh_live_authorization(db, client, 2, 456)
     assert row.reason == "advertising_precedent_identity_changed_before_send"

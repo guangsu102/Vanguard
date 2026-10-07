@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
+from telethon.tl.types import InputPeerChannel
 
 import app.modules.acquisition.automation as acquisition_automation
 from app.core.account.models import (
@@ -623,7 +624,7 @@ async def test_ad_policy_reads_public_messages_from_before_twenty_four_hour_cuto
 
 
 @pytest.mark.asyncio
-async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(test_db):
+async def test_group_history_high_confidence_ai_single_pass_for_soft_ad_trial(test_db):
     service = AcquisitionAutomationService(test_db)
     verdict = {
         "mode": "soft_ad_trial",
@@ -679,9 +680,9 @@ async def test_group_history_high_confidence_ai_uses_two_pass_for_soft_ad_trial(
 
     assert result.ad_allowed is True
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_TRIAL.value
-    assert result.decision_source == "gpt-5.6-sol_two_pass"
-    assert len(result.ai_reviews) == 2
-    assert service._ad_policy_llm_client.generate.await_count == 2
+    assert result.decision_source == "gpt-5.6-sol"
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
     assert result.reason == "group_history_supports_soft_ad_trial"
     assert result.confidence == 97
 
@@ -718,7 +719,8 @@ async def test_relevant_public_group_profile_cannot_enable_controlled_soft_ad_tr
         },
     )
 
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
+    assert result.reason == "group_rules_ai_not_passed"
     assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert service._ad_policy_llm_client.generate.await_count == 0
 
@@ -778,11 +780,11 @@ async def test_soft_ad_trial_below_configured_confidence_fails_closed(test_db):
         },
     )
 
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert result.reason == "group_rules_ai_consensus_failed"
-    assert len(result.ai_reviews) == 2
-    assert service._ad_policy_llm_client.generate.await_count == 2
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -825,10 +827,11 @@ async def test_explicit_permission_must_cite_authoritative_group_rule(test_db):
         },
     )
 
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert result.reason == "group_rules_ai_consensus_failed"
-    assert len(result.ai_reviews) == 2
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -861,7 +864,7 @@ async def test_sync_group_policy_preserves_ai_soft_ad_trial_mode(test_db):
 
 
 @pytest.mark.asyncio
-async def test_group_rules_high_confidence_direct_permission_uses_two_gpt_reviews(test_db):
+async def test_group_rules_high_confidence_direct_permission_uses_single_gpt_review(test_db):
     service = AcquisitionAutomationService(test_db)
     verdict = {
         "mode": "soft_ad_allowed",
@@ -893,9 +896,9 @@ async def test_group_rules_high_confidence_direct_permission_uses_two_gpt_review
     assert result.ad_allowed is True
     assert result.policy_mode == GroupAdPolicyMode.SOFT_AD_ALLOWED.value
     assert result.confidence == 98
-    assert result.decision_source == "gpt-5.4_two_pass"
-    assert len(result.ai_reviews) == 2
-    assert service._ad_policy_llm_client.generate.await_count == 2
+    assert result.decision_source == "gpt-5.4"
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -934,9 +937,12 @@ async def test_group_rules_gpt_disagreement_and_api_failure_fail_closed(test_db)
         GroupAdRulesAuditResult(evidence=evidence),
         capacity,
     )
-    assert disagreement.ad_allowed is None
-    assert disagreement.policy_mode == GroupAdPolicyMode.UNKNOWN.value
-    assert disagreement.reason == "group_rules_ai_consensus_failed"
+    # The single-call gate consults the first verdict only: a self-conflicting
+    # allow degrades to approval-required and binary fail-closed, never an allow.
+    assert service._ad_policy_llm_client.generate.await_count == 1
+    assert disagreement.ad_allowed is False
+    assert disagreement.policy_mode == GroupAdPolicyMode.APPROVAL_REQUIRED.value
+    assert disagreement.reason == "group_rules_ai_permission_not_direct"
 
     service._ad_policy_llm_client = SimpleNamespace(
         generate=AsyncMock(side_effect=TimeoutError("timeout"))
@@ -946,14 +952,14 @@ async def test_group_rules_gpt_disagreement_and_api_failure_fail_closed(test_db)
         GroupAdRulesAuditResult(evidence=evidence),
         capacity,
     )
-    assert failed.ad_allowed is None
+    assert failed.ad_allowed is False
     assert failed.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert failed.reason == "group_rules_ai_unavailable"
     assert failed.decision_source == "gpt_fail_closed"
 
 
 @pytest.mark.asyncio
-async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_fails_closed(
+async def test_group_rules_low_confidence_single_review_fails_closed(
     test_db,
 ):
     service = AcquisitionAutomationService(test_db)
@@ -984,12 +990,12 @@ async def test_group_rules_low_confidence_first_review_triggers_second_pass_and_
         },
     )
 
-    assert result.ad_allowed is None
+    assert result.ad_allowed is False
     assert result.policy_mode == GroupAdPolicyMode.UNKNOWN.value
     assert result.reason == "group_rules_ai_consensus_failed"
-    assert result.decision_source == "gpt-5.6-sol_two_pass"
-    assert len(result.ai_reviews) == 2
-    assert service._ad_policy_llm_client.generate.await_count == 2
+    assert result.decision_source == "gpt-5.6-sol"
+    assert len(result.ai_reviews) == 1
+    assert service._ad_policy_llm_client.generate.await_count == 1
 
 
 def test_ad_policy_evidence_hash_is_stable_until_retention_bucket_changes():
@@ -2008,11 +2014,19 @@ async def test_survival_check_failure_retries_before_becoming_inconclusive(test_
 async def test_telegram_success_never_releases_dispatcher_budget_when_log_confirmation_fails(
     monkeypatch,
 ):
-    from app.modules.acquisition import automation as dispatch_module
-    # The RPC budget gate has separate coverage; these tests exercise later dispatch behavior.
-    monkeypatch.setattr(dispatch_module, "check_read_ready", AsyncMock(return_value={"state": "ready"}))
+    # The RPC budget gate and gap repair have separate coverage; these tests
+    # exercise later dispatch behavior.
+    monkeypatch.setattr(
+        "app.core.account.rpc_governor.check_dispatch_ready",
+        AsyncMock(return_value={"state": "ready"}),
+    )
+    monkeypatch.setattr(
+        "app.modules.acquisition.qualification_events.queue_due_gaps",
+        AsyncMock(return_value=0),
+    )
     db = MagicMock()
     db.rollback = AsyncMock()
+    db.commit = AsyncMock()
     service = AcquisitionAutomationService(db)
     campaign = SimpleNamespace(id=1, enabled=True, status="active", start_at=None, end_at=None)
     binding = SimpleNamespace(id=1, account_id=1, campaign=campaign)
@@ -2754,7 +2768,12 @@ async def test_policy_probe_risk_guard_block_after_reservation_is_retryable_and_
 ):
     now = datetime.utcnow()
     target = await _create_policy_probe_target(test_db, now, 14)
-    client = SimpleNamespace(send_message=AsyncMock())
+    client = SimpleNamespace(
+        send_message=AsyncMock(),
+        get_input_entity=AsyncMock(
+            return_value=InputPeerChannel(target.group.group_id, 987)
+        ),
+    )
     wrapper = SimpleNamespace(client=client, record_message=MagicMock(), account_id=target.account.id)
     pool = SimpleNamespace(
         acquire_by_id=AsyncMock(return_value=wrapper),
@@ -2775,7 +2794,12 @@ async def test_policy_probe_risk_guard_block_after_reservation_is_retryable_and_
     monkeypatch.setattr("app.modules.acquisition.qualification_service.send_gate", AsyncMock(return_value=None))
     monkeypatch.setattr("app.modules.acquisition.qualification_actions.validate_live_send", AsyncMock(return_value=None))
     monkeypatch.setattr("app.modules.acquisition.qualification_service.current_authorization", AsyncMock(return_value=(
-        SimpleNamespace(id=1, evidence_hash="test", content_scope="text_profile", policy_version="test"),
+        SimpleNamespace(
+            id=1, evidence_hash="test", content_scope="text_profile", policy_version="test",
+            evidence_json=json.dumps({
+                "telegram_group_id": target.group.group_id, "group_type": "supergroup",
+            }),
+        ),
         target.group, SimpleNamespace(id=1),
     )))
     expected_reason = f"risk_guard_blocked:{block_reason}"

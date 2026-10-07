@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, desc, exists, func, or_, select
+from sqlalchemy import and_, case, desc, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 from app.core.account.models import TelegramAccount
@@ -37,6 +37,8 @@ from app.modules.acquisition.qualification_system_identity import covered_system
 from app.modules.acquisition.send_restriction import (
     confirmed_denial, track_restriction, verified_long_restriction,
 )
+
+from app.modules.acquisition.qualification_lifetime import EVIDENCE_TTL, authorization_current, evidence_expiry, renewal_at
 
 SETTING_KEY = "automation.group_qualification"
 AI_REVIEW_INCOMPLETE_REASONS = {
@@ -448,7 +450,8 @@ async def current_authorization(
         target_aliases is not None and member.telegram_group_id not in target_aliases
     ):
         return AuthorizationResolution(reason="qualification_membership_identity_changed")
-    row = await latest_review(db, member.id, include_pending=True)
+    from app.modules.acquisition.qualification_continuity import effective_review
+    row = await effective_review(db, member.id)
     return AuthorizationResolution(
         row, group, member, reason="qualification_review_required" if row is None else None
     )
@@ -521,6 +524,17 @@ def automatic_exit_reason(snapshot: dict[str, Any]) -> str | None:
 
 def qualifies_for_automatic_exit(snapshot: dict[str, Any]) -> bool:
     return automatic_exit_reason(snapshot) is not None
+
+
+def ai_failure_without_exit_evidence(snapshot: dict[str, Any]) -> bool:
+    """A failed recognition cannot manufacture exit or permanent rejoin facts."""
+    return bool(
+        snapshot.get("ai_final")
+        and snapshot.get("ai_decision") == "fail"
+        and not snapshot.get("group_level_advertising_ban")
+        and not snapshot.get("exit_group_rule_ban")
+        and not qualifies_for_automatic_exit(snapshot)
+    )
 
 
 def _base_review_schedule(
@@ -640,7 +654,7 @@ def _base_review_schedule(
                 if retry <= now:
                     retry = final
     if verdict in {"allowed", "trial"}:
-        retry = now + timedelta(hours=23)  # Renew evidence before the 24-hour cache expires.
+        retry = renewal_at(_date(snapshot.get("collected_at")) or now, now)
     # Review does not have a human approval lane. Unresolved evidence remains
     # blocked for advertising and is retried automatically.
     if state == "manual_required":
@@ -664,7 +678,89 @@ def review_schedule(
     from app.modules.acquisition.evidence_progress import evidence_maturity, progress_retry
 
     original_reason = snapshot["reason"]
-    if original_reason in {"telegram_rpc_cooldown", "telegram_read_budget", "telegram_rpc_guard_unavailable"}:
+    # AI recognition is single shot for one material set. A provider failure
+    # closes that material immediately, while a genuinely changed rule/evidence
+    # set is allowed to enter one fresh recognition attempt. ``ai_material_key``
+    # is strongest; the rule fingerprint covers legacy rows.
+    ai_material = snapshot.get("ai_material_key")
+    previous_material = previous.get("ai_material_key")
+    if ai_material and previous_material:
+        material_changed = ai_material != previous_material
+        current_fingerprint = str(ai_material)
+    else:
+        from app.modules.acquisition.qualification_retry import rule_retry_fingerprint
+
+        current_fingerprint = rule_retry_fingerprint(snapshot)
+        previous_audit = previous.get("advertising_audit")
+        if not isinstance(previous_audit, dict):
+            previous_audit = {}
+        previous_attempted = bool(
+            previous.get("rejection_fingerprint")
+            or previous.get("ai_material_key")
+            or previous.get("ai_final")
+            or previous.get("ai_review_incomplete")
+            or previous.get("ai_pending")
+            or previous_audit.get("decision_source")
+        )
+        previous_fingerprint = str(previous.get("rejection_fingerprint") or "")
+        if not previous_fingerprint and previous_attempted:
+            previous_fingerprint = rule_retry_fingerprint(previous)
+        material_changed = bool(previous_attempted and previous_fingerprint != current_fingerprint)
+    # ``ai_pending`` means the first recognition has not started yet and must
+    # remain in the bounded waiting lane.  Only an explicit incomplete marker
+    # or a terminal AI reason without that pending marker represents an unknown
+    # result that must fail closed.
+    ai_incomplete = bool(
+        snapshot.get("ai_review_incomplete")
+        or (
+            original_reason in AI_REVIEW_INCOMPLETE_REASONS
+            and not snapshot.get("ai_pending")
+        )
+    )
+    # New material gets exactly one new attempt. The next worker pass owns the
+    # provider call; this pass only records the changed-material wake-up.
+    if ai_incomplete and material_changed and not (
+        snapshot.get("ai_final") and snapshot.get("ai_decision") == "fail"
+    ):
+        snapshot.update(
+            ai_pending=True,
+            ai_review_incomplete=True,
+            ai_final=False,
+            ai_decision=None,
+            rejection_fingerprint=current_fingerprint,
+            unchanged_rejection_count=1,
+            review_trigger="evidence_changed",
+            decision="observe",
+            reason=original_reason or "group_rules_ai_unknown",
+        )
+        return "observe", snapshot["reason"], "completed", now + timedelta(hours=2)
+    # AI is a binary fail-closed gate. Unknown, timeout, provider rejection,
+    # and every other incomplete outcome terminate the current material.
+    if ai_incomplete and not (
+        snapshot.get("ai_final") and snapshot.get("ai_decision") == "fail"
+    ):
+        snapshot.update(
+            ai_pending=False,
+            ai_review_incomplete=False,
+            ai_final=True,
+            ai_decision="fail",
+            decision="reject",
+            reason=original_reason or "group_rules_ai_unknown",
+            rejection_fingerprint=current_fingerprint,
+            unchanged_rejection_count=1,
+            review_trigger="ai_terminal_failure",
+        )
+        return "reject", snapshot["reason"], "completed", None
+    if snapshot.get("ai_final") and snapshot.get("ai_decision") == "fail":
+        snapshot.update(ai_pending=False, ai_review_incomplete=False, review_trigger="evidence_changed")
+        snapshot["decision"] = "reject"
+        maturity = evidence_maturity(snapshot, now)
+        if maturity:
+            snapshot.update(next_evidence_maturity_at=maturity.isoformat(), review_trigger="ordinary_ad_maturity")
+        # Only real evidence maturation can schedule a read. The AI decision is
+        # terminal and its durable material record prevents another provider call.
+        return "reject", original_reason, "completed", maturity
+    if original_reason in {"telegram_rpc_cooldown", "telegram_read_budget", "telegram_read_slice", "telegram_rpc_guard_unavailable"}:
         snapshot["technical_failures"] = int(previous.get("technical_failures", 0))
         return "technical_wait", original_reason, "completed", now + timedelta(
             seconds=max(60, int(snapshot.get("retry_after_seconds") or 60))
@@ -679,10 +775,8 @@ def review_schedule(
         verdict, reason, state, retry = "observe", original_reason, "completed", maturity
         snapshot["decision"], snapshot["reason"] = verdict, reason
     if reason == "group_rules_ai_provider_content_rejected":
-        import hashlib
-        material = [(item.get("source"), item.get("message_id"), item.get("text"))
-                    for item in snapshot.get("evidence", [])]
-        fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        from app.modules.acquisition.qualification_retry import rule_retry_fingerprint
+        fingerprint = rule_retry_fingerprint(snapshot)
         streak = (int(previous.get("unchanged_rejection_count", 0)) + 1
                   if previous.get("rejection_fingerprint") == fingerprint else 1)
         snapshot["rejection_fingerprint"] = fingerprint
@@ -717,17 +811,26 @@ def review_schedule(
             retry = max(retry, now + timedelta(seconds=max(0, int(snapshot.get("retry_after_seconds") or 0))))
         except (ValueError, TypeError, OverflowError):
             pass
+    # Repeating unchanged, exhausted evidence does not improve qualification.
+    # A new callback, explicit recheck, or a real maturity/progress deadline can
+    # resume it; waiting here never creates a grant or a human approval lane.
+    from app.modules.acquisition.review_retention import waits_for_new_evidence
+
+    if waits_for_new_evidence(snapshot, now):
+        snapshot["review_trigger"] = "evidence_changed"
+        retry = None
     return verdict, reason, state, retry
+
 
 
 def text_profile_link_scope_verified(
     ad_result: Any, evidence: list[dict[str, Any]], *, min_confidence: int
 ) -> bool:
-    """A URL-only restriction needs two complete reviews of the fixed text/profile scope.
+    """A URL-only restriction needs one complete review of the fixed text/profile scope.
 
     The shared AI prompt explicitly audits a text advertisement with a profile CTA
     and no direct URL. Every matching restriction must be cited and explained by
-    both reviewers; an empty explanation cannot authorize that interpretation.
+    the reviewer; an empty explanation cannot authorize that interpretation.
     """
     link_indexes = {
         index
@@ -739,7 +842,7 @@ def text_profile_link_scope_verified(
     return bool(
         ad_result.ad_allowed is True
         and ad_result.policy_mode in {"soft_ad_trial", "soft_ad_allowed"}
-        and len(reviews) == 2
+        and len(reviews) >= 1
         and all(
             review.get("mode") == ad_result.policy_mode
             and int(review.get("confidence") or 0) >= max(95, min_confidence)
@@ -792,14 +895,53 @@ def topic_only_denial(evidence: list[dict[str, Any]]) -> bool:
     return True
 
 
+def ai_evidence_reusable(previous: dict, account: Any, now: datetime, change: dict | None = None) -> bool:
+    """Local AI may resume only within the same fresh, unrevoked evidence scope."""
+    from app.modules.acquisition.qualification_ai import profile_fingerprint
+    from app.modules.acquisition.evidence_progress import evidence_maturity
+    from app.modules.acquisition.qualification_events import same_evidence_event
+
+    collected_at = _date(previous.get("collected_at"))
+    maturity = evidence_maturity(previous, now)
+    return bool(
+        not previous.get("ai_final")
+        and not (maturity and maturity <= now + timedelta(seconds=1))
+        and (previous.get("ai_pending") or previous.get("ai_review_incomplete"))
+        and not previous.get("collection_needs_refresh")
+        and same_evidence_event(previous.get("collection_event"), change)
+        and previous.get("account_id", getattr(account, "id", None)) == getattr(account, "id", None)
+        and collected_at and now-timedelta(hours=24) <= collected_at <= now
+        and previous.get("policy_version") == POLICY_VERSION
+        and previous.get("profile_fingerprint") == profile_fingerprint(account)
+        and previous.get("quality_status") == "qualified"
+        and not previous.get("invalidated_at")
+        and not previous.get("technical_errors")
+        and automatic_exit_reason(previous) is None
+    )
+
+
 async def assess(
     service: Any, account_id: int, group: Group, *,
     row: GroupQualificationAudit | None = None, force_refresh: bool = False
+) -> Any:
+    from app.core.account.read_work import operation
+    scope = f"{row.membership_id}:{row.membership_joined_at.isoformat()}" if row is not None and row.membership_joined_at else ""
+    async with operation(account_id, group.id, "review", scope=scope) as work:
+        result = await _assess(service, account_id, group, row=row, force_refresh=force_refresh)
+        if work.outcome == "interrupted":
+            work.outcome = "allowed" if result.passed else (result.reason or "technical_wait")
+        return result
+
+
+async def _assess(
+    service: Any, account_id: int, group: Group, *,
+    row: GroupQualificationAudit | None = None, force_refresh: bool = False,
 ) -> Any:
     from app.core.automation_settings import get_ad_capacity_settings
     from app.modules.acquisition.automation import GroupAdRulesAuditResult, JoinedGroupAuditResult
 
     now = datetime.utcnow()
+    previous = _payload(row)
     membership = await service.db.scalar(
         select(GroupAccountMembership).where(
             GroupAccountMembership.account_id == account_id,
@@ -851,38 +993,98 @@ async def assess(
 
         previous = _payload(row)
         previous = previous.get("pending_collection") or previous
-        collected_at = _date(previous.get("collected_at"))
-        from app.modules.acquisition.evidence_progress import evidence_maturity
-        maturity = evidence_maturity(previous, now)
-        reuse = bool(
-            not force_refresh
-            and not (maturity and maturity <= now + timedelta(seconds=1))
-            and previous.get("ai_pending")
-            and collected_at
-            and collected_at >= now - timedelta(hours=24)
-            and previous.get("policy_version") == POLICY_VERSION
-            and previous.get("profile_fingerprint") == profile_fingerprint(account)
-            and previous.get("quality_status") == "qualified"
-            and automatic_exit_reason(previous) is None
+        from app.modules.acquisition.qualification_events import pending
+        collection_event = await pending(service.db, membership) if membership is not None else None
+        from app.modules.acquisition.qualification_events import same_evidence_event
+        from app.core.account.idempotency import operation_key
+        event_version = hashlib.sha256(
+            json.dumps(collection_event or {}, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        collection_operation_key = operation_key(
+            account_id=account_id,
+            operation="qualification_read",
+            subject_id=f"{membership.id}:{membership.joined_at}:{event_version}",
+            version=POLICY_VERSION,
         )
+        collection_reuse = bool(
+            not force_refresh
+            and row is not None
+            and row.decision in {"unknown", "technical_wait", "observe"}
+            and previous.get("collection_complete") is True
+            and previous.get("collection_operation_key") == collection_operation_key
+            and same_evidence_event(previous.get("collection_event"), collection_event)
+        )
+        if (row is not None and row.decision == "reject" and previous.get("ai_final")
+                and previous.get("ai_decision") == "fail" and not force_refresh
+                and (row.next_retry_at is None or row.next_retry_at > now)
+                and previous.get("profile_fingerprint") == profile_fingerprint(account)
+                and not previous.get("collection_needs_refresh")
+                and same_evidence_event(previous.get("collection_event"), collection_event)):
+            return JoinedGroupAuditResult(passed=False, reason=row.reason)
+        from app.modules.acquisition.qualification_continuity import OWN_SOURCE, effective_review, own_proof_valid
+        if row is not None and row.decision == "unknown" and not force_refresh:
+            approved = await effective_review(service.db, membership.id)
+            old = _payload(approved)
+            if (approved is not None and approved.id != row.id
+                    and approved.decision in {"allowed", "trial"}
+                    and authorization_current(approved, now)
+                    and scope_matches(approved, group, membership)
+                    and old.get("authorization_basis") == OWN_SOURCE
+                    and old.get("profile_fingerprint") == profile_fingerprint(account)
+                    and await own_proof_valid(service.db, old, membership, group, now)):
+                row.decision, row.reason = approved.decision, approved.reason
+                row.checked_at, row.expires_at = approved.checked_at, approved.expires_at
+                row.evidence_json, row.evidence_hash = approved.evidence_json, approved.evidence_hash
+                previous = old
+        from app.modules.acquisition.review_batch import current_batch
+        if row is not None and row.decision in {"allowed", "trial"} and current_batch.get() is not None:
+            await current_batch.get().close()
+        from app.modules.acquisition.qualification_renewal import try_light_renewal
+        renewed = await try_light_renewal(
+            service, account, group, membership, row, previous,
+            force_refresh=force_refresh or restricted_read or ai_evidence_reusable(previous, account, now, collection_event),
+        )
+        if renewed is not None:
+            from app.core.account.read_work import current
+            work = current(account_id)
+            if work is not None:
+                work.kind = "renewal"
+                work.outcome = row.decision if renewed.passed and row is not None else (renewed.reason or "technical_wait")
+                if row is not None:
+                    payload = _payload(row)
+                    payload["read_cost"] = work.summary()
+                    row.evidence_json = json.dumps(payload, ensure_ascii=False, default=str)
+            return renewed
+        reuse = not force_refresh and not restricted_read and ai_evidence_reusable(previous, account, now, collection_event)
+        from app.core.account.read_work import current
+        from app.modules.acquisition.review_cost import review_shape
+        active_work = current(account_id)
+        if active_work is not None:
+            active_work.phase, active_work.requested_reads = review_shape(
+                previous, row, membership, account, collection_event, now,
+                force_refresh=force_refresh or restricted_read)
+        from app.modules.acquisition.review_batch import current_batch
+        batch = current_batch.get()
         wrapper = None
+        verdict = "technical_wait"
         try:
-            if reuse:
+            if reuse or collection_reuse:
                 snapshot = {
                     key: value
                     for key, value in previous.items()
                     if key
                     not in {"previous_checks", "qualification_exit_history", "pending_collection"}
                 }
-                snapshot["collection_reused_for_ai"] = True
+                if reuse:
+                    snapshot["collection_reused_for_ai"] = True
+                else:
+                    snapshot["collection_reused"] = True
             else:
                 await service.account_pool.add_account_from_db(account)
-                wrapper = await service.account_pool.acquire_by_id(
-                    account_id,
-                    purpose="group_qualification",
-                    raise_on_lease_failure=True,
-                    allow_restricted=restricted_read,
-                )
+                wrapper = (await batch.acquire(account_id, restricted=restricted_read) if batch else
+                           await service.account_pool.acquire_by_id(
+                               account_id, purpose="group_qualification", raise_on_lease_failure=True,
+                               allow_restricted=restricted_read))
                 if wrapper is None or wrapper.client is None:
                     raise RuntimeError("account_unavailable")
                 client = wrapper.client
@@ -902,7 +1104,20 @@ async def assess(
                     and previous.get("system_identity_fingerprint") == identity_fingerprint
                     and not force_refresh
                 )
-                collector = EvidenceCollector(client, own_user_ids=own_ids)
+                from app.modules.acquisition.qualification_events import same_evidence_event
+                if not same_evidence_event(previous.get("collection_event"), collection_event):
+                    # Message hints remain useful, but a new event invalidates
+                    # skipped-page cursors and all assumptions about coverage.
+                    previous = {**previous, "collection_progress": {
+                        **(previous.get("collection_progress") or {}), "history_cursors": [],
+                    }}
+                # Leave other memberships a chance in the same read window.
+                # Unfinished identities retain message IDs for fresh continuation.
+                collector = EvidenceCollector(
+                    client, own_user_ids=own_ids, identity_limit=12, priority_identities=8,
+                )
+                from app.modules.acquisition.callback_evidence import hint_ids
+                collector.callback_message_ids = await hint_ids(service.db, membership, now)
                 collector.stop_on_permanent_mute = bool(membership.joined_at and membership.joined_at <= now - timedelta(hours=48))
                 if progress_valid:
                     collector.previous = previous
@@ -913,6 +1128,11 @@ async def assess(
                 snapshot["system_user_ids"] = sorted(own_ids)
                 snapshot["collected_at"] = now.isoformat()
                 snapshot["profile_fingerprint"] = profile_fingerprint(account)
+                snapshot["collection_event"] = collection_event
+                snapshot["collection_operation_key"] = collection_operation_key
+                snapshot["collection_complete"] = not bool(
+                    (snapshot.get("collection_progress") or {}).get("pending_message_ids")
+                ) and not snapshot.get("local_rpc_defer_reason")
             reason, verdict = snapshot["quality_reason"], snapshot["quality_status"]
             if snapshot.get("local_rpc_defer_reason"):
                 reason, verdict = snapshot["local_rpc_defer_reason"], "technical_wait"
@@ -928,9 +1148,20 @@ async def assess(
             if isinstance(exc, RpcDeferred):
                 reason = exc.reason
                 snapshot["retry_after_seconds"] = exc.retry_after_seconds
+                if previous.get("collection_progress") or previous.get("evidence"):
+                    snapshot["pending_collection"] = previous
         finally:
             if wrapper is not None:
-                await service.account_pool.release(wrapper)
+                if batch is None:
+                    await service.account_pool.release(wrapper)
+                elif verdict == "technical_wait":
+                    await batch.close()
+        from app.core.account.read_work import current, release
+        cost = current(account_id)
+        if cost is not None:
+            await release(cost)
+            cost.outcome = verdict
+            snapshot["read_cost"] = cost.summary()
         # No Telegram account lease is held during semantic review or its queue wait.
         previous_logs = list(
             (
@@ -990,7 +1221,7 @@ async def assess(
             )
             qualified_by_precedent = bool(ordinary_proof)
             limits = dict(await get_ad_capacity_settings(service.db))
-            limits["ad_policy_ai_require_second_pass"] = True
+            limits["ad_policy_ai_require_second_pass"] = False
             limits["require_evidence_arguments"] = True
             limits["ad_policy_ai_min_confidence"] = max(
                 95, int(limits.get("ad_policy_ai_min_confidence", 95))
@@ -1041,7 +1272,9 @@ async def assess(
                 )
                 snapshot["ai_pending"] = False
             else:
-                ad_result = await review_semantics(service, snapshot, account, ad_result, limits)
+                if batch is not None:
+                    await batch.close()  # AI latency must not hold the Telegram lease.
+                ad_result = await review_semantics(service, snapshot, account, ad_result, limits, previous=previous)
                 snapshot["exit_group_rule_ban"] = bool(
                     ad_result.ad_allowed is False
                     and ad_result.policy_mode == "forbidden"
@@ -1136,6 +1369,12 @@ async def assess(
         verdict = "reject"
         snapshot.pop("ai_pending", None)
         snapshot.pop("ai_review_incomplete", None)
+    if verdict == "technical_wait":
+        snapshot["first_blocked_at"] = previous.get("first_blocked_at") or now.isoformat()
+        snapshot["last_progress_at"] = (now.isoformat() if (snapshot.get("read_cost") or {}).get("reads")
+                                        else previous.get("last_progress_at"))
+    else:
+        snapshot["last_progress_at"] = now.isoformat()
     # Rate-limit waits start after collection ends, not when a long scan began.
     now = datetime.utcnow()
     snapshot.update(
@@ -1152,6 +1391,26 @@ async def assess(
         }
     )
     if membership is not None:
+        # An unsuccessful recheck is a job result, not a revocation of an
+        # existing approval. Preserve its timestamp, deadline and evidence.
+        if (not restricted_read and row is not None and row.decision in {"allowed", "trial"}
+                and (verdict == "technical_wait" or snapshot.get("ai_review_incomplete"))
+                and not exit_reason):
+            previous = _payload(row)
+            from app.core.account.read_work import current
+            work = current(account_id)
+            if work is not None:
+                work.outcome = "technical_wait"
+                snapshot["read_cost"] = work.summary()
+            previous["last_review_attempt"] = {"at": now.isoformat(), "reason": reason,
+                                               "technical_errors": snapshot.get("technical_errors", []),
+                                               "read_cost": snapshot.get("read_cost")}
+            if snapshot.get("collection_progress"):
+                previous["pending_collection"] = snapshot
+            row.evidence_json = json.dumps(previous, ensure_ascii=False, default=str)
+            row.state = "completed"
+            row.next_retry_at = now + timedelta(seconds=max(60, int(snapshot.get("retry_after_seconds") or 60)))
+            return JoinedGroupAuditResult(passed=False, reason=reason)
         if row is None:
             row = GroupQualificationAudit(
                 batch_id="automatic-" + uuid4().hex,
@@ -1186,6 +1445,7 @@ async def assess(
                     "pp-ai-qualification-v1", "pp-ai-qualification-v2", POLICY_VERSION
                 }
                 and historical.decision == "reject"
+                and not ai_failure_without_exit_evidence(old_snapshot)
             ):
                 exit_history.append(qualification_exit_fact(historical, old_snapshot))
         snapshot["checked_at"] = now.isoformat()
@@ -1196,7 +1456,7 @@ async def assess(
             }
         )
         verdict, reason, row.state, row.next_retry_at = review_schedule(snapshot, previous, now)
-        if verdict == "reject" and not qualifies_for_automatic_exit(snapshot):
+        if verdict == "reject" and not snapshot.get("ai_final") and not qualifies_for_automatic_exit(snapshot):
             row.next_retry_at = now + timedelta(hours=2)
         # Retain each previous evidence set (bounded by the maximum review lifecycle).
         history = list(previous.get("previous_checks", []))
@@ -1214,11 +1474,19 @@ async def assess(
         if previous.get("requested_account_ids") is not None:
             snapshot["requested_account_ids"] = previous["requested_account_ids"]
         row.decision, row.reason = verdict, reason
+        from app.core.account.read_work import current
+        work = current(account_id)
+        if work is not None:
+            work.outcome = verdict
+            snapshot["read_cost"] = work.summary()
         row.evidence_hash = snapshot_hash(snapshot, account_id, row.content_scope)
         row.checked_at = now
-        row.expires_at = min(now, _date(snapshot.get("collected_at")) or now) + timedelta(hours=24)
+        if verdict in {"allowed", "trial"}:
+            snapshot["authorization_mode"] = "events"
+        row.expires_at = evidence_expiry(_date(snapshot.get("collected_at")) or now, now)
         await service.db.flush()  # New automatic rows need a durable ID in the history.
-        if verdict == "reject" and row.policy_version == POLICY_VERSION:
+        if (verdict == "reject" and row.policy_version == POLICY_VERSION
+                and not ai_failure_without_exit_evidence(snapshot)):
             exit_history.append(
                 qualification_exit_fact(
                     row,
@@ -1353,6 +1621,14 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
     rows = []
     now = datetime.utcnow()
     for member in members:
+        from app.modules.acquisition.qualification_continuity import effective_review
+        active_authorization = await effective_review(db, member.id)
+        keep_approval = bool(
+            active_authorization and active_authorization.decision in {"allowed", "trial"}
+            and authorization_current(active_authorization, now)
+            and active_authorization.membership_joined_at == member.joined_at
+            and member.review_status == "approved" and member.ad_status == "active"
+        )
         pending = list(
             (
                 await db.scalars(
@@ -1366,6 +1642,8 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
             ).all()
         )
         for old in pending:
+            if keep_approval and old.id == active_authorization.id:
+                continue
             old.state, old.reason, old.next_retry_at = "cancelled", "superseded_by_recheck", None
         row = GroupQualificationAudit(
             batch_id=batch_id,
@@ -1380,15 +1658,19 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
         )
         db.add(row)
         rows.append(row)
-        member.review_status, member.ad_status = "initial_pending", "blocked"
+        if not keep_approval:
+            member.review_status, member.ad_status = "initial_pending", "blocked"
         member.review_started_at = member.review_deadline_at = member.review_next_at = None
         member.review_attempts = 0
     await db.flush()
     return [item.id for item in rows]
 
 
-async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100) -> list[int]:
+async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100, account_id: int | None = None) -> list[int]:
     """Recover missing confirmed-membership work; preserve deliberate terminal holds."""
+    from app.modules.acquisition.review_retention import retire_obsolete_reviews
+
+    await retire_obsolete_reviews(db, limit=500)
     recovered = []
     manual_query = select(GroupQualificationAudit).join(
         GroupAccountMembership, GroupAccountMembership.id == GroupQualificationAudit.membership_id
@@ -1401,6 +1683,8 @@ async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100) 
             GroupQualificationAudit.state != "cancelled"
         ).group_by(GroupQualificationAudit.membership_id)),
     ).limit(limit)
+    if account_id is not None:
+        manual_query = manual_query.where(GroupQualificationAudit.account_id == account_id)
     if config.get("exit_all_accounts") is not True and "account_ids" in config:
         manual_query = manual_query.where(GroupQualificationAudit.account_id.in_(_ids(config["account_ids"])))
     for audit in (await db.scalars(manual_query)).all():
@@ -1438,6 +1722,8 @@ async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100) 
     )
     if not (config.get("exit_all_accounts") is True) and "account_ids" in config:
         query = query.where(GroupAccountMembership.account_id.in_(_ids(config["account_ids"])))
+    if account_id is not None:
+        query = query.where(GroupAccountMembership.account_id == account_id)
     members = (
         await db.scalars(
             query.order_by(GroupAccountMembership.id)
@@ -1516,7 +1802,7 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
         latest_ad_review.state == "completed",
         latest_ad_review.decision.in_(["allowed", "trial"]),
         latest_ad_review.expires_at > now,
-        latest_ad_review.checked_at >= now - timedelta(hours=24),
+        latest_ad_review.checked_at >= now - EVIDENCE_TTL,
         ~exists(select(GroupQualificationAudit.id).where(
             GroupQualificationAudit.membership_id == latest_ad_review.membership_id,
             GroupQualificationAudit.id > latest_ad_review.id,
@@ -1607,7 +1893,18 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
     return accounts
 
 
-async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
+async def run_reviews(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
+    from app.modules.acquisition.review_batch import ReviewBatch, current_batch
+    batch = ReviewBatch(getattr(service, "account_pool", None))
+    token = current_batch.set(batch)
+    try:
+        return await _run_reviews(service, limit=limit, account_id=account_id)
+    finally:
+        current_batch.reset(token)
+        await batch.close()
+
+
+async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {"processed": 0, "results": []}
     config = await policy(service.db, fresh=True)
     if not config.get("enabled"):
@@ -1618,9 +1915,78 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
         from app.modules.acquisition.qualification_system_identity import ensure_system_identities
         await ensure_system_identities(service)
         config = await policy(service.db, fresh=True)
-    await ensure_membership_reviews(service.db, config)
-    suspended_accounts: set[int] = set()
-    for _ in range(limit):
+    await ensure_membership_reviews(service.db, config, account_id=account_id)
+    # A stored local-budget deadline is a forecast, not a platform cooldown.
+    # Reconsider it only after a fresh check proves a useful read slice is now
+    # available (for example after a reservation is released or idle loans grow).
+    reconsider_read_waits = False
+    reconsider_budget_wait_ids: set[int] = set()
+    local_read_wait = and_(
+        GroupQualificationAudit.state.in_(["queued", "completed"]),
+        GroupQualificationAudit.decision.in_(["unknown", "technical_wait"]),
+        GroupQualificationAudit.reason == "telegram_read_budget",
+    )
+    if account_id is not None:
+        # ``reason`` predates the durable wait ledger and only covers a subset
+        # of old rows.  The ledger is the source of truth for all rows whose
+        # future timer was produced by a local read-budget admission failure.
+        from app.modules.acquisition.review_waits import budget_wait_ids
+        reconsider_budget_wait_ids = await budget_wait_ids(
+            service.db, account_id, now=datetime.utcnow(), limit=500
+        )
+    if account_id is not None and (
+        reconsider_budget_wait_ids
+        or await service.db.scalar(select(GroupQualificationAudit.id).where(
+            local_read_wait, GroupQualificationAudit.account_id == account_id,
+            GroupQualificationAudit.next_retry_at > datetime.utcnow(),
+        ).limit(1))
+    ):
+        from app.core.account.rpc_governor import RpcDeferred, check_read_ready
+        try:
+            # This is only a wake-up probe.  The selected row performs its
+            # own exact read-cost check below, so a small available slice can
+            # wake a queue without falsely authorizing a larger collection.
+            await check_read_ready(service.db, account_id, purpose="group_qualification", minimum_reads=1)
+            reconsider_read_waits = True
+        except RpcDeferred:
+            pass
+    deferred_review_ids: set[int] = set()
+    reconsider_renewal_ids = []
+    if account_id is not None:
+        from app.core.account.rpc_governor import RpcDeferred, check_read_ready
+        checked_at = datetime.utcnow()
+        candidates = (await service.db.scalars(select(GroupQualificationAudit).where(
+            GroupQualificationAudit.account_id == account_id,
+            GroupQualificationAudit.state.in_(['queued', 'completed']),
+            GroupQualificationAudit.decision.in_(['allowed', 'trial']),
+            GroupQualificationAudit.next_retry_at > checked_at,
+        ).limit(300))).all()
+        try:
+            ready = (await check_read_ready(service.db, account_id, now=checked_at,
+                                           purpose='ad_qualification_refresh', minimum_reads=16)
+                     if candidates else {})
+            ready = ready if isinstance(ready, dict) else {}
+            boundaries = [checked_at + timedelta(seconds=ready['usage'][w]['ttl_seconds'])
+                          for w in ('hour', 'day') if ready.get('usage', {}).get(w, {}).get('ttl_seconds', -1) > 0]
+            for candidate in candidates:
+                saved = _payload(candidate)
+                local_wait = saved.get('renewal_wait_reason') == 'telegram_read_budget' or (
+                    saved.get('read_cost') or {}).get('outcome') == 'telegram_read_budget'
+                # Old readers did not label readiness deferrals. Only their
+                # precise current budget boundary is recognized during upgrade.
+                legacy_boundary = not saved.get('renewal_wait_reason') and any(
+                    0 <= (candidate.next_retry_at - end).total_seconds() <= 4 for end in boundaries)
+                if local_wait or legacy_boundary:
+                    reconsider_renewal_ids.append(candidate.id)
+        except RpcDeferred:
+            pass
+    claims = 0
+    # Readiness deferrals are local scheduling work, not execution quanta.
+    # Bound the scan, while letting independent ad renewals/local AI pass rows
+    # whose read lane is exhausted. Deferred deadlines persist across passes.
+    for _ in range(max(0, limit) * 4):
+        if claims >= limit:
+            break
         now = datetime.utcnow()
         other = aliased(GroupQualificationAudit)
         busy_account = exists(
@@ -1639,50 +2005,185 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
                     GroupQualificationAudit.next_retry_at <= now,
                 ),
             ),
+            # Recover a worker claim that expired before its durable
+            # writeback.  The subsequent path reuses the row's evidence and
+            # does not treat a terminal decision as a fresh review.
             and_(
-                GroupQualificationAudit.state.in_(
-                    ["running", "completed", "waiting_ai", "reviewing_ai"]
-                ),
+                GroupQualificationAudit.state == "running",
+                GroupQualificationAudit.next_retry_at.is_not(None),
+                GroupQualificationAudit.next_retry_at <= now,
+            ),
+            # The bounded waiting-AI lane is due work once its timer expires.
+            # Fresh reusable evidence resumes without a read; anything else
+            # still has to pass the read gate below.
+            and_(
+                GroupQualificationAudit.state == "waiting_ai",
+                GroupQualificationAudit.next_retry_at.is_not(None),
+                GroupQualificationAudit.next_retry_at <= now,
+            ),
+            # Technical/budget waits are explicitly retryable.  AI and
+            # completed semantic decisions are intentionally absent here;
+            # they are resumed only through a new evidence/renewal event.
+            and_(
+                GroupQualificationAudit.state == "completed",
+                GroupQualificationAudit.decision.in_(["unknown", "technical_wait"]),
+                GroupQualificationAudit.next_retry_at.is_not(None),
+                GroupQualificationAudit.next_retry_at <= now,
+            ),
+            # Send-time invalidation (qualification_actions.invalidate) and
+            # unresolved AI verdicts park rows as completed observe/reject
+            # decisions that still carry a retry timer.  No other path resumes
+            # them: without this branch such a row stays due-past forever while
+            # execution_admission keeps counting its membership as a pending
+            # first review, which permanently exhausts the join admission
+            # capacity (join_wait_execution_capacity deadlock).
+            and_(
+                GroupQualificationAudit.state == "completed",
+                GroupQualificationAudit.decision.in_(["observe", "reject"]),
+                GroupQualificationAudit.next_retry_at.is_not(None),
+                GroupQualificationAudit.next_retry_at <= now,
+            ),
+            # Expired approved/trial evidence is a renewal operation.  It is
+            # due work too; excluding it made the ad lane look healthy while
+            # silently leaving renewals behind older unresolved reviews.
+            and_(
+                GroupQualificationAudit.state == "completed",
+                GroupQualificationAudit.decision.in_(["allowed", "trial"]),
+                GroupQualificationAudit.next_retry_at.is_not(None),
                 GroupQualificationAudit.next_retry_at <= now,
             ),
         )
+        if reconsider_read_waits:
+            due = or_(due, local_read_wait, GroupQualificationAudit.id.in_(reconsider_budget_wait_ids))
+        if reconsider_renewal_ids:
+            due = or_(due, GroupQualificationAudit.id.in_(reconsider_renewal_ids))
         from app.core.account.rpc_governor import PREFIX, parse_date
         from app.core.settings_models import SystemSetting
         states = (await service.db.scalars(select(SystemSetting).where(SystemSetting.key.like(PREFIX + "%")))).all()
         cooling = [int(item.key[len(PREFIX):]) for item in states
                    if (parse_date(json.loads(item.value).get("pause_until")) or datetime.min) > now]
-        query = select(GroupQualificationAudit).where(due, ~busy_account)
-        if suspended_accounts:
-            query = query.where(GroupQualificationAudit.account_id.not_in(suspended_accounts))
+        exiting_membership = exists(select(GroupAccountMembership.id).where(
+            GroupAccountMembership.id == GroupQualificationAudit.membership_id,
+            GroupAccountMembership.review_status.in_(["exit_pending", "leave_failed", "membership_reconciliation"]),
+        ))
+        # Exit workers collect fresh evidence themselves. Ordinary reviews must
+        # not consume their due rows and clear the membership's exit state.
+        query = select(GroupQualificationAudit).where(due, ~busy_account, ~exiting_membership)
+        if account_id is not None:
+            query = query.where(GroupQualificationAudit.account_id == account_id)
+        if deferred_review_ids:
+            query = query.where(GroupQualificationAudit.id.not_in(deferred_review_ids))
         if cooling:
             query = query.where(GroupQualificationAudit.account_id.not_in(cooling))
         # Suspended reads remain due; do not consume attempts or model calls.
-        paused_accounts = select(TelegramAccount.id).where(TelegramAccount.risk_pause_until > now)
+        paused_accounts = select(TelegramAccount.id).where(or_(
+            TelegramAccount.risk_pause_until > now,
+            TelegramAccount.risk_level.in_(["quarantined", "frozen"]),
+            TelegramAccount.is_active.is_(False),
+        ))
         query = query.where(GroupQualificationAudit.account_id.not_in(paused_accounts))
         rollout_paused = [int(key) for key, value in (config.get("rollout_accounts") or {}).items()
                           if value.get("phase") == "paused"]
         if rollout_paused:
             query = query.where(GroupQualificationAudit.account_id.not_in(rollout_paused))
-        priority = await priority_account_ids(service.db, config, now)
-        if priority:
-            query = query.where(
-                or_(
-                    GroupQualificationAudit.account_id.not_in(priority),
-                    and_(
-                        GroupQualificationAudit.state == "waiting_ai",
-                        GroupQualificationAudit.expires_at > now,
-                    ),
-                )
-            )
+        priority = await priority_account_ids(service.db, config, now) if account_id is None else set()
+        # Due work is a scheduling preference, never an indefinite account veto.
+        # The operation lease still gives executable ads precedence at the RPC boundary.
+        priority_rank = case((GroupQualificationAudit.account_id.in_(priority), 1), else_=0)
         if not (config.get("exit_all_accounts") is True) and config.get("account_ids"):
             query = query.where(GroupQualificationAudit.account_id.in_(_ids(config["account_ids"])))
-        row = await service.db.scalar(
-            query.order_by(GroupQualificationAudit.next_retry_at, GroupQualificationAudit.id)
+        joined = exists(select(GroupAccountMembership.id).where(
+            GroupAccountMembership.id == GroupQualificationAudit.membership_id,
+            GroupAccountMembership.status == "joined",
+            GroupAccountMembership.left_at.is_(None),
+        ))
+        successful = exists(select(AdDeliveryLog.id).where(
+            AdDeliveryLog.account_id == GroupQualificationAudit.account_id,
+            AdDeliveryLog.group_id == GroupQualificationAudit.group_id,
+            AdDeliveryLog.status == "success",
+            AdDeliveryLog.telegram_message_id.is_not(None),
+            AdDeliveryLog.created_at >= now - timedelta(days=7),
+        ))
+        renewal_rank = case((and_(joined, or_(
+            GroupQualificationAudit.decision.in_(["allowed", "trial"]), successful,
+        )), 0), (or_(and_(
+            GroupQualificationAudit.checked_at.is_(None),
+            GroupQualificationAudit.decision == "unknown",
+            # A never-collected row that has been parked for a long period is
+            # stale maintenance work, not fresh join evidence.  Keep it in
+            # the normal retry family so it cannot displace an active renewal.
+            or_(
+                GroupQualificationAudit.next_retry_at.is_(None),
+                GroupQualificationAudit.next_retry_at >= now - timedelta(hours=6),
+            ),
+        ), and_(GroupQualificationAudit.batch_id.like("join-attempt:%"),
+                 GroupQualificationAudit.decision == "technical_wait")), 2), else_=1)
+        from app.modules.acquisition import qualification_queue
+        order = (priority_rank, GroupQualificationAudit.next_retry_at, renewal_rank, GroupQualificationAudit.id)
+        if account_id is not None:
+            family_order = qualification_queue.ordering(
+                await qualification_queue.cursor(service.db, account_id), renewal_rank
+            )
+            # A row parked for many hours is stale maintenance.  Keep it out
+            # of the first cursor turn so a currently qualified membership can
+            # renew before that historical item, while recent initial work
+            # continues to follow the persistent fair-turn cursor.
+            stale_rank = case(
+                (
+                    and_(
+                        GroupQualificationAudit.checked_at.is_(None),
+                        GroupQualificationAudit.decision == "unknown",
+                        GroupQualificationAudit.next_retry_at.is_not(None),
+                        GroupQualificationAudit.next_retry_at < now - timedelta(hours=6),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+            order = (stale_rank, *family_order)
+        selected = (await service.db.execute(
+            query.add_columns(renewal_rank).order_by(*order)
             .with_for_update(skip_locked=True)
             .limit(1)
-        )
-        if row is None:
+        )).first()
+        if selected is not None:
+            # If the only competing initial item is an old never-collected
+            # row, prefer an expired approval renewal.  This is a local DB
+            # ordering decision; it does not trigger an extra Telegram read.
+            selected_account_id = selected[0].account_id
+            stale_initial = (
+                selected[0].checked_at is None
+                and selected[0].decision == "unknown"
+                and selected[0].next_retry_at is not None
+                and selected[0].next_retry_at < now - timedelta(hours=6)
+            )
+            if stale_initial:
+                fresh_initial = await service.db.scalar(select(GroupQualificationAudit.id).where(
+                    GroupQualificationAudit.account_id == selected_account_id,
+                    GroupQualificationAudit.state == "queued",
+                    GroupQualificationAudit.decision == "unknown",
+                    GroupQualificationAudit.checked_at.is_(None),
+                    GroupQualificationAudit.next_retry_at.is_not(None),
+                    GroupQualificationAudit.next_retry_at >= now - timedelta(hours=6),
+                ).limit(1))
+                if fresh_initial is None:
+                    renewal = (await service.db.execute(
+                        query.where(
+                            GroupQualificationAudit.account_id == selected_account_id,
+                            GroupQualificationAudit.state == "completed",
+                            GroupQualificationAudit.decision.in_(["allowed", "trial"]),
+                            GroupQualificationAudit.next_retry_at.is_not(None),
+                            GroupQualificationAudit.next_retry_at <= now,
+                        ).add_columns(renewal_rank).order_by(
+                            GroupQualificationAudit.next_retry_at,
+                            GroupQualificationAudit.id,
+                        ).with_for_update(skip_locked=True).limit(1)
+                    )).first()
+                    if renewal is not None:
+                        selected = renewal
+        if selected is None:
             break
+        row, review_family = selected
         membership = await service.db.get(
             GroupAccountMembership, row.membership_id, populate_existing=True
         )
@@ -1700,6 +2201,12 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             or row.policy_version != POLICY_VERSION
             or row.content_scope != "text_profile"
         ):
+            if (latest is not None and latest.id != row.id
+                    and row.decision in {"allowed", "trial"}
+                    and membership is not None and scope_matches(row, group, membership)):
+                row.state, row.next_retry_at = "completed", None
+                await service.db.commit()
+                continue
             row.state, row.reason, row.next_retry_at = (
                 "cancelled",
                 "membership_or_scope_changed",
@@ -1731,38 +2238,128 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             await service.db.rollback()
             break
         from app.core.account.read_schedule import read_wait
-        pause = await read_wait(service.db, row.account_id, now, purpose="group_qualification")
-        if pause:
-            # Keep evidence, attempts and checked_at unchanged when no read can start.
-            # Older historical rows and running claims must not be rescheduled here.
-            newer = aliased(GroupQualificationAudit)
-            latest_due = select(GroupQualificationAudit.id).where(
-                GroupQualificationAudit.account_id == row.account_id, due,
-                GroupQualificationAudit.state != "running",
-                ~exists(select(newer.id).where(
-                    newer.membership_id == GroupQualificationAudit.membership_id,
-                    newer.id > GroupQualificationAudit.id, newer.state != "cancelled",
-                )),
-            )
-            from sqlalchemy import update
-            await service.db.execute(update(GroupQualificationAudit).where(
-                GroupQualificationAudit.id.in_(latest_due)
-            ).values(next_retry_at=pause[1]))
-            suspended_accounts.add(row.account_id)
+        account = await service.db.get(TelegramAccount, row.account_id, populate_existing=True)
+        previous = _payload(row)
+        previous = previous.get("pending_collection") or previous
+        from app.modules.acquisition.qualification_events import pending, acknowledge, same_evidence_event
+        change = await pending(service.db, membership)
+        from app.modules.acquisition.review_inventory import waiting_for_evidence
+        if waiting_for_evidence(row, now) and same_evidence_event(previous.get("collection_event"), change):
+            # Retire only an obsolete timer; new events/manual queues, read
+            # failures and real evidence maturity continue through the claim.
+            previous["review_trigger"] = "evidence_changed"
+            row.evidence_json = json.dumps(previous, ensure_ascii=False, default=str)
+            row.next_retry_at = None
+            membership.review_next_at = None
+            result["waiting_evidence"] = result.get("waiting_evidence", 0) + 1
             await service.db.commit()
             continue
-        row.state, row.next_retry_at = "running", now + timedelta(minutes=20)
+        from app.modules.acquisition.qualification_renewal import REFRESH_PURPOSE, eligible
+        light_renewal = (
+            not restricted_evidence_read_allowed(account, config, now)
+            and await eligible(service.db, account, group, membership, row, previous)
+        )
+        local_grant = light_renewal and change is None
+        local_ai = (not restricted_evidence_read_allowed(account, config, now)
+                    and ai_evidence_reusable(previous, account, now, change))
+        from app.core.account.read_work import review_required
+        from app.modules.acquisition.review_cost import review_shape
+        phase, fallback = review_shape(previous, row, membership, account, change, now,
+                                      force_refresh=restricted_evidence_read_allowed(account, config, now))
+        work_scope = f"{membership.id}:{membership.joined_at.isoformat()}" if membership.joined_at else ""
+        required = 16 if light_renewal else await review_required(row.account_id, group.id, work_scope,
+                                                                 phase=phase, fallback=fallback)
+        pause = None if local_ai or local_grant else await read_wait(
+            service.db, row.account_id, now,
+            purpose=REFRESH_PURPOSE if light_renewal else "group_qualification",
+            requires_bootstrap=True,
+            minimum_reads=required,
+            work_group_id=group.id,
+            work_scope=work_scope,
+        )
+        if pause:
+            # Defer only this network-dependent row. Another membership may
+            # already have complete evidence and require only the AI decision.
+            # An expired claim is no longer running. Keeping that state while
+            # extending its deadline would lock every other review on the account.
+            if row.state in {"running", "reviewing_ai"}:
+                row.state = "completed" if row.decision in {"allowed", "trial"} else "queued"
+            row.next_retry_at = pause[1]
+            from app.modules.acquisition.review_waits import record
+            await record(service.db, row.id, pause[0], required, pause[1], now)
+            if pause[0] == "telegram_read_budget" and row.decision in {"unknown", "technical_wait"}:
+                row.reason = pause[0]
+            if light_renewal:
+                saved = _payload(row)
+                saved['renewal_wait_reason'] = pause[0]
+                row.evidence_json = json.dumps(saved, ensure_ascii=False)
+            deferred_review_ids.add(row.id)
+            await service.db.commit()
+            continue
+        # Account quanta have a six-minute hard deadline. Their abandoned claim
+        # becomes eligible after eight minutes, without delaying unrelated accounts.
+        claim_seconds = 480 if account_id is not None else 1200
+        from app.modules.acquisition.review_waits import clear
+        await clear(service.db, row.id)
+        row.state, row.next_retry_at = "running", now + timedelta(seconds=claim_seconds)
         row.attempts = (row.attempts or 0) + 1
+        claimed_id, claimed_attempt = row.id, row.attempts
+        await qualification_queue.claimed(service.db, row.account_id, row.id, review_family)
         await service.db.commit()
-        audit = await assess(service, row.account_id, group, row=row)
+        claims += 1
+        try:
+            audit = await assess(service, row.account_id, group, row=row)
+        except Exception as exc:
+            # One malformed peer/model response must not leave the entire
+            # account locked in "running" until its abandoned-claim deadline.
+            await service.db.rollback()
+            current = await service.db.get(GroupQualificationAudit, claimed_id, with_for_update=True)
+            if (current is not None and current.attempts == claimed_attempt
+                    and current.state in {"running", "reviewing_ai"}):
+                current.state = "completed" if current.decision in {"allowed", "trial"} else "queued"
+                delay = min(900, 30 * 2 ** min(claimed_attempt, 5))
+                current.next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
+                await service.db.commit()
+            deferred_review_ids.add(claimed_id)
+            result["failed"] = result.get("failed", 0) + 1
+            result["results"].append({"audit_id": claimed_id, "reason": "review_exception:" + type(exc).__name__})
+            if type(exc).__name__ == "SoftTimeLimitExceeded":
+                raise
+            continue
         # A concurrent requeue or leave cannot be overwritten by a completed old read.
+        # Reacquire the audit row before the membership row so every writeback
+        # follows the dispatcher order and uses a fresh ORM instance.
+        await service.db.flush()
+        row = await service.db.scalar(select(GroupQualificationAudit).where(
+            GroupQualificationAudit.id == row.id,
+        ).with_for_update(of=GroupQualificationAudit).execution_options(populate_existing=True))
+        if row is None:
+            await service.db.rollback()
+            continue
+        membership = await service.db.scalar(select(GroupAccountMembership).where(
+            GroupAccountMembership.id == row.membership_id,
+        ).with_for_update(of=GroupAccountMembership).execution_options(populate_existing=True))
+        if membership is None:
+            row.state, row.reason, row.next_retry_at = (
+                "cancelled", "membership_or_scope_changed", None
+            )
+            await service.db.commit()
+            continue
         latest = await latest_review(service.db, membership.id, include_pending=True)
-        await service.db.refresh(membership)
         if (
             latest is None
             or latest.id != row.id
             or membership.joined_at != row.membership_joined_at
+            or membership.account_id != row.account_id
+            or membership.group_id != row.group_id
+            or membership.status not in {"joined", "pending", "rejected", "leave_failed"}
         ):
+            if (latest is not None and latest.id != row.id
+                    and row.decision in {"allowed", "trial"}
+                    and scope_matches(row, group, membership)):
+                row.state, row.next_retry_at = "completed", None
+                await service.db.commit()
+                continue
             row.state, row.reason, row.next_retry_at = (
                 "cancelled",
                 "superseded_during_collection",
@@ -1770,8 +2367,46 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             )
             await service.db.commit()
             continue
+        if getattr(audit, "passed", False):
+            if (membership.ad_status == "paused" or membership.review_status in {
+                "manual_required", "exit_pending", "owned_group_excluded",
+            }):
+                row.state, row.next_retry_at = "completed", None
+                await service.db.commit()
+                continue
+            if not await acknowledge(service.db, membership, change):
+                row.state, row.next_retry_at = "queued", datetime.utcnow()
+                membership.review_next_at = row.next_retry_at
+                await service.db.commit()
+                continue
+            from app.modules.acquisition.qualification_continuity import restore_own_authorization
+            await restore_own_authorization(service.db, membership.id, apply=True)
         decision = row.decision
         evidence = _payload(row)
+        from app.modules.acquisition.qualification_continuity import effective_review, review_only
+        if review_only(row):
+            approved = await effective_review(service.db, membership.id)
+            if (approved is not None and approved.id != row.id
+                    and approved.decision in {"allowed", "trial"}
+                    and authorization_current(approved, now)
+                    and scope_matches(approved, group, membership)
+                    and membership.ad_status not in {"paused", "blocked"}):
+                membership.review_status = "approved"
+                membership.review_next_at = row.next_retry_at
+                await service.db.commit()
+                result["processed"] += 1
+                result["results"].append({"audit_id": row.id, "decision": decision,
+                                          "reason": row.reason, "approval_retained": approved.id})
+                continue
+        if decision in {"allowed", "trial"} and not audit.passed:
+            # A deferred lightweight renewal retains its previous approval and
+            # ad profile. Only the next review deadline changes.
+            membership.review_next_at = row.next_retry_at
+            await service.db.commit()
+            result["processed"] += 1
+            result["results"].append({"account_id": row.account_id, "group_id": row.group_id,
+                                      "decision": decision, "reason": audit.reason, "deferred": True})
+            continue
         membership.review_started_at = _date(evidence.get("observation_started_at"))
         membership.review_deadline_at = (
             membership.review_started_at + timedelta(hours=24)
@@ -1807,12 +2442,15 @@ async def run_reviews(service: Any, *, limit: int = 1) -> dict[str, Any]:
             await service._sync_group_ad_policy_from_audit(group, audit)
         elif decision == "reject":
             membership.ad_status, membership.review_status = "blocked", "review_2h"
-            membership.review_next_at = row.next_retry_at or now + timedelta(hours=2)
+            membership.review_next_at = (row.next_retry_at if evidence.get("ai_final") else row.next_retry_at or now + timedelta(hours=2))
         else:
             membership.ad_status = (
                 "warming" if membership.status in {"joined", "pending"} else "blocked"
             )
-            membership.review_status = "review_2h"
+            membership.review_status = (
+                "initial_pending" if row.batch_id.startswith("join-attempt:")
+                and decision == "technical_wait" else "review_2h"
+            )
         await service.db.commit()
         result["processed"] += 1
         result["results"].append(
@@ -1951,15 +2589,13 @@ async def send_gate(
         or row.membership_joined_at != member.joined_at
     ):
         return "qualification_review_required"
-    if row.decision not in {"allowed", "trial"} or row.state != "completed":
+    if row.decision not in {"allowed", "trial"} or row.state not in {"completed", "running"}:
         return "qualification_not_approved"
-    if (
-        row.expires_at is None
-        or row.expires_at <= now
-        or row.checked_at is None
-        or row.checked_at < now - timedelta(hours=24)
-    ):
+    if not authorization_current(row, now):
         return "qualification_expired"
+    from app.modules.acquisition.qualification_events import pending
+    if await pending(db, member):
+        return "qualification_event_pending"
     if not scope_matches(row, group, member):
         return "qualification_scope_changed"
     snapshot = _payload(row)
@@ -1979,7 +2615,11 @@ async def send_gate(
     # A verified 24-hour ordinary-member precedent can authorize a trial even
     # when a current or historical group rule prohibits ads. Its original post
     # is rechecked by validate_live_send immediately before the actual send.
-    precedent_authorizes_trial = (
+    from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+    own_authorizes = snapshot.get("authorization_basis") == OWN_SOURCE
+    if own_authorizes and not await own_proof_valid(db, snapshot, member, group, now):
+        return "qualification_own_delivery_unconfirmed"
+    precedent_authorizes_trial = own_authorizes or (
         row.decision == "trial"
         and (snapshot.get("advertising_audit") or {}).get("decision_source")
         == "verified_ordinary_member_precedent"
@@ -2052,6 +2692,10 @@ async def send_gate(
                 for term in ("send_outcome_unknown", "delivery_unknown", "unconfirmed")
             )
         ):
+            if str(item.error or "").startswith("manual_evidence_required:"):
+                # Terminal reconciliation outcome recorded by the survival
+                # lane; no automatic action can resolve it further.
+                continue
             return "qualification_delivery_reconciliation_required"
         if item.status in {"pending", "sending"}:
             if reservation_token and item.reservation_token == reservation_token:
@@ -2102,7 +2746,7 @@ async def send_gate(
         return "qualification_system_identity_unconfirmed"
     if not snapshot.get("system_identity_coverage"):
         return "qualification_system_identity_unconfirmed"
-    if row.decision == "trial" and not trial_proof(
+    if row.decision == "trial" and not own_authorizes and not trial_proof(
         [item for item in snapshot.get("evidence", []) if item.get("topic_id") is None]
     ):
         return "qualification_ad_precedent_unconfirmed"
