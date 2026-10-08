@@ -27,10 +27,21 @@ def test_continuity_trial_below_threshold_keeps_normal_flow():
 
 
 def test_stale_reject_finalizes_after_three_attempts():
-    row = Row(decision="reject", reason="group_rules_no_authoritative_evidence", attempts=101)
+    row = Row(state="queued", decision="reject", reason="group_rules_no_authoritative_evidence", attempts=101)
     assert stale_claim_action(row, now=NOW) == "finalize_reject"
-    row2 = Row(decision="reject", reason="no_ordinary_member_ad_48h", attempts=1)
+    row2 = Row(state="queued", decision="reject", reason="no_ordinary_member_ad_48h", attempts=1)
     assert stale_claim_action(row2, now=NOW) is None
+
+
+def test_completed_reject_keeps_designed_retry_ladders():
+    # Completed reject rows are excluded even at high attempt counts: the
+    # AI-inconclusive observation ladder counts per-material streaks and
+    # maturity-scheduled rejects recover on evidence maturation. A lifetime
+    # threshold here would cut those ladders short.
+    for reason in ("group_rules_ai_consensus_failed", "group_rules_ai_unresolved_conflict",
+                   "no_ordinary_member_ad_48h"):
+        row = Row(state="completed", decision="reject", reason=reason, attempts=97)
+        assert stale_claim_action(row, now=NOW) is None, reason
 
 
 def test_retired_precedent_escalates_to_full_review():
@@ -52,11 +63,7 @@ def test_normal_reviews_never_escalate():
         Row(state="completed", decision="trial", reason="ordinary_member_ads_verified", attempts=50),
         Row(state="waiting_ai", decision="observe", reason="group_rules_ai_unavailable", attempts=9),
         Row(state="queued", decision="trial", reason="group_rules_ai_unresolved_conflict", attempts=9),
+        Row(state="running", decision="trial", reason="ordinary_member_ads_verified", attempts=9),
     ]
     for row in cases:
         assert stale_claim_action(row, now=NOW) is None, row.reason
-
-
-def test_graduation_window_is_renewal_aligned():
-    # The graduated timer must land on the standard two-week renewal horizon.
-    assert (NOW + timedelta(days=14)).date() == (NOW + timedelta(days=14)).date()

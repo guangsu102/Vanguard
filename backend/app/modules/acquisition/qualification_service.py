@@ -85,7 +85,15 @@ def stale_claim_action(row: Any, *, now: datetime) -> str | None:
         and attempts >= CONTINUITY_TRIAL_GRADUATION_ATTEMPTS
     ):
         return "graduate_trial"
-    if row.decision == "reject" and attempts >= STALE_CLAIM_ESCALATION_ATTEMPTS:
+    # Only the queued-reject anomaly finalizes here. Completed reject rows keep
+    # their designed retry ladders: the AI-inconclusive observation ladder
+    # counts per-material streaks, and maturity-scheduled rejects recover on
+    # evidence maturation. Both would be cut short by a lifetime-attempts
+    # threshold.
+    if (
+        row.state == "queued" and row.decision == "reject"
+        and attempts >= STALE_CLAIM_ESCALATION_ATTEMPTS
+    ):
         return "finalize_reject"
     if reason in RETIRED_PRECEDENT_REASONS and attempts >= STALE_CLAIM_ESCALATION_ATTEMPTS:
         return "escalate_full_review"
@@ -2280,26 +2288,44 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         action = stale_claim_action(row, now=now)
         if action == "graduate_trial":
             # A continuity-restored trial has been cheaply re-verified enough
-            # times; graduate to the standard long renewal schedule. The
-            # send-time rules revalidation remains the real-time guard.
+            # times; graduate to a long renewal horizon well inside the 30-day
+            # evidence TTL. The send-time rules revalidation remains the
+            # real-time guard.
             row.state, row.next_retry_at = "completed", now + timedelta(days=14)
+            membership.review_next_at = row.next_retry_at
             await service.db.commit()
             deferred_review_ids.add(row.id)
             continue
         if action == "finalize_reject":
             # A reject that keeps being re-queued without a terminal write is
             # already a concluded verdict; finalize it like the standard
-            # reject writeback instead of re-reviewing it every pass.
+            # reject writeback.  The ai_final marker keeps waiting_for_evidence
+            # exempting the row from execution capacity, otherwise a terminal
+            # non-AI reject would count as pending review forever.
+            saved = _payload(row)
+            saved["ai_final"] = True
+            saved["ai_decision"] = "fail"
+            row.evidence_json = json.dumps(saved, ensure_ascii=False, default=str)
             row.state, row.next_retry_at = "completed", None
+            membership.review_next_at = None
             await service.db.commit()
             deferred_review_ids.add(row.id)
             continue
         if action == "escalate_full_review":
             # The retired-precedent light re-check never converges on its own
             # (the precedent message is gone); escalate to a full evidence
-            # re-collection so the group gets a fresh, decisive review.
+            # re-collection.  Strip the prior snapshot's freshness markers so
+            # every light-reuse shortcut rejects it, keeping the old evidence
+            # only as previous_checks history.
+            prior = _payload(row)
+            history = prior.get("previous_checks") or []
+            history.append({k: v for k, v in prior.items() if k != "previous_checks"})
             row.state, row.decision, row.checked_at = "queued", "unknown", None
             row.reason = "qualification_escalated_full_review"
+            row.evidence_json = json.dumps(
+                {"decision": "unknown", "reason": "qualification_escalated_full_review",
+                 "previous_checks": history},
+                ensure_ascii=False, default=str)
             row.next_retry_at = now
             await service.db.commit()
             deferred_review_ids.add(row.id)
