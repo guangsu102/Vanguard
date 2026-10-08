@@ -52,6 +52,45 @@ AI_REVIEW_INCOMPLETE_REASONS = {
     "group_rules_ai_consensus_failed",
 }
 
+# Continuity-restored trials re-verify cheaply every cycle; after this many
+# verifications they graduate to the standard long renewal schedule instead
+# of occupying the review lane daily.
+CONTINUITY_TRIAL_REASONS = {
+    "own_ad_survived_twenty_four_hours",
+    "ordinary_member_ads_verified",
+}
+CONTINUITY_TRIAL_GRADUATION_ATTEMPTS = 3
+# Light re-checks that keep re-confirming the same non-converging state
+# (retired precedent snapshots, stale reject verdicts) escalate after this
+# many attempts instead of looping forever.
+STALE_CLAIM_ESCALATION_ATTEMPTS = 3
+
+
+def stale_claim_action(row: Any, *, now: datetime) -> str | None:
+    """Classify a claimed row that keeps re-confirming the same non-converging state.
+
+    Production data showed single rows re-claimed 100+ times: continuity
+    trials re-verified daily, retired-precedent snapshots re-confirmed with
+    4-read passes, and reject verdicts re-queued without a terminal write.
+    Each returns the escape action for the claim loop; None keeps the normal
+    review flow.
+    """
+    from app.modules.acquisition.qualification_continuity import RETIRED_PRECEDENT_REASONS
+
+    attempts = int(getattr(row, "attempts", 0) or 0)
+    reason = getattr(row, "reason", None)
+    if (
+        row.state == "queued" and row.decision == "trial"
+        and reason in CONTINUITY_TRIAL_REASONS
+        and attempts >= CONTINUITY_TRIAL_GRADUATION_ATTEMPTS
+    ):
+        return "graduate_trial"
+    if row.decision == "reject" and attempts >= STALE_CLAIM_ESCALATION_ATTEMPTS:
+        return "finalize_reject"
+    if reason in RETIRED_PRECEDENT_REASONS and attempts >= STALE_CLAIM_ESCALATION_ATTEMPTS:
+        return "escalate_full_review"
+    return None
+
 
 async def policy(db: Any, *, fresh: bool = False) -> dict[str, Any]:
     row = (
@@ -2238,6 +2277,33 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
             continue
         # Serialize the claim across different memberships of the same account.
         # The row lock lasts through the durable running-state commit.
+        action = stale_claim_action(row, now=now)
+        if action == "graduate_trial":
+            # A continuity-restored trial has been cheaply re-verified enough
+            # times; graduate to the standard long renewal schedule. The
+            # send-time rules revalidation remains the real-time guard.
+            row.state, row.next_retry_at = "completed", now + timedelta(days=14)
+            await service.db.commit()
+            deferred_review_ids.add(row.id)
+            continue
+        if action == "finalize_reject":
+            # A reject that keeps being re-queued without a terminal write is
+            # already a concluded verdict; finalize it like the standard
+            # reject writeback instead of re-reviewing it every pass.
+            row.state, row.next_retry_at = "completed", None
+            await service.db.commit()
+            deferred_review_ids.add(row.id)
+            continue
+        if action == "escalate_full_review":
+            # The retired-precedent light re-check never converges on its own
+            # (the precedent message is gone); escalate to a full evidence
+            # re-collection so the group gets a fresh, decisive review.
+            row.state, row.decision, row.checked_at = "queued", "unknown", None
+            row.reason = "qualification_escalated_full_review"
+            row.next_retry_at = now
+            await service.db.commit()
+            deferred_review_ids.add(row.id)
+            continue
         account_claim = await service.db.scalar(
             select(TelegramAccount.id)
             .where(TelegramAccount.id == row.account_id)
