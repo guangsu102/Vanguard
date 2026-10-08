@@ -106,10 +106,16 @@ def test_unrelated_promotions_do_not_reset_provider_rejection_backoff():
                          {"source": "recent_promotional_message", "message_id": 0,
                           "text": "unrelated offer"}]}
     result = service.review_schedule(data, {}, now)
-    assert result[3] is None and data["unchanged_rejection_count"] == 1
+    # An inconclusive provider rejection observes under the three-stage ladder
+    # instead of failing closed on the first attempt.
+    assert result[3] == now + timedelta(hours=12) and data["unchanged_rejection_count"] == 1
     duplicate = {**data, "decision": "observe", "ai_final": False,
                  "ai_review_incomplete": True}
-    assert service.review_schedule(duplicate, data, now)[3] is None
+    assert service.review_schedule(duplicate, data, now)[3] == now + timedelta(hours=24)
+    streak3 = {**data, "decision": "observe", "ai_final": False,
+               "ai_review_incomplete": True}
+    assert service.review_schedule(streak3, {"rejection_fingerprint": data["rejection_fingerprint"],
+                                             "unchanged_rejection_count": 2}, now)[3] is None
     changed = {**data, "evidence": [{"source": "full_about", "text": "changed rules"}],
                "ai_final": False, "ai_review_incomplete": True}
     assert service.review_schedule(changed, data, now)[3] == now + timedelta(hours=2)
@@ -133,7 +139,9 @@ async def test_ai_only_retry_does_not_acquire_telegram_or_renew_collection_date(
     result = json.loads(row.evidence_json)
     assert result["collection_reused_for_ai"]
     assert result["collected_at"] == collected.isoformat()
-    assert row.decision == "reject"
+    # An inconclusive AI verdict observes (degraded pacing) rather than
+    # rejecting the group on the first attempt.
+    assert row.decision == "observe"
 
 
 @pytest.mark.asyncio
