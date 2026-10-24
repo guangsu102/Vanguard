@@ -321,6 +321,14 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour=4, minute=37),
         "options": {"queue": "default", "expires": 3600},
     },
+    # P5 release observation: sample the release health, evaluate the gates
+    # against the pre-release baseline and engage the kill switch on a
+    # hard-stop verdict.  Decision-only; never touches Telegram directly.
+    "p5-rollout-observe-every-minute": {
+        "task": "app.core.scheduler.tasks.p5_rollout_observe_task",
+        "schedule": 60.0,
+        "options": {"queue": "default", "expires": 55},
+    },
 }
 
 # =============================================================================
@@ -345,6 +353,7 @@ celery_app.conf.beat_schedule["growth-account-dispatch-every-15s"] = {
 celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task": {"queue": "automation"},
     "app.core.scheduler.growth_dispatch.dispatch_growth_task": {"queue": "growth_dispatch"},
+    "app.core.scheduler.tasks.p5_rollout_observe_task": {"queue": "default"},
     "app.core.scheduler.tasks.group_qualification_task": {"queue": "qualification"},
     "app.core.scheduler.tasks.group_verification_task": {"queue": "growth_maintenance"},
     "app.core.scheduler.tasks.reconcile_join_requests_task": {"queue": "growth_maintenance"},

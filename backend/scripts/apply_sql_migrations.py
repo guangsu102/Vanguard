@@ -58,6 +58,7 @@ DEFAULT_MIGRATIONS = [
     "071_p3_qualification_snapshots.sql",
     "072_p4_pacing_and_history.sql",
     "073_preserve_growth_operation_identity.sql",
+    "074_p5_release_control.sql",
 ]
 
 

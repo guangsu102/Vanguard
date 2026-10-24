@@ -218,3 +218,22 @@ groups:
         annotations:
           summary: History archive backlog exceeds 5000 operations
           description: Enable archiving (disable dry-run) or increase the batch size; eligible rows are past their hot retention.
+
+  - name: vanguard-p5-rollout
+    interval: 30s
+    rules:
+      - alert: VanguardP5RolloutStopped
+        expr: vanguard_p5_rollout_stopped > 0
+        for: 1m
+        labels: {severity: critical, service: p5}
+        annotations:
+          summary: P5 rollout kill switch is engaged
+          description: A hard-stop gate verdict or an operator rollback stopped new ads/join admission for the release cohort; check the release record reasons and /api/operations/status.
+
+      - alert: VanguardP5GateHold
+        expr: vanguard_p5_gate_result == 1
+        for: 10m
+        labels: {severity: warning, service: p5}
+        annotations:
+          summary: P5 rollout gate is holding the release
+          description: A release metric regressed against the pre-release baseline (or a fairness/trend hold fired); do not expand the cohort until the gate passes again.

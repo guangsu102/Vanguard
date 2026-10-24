@@ -36,6 +36,7 @@ def _import_models() -> None:
         "app.modules.acquisition.qualification_snapshot",
                 "app.modules.acquisition.p2_models",
         "app.modules.acquisition.p4_models",
+        "app.modules.acquisition.p5_models",
         "app.modules.private_chat.models",
         "app.modules.qq.models",
         "app.modules.owned_group.models",

@@ -515,6 +515,36 @@ async def record_metrics(evaluation: PacingEvaluation, *, selected_account_id: i
         )
 
 
+def _p5_pacing_scope(candidate_ids: list[int]) -> set[int] | None:
+    """Effective pacing canary scope under the P5 release control plane.
+
+    While P5 governs, the release cohort is the one pacing scope and the
+    underlying ``P4_AD_PACING_ACCOUNT_IDS`` allowlist is ignored.  Returns
+    ``None`` when P5 governs but the resolved cohort is empty: fail closed,
+    no account is paced.  An empty set means "every candidate is paced",
+    matching the underlying P4 semantic used by ``canary_order``.
+    """
+    mode = settings.p5_rollout_mode
+    if mode in {"off", "shadow"}:
+        return settings.p4_pacing_canary_accounts
+    if mode == "canary":
+        canary = settings.p5_canary_accounts
+        return canary if canary else None
+    if mode == "full":
+        return set()
+    members = {
+        int(account_id)
+        for account_id in candidate_ids
+        if settings.p5_cohort_member(int(account_id))
+    } | settings.p5_canary_accounts
+    return members if members else None
+
+
+def _p5_pacing_active() -> bool:
+    """Real reordering also requires the P5 release unit to be live."""
+    return settings.p4_pacing_active and settings.p5_rollout_mode != "shadow"
+
+
 async def apply_to_dispatch(
     db: Any,
     legacy_order: list[int],
@@ -526,8 +556,9 @@ async def apply_to_dispatch(
     """Reorder one ads dispatch window and persist the decision.
 
     Returns the final account order (identical to ``legacy_order`` in shadow
-    mode or when every candidate is gated out of the canary).  The dispatcher
-    treats this as advisory: execution revalidates every authority as before.
+    mode, when P5 fail-closes an empty cohort, or when every candidate is
+    gated out of the canary).  The dispatcher treats this as advisory:
+    execution revalidates every authority as before.
     """
     import structlog
 
@@ -540,8 +571,9 @@ async def apply_to_dispatch(
     now_dt = datetime.utcfromtimestamp(now_epoch)
     last_scheduled = _ads_last_scheduled(last_runs or {})
     evaluation = await evaluate(db, legacy_order, now_dt, last_scheduled=last_scheduled)
-    active = settings.p4_pacing_active
-    canary = settings.p4_pacing_canary_accounts
+    scope = _p5_pacing_scope(legacy_order)
+    active = _p5_pacing_active() and scope is not None
+    canary = scope if scope is not None else set()
     paced = canary_order(evaluation, legacy_order, canary)
     if active:
         order = paced

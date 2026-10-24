@@ -2036,3 +2036,34 @@ def p4_history_governance_task() -> dict[str, Any]:
             severity=AlertSeverity.ERROR,
         )
         raise
+
+
+@celery_app.task(
+    name="app.core.scheduler.tasks.p5_rollout_observe_task",
+    time_limit=120,
+    soft_time_limit=100,
+)
+def p5_rollout_observe_task() -> dict[str, Any]:
+    """One P5 release observation cycle: sample, gate, record, act.
+
+    The observer is decision-only.  Its single traffic-facing lever is the
+    kill switch: a hard-stop gate verdict blocks new ads/join admission for
+    the release cohort while reconciliation keeps resolving results.
+    """
+
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.core.redis import get_redis
+        from app.modules.acquisition.p5_rollout import observe_cycle
+
+        return await observe_cycle(db, await get_redis())
+
+    try:
+        return _run_async(_run_with_db(handler))
+    except Exception as exc:
+        logger.error("p5_rollout_observe_failed", error=str(exc))
+        get_alert_manager().send_task_alert(
+            task_name="p5_rollout_observe_task",
+            error=str(exc),
+            severity=AlertSeverity.ERROR,
+        )
+        raise

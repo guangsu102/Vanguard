@@ -4,6 +4,7 @@ Vanguard Configuration Module
 Application configuration using Pydantic Settings with environment variable support.
 """
 
+import hashlib
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -13,6 +14,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_DEV_SECRET = "vanguard-development-secret-key-must-be-replaced-in-production-with-minimum-sixty-four-characters-long"
 PLACEHOLDER_VANGUARD_SIGNING_SECRET = "replace-with-shared-secret"
 PLACEHOLDER_VANGUARD_CALLBACK_SECRET = "replace-with-callback-secret"
+
+
+def p5_cohort_rank(account_id: int) -> int:
+    """Deterministic 0-99 cohort rank for one account.
+
+    The rank never changes, so growing ``P5_COHORT_PERCENT`` from N to M only
+    adds members; an account that already joined the cohort stays in it.
+    """
+    digest = hashlib.sha256(
+        f"vanguard:p5:cohort:v1:{int(account_id)}".encode()
+    ).hexdigest()
+    return int(digest[:8], 16) % 100
 
 
 class Settings(BaseSettings):
@@ -237,6 +250,46 @@ class Settings(BaseSettings):
         description="Maximum terminal operations archived per governance batch",
     )
 
+    # P5 unified release control plane for the P2-P4 growth release unit.
+    # ``off`` leaves the pre-P5 phase flags in charge (transparent).  Any
+    # governing mode (canary/cohort/full) makes the P5 cohort the single
+    # release-unit scope: it replaces the per-phase allowlists while the P2/P3
+    # master and lane flags stay mandatory.  ``shadow`` runs the controller
+    # (selection, gates, records) without allowing any real release traffic.
+    # The runtime kill switch is the persisted stopped state written by the
+    # observer; it blocks new ads/join admission for the stopped cohort even
+    # after the mode returns to ``off``.
+    P5_ROLLOUT_MODE: str = Field(
+        default="off",
+        description="P5 rollout mode: off|shadow|canary|cohort|full",
+    )
+    P5_CANARY_ACCOUNT_IDS: str = Field(
+        default="",
+        description="Comma-separated resolved canary account IDs; empty is fail closed",
+    )
+    P5_COHORT_PERCENT: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Stable-hash cohort percentage; growth from N% to M% keeps existing members",
+    )
+    P5_HISTORY_APPLY: bool = Field(
+        default=False,
+        description="Real history archiving requires an explicit approval after P5 observation; false keeps governance dry-run",
+    )
+    P5_RELEASE_ID: str = Field(
+        default="",
+        description="Immutable release id of the frozen P5 release candidate",
+    )
+
+    @field_validator("P5_ROLLOUT_MODE")
+    @classmethod
+    def validate_p5_rollout_mode(cls, value: str) -> str:
+        normalized = (value or "off").strip().lower()
+        if normalized not in {"off", "shadow", "canary", "cohort", "full"}:
+            raise ValueError("P5_ROLLOUT_MODE must be one of off|shadow|canary|cohort|full")
+        return normalized
+
     @property
     def p1_sync_canary_accounts(self) -> set[int]:
         return {
@@ -263,14 +316,59 @@ class Settings(BaseSettings):
         }
 
     def p2_outbox_enabled_for(self, kind: str, account_id: int) -> bool:
-        """Check the P2 lane and account canary gate for an operation kind."""
-        if not self.P2_OUTBOX_ENABLED or int(account_id) not in self.p2_canary_accounts:
+        """Check the P2 lane and account canary gate for an operation kind.
+
+        When the P5 rollout governs (canary/cohort/full), the P5 cohort is the
+        one release-unit scope and replaces the underlying allowlist; shadow
+        mode keeps the release unit record-only.  Mode ``off`` leaves the
+        pre-P5 baseline flags in charge.
+        """
+        if not self.P2_OUTBOX_ENABLED:
             return False
         if kind == "join_group":
-            return self.P2_JOIN_OUTBOX_ENABLED
-        if kind == "send_ad":
-            return self.P2_AD_OUTBOX_ENABLED
-        return False
+            if not self.P2_JOIN_OUTBOX_ENABLED:
+                return False
+        elif kind == "send_ad":
+            if not self.P2_AD_OUTBOX_ENABLED:
+                return False
+        else:
+            return False
+        mode = self.p5_rollout_mode
+        if mode == "off":
+            return int(account_id) in self.p2_canary_accounts
+        if mode == "shadow":
+            return False
+        return self.p5_cohort_member(int(account_id))
+
+    @property
+    def p5_canary_accounts(self) -> set[int]:
+        """Explicitly resolved P5 canary accounts; empty is fail closed."""
+        return {
+            int(value.strip())
+            for value in self.P5_CANARY_ACCOUNT_IDS.split(",")
+            if value.strip().isdigit() and int(value.strip()) > 0
+        }
+
+    @property
+    def p5_rollout_mode(self) -> str:
+        """Normalized P5 rollout mode (the field validator also guards it)."""
+        return (self.P5_ROLLOUT_MODE or "off").strip().lower()
+
+    @property
+    def p5_governs(self) -> bool:
+        """True when the P5 cohort is the active release-unit scope."""
+        return self.p5_rollout_mode in {"canary", "cohort", "full"}
+
+    def p5_cohort_member(self, account_id: int) -> bool:
+        """Cohort membership while P5 governs.
+
+        Members are the resolved canary accounts plus the stable-hash cohort;
+        canary accounts stay members at every percentage so expansion never
+        removes an account that already runs the release unit.
+        """
+        if int(account_id) in self.p5_canary_accounts:
+            return True
+        return p5_cohort_rank(int(account_id)) < self.P5_COHORT_PERCENT
 
     @property
     def p4_pacing_canary_accounts(self) -> set[int]:
@@ -535,6 +633,12 @@ class Settings(BaseSettings):
             errors.append(
                 "GROUP_AD_POLICY_API_KEY and GROUP_AD_POLICY_BASE_URL must both be set "
                 "when GROUP_AD_POLICY_DEDICATED_ENABLED=true"
+            )
+        # A governing P5 release must be attributable to one frozen, immutable
+        # release record; an unattributable release unit fails closed.
+        if self.p5_governs and not self.P5_RELEASE_ID.strip():
+            errors.append(
+                "P5_RELEASE_ID must be set when P5_ROLLOUT_MODE is canary, cohort or full in production"
             )
         if errors:
             raise ValueError("; ".join(errors))

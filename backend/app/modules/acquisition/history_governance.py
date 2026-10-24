@@ -636,7 +636,11 @@ async def run_pass(db: Any, *, now: datetime | None = None) -> dict[str, Any]:
         result["skipped"] = "history_governance_disabled"
         return result
     result["daily_stats"] = await refresh_daily_stats(db, now - timedelta(days=1))
-    if settings.P4_HISTORY_GOVERNANCE_DRY_RUN:
+    # P5 keeps history governance dry-run for the whole rollout; real
+    # archiving is a separate post-observation approval (P5_HISTORY_APPLY).
+    if settings.P4_HISTORY_GOVERNANCE_DRY_RUN or (
+        settings.p5_rollout_mode != "off" and not settings.P5_HISTORY_APPLY
+    ):
         result["skipped"] = "dry_run_mode"
         return result
     result["archive"] = await archive_batch(db, now)

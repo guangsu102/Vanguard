@@ -422,6 +422,21 @@ async def dispatch(db: Any, client: Any, broker: Any, publish: Any, *, now: floa
         from app.modules.acquisition.qualification_recovery import repair
         repairs = await repair(db, client, datetime.utcfromtimestamp(now))
         available = await account_sets(db, datetime.utcfromtimestamp(now))
+        # The P5 kill switch removes the stopped cohort from new ads/join
+        # admission; maintenance lanes keep resolving unconfirmed results.
+        try:
+            from app.modules.acquisition import p5_rollout
+
+            p5_blocked = await p5_rollout.dispatch_blocked_accounts(client)
+        except Exception:
+            p5_blocked = set()
+        if p5_blocked:
+            for guarded_stage in ("ads", "join"):
+                if available.get(guarded_stage):
+                    available[guarded_stage] = [
+                        account_id for account_id in available[guarded_stage]
+                        if int(account_id) not in p5_blocked
+                    ]
         await db.commit()  # No held DB connection while publishing.
         # Rotate maintenance stages too: a full shared queue cannot favor survival forever.
         stage_names = list(STAGES)
@@ -609,6 +624,24 @@ async def run_ticket(stage: str, account_id: int, token: str) -> dict:
     if claimed < 0:
         await finish(client, stage, account_id, token, now + 15)
         return {"reason": "growth_capacity_wait"}
+    if stage in PROTECTED_STAGES:
+        # A ticket published before a P5 hard stop must not execute either;
+        # the account retries with a short lease once the stop is cleared.
+        try:
+            from app.modules.acquisition import p5_rollout
+
+            if await p5_rollout.ticket_blocked(client, stage, account_id):
+                await finish(client, stage, account_id, token, now + 60)
+                return {
+                    "stage": stage,
+                    "account_id": account_id,
+                    "processed": 0,
+                    "skipped": 1,
+                    "reason": "p5_rollout_stopped",
+                    "retryable": False,
+                }
+        except Exception:
+            pass
     interval = 30
     outcome = "failed"
     result = {}

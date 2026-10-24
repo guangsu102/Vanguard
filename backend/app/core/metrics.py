@@ -71,6 +71,16 @@ P4_PACING_REASONS = {
 P4_DUPLICATE_KINDS = {"join_group", "send_ad"}
 P4_HISTORY_MODES = {"dry_run", "archive", "cleanup"}
 P4_HISTORY_OUTCOMES = {"succeeded", "failed"}
+# P5 rollout lifecycle events; the observer is the only writer.
+P5_EVENTS = {
+    "release_started",
+    "release_completed",
+    "gate_hold",
+    "gate_stop",
+    "cohort_changed",
+    "rollback",
+    "recovered",
+}
 
 COUNTER_LABELS = {
     "vanguard_join_attempts": ("status", "reason_class"),
@@ -97,6 +107,7 @@ EXTRA_COUNTER_LABELS = {
     "vanguard_p4_pacing_decisions_total": ("stage", "reason"),
     "vanguard_p4_duplicate_targets_total": ("kind",),
     "vanguard_p4_history_batches_total": ("mode", "outcome"),
+    "vanguard_p5_events_total": ("event",),
 }
 GAUGE_LABELS = {
     "vanguard_budget_remaining": ("lane", "window"),
@@ -139,6 +150,11 @@ GAUGE_LABELS = {
     "vanguard_p4_reconciliation_overdue": (),
     "vanguard_p4_history_eligible_operations": (),
     "vanguard_p4_history_oldest_eligible_age_seconds": (),
+    "vanguard_p5_release_active": (),
+    "vanguard_p5_rollout_stopped": (),
+    "vanguard_p5_cohort_size": (),
+    "vanguard_p5_gate_result": (),
+    "vanguard_p5_stage_age_seconds": (),
 }
 
 RECORD_LUA = """
@@ -218,6 +234,8 @@ def _safe_counter_labels(name: str, labels: list[str]) -> bool:
         return labels[0] in P4_DUPLICATE_KINDS
     if name == "vanguard_p4_history_batches_total":
         return labels[0] in P4_HISTORY_MODES and labels[1] in P4_HISTORY_OUTCOMES
+    if name == "vanguard_p5_events_total":
+        return labels[0] in P5_EVENTS
     return False
 
 
@@ -423,6 +441,13 @@ async def record_history_batch(mode: str, outcome: str) -> None:
     if mode not in P4_HISTORY_MODES or outcome not in P4_HISTORY_OUTCOMES:
         raise ValueError("invalid_metric_label")
     await _record({_field("vanguard_p4_history_batches_total", (mode, outcome)): 1})
+
+
+async def record_p5_event(event: str) -> None:
+    """P5 rollout lifecycle event counter (release/gate/cohort/rollback)."""
+    if event not in P5_EVENTS:
+        raise ValueError("invalid_metric_label")
+    await _record({_field("vanguard_p5_events_total", (event,)): 1})
 
 
 def age(now: datetime, value: datetime | None) -> float:
@@ -717,6 +742,7 @@ async def aggregate(db: Any, cache: Any) -> dict:
     p4_section = {"enabled": settings.P4_ADMIN_METRICS}
     if settings.P4_ADMIN_METRICS:
         p4_section.update(await _aggregate_p4(db, cache, now, gauge))
+    p5_section = await _aggregate_p5(db, cache, gauge)
     snapshot_at = await cache.get(SNAPSHOT_AT)
     result = {
         "at": time.time(),
@@ -724,6 +750,7 @@ async def aggregate(db: Any, cache: Any) -> dict:
         "ledger_snapshot_at": float(snapshot_at) if snapshot_at else 0,
         "slo": SLO,
         "p4": p4_section,
+        "p5": p5_section,
         "budget": {
             "enabled": settings.BUDGET_LEDGER_ENABLED,
             "snapshot_at": snapshot_at,
@@ -922,6 +949,29 @@ async def _aggregate_p4(db: Any, cache: Any, now: datetime, gauge: Any) -> dict[
     return section
 
 
+async def _aggregate_p5(db: Any, cache: Any, gauge: Any) -> dict[str, Any]:
+    """P5 rollout gauges from the latest release record and Redis state.
+
+    Emitted on every aggregation pass, including when P5 is off, so the
+    stopped gauge can never go stale while a kill switch is engaged.
+    """
+    try:
+        from app.modules.acquisition.p5_rollout import status_payload
+
+        payload = await status_payload(db, cache)
+    except Exception:
+        payload = {}
+    gauge("vanguard_p5_release_active", int(payload.get("release_status") == "active" and bool(payload.get("governs"))))
+    gauge("vanguard_p5_rollout_stopped", int(bool(payload.get("stopped"))))
+    gauge("vanguard_p5_cohort_size", int(payload.get("cohort_size") or 0))
+    gauge(
+        "vanguard_p5_gate_result",
+        {"pass": 0, "hold": 1, "stop": 2}.get(payload.get("gate_result"), -1),
+    )
+    gauge("vanguard_p5_stage_age_seconds", float(payload.get("stage_age_seconds") or 0))
+    return payload
+
+
 async def cached_status(cache: Any) -> dict:
     raw = await cache.get(SNAPSHOT)
     data = json.loads(raw) if raw else {}
@@ -933,6 +983,10 @@ async def cached_status(cache: Any) -> dict:
         "reconciliation": data.get("reconciliation", {"state": "unavailable"}),
         "runtime_reliability": data.get("runtime_reliability", {"state": "unavailable"}),
         "p4": data.get("p4", {"enabled": settings.P4_ADMIN_METRICS, "state": "unavailable"}),
+        "p5": data.get(
+            "p5",
+            {"governs": settings.p5_governs, "mode": settings.p5_rollout_mode, "state": "unavailable"},
+        ),
     }
 
 
