@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace as Obj
 from unittest.mock import AsyncMock
@@ -95,3 +96,30 @@ async def test_dynamic_legacy_paths_are_closed(test_db, monkeypatch):
     with pytest.raises(TelegramSendPreflightError):
         await execution.send_private_message(account, 12345, "广告")
     account.client.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["before_write", "during_write", "after_receipt"])
+async def test_owner_cancellation_retains_attempted_write_and_releases_only_preflight(test_db, monkeypatch, phase):
+    execution, account, gate, risk = await setup(test_db, monkeypatch)
+    if phase == "before_write":
+        gate.side_effect = [None, asyncio.CancelledError()]
+    elif phase == "during_write":
+        account.client.send_message.side_effect = asyncio.CancelledError()
+    else:
+        risk.record_success.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await execution.send_ad(account, -1001111222233, "文字简介", reservation_token="cancelled-owner")
+    row = await test_db.scalar(select(AccountOutboundAttempt))
+    assert row.state == {"before_write": "cancelled", "during_write": "unknown", "after_receipt": "succeeded"}[phase]
+    if phase == "before_write":
+        assert row.attempted_at is None
+        account.client.send_message.assert_not_awaited()
+    else:
+        assert row.attempted_at is not None
+        assert row.message_id == (99 if phase == "after_receipt" else None)
+        with pytest.raises(TelegramSendOutcomeUnknownError):
+            await execution.send_ad(account, -1001111222233, "文字简介", reservation_token="cancelled-owner")
+        with pytest.raises(TelegramSendPreflightError):
+            await execution.send_ad(account, -1001111222233, "另一文案", reservation_token="new-after-cancel")
+        assert account.client.send_message.await_count == 1

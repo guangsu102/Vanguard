@@ -1,0 +1,50 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 30s
+
+tests:
+  - name: shadow backlog stays visible without a stalled-consumer page
+    interval: 30s
+    input_series:
+      - series: 'vanguard_reconciliation_oldest_age_seconds{kind="join"}'
+        values: '2000+0x40'
+      - series: vanguard_reconciliation_shadow_mode
+        values: '1+0x40'
+      - series: vanguard_reconciliation_enabled
+        values: '1+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: VanguardReconciliationStalled
+        exp_alerts: []
+
+  - name: active unfinished work older than thirty minutes escalates
+    interval: 30s
+    input_series:
+      - series: 'vanguard_reconciliation_oldest_age_seconds{kind="join"}'
+        values: '2000+0x12'
+      - series: vanguard_reconciliation_shadow_mode
+        values: '0+0x12'
+      - series: vanguard_reconciliation_enabled
+        values: '1+0x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: VanguardReconciliationStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, service: reconciliation}
+            exp_annotations:
+              summary: Reconciliation task has been pending for over 30 minutes
+              description: Inspect the reconciliation stream consumer and database leases.
+
+  - name: unknown advertising outcomes escalate after one hour
+    interval: 30s
+    input_series:
+      - series: vanguard_ad_unresolved_oldest_age_seconds
+        values: '3601+0x12'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: VanguardAdUnknownCritical
+        exp_alerts:
+          - exp_labels: {severity: critical, service: growth}
+            exp_annotations:
+              summary: Unresolved advertising delivery is older than one hour
+              description: Escalate the evidence workflow in the monitoring console.

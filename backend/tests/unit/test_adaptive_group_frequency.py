@@ -202,9 +202,15 @@ async def test_independent_probe_budget_and_mature_capacity(test_db):
     budget = AccountOutboundBudgetService(test_db)
     info = await budget.snapshot(a.id, NOW)
     assert info["ad_lanes"]["probe"]["remaining"] == 0
+    assert info["ad_lanes"]["probe"]["next_allowed_at"] == (
+        NOW + timedelta(hours=22)
+    ).isoformat()
     assert info["ad_lanes"]["mature"]["remaining"] > 0
-    assert info["limits"]["total"] > 62
-    await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})
+    # Adaptive lanes remain independent for probe admission, while the
+    # account-wide configured ceiling still caps all outbound ads together.
+    assert info["limits"]["total"] == 62
+    with pytest.raises(OutboundBudgetBlocked, match="outbound_ad_budget"):
+        await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})
     state.mature = False
     with pytest.raises(OutboundBudgetBlocked, match="outbound_ad_probe_budget"):
         await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})
@@ -640,4 +646,5 @@ async def test_mature_sends_do_not_consume_thirty_probe_allowance(test_db):
     assert info["ad_lanes"]["mature"]["used_rolling_24h"] == 60
     assert info["ad_lanes"]["probe"]["used_rolling_24h"] == 0
     assert info["ad_lanes"]["probe"]["remaining"] == 30
-    await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})
+    with pytest.raises(OutboundBudgetBlocked, match="outbound_ad_budget"):
+        await budget._check(a.id, "ad", NOW, context={"frequency": svc.context(state)})

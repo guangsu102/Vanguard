@@ -5,8 +5,8 @@ SQLAlchemy 2.0 async support with connection pooling.
 """
 
 import importlib
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from sqlalchemy import MetaData
 from sqlalchemy.ext.asyncio import (
@@ -31,7 +31,7 @@ convention = {
 
 class Base(DeclarativeBase):
     """Base class for all database models."""
-    
+
     metadata = MetaData(naming_convention=convention)
 
 
@@ -43,7 +43,7 @@ async_session_factory: async_sessionmaker[AsyncSession] | None = None
 async def init_db(create_tables: bool = True) -> None:
     """Initialize database connection and optionally create tables."""
     global engine, async_session_factory
-    
+
     engine = create_async_engine(
         settings.DATABASE_URL,
         pool_size=settings.DATABASE_POOL_SIZE,
@@ -52,7 +52,7 @@ async def init_db(create_tables: bool = True) -> None:
         pool_recycle=3600,
         echo=settings.DEBUG,
     )
-    
+
     async_session_factory = async_sessionmaker(
         engine,
         class_=AsyncSession,
@@ -60,10 +60,11 @@ async def init_db(create_tables: bool = True) -> None:
         autocommit=False,
         autoflush=False,
     )
-    
+
     # Import model modules so SQLAlchemy registers every table with Base.metadata.
     for model_module in (
         "app.core.account.models",
+        "app.core.account.control_models",
         "app.core.group.models",
         "app.core.keyword.models",
         "app.core.user.models",
@@ -73,6 +74,9 @@ async def init_db(create_tables: bool = True) -> None:
         "app.api.broadcasts",
         "app.modules.guardian.models",
         "app.modules.acquisition.models",
+        "app.modules.acquisition.qualification_snapshot",
+        "app.modules.acquisition.p2_models",
+        "app.modules.acquisition.p4_models",
         "app.modules.private_chat.models",
         "app.modules.qq.models",
         "app.modules.owned_group.models",
@@ -101,7 +105,7 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Get database session for dependency injection."""
     if async_session_factory is None:
         raise RuntimeError("Database not initialized")
-    
+
     async with async_session_factory() as session:
         try:
             yield session
@@ -118,7 +122,7 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Get database session as context manager."""
     if async_session_factory is None:
         raise RuntimeError("Database not initialized")
-    
+
     async with async_session_factory() as session:
         try:
             yield session

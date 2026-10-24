@@ -49,6 +49,10 @@ class AccountOperationLeaseBusy(RuntimeError):
     """Raised when another operation currently owns an account lease."""
 
 
+class AccountSessionLeaseBusy(AccountOperationLeaseBusy):
+    """Raised when a Telegram auth-key session lease is owned elsewhere."""
+
+
 @dataclass(frozen=True)
 class AccountOperationLeaseHandle:
     account_id: int

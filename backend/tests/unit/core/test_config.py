@@ -121,6 +121,24 @@ def test_fast_llm_model_falls_back_to_primary_model_when_empty():
     assert configured.LLM_FAST_MODEL == 'primary-model'
 
 
+def test_group_ad_policy_dedicated_endpoint_is_opt_in():
+    configured = Settings(
+        _env_file=None,
+        GROUP_AD_POLICY_API_KEY="legacy-key",
+        GROUP_AD_POLICY_BASE_URL="https://ark.example/v1",
+    )
+
+    assert configured.GROUP_AD_POLICY_DEDICATED_ENABLED is False
+
+
+def test_group_ad_policy_dedicated_endpoint_requires_complete_configuration():
+    with pytest.raises(ValueError, match="GROUP_AD_POLICY_API_KEY"):
+        _production_settings(
+            GROUP_AD_POLICY_DEDICATED_ENABLED=True,
+            GROUP_AD_POLICY_BASE_URL="https://ark.example/v1",
+        )
+
+
 def test_redis_url_password_takes_precedence_over_legacy_password():
     configured = Settings(
         _env_file=None,

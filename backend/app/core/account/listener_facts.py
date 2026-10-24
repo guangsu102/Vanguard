@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
+from app.core.config import settings
 from app.core.worker_status import TelegramEventInbox
 
 
@@ -29,7 +30,15 @@ async def enqueue_fact(db: Any, account_id: int, fact: dict) -> None:
     elif kind != "deleted":
         identity.append(int(fact["at"] // 300))
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-    await db.execute(
+    now = datetime.utcnow()
+    coalesce_key = None
+    if kind == "gap" and settings.P1_RUNTIME_RELIABILITY_ENABLED and settings.P1_INBOX_COALESCE_SECONDS > 0:
+        # Gap cues have no message/receipt content. Membership, verification,
+        # rules, evidence candidates and exact deletion facts keep each fact.
+        coalesce_key = hashlib.sha256(json.dumps(
+            [account_id, fact["peer"], kind, fact.get("joined_at")], sort_keys=True,
+        ).encode()).hexdigest()
+    inserted = await db.scalar(
         insert(TelegramEventInbox)
         .values(
             account_id=account_id,
@@ -38,10 +47,35 @@ async def enqueue_fact(db: Any, account_id: int, fact: dict) -> None:
             chat_id=fact["peer"],
             payload_json=json.dumps(fact),
             state="pending",
-            next_attempt_at=datetime.utcnow(),
+            next_attempt_at=now,
+            available_at=now,
+            lane="listener_fact",
+            coalesce_key=coalesce_key,
         )
         .on_conflict_do_nothing(index_elements=["account_id", "event_key"])
+        .returning(TelegramEventInbox.id)
     )
+    if inserted is None or coalesce_key is None:
+        return
+    target = await db.scalar(select(TelegramEventInbox).where(
+        TelegramEventInbox.account_id == account_id,
+        TelegramEventInbox.coalesce_key == coalesce_key,
+        TelegramEventInbox.id < inserted,
+        TelegramEventInbox.state == "pending",
+        TelegramEventInbox.external_attempted.is_(False),
+        TelegramEventInbox.received_at >= now - timedelta(seconds=settings.P1_INBOX_COALESCE_SECONDS),
+    ).order_by(TelegramEventInbox.id.desc()).with_for_update(skip_locked=True).limit(1))
+    if target is None:
+        return
+    previous = json.loads(target.payload_json)
+    if float(fact["at"]) > float(previous["at"]):
+        target.payload_json = json.dumps(fact)
+    target.coalesced_count = int(target.coalesced_count or 0) + 1
+    # Preserve the unique event identity, so a duplicate producer delivery
+    # cannot coalesce repeatedly or recreate work after the original finishes.
+    row = await db.get(TelegramEventInbox, inserted)
+    row.state, row.completed_at = "completed", now
+    row.payload_json = json.dumps({"audit": {"coalesced_into": target.id, "replayed": False}})
 
 
 async def apply_fact(db: Any, account_id: int, fact: dict) -> None:

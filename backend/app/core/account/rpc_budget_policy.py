@@ -20,10 +20,14 @@ CRITICAL_PURPOSES = {
     "auto_join_leave",
     "qualification_exit_reconcile",
     "join_request_reconciliation",
+    # Public search is part of the automatic join transaction.  It must use
+    # the same protected join reservation as candidate previews and the final
+    # join request; charging it to background capacity makes a full routine
+    # window look like "no groups found" even when join reads remain.
+    "auto_join_search",
 }
 BACKGROUND = {
     "group_metadata_sync",
-    "auto_join_search",
     "search",
     "resource_search",
     "discover_related",
@@ -37,7 +41,7 @@ LANE_SHARES = {"ad": AD_SHARE_PERCENT, "survival": SURVIVAL_SHARE_PERCENT, "sync
 LANES = (*LANE_SHARES, "listener")
 WINDOWS = (("minute", 60), ("hour", 3600), ("day", 86400)) + tuple(
     (f"{lane}_{window}", duration)
-    for lane in ("background", "sync", "critical", "routine", "ad", "non_ad", "survival", "non_survival", "ad_pool", "join_reserved", "sync_reserved", "flex_reserved", "survival_lent", "listener", "critical_join", "critical_review", "sync_lent", "ad_lent")
+    for lane in ("background", "sync", "critical", "routine", "ad", "non_ad", "survival", "non_survival", "ad_pool", "join_reserved", "sync_reserved", "flex_reserved", "survival_lent", "listener", "critical_join", "critical_review", "sync_lent", "ad_lent", "sync_borrowed_ad", "sync_borrowed_survival")
     for window, duration in (("hour", 3600), ("day", 86400))
 )
 
@@ -63,7 +67,7 @@ def window_plan(limits: dict[str, int], lane: str) -> list[tuple[str, int, int]]
         ))
         for name, duration in WINDOWS
         if name in {"minute", "hour", "day"}
-        or (name.startswith(lane + "_") and not name.startswith(("survival_lent_", "sync_lent_", "ad_lent_")))
+        or (name.startswith(lane + "_") and not name.startswith(("survival_lent_", "sync_lent_", "ad_lent_", "sync_borrowed_")))
         or (lane != "ad" and name.startswith("non_ad_"))
         or (lane not in {"ad", "survival"} and name.startswith("non_survival_"))
     ]

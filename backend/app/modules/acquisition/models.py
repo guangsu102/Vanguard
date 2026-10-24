@@ -1884,8 +1884,16 @@ class GroupQualificationAudit(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Re-entrant P1 checkpoints.  ``checkpoint_revision`` identifies the
+    # membership/evidence version; a stage is considered reusable only when
+    # both values match the current review request.
+    checkpoint_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    checkpoint_revision: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    checkpoint_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    checkpoint_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     __table_args__ = (
         UniqueConstraint("batch_id", "membership_id", name="uq_group_qualification_batch_member"),
         Index("idx_group_qualification_due", "state", "next_retry_at"),
         Index("idx_group_qualification_member", "membership_id", "checked_at"),
+        Index("idx_group_qualification_checkpoint", "membership_id", "checkpoint_revision", "checkpoint_stage"),
     )

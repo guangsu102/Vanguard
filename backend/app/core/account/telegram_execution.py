@@ -40,6 +40,14 @@ class TelegramSendPreflightError(TelegramExecutionError):
     """A confirmed pre-send failure where no Telegram write was attempted."""
 
 
+class TelegramSendDeferredError(TelegramSendPreflightError):
+    """A typed local wait with proof that the write has not been attempted."""
+
+    def __init__(self, reason: str, retry_after_seconds: int):
+        self.reason = reason
+        super().__init__(reason, retry_after_seconds=max(1, retry_after_seconds))
+
+
 class TelegramSendReservationReleasePendingError(TelegramSendPreflightError):
     """The write was not attempted, but its risk reservation still needs recovery."""
 
@@ -576,7 +584,7 @@ class TelegramExecutionService:
                 row = await budget.reserve(account.account_id, attempt_key=attempt_key,
                     category=category, target_key=str(target), context=context)
             except OutboundBudgetBlocked as exc:
-                raise TelegramSendPreflightError(str(exc), retry_after_seconds=exc.retry_after_seconds) from exc
+                raise TelegramSendDeferredError(exc.reason, exc.retry_after_seconds or 60) from exc
             if row.state != "reserved":
                 unknown = TelegramSendOutcomeUnknownError("outbound_original_attempt_requires_reconciliation")
                 unknown.telegram_message_id = row.message_id
@@ -620,6 +628,20 @@ class TelegramExecutionService:
                     await budget.finish(attempt_key, account_id=account.account_id,
                                         state="succeeded", message_id=message_id)
             return result
+        except asyncio.CancelledError:
+            # The owner deadline may interrupt the RPC or its result writeback.
+            # Release only a confirmed unattempted reservation. An attempted
+            # write remains occupied until its exact receipt is reconciled.
+            if budget:
+                try:
+                    await budget.db.rollback()
+                    await budget.finish(attempt_key, account_id=account.account_id,
+                        state="succeeded" if message_id else "failed" if isinstance(rpc_error, RPCError)
+                              else "unknown" if attempted else "cancelled",
+                        message_id=message_id, error_code="CancelledError")
+                except Exception:
+                    pass  # The committed attempted marker still blocks a resend.
+            raise
         except Exception as exc:
             # Audit/database errors must not rewrite a known Telegram result into a retry.
             if budget:
@@ -634,6 +656,9 @@ class TelegramExecutionService:
             if not attempted:
                 if isinstance(exc, TelegramSendPreflightError):
                     raise
+                from app.core.account.rpc_governor import RpcDeferred
+                if isinstance(exc, (RpcDeferred, OutboundBudgetBlocked)):
+                    raise TelegramSendDeferredError(exc.reason, exc.retry_after_seconds or 60) from exc
                 raise TelegramSendPreflightError(str(exc), retry_after_seconds=getattr(exc, "retry_after_seconds", None)) from exc
             if message_id:
                 unknown = TelegramSendOutcomeUnknownError("send_outcome_unknown:post_send_audit_failed:" + type(exc).__name__)

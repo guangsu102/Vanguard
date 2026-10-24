@@ -18,10 +18,11 @@ def statement(days=180, **kwargs):
         source="owner_confirmation", confirmed_by=1, version=1, **kwargs))
 
 
-@pytest.mark.parametrize("days,allowed", [(179, False), (180, True)])
-def test_age_boundary_from_lower_bound(days, allowed):
+@pytest.mark.parametrize("days", [0, 2, 179, 180])
+def test_account_age_does_not_block_automation(days):
     account = Obj(registered_at=None, age_attestation_json=statement(days))
-    assert (account_age_eligibility_reason(account, NOW) is None) is allowed
+    assert account_age_eligibility_reason(account, NOW) is None
+    assert age_evidence(account, NOW)["minimum_age_days"] == days
     assert account.registered_at is None
 
 
@@ -33,8 +34,10 @@ def test_age_attestation_revocation_conflict_and_growth():
     a.registered_at = None
     a.age_attestation_json = statement(revoked_at=NOW.isoformat())
     assert age_evidence(a, NOW)["minimum_age_days"] is None
+    assert account_age_eligibility_reason(a, NOW) is None
     a.age_attestation_json = statement()
     assert age_evidence(a, NOW - timedelta(seconds=1))["minimum_age_days"] is None
+    assert account_age_eligibility_reason(Obj(registered_at=None, age_attestation_json=None), NOW) is None
 
 
 def test_exact_date_and_timezone_remain_distinct():

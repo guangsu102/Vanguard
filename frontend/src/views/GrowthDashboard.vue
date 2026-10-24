@@ -1036,10 +1036,10 @@ onBeforeUnmount(() => {
                 <el-switch v-model="warmupPolicyForm.enabled" />
               </el-form-item>
               <el-form-item label="默认天数">
-                <el-input-number v-model="warmupPolicyForm.default_warmup_days" :min="7" :max="120" />
+                <el-input-number v-model="warmupPolicyForm.default_warmup_days" :min="0" :max="120" />
               </el-form-item>
               <el-form-item label="账号生命周期最短暖号天数">
-                <el-input-number v-model="warmupPolicyForm.minimum_warmup_days" :min="7" :max="120" />
+                <el-input-number v-model="warmupPolicyForm.minimum_warmup_days" :min="0" :max="120" />
               </el-form-item>
               <el-form-item label="用户私聊倍率">
                 <el-input-number v-model="warmupPolicyForm.user_initiated_private_message_multiplier" :min="0" :max="2" :step="0.05" />
@@ -1051,7 +1051,7 @@ onBeforeUnmount(() => {
               </el-table-column>
               <el-table-column label="暖号天数" min-width="140">
                 <template #default="{ row }">
-                  <el-input-number v-model="warmupPolicyForm.tiers[row.value].warmup_days" :min="7" :max="120" size="small" />
+                  <el-input-number v-model="warmupPolicyForm.tiers[row.value].warmup_days" :min="0" :max="120" size="small" />
                 </template>
               </el-table-column>
             </el-table>

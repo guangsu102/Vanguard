@@ -4,6 +4,7 @@ from __future__ import annotations
 JOIN_PURPOSES = {
     "auto_join", "join_candidate_preview", "join_verification",
     "qualification_verification", "auto_join_leave", "join_request_reconciliation",
+    "auto_join_search",
 }
 
 
@@ -46,7 +47,11 @@ def add_workload_budgets(budget: dict, limits: dict) -> None:
         for window, duration in (("hour", 3600), ("day", 86400)):
             used = [usage[f"{lane}_{window}"]["used"] for lane in ("ad", "survival", "critical", "sync", "routine")]
             base = allocations(limits[window])
-            caps = transferred_caps(base, usage[f"survival_lent_{window}"]["used"], usage.get(f"sync_lent_{window}", {}).get("used", 0), usage.get(f"ad_lent_{window}", {}).get("used", 0))
+            caps = transferred_caps(base, usage[f"survival_lent_{window}"]["used"],
+                                    usage.get(f"sync_lent_{window}", {}).get("used", 0),
+                                    usage.get(f"ad_lent_{window}", {}).get("used", 0),
+                                    usage.get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
+                                    usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0))
             caps = lending_caps(caps, used, "critical", limits.get(f"survival_hold_{window}", -1), limits.get(f"sync_hold_{window}", -1), limits.get(f"ad_demand_hold_{window}", -1))
             hold = other_hold(base[2], used[2], usage[f"critical_join_{window}"]["used"],
                               usage[f"critical_review_{window}"]["used"], kind,

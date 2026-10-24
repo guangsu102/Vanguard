@@ -34,13 +34,17 @@ from app.core.account.operation_lease import (
     AccountOperationLeaseHandle,
     AccountOperationLeaseManager,
     AccountOperationLeaseUnavailable,
+    AccountSessionLeaseBusy,
 )
 from app.core.account.proxy_policy_events import ProxyPolicyState, get_account_proxy_policy_state
 from app.core.account.proxy_resolver import ResolvedProxy, normalize_proxy_mode
 from app.core.account.rpc_governor import RpcDeferred, RpcGovernor, install_governor
 from app.core.account.session_crypto import decrypt_session_string
 from app.core.account.session_files import resolve_telegram_session_file
-from app.core.account.session_guard import AccountSessionGuard
+from app.core.account.session_guard import (
+    AccountSessionGuard,
+    install_session_failure_hook,
+)
 from app.core.network.fingerprint import FingerprintManager
 from app.modules.owned_group.security import safe_exception_message
 
@@ -227,6 +231,10 @@ class AccountPool:
         self._session_dir: Optional[Path] = None
         self._static_proxy_resolver = static_proxy_resolver
         self._operation_lease_manager = operation_lease_manager or AccountOperationLeaseManager()
+        # Keep the last durable reason an account was filtered out of the pool.
+        # Callers that target a specific account can then distinguish a
+        # temporary proxy/session outage from a generic empty-pool result.
+        self._unavailability_reasons: dict[int, str] = {}
         self.logger = logger.bind(module="account_pool")
         # A sync returning zero only means that no new wrapper was created in
         # that pass.  Keep a structured report so callers can distinguish a
@@ -265,6 +273,9 @@ class AccountPool:
                 purpose=purpose,
                 error=safe_exception_message(exc, max_length=500),
             )
+            self._unavailability_reasons[int(account.account_id)] = (
+                "account_lease_unavailable:" + safe_exception_message(exc, max_length=300)
+            )
             if raise_on_failure:
                 raise
             return False
@@ -274,6 +285,7 @@ class AccountPool:
                 account_id=account.account_id,
                 purpose=purpose,
             )
+            self._unavailability_reasons[int(account.account_id)] = "account_lease_busy"
             if raise_on_failure:
                 raise AccountOperationLeaseBusy(
                     f"account operation lease busy: account_id={account.account_id} purpose={purpose}"
@@ -428,6 +440,7 @@ class AccountPool:
 
     async def invalidate_account(self, account_id: int, *, reason: str) -> bool:
         """Disconnect and evict one account so stale proxy settings cannot be reused."""
+        self._unavailability_reasons[int(account_id)] = str(reason)
         async with self._lock:
             account = next(
                 (item for item in self._accounts.values() if item.account_id == account_id),
@@ -445,6 +458,11 @@ class AccountPool:
                 reason=reason,
             )
             return True
+
+    def unavailability_reason(self, account_id: int) -> str | None:
+        """Return the last account-pool admission reason, if one is known."""
+
+        return self._unavailability_reasons.get(int(account_id))
 
     def _ensure_session_dir(self) -> Path:
         """Ensure session directory exists."""
@@ -543,6 +561,7 @@ class AccountPool:
             )
 
             self._accounts[session_name] = wrapper
+            self._unavailability_reasons.pop(int(account_id), None)
             self.logger.info(
                 "account_added",
                 session_name=session_name,
@@ -824,6 +843,7 @@ class AccountPool:
 
             if selected is None:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
+                self._unavailability_reasons[int(account_id)] = "account_not_in_pool"
                 return None
 
             allowed_statuses = [
@@ -840,6 +860,9 @@ class AccountPool:
                     status=selected.status.value,
                     purpose=purpose,
                 )
+                self._unavailability_reasons[int(account_id)] = (
+                    f"account_status:{selected.status.value}"
+                )
                 if raise_on_lease_failure and selected.status == AccountStatus.WORKING:
                     raise AccountOperationLeaseBusy(
                         f"account operation lease busy: account_id={account_id} purpose={purpose}"
@@ -850,6 +873,7 @@ class AccountPool:
                 self.logger.warning(
                     "account_session_missing", account_id=account_id, purpose=purpose
                 )
+                self._unavailability_reasons[int(account_id)] = "account_session_missing"
                 return None
 
             pause = getattr(selected.client, "_vanguard_listener_pause", None)
@@ -923,6 +947,7 @@ class AccountPool:
                 session_name=selected.session_name,
                 purpose=purpose,
             )
+            self._unavailability_reasons.pop(int(account_id), None)
             return selected
 
     async def listener_storage_snapshot(self, account_id: int) -> dict[str, Any]:
@@ -980,6 +1005,7 @@ class AccountPool:
 
             if selected is None:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
+                self._unavailability_reasons[int(account_id)] = "account_not_in_pool"
                 return None
 
             if selected.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
@@ -989,12 +1015,16 @@ class AccountPool:
                     status=selected.status.value,
                     purpose=purpose,
                 )
+                self._unavailability_reasons[int(account_id)] = (
+                    f"account_status:{selected.status.value}"
+                )
                 return None
 
             if require_session and not selected.session_exists:
                 self.logger.warning(
                     "account_session_missing", account_id=account_id, purpose=purpose
                 )
+                self._unavailability_reasons[int(account_id)] = "account_session_missing"
                 return None
 
             previous_keep_connected = selected.keep_connected
@@ -1064,6 +1094,14 @@ class AccountPool:
 
     async def _create_client(self, account: TelegramAccountWrapper) -> TelegramClient:
         """Create a Telethon client bound to the account session."""
+        # Retained budget pauses reconnect their existing client in connect_by_id.
+        # Other replacements must close the disconnected generation before
+        # acquiring another lease, including when its client reference was lost.
+        old_guard = account.session_guard
+        if old_guard is not None:
+            await old_guard.close()
+            account.session_guard = None
+        account.client = None
         session_guard: AccountSessionGuard | None = None
         api_id = str(account.api_id or "").strip()
         api_hash = str(account.api_hash or "").strip()
@@ -1137,56 +1175,81 @@ class AccountPool:
                     ),
                 )
                 if not await session_guard.acquire():
-                    raise RuntimeError(
+                    raise AccountSessionLeaseBusy(
                         f"Telegram session lease is busy for account {account.account_id}"
                     )
+        except asyncio.CancelledError:
+            if session_guard is not None:
+                with suppress(Exception):
+                    await session_guard.close()
+            raise
         except RuntimeError:
+            if session_guard is not None:
+                with suppress(Exception):
+                    await session_guard.close()
             raise
         except Exception as exc:
+            # Redis may be temporarily unavailable. Preserve the existing
+            # guarded-client fallback, but release a partially acquired token.
+            if session_guard is not None:
+                with suppress(Exception):
+                    await session_guard.close()
             self.logger.warning(
                 "telegram_session_lease_unavailable",
                 account_id=account.account_id,
                 error=safe_exception_message(exc, max_length=300),
             )
-        client = TelegramClient(
-            session,
-            api_id_int,
-            api_hash,
-            proxy=proxy_config,
-            device_model=device_model,
-            system_version=system_version,
-            app_version=app_version,
-            lang_code=lang_code,
-            system_lang_code=lang_code,
-            auto_reconnect=True,
-            connection_retries=TELEGRAM_CONNECTION_RETRIES,
-            retry_delay=TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS,
-            timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
-            base_logger=f"vanguard.telethon.account.{account.account_id}",
-            flood_sleep_threshold=0,
-            receive_updates=account.keep_connected,
-            sequential_updates=account.keep_connected,
-            catch_up=account.keep_connected,
-        )
-        if session_guard is not None:
-            session_guard.client = client
-            account.session_guard = session_guard
-            client._vanguard_session_guard = session_guard
-        install_governor(client, RpcGovernor(
-            account.account_id, lambda: account.active_purpose,
-            budget_reads=account.account_type == AccountType.PROMOTER,
-        ))
-        if account.keep_connected:
-            from app.core.account.listener_checkpoint import install_listener_checkpoint
-            from app.core.account.listener_pause import ListenerPause
-
-            # Lightweight fake clients used by offline tests have no SDK session.
-            if hasattr(client, "session"):
-                install_listener_checkpoint(client)
-
-            client._vanguard_listener_pause = ListenerPause(
-                client, lambda: self.pause_listener(account, client)
+        try:
+            client = TelegramClient(
+                session,
+                api_id_int,
+                api_hash,
+                proxy=proxy_config,
+                device_model=device_model,
+                system_version=system_version,
+                app_version=app_version,
+                lang_code=lang_code,
+                system_lang_code=lang_code,
+                auto_reconnect=True,
+                connection_retries=TELEGRAM_CONNECTION_RETRIES,
+                retry_delay=TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS,
+                timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
+                base_logger=f"vanguard.telethon.account.{account.account_id}",
+                flood_sleep_threshold=0,
+                receive_updates=account.keep_connected,
+                sequential_updates=account.keep_connected,
+                catch_up=account.keep_connected,
             )
+            if session_guard is not None:
+                session_guard.client = client
+                account.session_guard = session_guard
+                client._vanguard_session_guard = session_guard
+            install_session_failure_hook(client)
+            install_governor(client, RpcGovernor(
+                account.account_id, lambda: account.active_purpose,
+                budget_reads=account.account_type == AccountType.PROMOTER,
+            ))
+            if account.keep_connected:
+                from app.core.account.listener_checkpoint import install_listener_checkpoint
+                from app.core.account.listener_pause import ListenerPause
+
+                # Lightweight fake clients used by offline tests have no SDK session.
+                if hasattr(client, "session"):
+                    install_listener_checkpoint(client)
+
+                client._vanguard_listener_pause = ListenerPause(
+                    client, lambda: self.pause_listener(account, client)
+                )
+        except BaseException:
+            # The lease is claimed before SDK construction. Every local setup
+            # failure must release it, including a constructor/import error
+            # before ``account.session_guard`` is attached.
+            if session_guard is not None:
+                with suppress(Exception):
+                    await session_guard.close()
+                if account.session_guard is session_guard:
+                    account.session_guard = None
+            raise
         try:
             await client._vanguard_governor.before([])
             client._vanguard_governor.bootstrapping = account.keep_connected
@@ -1453,18 +1516,7 @@ class AccountPool:
                 return False
 
             account = self._accounts[session_name]
-            if account.client is not None:
-                try:
-                    if account.client.is_connected():
-                        await account.client.disconnect()
-                except Exception as e:
-                    self.logger.warning(
-                        "set_offline_disconnect_failed",
-                        session_name=session_name,
-                        error=safe_exception_message(e, max_length=500),
-                    )
-            account.status = AccountStatus.OFFLINE
-            account.client = None
+            await self._disconnect_account_client(account, reason="set_offline")
             return True
 
     async def set_error(self, session_name: str, error: str = "") -> bool:
@@ -1716,7 +1768,10 @@ class AccountPool:
                 except StaticProxyUnavailableError as exc:
                     await self.invalidate_account(
                         account.id,
-                        reason="static_proxy_unavailable",
+                        reason=(
+                            "static_proxy_unavailable:"
+                            + safe_exception_message(exc, max_length=300)
+                        ),
                     )
                     self.logger.warning(
                         "account_static_proxy_unavailable",
@@ -1757,10 +1812,14 @@ class AccountPool:
                 existing.system_version = account.system_version
                 existing.app_version = account.app_version
                 updated += 1
+                self._unavailability_reasons.pop(int(account.id), None)
             else:
                 try:
                     await self.add_account_from_db(account)
                 except StaticProxyUnavailableError as exc:
+                    self._unavailability_reasons[int(account.id)] = (
+                        f"static_proxy_unavailable:{safe_exception_message(exc, max_length=300)}"
+                    )
                     self.logger.warning(
                         "account_static_proxy_unavailable",
                         account_id=account.id,
@@ -1770,6 +1829,7 @@ class AccountPool:
                     filtered_by_static_proxy += 1
                     continue
                 synced += 1
+                self._unavailability_reasons.pop(int(account.id), None)
 
         supplied_stats = candidate_stats or {}
         filtered_by_status = int(supplied_stats.get("filtered_by_status", 0))

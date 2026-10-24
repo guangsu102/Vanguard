@@ -1,7 +1,7 @@
 import asyncio
 import importlib
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +28,7 @@ from app.core.account.models import (
 from app.core.group.join_review import JOIN_REVIEW_APPROVED
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.modules.acquisition.automation import AcquisitionAutomationService
+from app.modules.acquisition.ad_readiness import AdSkipReason
 from app.modules.acquisition.models import AccountAdBinding, AdCampaign
 from app.modules.owned_group.models import OwnedGroupAsset
 
@@ -309,6 +310,53 @@ async def test_zero_ad_health_limit_still_runs_probe_checks_but_blocks_ad_send(t
     ]
     service._choose_delivery_creative.assert_not_awaited()
     send_ad.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ad_skip_deadline_is_kept_for_growth_dispatch_backoff(test_db, monkeypatch):
+    monkeypatch.setattr(
+        "app.core.account.rpc_governor.check_dispatch_ready",
+        AsyncMock(return_value={"state": "ready"}),
+    )
+    service = AcquisitionAutomationService(test_db)
+    campaign = SimpleNamespace(id=711, delivery_policy="growth")
+    binding = SimpleNamespace(id=712, account_id=713, campaign=campaign)
+    membership = SimpleNamespace(
+        telegram_group_id=714,
+        group=SimpleNamespace(id=715),
+    )
+    retry_at = datetime.utcnow() + timedelta(hours=2)
+
+    monkeypatch.setattr(
+        service, "_list_enabled_ad_bindings_for_account", AsyncMock(return_value=[binding])
+    )
+    monkeypatch.setattr(
+        service, "_list_joined_groups_for_account", AsyncMock(return_value=[membership])
+    )
+    monkeypatch.setattr(service, "_growth_ad_health_allowed", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_campaign_is_active", lambda _campaign: True)
+    monkeypatch.setattr(
+        service,
+        "_ad_skip_reason",
+        AsyncMock(return_value=AdSkipReason("frequency_daily_review_unknown", retry_at)),
+    )
+
+    result = await service._run_ad_delivery_for_account(
+        binding.account_id,
+        binding_ids=[binding.id],
+        dry_run=False,
+        delivery_budget={"remaining": 1},
+        delivery_budget_lock=asyncio.Lock(),
+        reserved_ad_targets=set(),
+        ad_target_lock=asyncio.Lock(),
+        max_deliveries_per_account=1,
+        stop_after_success=False,
+        stop_after_failure=False,
+    )
+
+    assert result.details[0]["reason"] == "frequency_daily_review_unknown"
+    assert result.details[0]["next_retry_at"] == retry_at.isoformat()
+    assert result.details[0]["retry_at"] == retry_at.isoformat()
 
 
 @pytest.mark.asyncio

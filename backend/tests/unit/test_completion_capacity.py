@@ -78,7 +78,10 @@ async def test_idle_join_floor_is_lent_with_and_without_backlog_flag(test_db, mo
     state = await rpc.snapshot(test_db, 2, datetime.utcnow())
     assert state['state'] == 'ready'
     assert state['limits']['join_idle_hold_day'] == 0
-    reason = 'join_wait_pending_review' if blocked != 'none' else 'no_executable_join_candidate'
+    # An initial review alone is not an executable join blocker: lending is
+    # held only when the review backlog is explicitly paused or a real
+    # candidate is ready to run.
+    reason = 'join_wait_pending_review' if blocked == 'backlog' else 'no_executable_join_candidate'
     assert state['join_idle_lending']['reason'] == reason
 
 

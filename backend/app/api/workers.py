@@ -12,10 +12,48 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.worker_status import TelegramWorkerRole, TelegramWorkerStatus, TelegramWorkerStatusValue
-from app.core.security import get_current_user
+from app.core.security import get_current_user, require_admin
+from app.core.worker_status import (
+    TelegramWorkerRole,
+    TelegramWorkerStatus,
+    TelegramWorkerStatusValue,
+)
 
 router = APIRouter()
+
+
+class InboxReconciliationRequest(BaseModel):
+    evidence: str = Field(min_length=10, max_length=1000)
+
+
+@router.get("/inbox/reconciliation")
+async def list_inbox_reconciliation(
+    db: AsyncSession = Depends(get_db), current_user: dict = Depends(get_current_user),
+) -> dict:
+    from app.core.worker_status import TelegramEventInbox
+    rows = (await db.scalars(select(TelegramEventInbox).where(
+        TelegramEventInbox.state == "reconciliation_required",
+    ).order_by(TelegramEventInbox.id).limit(100))).all()
+    return {"code": 0, "data": [{"id": row.id, "account_id": row.account_id,
+             "kind": row.kind, "chat_id": row.chat_id, "external_attempted": row.external_attempted,
+             "last_error": row.last_error, "received_at": row.received_at.isoformat()} for row in rows]}
+
+
+@router.post("/inbox/{event_id}/reconcile")
+async def reconcile_inbox_event(
+    event_id: int, request: InboxReconciliationRequest,
+    db: AsyncSession = Depends(get_db), current_user: dict = Depends(require_admin),
+) -> dict:
+    from app.core.account.event_inbox import resolve_reconciliation
+    try:
+        row = await resolve_reconciliation(db, event_id, evidence=request.evidence,
+                                           actor=str(current_user.get("sub", current_user.get("username", "operator"))))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await db.commit()
+    return {"code": 0, "data": {"id": row.id, "state": row.state, "replayed": False}}
 
 
 class WorkerHeartbeatRequest(BaseModel):

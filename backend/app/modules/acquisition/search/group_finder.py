@@ -162,6 +162,7 @@ class GroupFinder:
         account_id: Optional[int] = None,
         raise_errors: bool = False,
         operation_lease: AccountOperationLeaseHandle | None = None,
+        purpose: str = "search",
     ) -> list[DiscoveredGroup]:
         """
         Search groups by keyword.
@@ -173,23 +174,26 @@ class GroupFinder:
         Returns:
             List of discovered groups
         """
-        self.logger.info("search_by_keyword", keyword=keyword, limit=limit)
+        self.logger.info(
+            "search_by_keyword", keyword=keyword, limit=limit,
+            account_id=account_id, purpose=purpose,
+        )
 
         # 获取可用账号
         if account_id is not None and hasattr(self.account_pool, "acquire_by_id"):
             if operation_lease is not None:
                 account = await self.account_pool.acquire_by_id(
                     account_id,
-                    purpose="resource_search",
+                    purpose="resource_search" if purpose == "search" else purpose,
                     operation_lease=operation_lease,
                 )
             else:
                 account = await self.account_pool.acquire_by_id(
                     account_id,
-                    purpose="search",
+                    purpose=purpose,
                 )
         else:
-            account = await self.account_pool.acquire(purpose="search")
+            account = await self.account_pool.acquire(purpose=purpose)
 
         if account is None:
             self.logger.warning("search_no_account", keyword=keyword, account_id=account_id)

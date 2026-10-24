@@ -57,19 +57,34 @@ def test_unchanged_rejected_content_is_terminal_but_changed_content_resumes_once
     now = datetime.utcnow()
     first = snapshot('observe', reason='group_rules_ai_provider_content_rejected')
     result = service.review_schedule(first, {}, now)
-    assert result == ('reject', 'group_rules_ai_provider_content_rejected', 'completed', None)
-    assert first['review_trigger'] == 'ai_terminal_failure'
+    assert result == (
+        'observe',
+        'group_rules_ai_provider_content_rejected',
+        'completed',
+        now + timedelta(hours=12),
+    )
+    assert first['review_trigger'] == 'ai_incomplete_observation'
 
     duplicate = snapshot('observe', reason='group_rules_ai_provider_content_rejected')
     assert service.review_schedule(duplicate, first, now) == (
+        'observe',
+        'group_rules_ai_provider_content_rejected',
+        'completed',
+        now + timedelta(hours=24),
+    )
+    assert duplicate['review_trigger'] == 'ai_incomplete_observation'
+
+    terminal = snapshot('observe', reason='group_rules_ai_provider_content_rejected')
+    assert service.review_schedule(terminal, duplicate, now) == (
         'reject', 'group_rules_ai_provider_content_rejected', 'completed', None
     )
+    assert terminal['review_trigger'] == 'ai_terminal_failure'
 
     changed = snapshot('observe', reason='group_rules_ai_provider_content_rejected')
     changed.setdefault('evidence', []).append(
         {'source': 'full_about', 'message_id': 999, 'text': 'changed rules'}
     )
-    assert service.review_schedule(changed, first, now)[3] == now + timedelta(hours=2)
+    assert service.review_schedule(changed, terminal, now)[3] == now + timedelta(hours=2)
     assert changed['review_trigger'] == 'evidence_changed'
 
 

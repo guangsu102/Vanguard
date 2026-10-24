@@ -102,7 +102,8 @@ async def collection_for_groups(db: AsyncSession, targets: list[int]) -> dict[in
 
 
 async def sync_stale_groups(
-    db: AsyncSession, *, limit: int = 5, pool: Any = None
+    db: AsyncSession, *, limit: int = 5, pool: Any = None,
+    account_id: int | None = None, group_id: int | None = None,
 ) -> dict[str, Any]:
     """A shared six-hour refresh budget; no history scanning, joins or sends."""
     from app.core.account.pool import (
@@ -131,6 +132,7 @@ async def sync_stale_groups(
                 )
                 .where(
                     joined,
+                    True if group_id is None else Group.id == group_id,
                     or_(
                         SystemSetting.key.is_(None),
                         SystemSetting.updated_at <= now - timedelta(hours=FRESH_HOURS),
@@ -152,6 +154,7 @@ async def sync_stale_groups(
                     GroupAccountMembership, GroupAccountMembership.account_id == TelegramAccount.id
                 )
                 .where(
+                    True if account_id is None else TelegramAccount.id == account_id,
                     GroupAccountMembership.group_id == group.id,
                     GroupAccountMembership.status == "joined",
                     TelegramAccount.is_active.is_(True),
@@ -208,6 +211,36 @@ async def sync_stale_groups(
                                                "reason": plan["join_blocker"]})
                     # A scheduling deferral must not overwrite fresh group evidence.
                     continue
+            from app.core.account.session_exec import PROCESS_ID, forward, owner_id
+            from app.core.redis import get_redis
+
+            cache = await get_redis()
+            session_owner = await owner_id(cache, account.id)
+            if session_owner and session_owner != PROCESS_ID:
+                # Release the caller's DB connection while the session owner
+                # runs this exact group/account slice with its connected client.
+                await db.commit()
+                reply = await forward(account.id, f"group_metadata:{group.id}")
+                remote = (reply or {}).get("result")
+                if remote is not None and not (reply or {}).get("error"):
+                    for field in ("updated", "skipped", "failed"):
+                        counts[field] += int(remote.get(field, 0))
+                    counts["details"].extend(remote.get("details", []))
+                    if not remote.get("checked"):
+                        counts["skipped"] += 1
+                else:
+                    counts["skipped"] += 1
+                    counts["details"].append({"group_id": group.id, "result": "deferred",
+                                               "reason": "metadata_session_owner_unavailable"})
+                continue
+            if not session_owner and await cache.exists(f"vanguard:telegram:lease:{account.id}"):
+                # A missing/stale owner marker is not permission to contend for
+                # the auth key. Let the existing lease expire or recover first.
+                counts["skipped"] += 1
+                counts["details"].append({"group_id": group.id, "result": "deferred",
+                                           "reason": "metadata_session_owner_unavailable"})
+                await db.commit()
+                continue
             await pool.sync_from_db([account])
             wrapper = await pool.acquire_by_id(
                 account.id, purpose="group_metadata_sync", raise_on_lease_failure=True

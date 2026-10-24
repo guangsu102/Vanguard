@@ -11,6 +11,8 @@ import contextlib
 import json
 import math
 import re
+import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -32,6 +34,7 @@ from app.core.settings_models import SystemSetting
 logger = structlog.get_logger()
 PREFIX = "telegram.rpc.account."
 _SESSION_GATE = AccountSessionGate()
+_metric_rpc: ContextVar[tuple[str, str, int] | None] = ContextVar("metric_rpc", default=None)
 
 READ_PREFIXES = ("Get", "Search", "Resolve", "CheckChatInvite")
 
@@ -60,7 +63,7 @@ def recovery_factor(state: dict, now: datetime) -> float:
     return factor
 
 
-def limits_for(state: dict, now: datetime) -> dict[str, int]:
+def limits_for(state: dict, now: datetime, account_id: int | None = None) -> dict[str, int]:
     factor = recovery_factor(state, now)
     percent = settings.TELEGRAM_READ_BUDGET_PERCENT
     limits = {
@@ -68,6 +71,11 @@ def limits_for(state: dict, now: datetime) -> dict[str, int]:
         for name, base, floor in (("minute", 120, 6), ("hour", 240, 30), ("day", 2400, 120))
     }
     from app.core.account.reserved_reads import allocations, listener_reserve
+    sync_target = 20
+    p1_sync = account_id is not None and settings.p1_sync_enabled_for(account_id)
+    if p1_sync:
+        sync_target = settings.P1_SYNC_TARGET_PERCENT
+    limits["sync_target_enforced"] = int(p1_sync)
     for window in ("hour", "day"):
         ad, survival, joining, sync, flex = allocations(limits[window])
         for name, value in {"ad": ad, "survival": survival, "critical": joining,
@@ -81,9 +89,14 @@ def limits_for(state: dict, now: datetime) -> dict[str, int]:
         limits[f"survival_lent_{window}"] = survival
         limits[f"sync_lent_{window}"] = sync
         limits[f"ad_lent_{window}"] = ad
+        limits[f"sync_borrowed_ad_{window}"] = ad
+        limits[f"sync_borrowed_survival_{window}"] = survival
         limits[f"critical_join_{window}"] = joining
         limits[f"critical_review_{window}"] = joining
         limits[f"ad_pool_{window}"] = ad + flex
+        limits["sync_target_percent"] = sync_target
+        limits[f"sync_target_{window}"] = max(0, limits[window] * sync_target // 100)
+        limits[f"sync_protection_floor_{window}"] = max(0, limits[window] - ad - survival - joining)
     return limits
 
 
@@ -163,10 +176,14 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
         lent = raw[f"survival_lent_{window}"][0] if ttl != -2 else 0
         sync_lent = raw[f"sync_lent_{window}"][0] if ttl != -2 else 0
         ad_lent = raw[f"ad_lent_{window}"][0] if ttl != -2 else 0
-        caps = transferred_caps(caps, lent, sync_lent, ad_lent)
+        sync_borrowed_ad = raw[f"sync_borrowed_ad_{window}"][0] if ttl != -2 else 0
+        sync_borrowed_survival = raw[f"sync_borrowed_survival_{window}"][0] if ttl != -2 else 0
+        caps = transferred_caps(caps, lent, sync_lent, ad_lent, sync_borrowed_ad, sync_borrowed_survival)
         raw[f"survival_lent_{window}"] = (lent, ttl)
         raw[f"sync_lent_{window}"] = (sync_lent, ttl)
         raw[f"ad_lent_{window}"] = (ad_lent, ttl)
+        raw[f"sync_borrowed_ad_{window}"] = (sync_borrowed_ad, ttl)
+        raw[f"sync_borrowed_survival_{window}"] = (sync_borrowed_survival, ttl)
         control_used = raw[f"listener_{window}"][0] if ttl != -2 else 0
         control_room = max(0, limits[f"listener_{window}"]-control_used)
         raw[f"listener_{window}"] = (control_used, ttl)
@@ -220,6 +237,15 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
 
 def deferred_error(error: Exception | str) -> tuple[str, int] | None:
     """Recognize only pre-RPC scheduling outcomes, never unknown send outcomes."""
+    from app.core.account.telegram_execution import (
+        TelegramSendDeferredError,
+        TelegramSendOutcomeUnknownError,
+    )
+
+    if isinstance(error, TelegramSendOutcomeUnknownError):
+        return None
+    if isinstance(error, TelegramSendDeferredError):
+        return error.reason, error.retry_after_seconds
     if isinstance(error, RpcDeferred):
         return error.reason, error.retry_after_seconds
     from app.core.account.outbound_budget import OutboundBudgetBlocked
@@ -241,7 +267,7 @@ def deferred_error(error: Exception | str) -> tuple[str, int] | None:
 async def snapshot(db: Any, account_id: int, now: datetime) -> dict:
     state = await load_state(db, account_id)
     end = parse_date(state.get("pause_until"))
-    limits = limits_for(state, now)
+    limits = limits_for(state, now, account_id)
     factor = recovery_factor(state, now)
     result = {**state, "state": "recovering" if factor < 1.0 else "ready",
               "budget_percent": settings.TELEGRAM_READ_BUDGET_PERCENT,
@@ -348,6 +374,9 @@ class RpcGovernor:
         self.account_id, self.purpose, self.budget_reads = account_id, purpose, budget_reads
 
     async def before(self, methods: list[str], *, sync: bool = False) -> None:
+        _metric_rpc.set(None)
+        lane = None
+        started = time.monotonic()
         from app.core.database import get_db_session
         from app.core.redis import get_redis
 
@@ -365,7 +394,7 @@ class RpcGovernor:
             reads = sum(method.split(".")[-1].startswith(READ_PREFIXES) for method in methods)
             if not self.budget_reads:
                 return
-            limits = limits_for(state, now)
+            limits = limits_for(state, now, self.account_id)
             purpose = str(self.purpose())
             from app.core.account.event_inbox import current_event_id
             if current_event_id.get() is not None and not sync and purpose not in (AD_PURPOSES | {"ad_survival_check"}):
@@ -378,12 +407,13 @@ class RpcGovernor:
                 # Background catch-up remains on the separate sync lane.
                 lane = "listener"
             from app.core.account import read_work
-            work = read_work.current(self.account_id) if not sync and (
-                lane == 'critical' or purpose == 'ad_qualification_refresh'
-            ) else None
+            work = read_work.current(self.account_id) if not sync else None
+            if work is not None and read_work.lane_for(work) != lane:
+                work = None
             if not reads and work is None and purpose != "join_candidate_preview":
                 return
-            if lane == "critical" or work is not None or purpose == 'ad_qualification_refresh':
+            p1_sync = lane == "sync" and settings.p1_sync_enabled_for(self.account_id)
+            if lane == "critical" or work is not None or purpose == 'ad_qualification_refresh' or p1_sync:
                 # Recompute before each actual read. The Lua allocator retains
                 # all totals/TTLs and applies the buffer to current counters.
                 async with get_db_session() as db:
@@ -392,11 +422,13 @@ class RpcGovernor:
                         await read_work.ensure(db, self.account_id, current["limits"], redis)
                     elif current["state"] not in {"cooldown", "unavailable", "budget_wait"} and purpose == "join_candidate_preview":
                         from app.core.account.critical_fairness import purpose_budget
-                        # Preview must leave enough to join and perform a first
-                        # review. Stop before connecting if a new join is unfinished.
-                        pending = await read_work.initial_pending(db, self.account_id, 0)
-                        if pending:
-                            raise RpcDeferred("join_initial_review_pending", max(60, math.ceil((pending[1] - now).total_seconds())))
+
+                        # Preview shares the same account-local admission as
+                        # joining. One parked technical retry is not a veto.
+                        from app.modules.acquisition.growth_admission import admission_plan
+                        admission = await admission_plan(db, self.account_id, now, rpc=current)
+                        if admission['reason']:
+                            raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
                         required = read_work.DEFAULT_JOIN_READS + read_work.DEFAULT_REVIEW_READS + reads
                         if purpose_budget(current, purpose).get("remaining", 0) < required:
                             raise RpcDeferred("telegram_read_budget", read_work.minimum_wait(current, purpose, required))
@@ -413,7 +445,7 @@ class RpcGovernor:
             # advertising/survival pools still bound every actual RPC.
             catchup = lane == "sync" and getattr(self, "catchup", False)
             pace = (1000 if catchup
-                    else math.ceil(86400000 / limits["sync_day"]) if lane == "sync"
+                    else math.ceil(86400000 / limits.get("sync_target_day", limits["sync_day"])) if lane == "sync"
                     else {"routine": 1500, "background": 3000}.get(lane, 0))
             if lane == "sync" and getattr(self, "bootstrapping", False):
                 # A connection must finish get_me/GetState/GetDifference together.
@@ -471,6 +503,14 @@ class RpcGovernor:
                         delay = min(delay, completion_delay)
             if delay:
                 raise RpcDeferred("telegram_read_budget", math.ceil(delay / 1000))
+            if lane == "sync":
+                from app.core.metrics import record_sync_observation
+                waited = max(0, time.monotonic() - getattr(self, "_sync_wait_started", started))
+                await record_sync_observation(admission_to_read_seconds=waited, claim_wait_seconds=waited)
+                if hasattr(self, "_sync_wait_started"):
+                    del self._sync_wait_started
+            from app.core.metrics import purpose_class
+            _metric_rpc.set((lane, "sync" if sync and lane == "sync" else purpose_class(purpose), reads))
             from app.modules.acquisition.read_costs import charge_reads
             charge_reads(self.account_id, reads, lane)
             if not sync:
@@ -487,7 +527,13 @@ class RpcGovernor:
                     pipe.hincrby(usage_key, f"{lane}|{purpose}|{method}", 1)
                 pipe.expire(usage_key, 7 * 86400)
                 await pipe.execute()
-        except RpcDeferred:
+        except RpcDeferred as exc:
+            if lane == "sync":
+                if not hasattr(self, "_sync_wait_started"):
+                    self._sync_wait_started = started
+                if exc.reason == "telegram_read_budget":
+                    from app.core.metrics import record_sync_observation
+                    await record_sync_observation(protection_reason="unknown")
             raise
         except Exception as exc:
             logger.error(
@@ -570,6 +616,9 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             type(item).__module__.rsplit(".", 1)[-1] + "." + type(item).__name__
             for item in requests
         ]
+        from app.core.account.reconciliation_handlers import verification_only
+        if verification_only.get() and any(not method.split(".")[-1].startswith(READ_PREFIXES) for method in methods):
+            raise RuntimeError("reconciliation_write_forbidden")
         internal_sync = bool(methods) and all(method.split(".")[-1].startswith(READ_PREFIXES) for method in methods)
         internal_sync = internal_sync and asyncio.current_task() is getattr(client, "_updates_handle", None)
         while True:
@@ -620,6 +669,8 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
                 await asyncio.sleep(min(60, exc.retry_after_seconds + 1))
         if internal_sync:
             client._vanguard_sync_wait = None
+        metric_rpc = _metric_rpc.get()
+        rpc_outcome = "unknown"
         try:
             if any(not method.split(".")[-1].startswith(READ_PREFIXES) for method in methods):
                 from app.core.account.event_inbox import mark_external_attempt
@@ -631,9 +682,14 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             # session response is surfaced and quarantines the client rather
             # than being replayed against a new connection.
             async with _SESSION_GATE.operation(getattr(governor, "account_id", "unknown")):
+                guard = getattr(client, "_vanguard_session_guard", None)
+                if guard is not None:
+                    await guard.assert_owned()
                 result = await original(sender, request, ordered=ordered, flood_sleep_threshold=0)
+                rpc_outcome = "success"
             await record_request(getattr(governor, "account_id", None), requests, result)
         except Exception as exc:
+            rpc_outcome = "flood" if "FloodWait" in type(exc).__name__ else "error"
             await governor.failed(methods, exc)
             if is_wrong_session_error(exc):
                 client._vanguard_session_quarantined = True
@@ -650,6 +706,10 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
                     methods=methods,
                 )
             raise
+        finally:
+            if metric_rpc is not None:
+                from app.core.metrics import record_rpc
+                await record_rpc(metric_rpc[0], metric_rpc[1], rpc_outcome, metric_rpc[2])
         if internal_sync:
             client._vanguard_difference_continuation = type(result).__name__ == "DifferenceSlice"
             from app.core.account.sync_completion import record

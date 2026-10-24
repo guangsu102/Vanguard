@@ -35,7 +35,6 @@ def fresh(fact: dict, group: Any, account_id: int, now: datetime) -> bool:
     # A message sample is time-sensitive evidence and keeps its TTL.
     if fact.get("status") in {
         "metadata_checked", "identity_mismatch", "not_joinable",
-        "entity_unknown", "preview_error",
     }:
         return True
     return bool(expires and checked <= now < expires <= checked + timedelta(hours=6))
@@ -56,7 +55,7 @@ def ready(fact: dict) -> bool:
     )
 
 
-def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime) -> dict:
+def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime, previous: dict | None = None) -> dict:
     collected = min(now, date(hint.evidence_collected_at) or now)
     fact = {
         **asdict(hint),
@@ -76,6 +75,10 @@ def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime) -
         if hint.exclusion_reason
         else timedelta(hours=3) if ready(fact) else timedelta(minutes=15)
     )
+    if hint.status not in {"metadata_checked", "sampled", "identity_mismatch", "not_joinable"}:
+        fact["preview_terminal"] = False
+        fact["failure_count"] = min(5, int((previous or {}).get("failure_count") or 0) + 1)
+        ttl = timedelta(minutes=min(120, 15 * 2 ** (fact["failure_count"] - 1)))
     fact["expires_at"] = (collected + ttl).isoformat()
     fact["next_preview_at"] = fact["expires_at"]
     return fact
@@ -122,6 +125,19 @@ async def load(db: Any, account_id: int, group_ids: list[int]) -> dict[int, dict
 
 
 async def save(db: Any, account_id: int, group_id: int, fact: dict) -> None:
+    # Bind the read-only preview to the current local Telegram fact watermark.
+    # A later P2 producer must reject a preview collected before an inbox
+    # invalidation; the schema ``version`` above is only the JSON format
+    # version and cannot serve as that watermark.
+    from app.modules.acquisition.qualification_snapshot import current_fact_version
+
+    fact = dict(fact)
+    # ``group_id`` is the local database PK while the qualification fact
+    # watermark is keyed by Telegram's canonical group id.  Persist the
+    # latter so an inbox invalidation cannot leave a preview looking current.
+    fact["source_fact_version"] = await current_fact_version(
+        db, str(fact.get("telegram_group_id") or group_id)
+    )
     if db.get_bind().dialect.name == "postgresql":
         from sqlalchemy.dialects.postgresql import insert
     else:

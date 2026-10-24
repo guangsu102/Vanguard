@@ -13,12 +13,17 @@ import app.modules.acquisition.automation as automation_module
 from app.core.account.models import (
     AccountOperationConfig,
     AccountOperationMode,
+    AccountOutboundAttempt,
     AccountStatus,
     AccountType,
     TelegramAccount,
 )
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard, RiskBudget
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
+from app.modules.acquisition.ad_reconciliation import (
+    RECONCILIATION_REASON_PREFIX,
+    pause_unresolved_ad_schedules,
+)
 from app.modules.acquisition.automation import (
     AD_DELIVERY_THROTTLE_KEY_PREFIX,
     AcquisitionAutomationService,
@@ -96,6 +101,84 @@ async def test_growth_creative_selection_keeps_target_dedupe():
     )
 
 
+@pytest.mark.asyncio
+async def test_growth_creative_dedupe_matches_legacy_marked_peer_id(test_db):
+    """A marked channel peer must share history with its legacy raw ID."""
+    account = TelegramAccount(
+        identifier="marked-peer-dedupe",
+        session_name="marked-peer-dedupe",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    campaign = AdCampaign(
+        name="Marked peer dedupe",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    previous = AdCreative(name="Previous", content="same content", enabled=True)
+    candidate = AdCreative(name="Candidate", content="same content", enabled=True)
+    test_db.add_all([account, campaign, previous, candidate])
+    await test_db.flush()
+    raw_group_id = 951123
+    marked_group_id = -1_000_000_000_000 - raw_group_id
+    test_db.add(
+        AdDeliveryLog(
+            account_id=account.id,
+            telegram_group_id=marked_group_id,
+            ad_campaign_id=campaign.id,
+            creative_id=previous.id,
+            status=DeliveryStatus.SUCCESS.value,
+            sent_at=datetime.utcnow() - timedelta(hours=1),
+        )
+    )
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    allowed = await service._filter_recent_target_creatives(
+        [candidate], campaign.id, raw_group_id
+    )
+
+    assert allowed == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_ad_target_reservation_unifies_raw_and_marked_peer_ids():
+    service = AcquisitionAutomationService(db=AsyncMock())
+    reserved: set[int] = set()
+    lock = asyncio.Lock()
+
+    assert await service._reserve_ad_delivery_target(951124, reserved, lock)
+    assert not await service._reserve_ad_delivery_target(
+        -1_000_000_000_000 - 951124, reserved, lock
+    )
+
+
+@pytest.mark.asyncio
+async def test_ad_send_target_prefers_active_group_when_aliases_collide(test_db):
+    """A rejected marked-ID duplicate must not break the active raw-ID target."""
+    test_db.add_all(
+        [
+            Group(
+                id=11,
+                group_id=1_199_142_903,
+                username="Chineseinus",
+                status="active",
+            ),
+            Group(
+                id=83,
+                group_id=-1_001_199_142_903,
+                status="rejected",
+            ),
+        ]
+    )
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+
+    assert await service._ad_send_target(1_199_142_903) == "@Chineseinus"
+    assert await service._ad_send_target(-1_001_199_142_903) == "@Chineseinus"
+
+
 def test_ad_delivery_pool_unavailable_is_transient_not_account_issue():
     service = AcquisitionAutomationService(db=AsyncMock())
 
@@ -108,6 +191,9 @@ def test_ad_delivery_pool_unavailable_is_transient_not_account_issue():
     assert service._classify_ad_delivery_error(
         automation_module.AccountOperationLeaseUnavailable("redis unavailable")
     ) == "account_operation_lease_unavailable"
+    assert service._classify_ad_delivery_error(
+        RuntimeError("Telegram session lease is busy for account 35")
+    ) == "account_operation_lease_busy"
 
 
     assert service._classify_ad_delivery_error(
@@ -155,6 +241,7 @@ async def test_growth_campaign_account_daily_quota_reserves_and_releases(test_db
     await test_db.commit()
 
     service = AcquisitionAutomationService(test_db)
+    service._dynamic_qualification_mode = AsyncMock(return_value=False)
     first, first_reason = await service._claim_growth_campaign_daily_quota(
         campaign=campaign,
         account_id=account.id,
@@ -186,6 +273,58 @@ async def test_growth_campaign_account_daily_quota_reserves_and_releases(test_db
     )
     assert released is not None
     assert released_reason is None
+
+
+@pytest.mark.asyncio
+async def test_growth_campaign_daily_quota_still_applies_when_adaptive_ads_enabled(test_db):
+    account = TelegramAccount(
+        identifier="adaptive-growth-account-quota",
+        session_name="adaptive-growth-account-quota",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    config = AccountOperationConfig(
+        enabled=True,
+        account=account,
+        auto_ads_enabled=True,
+        adaptive_ads_enabled=True,
+        dynamic_capacity_enabled=True,
+        max_ads_per_day=30,
+        message_interval_seconds=600,
+    )
+    groups = [
+        Group(group_id=951005 + index, title=f"Adaptive quota group {index}", level=GroupLevel.A)
+        for index in range(2)
+    ]
+    campaign = AdCampaign(
+        name="Adaptive account daily quota",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+        max_sends_per_account_per_day=1,
+        max_sends_per_group_per_day=1,
+    )
+    creative = AdCreative(name="Adaptive quota creative", content="quota", enabled=True)
+    test_db.add_all([account, config, *groups, campaign, creative])
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    service._dynamic_qualification_mode = AsyncMock(return_value=False)
+    first, first_reason = await service._claim_growth_campaign_daily_quota(
+        campaign=campaign,
+        account_id=account.id,
+        group=groups[0],
+        creative=creative,
+    )
+    assert first is not None and first_reason is None
+
+    blocked, blocked_reason = await service._claim_growth_campaign_daily_quota(
+        campaign=campaign,
+        account_id=account.id,
+        group=groups[1],
+        creative=creative,
+    )
+    assert blocked is None
+    assert blocked_reason == "campaign_account_daily_limit"
 
 
 @pytest.mark.asyncio
@@ -240,6 +379,178 @@ async def test_growth_campaign_group_daily_quota_excludes_legacy_unreserved_prob
     )
     assert blocked is None
     assert blocked_reason == "campaign_group_daily_limit"
+
+
+@pytest.mark.asyncio
+async def test_qualified_growth_group_cap_is_shared_across_campaigns(test_db):
+    account = TelegramAccount(
+        identifier="qualified-global-group-cap",
+        session_name="qualified-global-group-cap",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=951014, title="Qualified global group cap", level=GroupLevel.A)
+    previous_campaign = AdCampaign(
+        name="Previous qualified campaign",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+        max_sends_per_account_per_day=30,
+        max_sends_per_group_per_day=10,
+    )
+    current_campaign = AdCampaign(
+        name="Current qualified campaign",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+        max_sends_per_account_per_day=30,
+        max_sends_per_group_per_day=10,
+    )
+    test_db.add_all([account, group, previous_campaign, current_campaign])
+    await test_db.flush()
+    test_db.add(
+        AdDeliveryLog(
+            account_id=account.id,
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            ad_campaign_id=previous_campaign.id,
+            status=DeliveryStatus.SUCCESS.value,
+            sent_at=datetime.utcnow() - timedelta(hours=2),
+        )
+    )
+    await test_db.commit()
+
+    reason = await AcquisitionAutomationService(test_db)._growth_campaign_daily_quota_reason(
+        campaign=current_campaign,
+        account_id=account.id,
+        group=group,
+        qualified=True,
+        now=datetime.utcnow(),
+    )
+
+    assert reason == "growth_group_global_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_qualified_group_cooldown_backoff_uses_exposure_deadline(test_db, monkeypatch):
+    now = datetime(2026, 10, 17, 12, 0)
+    account = TelegramAccount(
+        identifier="qualified-cooldown-backoff",
+        session_name="qualified-cooldown-backoff",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    config = AccountOperationConfig(
+        account=account,
+        enabled=True,
+        auto_ads_enabled=True,
+        dynamic_capacity_enabled=True,
+    )
+    group = Group(group_id=951016, title="Qualified cooldown backoff", level=GroupLevel.A)
+    campaign = AdCampaign(
+        name="Qualified cooldown backoff",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    exposure_at = now - timedelta(hours=2)
+    state = AdDeliveryScheduleState(
+        campaign=campaign,
+        account=account,
+        group=group,
+        telegram_group_id=group.group_id,
+        next_due_at=now,
+        status=AdScheduleStatus.SENDING.value,
+        lock_token="cooldown-token",
+    )
+    test_db.add_all(
+        [
+            account,
+            config,
+            group,
+            campaign,
+            state,
+            AdDeliveryLog(
+                account=account,
+                group=group,
+                telegram_group_id=group.group_id,
+                campaign=campaign,
+                status=DeliveryStatus.SUCCESS.value,
+                sent_at=exposure_at,
+            ),
+        ]
+    )
+    await test_db.flush()
+    await test_db.commit()
+    monkeypatch.setattr(automation_module, "_now", lambda: now)
+    monkeypatch.setattr(
+        automation_module,
+        "get_ad_delivery_execution_settings",
+        AsyncMock(
+            return_value={
+                "growth_group_global_cooldown_seconds": 86400,
+                "dispatcher_interval_seconds": 60,
+            }
+        ),
+    )
+
+    await AcquisitionAutomationService(test_db)._finish_ad_schedule_state(
+        state.id,
+        state.lock_token,
+        campaign=campaign,
+        succeeded=False,
+        reason="growth_group_global_cooldown",
+        completed_at=now,
+    )
+
+    await test_db.refresh(state)
+    assert state.status == AdScheduleStatus.RETRY.value
+    assert state.next_due_at == exposure_at + timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    ["campaign_account_daily_limit", "campaign_group_daily_limit"],
+)
+async def test_campaign_daily_quota_backoff_waits_for_next_operating_day(
+    test_db, reason
+):
+    now = datetime(2026, 10, 17, 12, 0)
+    account = TelegramAccount(
+        identifier=f"daily-quota-backoff-{reason}",
+        session_name=f"daily-quota-backoff-{reason}",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=951017, title="Daily quota backoff", level=GroupLevel.A)
+    campaign = AdCampaign(
+        name=f"Daily quota backoff {reason}",
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    state = AdDeliveryScheduleState(
+        campaign=campaign,
+        account=account,
+        group=group,
+        telegram_group_id=group.group_id,
+        next_due_at=now,
+        status=AdScheduleStatus.SENDING.value,
+        lock_token="daily-quota-token",
+    )
+    test_db.add_all([account, group, campaign, state])
+    await test_db.flush()
+    await test_db.commit()
+
+    await AcquisitionAutomationService(test_db)._finish_ad_schedule_state(
+        state.id,
+        state.lock_token,
+        campaign=campaign,
+        succeeded=False,
+        reason=reason,
+        completed_at=now,
+    )
+
+    await test_db.refresh(state)
+    assert state.status == AdScheduleStatus.RETRY.value
+    assert state.next_due_at == automation_module._day_start(now) + timedelta(days=1)
+    assert state.last_reason == reason
 
 
 @pytest.mark.asyncio
@@ -1538,6 +1849,140 @@ def test_delivery_schedule_lock_targets_only_schedule_table_on_postgresql():
     sql = " ".join(str(statement.compile(dialect=postgresql.dialect())).split())
 
     assert "FOR UPDATE OF ad_delivery_schedule_state" in sql
+
+
+@pytest.mark.asyncio
+async def test_unresolved_ad_outbound_pauses_schedule_and_blocks_claim(test_db):
+    now = datetime(2026, 10, 17, 8, 0, 0)
+    account = TelegramAccount(
+        identifier="reconciliation-fenced-account",
+        session_name="reconciliation-fenced-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=991001, title="Fenced target", level=GroupLevel.A)
+    campaign = AdCampaign(
+        name="Fenced target campaign",
+        enabled=True,
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    membership = GroupAccountMembership(
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        account_id=account.id,
+        status="joined",
+        review_status="approved",
+        ad_status="active",
+    )
+    state = AdDeliveryScheduleState(
+        campaign_id=campaign.id,
+        account_id=account.id,
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        next_due_at=now,
+        status=AdScheduleStatus.RETRY.value,
+        last_reason="campaign_group_daily_limit",
+    )
+    attempt = AccountOutboundAttempt(
+        account_id=account.id,
+        attempt_key="ad:reconciliation-fenced",
+        category="ad",
+        target_key=str(group.group_id),
+        state="unknown",
+        attempted_at=now - timedelta(minutes=5),
+        error_code="CancelledError",
+    )
+    test_db.add_all([membership, state, attempt])
+    await test_db.commit()
+
+    changed = await pause_unresolved_ad_schedules(test_db, now)
+    assert changed == 1
+    await test_db.refresh(state)
+    assert state.status == AdScheduleStatus.PAUSED.value
+    assert state.last_reason == f"{RECONCILIATION_REASON_PREFIX}:{attempt.id}"
+    assert state.lock_token is None
+    assert state.lease_expires_at is None
+
+    service = AcquisitionAutomationService(test_db)
+    state_id, token, reason = await service._claim_ad_schedule_state(
+        campaign=campaign,
+        account_id=account.id,
+        membership=membership,
+        lease_seconds=60,
+    )
+    assert state_id == state.id
+    assert token is None
+    assert reason == RECONCILIATION_REASON_PREFIX
+
+
+@pytest.mark.asyncio
+async def test_confirmed_ad_reconciliation_wakes_paused_schedule(test_db):
+    from app.core.account.outbound_budget import AccountOutboundBudgetService
+
+    now = datetime(2026, 10, 17, 8, 0, 0)
+    account = TelegramAccount(
+        identifier="reconciliation-wake-account",
+        session_name="reconciliation-wake-account",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.ONLINE,
+        is_active=True,
+    )
+    group = Group(group_id=991002, title="Reconciled target", level=GroupLevel.A)
+    campaign = AdCampaign(
+        name="Reconciled target campaign",
+        enabled=True,
+        delivery_policy=AdDeliveryPolicy.GROWTH.value,
+    )
+    token = "reconciliation-wake-token"
+    test_db.add_all([account, group, campaign])
+    await test_db.flush()
+    schedule = AdDeliveryScheduleState(
+        campaign_id=campaign.id,
+        account_id=account.id,
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        next_due_at=now,
+        status=AdScheduleStatus.PAUSED.value,
+        last_reason=f"{RECONCILIATION_REASON_PREFIX}:123",
+    )
+    log = AdDeliveryLog(
+        account_id=account.id,
+        group_id=group.id,
+        telegram_group_id=group.group_id,
+        ad_campaign_id=campaign.id,
+        status=DeliveryStatus.PENDING.value,
+        reservation_token=token,
+    )
+    attempt = AccountOutboundAttempt(
+        account_id=account.id,
+        attempt_key=f"ad:{token}",
+        category="ad",
+        target_key=str(group.group_id),
+        state="unknown",
+        attempted_at=now - timedelta(minutes=5),
+        error_code="CancelledError",
+    )
+    test_db.add_all([schedule, log, attempt])
+    await test_db.commit()
+
+    await AccountOutboundBudgetService(test_db).reconcile(
+        f"ad:{token}",
+        account_id=account.id,
+        state="failed",
+        error_code="confirmed_external_failure",
+        confirmed=True,
+        now=now,
+    )
+
+    await test_db.refresh(schedule)
+    assert schedule.status == AdScheduleStatus.RETRY.value
+    assert schedule.last_reason == "reconciliation_resolved_failed"
+    assert schedule.next_due_at > now
+    assert schedule.lock_token is None
+    assert schedule.lease_expires_at is None
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ async def inventory_snapshot(
                 select(*(getattr(GroupAccountMembership, key) for key in (
                     "id", "joined_at", "review_status", "status", "telegram_group_id",
                     "ad_status", "ad_pause_until", "left_at", "group_id", "account_id",
+                    "first_ad_allowed_at", "interaction_started_at", "created_at",
                 ))).where(
                     GroupAccountMembership.account_id == account_id,
                     GroupAccountMembership.status.in_(["joined", "pending", "leave_failed"]),
@@ -74,7 +75,17 @@ async def inventory_snapshot(
     usable_keys: dict[int, int] = {}
     mature_keys: set[int] = set()
     identity_blocked = 0
+    warmup_waiting = 0
+    from app.modules.acquisition.ad_warmup import readiness as warmup_readiness
+    from app.core.automation_settings import get_account_warmup_policy_settings
+    warmup_policy = await get_account_warmup_policy_settings(db)
+    warmup_account = await db.get(TelegramAccount, account_id)
     frequency_service = FrequencyService(db)
+    from app.modules.acquisition.qualification_service import policy
+    from app.modules.acquisition.qualification_system_identity import covered_system_ids
+    system_ids, identity_fingerprint = await covered_system_ids(
+        db, await policy(db, fresh=True), account_id=account_id,
+    )
     seen, ready, active, overdue = set(), 0, 0, 0
     probe_backlog = probe_overdue = stalled = 0
     unresolved = evidence_waiting = probe_evidence_waiting = 0
@@ -94,7 +105,10 @@ async def inventory_snapshot(
             continue
         if member.review_status == "manual_required" or row.state == "manual_required":
             continue
-        from app.modules.acquisition.review_inventory import scheduled_observation, waiting_for_evidence
+        from app.modules.acquisition.review_inventory import (
+            scheduled_observation,
+            waiting_for_evidence,
+        )
         waiting = waiting_for_evidence(row, now)
         scheduled = not waiting and scheduled_observation(row, now)
         unresolved += int(row.decision in {"unknown", "observe", "wait", "technical_wait"})
@@ -113,8 +127,16 @@ async def inventory_snapshot(
             from app.modules.acquisition.qualification_events import pending
             if await pending(db, member):
                 continue
-            ready += 1
             context = payload(row.evidence_json)
+            if (not identity_fingerprint or not context.get("system_identity_coverage")
+                    or context.get("system_identity_fingerprint") != identity_fingerprint
+                    or context.get("system_user_ids") != sorted(system_ids)):
+                identity_blocked += 1
+                continue
+            ready += 1
+            if warmup_readiness(warmup_policy, warmup_account, member, now).reason:
+                warmup_waiting += 1
+                continue
             key = canonical(member.telegram_group_id, context)
             frequency = frequencies.get(key)
             profile = profiles.get(member.group_id)
@@ -163,7 +185,7 @@ async def inventory_snapshot(
                 if not mature:
                     probe_overdue += 1
                     probe_pressure_overdue += int(not waiting)
-    return {
+    result = {
         "total": len(members),
         "qualified": ready,
         "usable": len(usable_keys),
@@ -190,6 +212,9 @@ async def inventory_snapshot(
         "target_hours": 24,
         "review_due": review_due,
     }
+    if warmup_waiting:
+        result["warmup_waiting"] = warmup_waiting
+    return result
 
 
 async def executable_inventory(
@@ -336,6 +361,11 @@ async def executable_inventory(
                     # it with other groups/materials below.
                     if schedule.reason and schedule.next_allowed_at is None:
                         continue
+                    if reason.startswith(("ad_warmup_", "account_warmup_")):
+                        from app.modules.acquisition.ad_warmup import warmup_readiness
+                        warmup = await warmup_readiness(db, account_id, member, now)
+                        if warmup.next_allowed_at:
+                            target_deadlines.append(max(warmup.next_allowed_at, schedule.next_allowed_at or now))
                     if reason.startswith("frequency_"):
                         from app.modules.acquisition.adaptive_frequency import FrequencyService
                         context, context_reason = await service._qualified_ad_context(
@@ -380,6 +410,8 @@ async def executable_inventory(
                     account_id=account_id,
                     group=member_groups[member.id],
                     day_start=operating_day_start(now),
+                    now=now,
+                    qualified=phase in {"pilot", "dynamic"},
                 )
                 if reason:
                     reasons[reason] += 1
@@ -423,15 +455,21 @@ async def executable_inventory(
     )
     from app.modules.acquisition import candidate_inventory as preview_inventory
     facts = await preview_inventory.load(db, account_id, [group.id for group in candidate_rows[:300]])
-    # Exclude a group joined by any account, as the execution helper does, but
-    # fetch the bounded candidate set once instead of one query per candidate.
+    from app.modules.acquisition.join_claims import group_occupied, occupied_group_ids
+    # Search results belong to one global pool; previews and daily budgets are
+    # account-local. Live requests hold a group before a membership exists.
     candidate_ids = [group.id for group in candidate_rows[:300]]
-    joined_candidate_ids = set((await db.scalars(
-        select(GroupAccountMembership.group_id).where(
-            GroupAccountMembership.group_id.in_(candidate_ids),
-            GroupAccountMembership.status == "joined",
-        ).distinct()
-    )).all()) if candidate_ids else set()
+    joined_candidate_ids = await occupied_group_ids(db, candidate_ids, now)
+    occupied = group_occupied(now)
+    other_occupied = group_occupied(now, exclude_account_id=account_id)
+    pool = (await db.execute(select(
+        func.count(Group.id).label("total"),
+        func.count(Group.id).filter(occupied).label("occupied"),
+        func.count(Group.id).filter(other_occupied).label("other_occupied"),
+    ).where(
+        Group.status.in_(["pending_join", "join_failed", "cooling_down"]),
+        Group.username.is_not(None),
+    ))).one()
     join_ready = identity_pending = preview_pending = excluded = candidate_total = 0
     for group in candidate_rows[:300]:
         if group.id in joined_candidate_ids:
@@ -488,6 +526,12 @@ async def executable_inventory(
         "join_candidates_total": candidate_total,
         "join_candidates_preview_pending": preview_pending,
         "join_candidates_excluded": excluded,
+        "shared_candidate_pool_total": pool.total,
+        "shared_candidate_pool_available": pool.total - pool.occupied,
+        "shared_candidate_pool_occupied": pool.occupied,
+        "shared_candidate_pool_occupied_by_other_accounts": pool.other_occupied,
+        "join_candidate_deduplication_scope": "global",
+        "join_candidate_preview_scope": "account",
         "material_count": len(materials),
         "rollout_phase": phase,
         "blocker_counts": dict(reasons),

@@ -133,10 +133,10 @@ async def public_candidate_preview(
     # or full-metadata checks.  Callers must clear this fact explicitly when a
     # new preview version is requested.
     saved = progress or {}
-    if saved.get("preview_terminal") or saved.get("status") in {
-        "metadata_checked", "sampled", "identity_mismatch", "not_joinable",
-        "entity_unknown", "preview_error",
-    }:
+    structural = saved.get("status") in {"metadata_checked", "identity_mismatch", "not_joinable"}
+    from app.modules.acquisition.evidence_progress import date
+    expires = date(saved.get("expires_at", saved.get("next_preview_at")))
+    if structural or (saved.get("status") == "sampled" and expires and expires > now):
         fields = {
             "status": saved.get("status", "entity_unknown"),
             "rules_readable": bool(saved.get("rules_readable", False)),
@@ -217,7 +217,7 @@ async def public_candidate_preview(
             if isinstance(exc, RpcDeferred):
                 raise
             raise_if_flood_wait(exc, operation="join_candidate_preview_rules")
-            rules_readable = False
+            return CandidatePreview(status="preview_error", **facts)
         if checkpoint is not None and rules_readable:
             await checkpoint({"checked_at": now.isoformat(), "namespace": actual[1], "entity_id": actual[0],
                               "facts": facts, "rules_readable": rules_readable, "rule_signal": rule_signal})

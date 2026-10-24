@@ -1209,3 +1209,263 @@ async def get_campaign_stats(
         }
     }
 
+
+# =============================================================================
+# P4: Ad fairness pacing, admin metrics and history governance summary
+# =============================================================================
+
+@router.get("/p4/summary")
+async def get_p4_summary(
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Read-only P4 summary: pacing decisions, queues, receipts and retention.
+
+    Every value is derived from durable rows or the bounded metrics snapshot;
+    the endpoint never triggers Telegram work and never writes business state.
+    """
+    import json as json_module
+
+    from app.core.account.control_models import ReconciliationTask
+    from app.core.config import settings
+    from app.core.metrics import age as metric_age
+    from app.core.metrics import cached_status
+    from app.modules.acquisition.history_governance import candidate_summary
+    from app.modules.acquisition.p2_models import GrowthOutbox
+    from app.modules.acquisition.p4_models import (
+        GrowthHistoryGovernanceBatch,
+        GrowthOperationArchive,
+        GrowthPacingDailyAccountStat,
+        GrowthPacingDecision,
+    )
+
+    now = datetime.utcnow()
+    data: dict = {
+        "flags": {
+            "ad_pacing_enabled": settings.P4_AD_PACING,
+            "ad_pacing_shadow": settings.P4_AD_PACING_SHADOW,
+            "ad_pacing_active": settings.p4_pacing_active,
+            "admin_metrics_enabled": settings.P4_ADMIN_METRICS,
+            "history_governance_enabled": settings.P4_HISTORY_GOVERNANCE,
+            "history_governance_dry_run": settings.P4_HISTORY_GOVERNANCE_DRY_RUN,
+            "canary_account_ids": sorted(settings.p4_pacing_canary_accounts),
+            "survival_backlog_limit": settings.P4_SURVIVAL_BACKLOG_LIMIT,
+            "unresolved_backlog_limit": settings.P4_UNRESOLVED_BACKLOG_LIMIT,
+            "retention_days": {
+                "hot": settings.P4_HISTORY_HOT_RETENTION_DAYS,
+                "audit": settings.P4_HISTORY_AUDIT_RETENTION_DAYS,
+                "recent": settings.P4_PACING_DECISION_RETENTION_DAYS,
+            },
+        },
+        "generated_at": now.isoformat(),
+    }
+
+    # --- Pacing decisions ---------------------------------------------------
+    decision = await db.scalar(
+        select(GrowthPacingDecision).order_by(GrowthPacingDecision.id.desc()).limit(1)
+    )
+    pacing_accounts: list[dict] = []
+    if decision is not None:
+        try:
+            candidates = json_module.loads(decision.candidates_json or "[]")
+        except (TypeError, ValueError):
+            candidates = []
+        risk_levels: dict[int, str] = {}
+        candidate_ids = [
+            item.get("account_id") for item in candidates
+            if isinstance(item, dict) and isinstance(item.get("account_id"), int)
+        ]
+        if candidate_ids:
+            for account_id, risk_level in (await db.execute(
+                select(TelegramAccount.id, TelegramAccount.risk_level).where(
+                    TelegramAccount.id.in_(candidate_ids)
+                )
+            )).all():
+                risk_levels[int(account_id)] = str(
+                    getattr(risk_level, "value", risk_level) or ""
+                )
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            account_id = item.get("account_id")
+            if not isinstance(account_id, int):
+                continue
+            pacing_accounts.append({**item, "risk_level": risk_levels.get(account_id, "")})
+        data["pacing"] = {
+            "last_decision": {
+                "id": decision.id,
+                "stage": decision.stage,
+                "mode": decision.mode,
+                "applied": bool(decision.applied),
+                "window_started_at": decision.window_started_at.isoformat(),
+                "window_seconds": decision.window_seconds,
+                "candidate_count": decision.candidate_count,
+                "gated_count": decision.gated_count,
+                "scheduled_count": decision.scheduled_count,
+                "selected_account_id": decision.selected_account_id,
+                "gate_reasons": json_module.loads(decision.gate_reasons_json or "{}"),
+            },
+            "accounts": pacing_accounts,
+        }
+        daily = (await db.execute(
+            select(GrowthPacingDailyAccountStat)
+            .order_by(
+                desc(GrowthPacingDailyAccountStat.stat_date),
+                GrowthPacingDailyAccountStat.account_id,
+            )
+            .limit(400)
+        )).scalars().all()
+        data["pacing"]["daily_stats"] = [
+            {
+                "stat_date": row.stat_date.isoformat(),
+                "account_id": row.account_id,
+                "decision_count": row.decision_count,
+                "scheduled_count": row.scheduled_count,
+                "gated_count": row.gated_count,
+                "avg_score": row.avg_score,
+                "fair_share_avg": row.fair_share_avg,
+                "actual_share_avg": row.actual_share_avg,
+                "ad_success_count": row.ad_success_count,
+            }
+            for row in daily
+        ]
+    else:
+        data["pacing"] = {"last_decision": None, "accounts": [], "daily_stats": []}
+
+    # --- Ads queue lane, receipts and queue gauges (best effort) -----------
+    redis_client = None
+    try:
+        from app.core.redis import get_redis
+        from app.core.scheduler.growth_dispatch import snapshot as dispatch_snapshot
+
+        redis_client = await get_redis()
+        dispatch_state = await dispatch_snapshot(redis_client)
+        data["ads_queue"] = dispatch_state.get("lanes", {}).get("ads", {})
+        data["last_dispatch_at"] = dispatch_state.get("last_dispatch_at")
+    except Exception:
+        data["ads_queue"] = {"state": "unavailable"}
+    try:
+        growth_status = await cached_status(redis_client)
+        p4_metrics = growth_status.get("p4", {}) if isinstance(growth_status, dict) else {}
+        data["receipts"] = {
+            "latency_p95_seconds": p4_metrics.get("receipt_latency_p95_seconds"),
+        }
+    except Exception:
+        data["receipts"] = {"latency_p95_seconds": None}
+
+    # --- Ad Outbox -----------------------------------------------------------
+    outbox_states = (await db.execute(
+        select(GrowthOutbox.state, func.count(GrowthOutbox.id))
+        .where(GrowthOutbox.kind == "send_ad")
+        .group_by(GrowthOutbox.state)
+    )).all()
+    oldest_outbox = await db.scalar(
+        select(func.min(GrowthOutbox.available_at)).where(
+            GrowthOutbox.kind == "send_ad",
+            GrowthOutbox.state.in_(["pending", "retryable_failed"]),
+        )
+    )
+    data["outbox"] = {
+        "states": {state: int(count or 0) for state, count in outbox_states},
+        "pending": sum(
+            int(count or 0) for state, count in outbox_states
+            if state in ("pending", "retryable_failed")
+        ),
+        "oldest_age_seconds": metric_age(now, oldest_outbox),
+    }
+
+    # --- Survival and unresolved sends --------------------------------------
+    survival_rows = (await db.execute(
+        select(
+            func.count(AdDeliveryLog.id).filter(
+                AdDeliveryLog.status == "success",
+                AdDeliveryLog.telegram_message_id.is_not(None),
+                AdDeliveryLog.survival_status == "pending",
+            ).label("backlog"),
+            func.count(AdDeliveryLog.id).filter(
+                AdDeliveryLog.status == "success",
+                AdDeliveryLog.telegram_message_id.is_not(None),
+                AdDeliveryLog.survival_status == "pending",
+                AdDeliveryLog.survival_check_due_at <= now,
+            ).label("due"),
+            func.count(AdDeliveryLog.id).filter(
+                AdDeliveryLog.status.in_(
+                    ["pending", "unknown", "sending", "reconciliation_required"]
+                )
+            ).label("unresolved"),
+        )
+    )).one()
+    data["survival"] = {
+        "backlog": int(survival_rows.backlog or 0),
+        "check_due": int(survival_rows.due or 0),
+        "unresolved_sends": int(survival_rows.unresolved or 0),
+    }
+
+    # --- Reconciliation aging ------------------------------------------------
+    task_rows = (await db.execute(
+        select(ReconciliationTask.kind, ReconciliationTask.state, func.count())
+        .group_by(ReconciliationTask.kind, ReconciliationTask.state)
+    )).all()
+    oldest_by_kind = {
+        kind: metric_age(now, at)
+        for kind, at in (await db.execute(
+            select(
+                ReconciliationTask.kind,
+                func.min(func.coalesce(
+                    ReconciliationTask.verification_due_at, ReconciliationTask.created_at
+                )),
+            )
+            .where(ReconciliationTask.state.in_(["pending", "leased"]))
+            .group_by(ReconciliationTask.kind)
+        )).all()
+    }
+    overdue_tasks = int(await db.scalar(
+        select(func.count()).select_from(ReconciliationTask).where(
+            ReconciliationTask.state.in_(["pending", "leased"]),
+            ReconciliationTask.available_at <= now,
+        )
+    ) or 0)
+    data["reconciliation"] = {
+        "states": [
+            {"kind": kind, "state": state, "count": int(count or 0)}
+            for kind, state, count in task_rows
+        ],
+        "oldest_age_seconds": oldest_by_kind,
+        "overdue": overdue_tasks,
+    }
+
+    # --- History governance --------------------------------------------------
+    try:
+        candidates_report = await candidate_summary(db, now)
+    except Exception:
+        candidates_report = {}
+    batches = (await db.execute(
+        select(GrowthHistoryGovernanceBatch)
+        .order_by(desc(GrowthHistoryGovernanceBatch.id))
+        .limit(10)
+    )).scalars().all()
+    archive_count, oldest_archive = (await db.execute(
+        select(
+            func.count(GrowthOperationArchive.id),
+            func.min(GrowthOperationArchive.archived_at),
+        )
+    )).one()
+    data["history"] = {
+        "candidates": candidates_report,
+        "latest_batches": [
+            {
+                "id": batch.id,
+                "mode": batch.mode,
+                "status": batch.status,
+                "dry_run": bool(batch.dry_run),
+                "archived_count": batch.archived_count,
+                "deleted_count": batch.deleted_count,
+                "started_at": batch.started_at.isoformat() if batch.started_at else None,
+                "finished_at": batch.finished_at.isoformat() if batch.finished_at else None,
+                "error": batch.error,
+            }
+            for batch in batches
+        ],
+        "archive_count": int(archive_count or 0),
+        "oldest_archive_age_seconds": metric_age(now, oldest_archive),
+    }
+    return {"code": 0, "message": "success", "data": data}

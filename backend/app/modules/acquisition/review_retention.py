@@ -22,7 +22,9 @@ async def retire_obsolete_reviews(db: Any, *, limit: int = 500) -> int:
         ["left", "banned", "rejected", "leave_failed", "account_lost"]
     )
     actionable = or_(
-        GroupQualificationAudit.state.in_(["queued", "waiting_ai", "reviewing_ai", "manual_required"]),
+        GroupQualificationAudit.state.in_([
+            "queued", "running", "waiting_ai", "reviewing_ai", "manual_required"
+        ]),
         (GroupQualificationAudit.state == "completed") & GroupQualificationAudit.next_retry_at.is_not(None),
         (GroupQualificationAudit.state == "waiting_membership") & terminal_membership,
     )
@@ -31,6 +33,7 @@ async def retire_obsolete_reviews(db: Any, *, limit: int = 500) -> int:
     ).where(actionable, or_(
         superseded,
         terminal_membership,
+        GroupQualificationAudit.membership_joined_at.is_distinct_from(GroupAccountMembership.joined_at),
         (GroupQualificationAudit.decision == "protected") & (GroupAccountMembership.review_status == "owned_group_excluded"),
         (GroupQualificationAudit.reason == "join_approval_pending") & (GroupAccountMembership.status == "pending"),
     )).order_by(GroupQualificationAudit.id).limit(max(1, min(limit, 500)))

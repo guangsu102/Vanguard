@@ -1853,7 +1853,7 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "warmup_days": _int_setting(
                 item.get("warmup_days", item.get("warmupDays", default_policy["warmup_days"])),
                 int(default_policy["warmup_days"]),
-                min_value=7,
+                min_value=0,
                 max_value=120,
             ),
         }
@@ -1951,7 +1951,7 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "minimum_warmup_days", raw.get("minimumWarmupDays", defaults["minimum_warmup_days"])
         ),
         int(defaults["minimum_warmup_days"]),
-        min_value=7,
+        min_value=0,
         max_value=120,
     )
     default_days = _int_setting(
@@ -1959,7 +1959,7 @@ def normalize_account_warmup_policy_settings(payload: dict[str, Any] | None) -> 
             "default_warmup_days", raw.get("defaultWarmupDays", defaults["default_warmup_days"])
         ),
         int(defaults["default_warmup_days"]),
-        min_value=7,
+        min_value=0,
         max_value=120,
     )
     if default_days < minimum_days:

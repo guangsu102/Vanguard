@@ -221,7 +221,17 @@ async def test_frequency_deferrals_do_not_suppress_ordinary_exit_lane(test_db, m
     assert ordinary.await_count == 30
 
 
-async def test_offline_consumers_keep_physical_queues_bounded_and_resume_fairly(queue_store, monkeypatch):
+@pytest.fixture
+def mock_dispatch_repairs(monkeypatch):
+    # These cases exercise real Redis queues with a stubbed account selector.
+    # Database repair is covered separately with real SQLite and PostgreSQL.
+    monkeypatch.setattr("app.core.account.backlog_discard.maybe_sweep_ineligible_backlog",
+                        AsyncMock(return_value={}))
+    monkeypatch.setattr("app.modules.acquisition.qualification_recovery.repair",
+                        AsyncMock(return_value={}))
+
+
+async def test_offline_consumers_keep_physical_queues_bounded_and_resume_fairly(queue_store, monkeypatch, mock_dispatch_repairs):
     cache = queue_store
     available = {stage: list(range(1, 31)) for stage in scheduler.STAGES}
     monkeypatch.setattr(scheduler, "account_sets", AsyncMock(return_value=available))
@@ -247,7 +257,7 @@ async def test_offline_consumers_keep_physical_queues_bounded_and_resume_fairly(
         assert await scheduler.start(cache, stage, account_id, token, now) == 0
 
 
-async def test_thirty_account_overload_fairness_and_recovery(queue_store, monkeypatch):
+async def test_thirty_account_overload_fairness_and_recovery(queue_store, monkeypatch, mock_dispatch_repairs):
     """Six simulated hours: slow account, cooling account, restart, sustained load."""
     cache = queue_store
     available = {stage: list(range(1, 31)) for stage in scheduler.STAGES}
@@ -434,5 +444,5 @@ async def test_poisoned_review_is_deferred_and_same_account_keeps_progress(test_
     result = await reviews.run_reviews(Obj(db=test_db), account_id=1, limit=2)
     assert result["failed"] == 1 and result["processed"] == 1
     failed = await test_db.get(GroupQualificationAudit, ids[0])
-    assert failed.state == "queued" and failed.next_retry_at > now
+    assert failed.state == "completed" and failed.decision == "technical_wait" and failed.next_retry_at > now
     assert (await test_db.get(GroupQualificationAudit, ids[1])).state == "completed"

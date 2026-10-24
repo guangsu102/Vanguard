@@ -304,7 +304,7 @@ async def test_queue_reserves_v3_ranked_candidate_before_legacy_first():
         scalars=lambda: SimpleNamespace(all=lambda: groups)
     )
     service = object.__new__(AcquisitionAutomationService)
-    service.db = SimpleNamespace(execute=AsyncMock(return_value=rows))
+    service.db = SimpleNamespace(execute=AsyncMock(return_value=rows), get=AsyncMock(return_value=None))
     service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
     service._rank_pending_join_candidates = AsyncMock(return_value=[groups[1], groups[0]])
     service._reserve_auto_join_candidate = AsyncMock(return_value=True)

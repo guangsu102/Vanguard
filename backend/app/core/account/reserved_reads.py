@@ -7,6 +7,8 @@ Only critical reads borrow idle survival capacity; a ledger preserves spent loan
 from __future__ import annotations
 
 LANE_INDEX = {"ad": 0, "survival": 1, "critical": 2, "sync": 3, "routine": 4, "background": 4}
+BASE_SYNC_TARGET_PERCENT = 20
+MAX_SYNC_TARGET_PERCENT = 35
 def listener_reserve(total: int) -> int:
     """Bounded control traffic, carved out of the existing survival reservation."""
     return max(3, (total * 2 + 99) // 100)
@@ -15,10 +17,36 @@ def listener_reserve(total: int) -> int:
 COUNTERS = ("ad", "survival", "join_reserved", "sync_reserved", "flex_reserved")
 
 
-def allocations(total: int) -> list[int]:
+def allocations(total: int, sync_target_percent: int = BASE_SYNC_TARGET_PERCENT) -> list[int]:
+    """Return protected lane caps.
+
+    The default remains the production 20% sync reservation.  P1 may raise
+    the *target* for an allowlisted account; the protection floors remain
+    fixed at ad 35%, survival 15% and critical 25%, and any excess is only
+    admitted through the idle-capacity lending path.
+    """
     protected = [(total * share + 99) // 100 for share in (35, 15, 25)]
-    sync = total * 20 // 100
+    sync = total * BASE_SYNC_TARGET_PERCENT // 100
     return [*protected, sync, total - sum(protected) - sync]
+
+
+def sync_target_limit(total: int, target_percent: int = BASE_SYNC_TARGET_PERCENT) -> int:
+    """Maximum sync reads after the P1 idle-capacity target is applied."""
+    target = max(BASE_SYNC_TARGET_PERCENT, min(MAX_SYNC_TARGET_PERCENT, int(target_percent)))
+    return max(0, total * target // 100)
+
+
+def sync_idle_borrow_limit(total: int, used: list[int], *, target_percent: int) -> int:
+    """Headroom sync may borrow while retaining all protected floors.
+
+    This is intentionally a pure bounded calculation used by both admission
+    and telemetry.  It never increases the account's total window budget.
+    """
+    caps = allocations(total)
+    target = sync_target_limit(total, target_percent)
+    protected_remaining = sum(max(0, caps[i] - used[i]) for i in (0, 1, 2))
+    total_remaining = max(0, total - sum(max(0, value) for value in used))
+    return max(0, min(target - max(0, used[3]), total_remaining - protected_remaining))
 
 
 def classified(total: int, measured: list[int], caps: list[int]) -> list[int]:
@@ -68,7 +96,8 @@ def lending_caps(caps: list[int], used: list[int], lane: str, hold: int = -1, sy
     return adjusted
 
 
-def transferred_caps(caps: list[int], lent: int, sync_lent: int = 0, ad_lent: int = 0) -> list[int]:
+def transferred_caps(caps: list[int], lent: int, sync_lent: int = 0, ad_lent: int = 0,
+                     sync_borrowed_ad: int = 0, sync_borrowed_survival: int = 0) -> list[int]:
     """Spent loans stay transferred until the original window expires."""
     adjusted = list(caps)
     lent = min(caps[1], max(0, lent))
@@ -80,6 +109,12 @@ def transferred_caps(caps: list[int], lent: int, sync_lent: int = 0, ad_lent: in
     ad_lent = min(caps[0], max(0, ad_lent))
     adjusted[0] -= ad_lent
     adjusted[2] += ad_lent
+    # P1 loans are spent capacity, not a transient forecast.  Retain their
+    # transfer for every lane until the corresponding account window ends.
+    for donor, amount in ((0, sync_borrowed_ad), (1, sync_borrowed_survival)):
+        amount = min(adjusted[donor], max(0, amount))
+        adjusted[donor] -= amount
+        adjusted[3] += amount
     return adjusted
 
 
@@ -106,16 +141,20 @@ def reservation_args(account_id: int, limits: dict, lane: str, reads: int, pace:
     keys.extend(f"vanguard:rpc:{account_id}:survival_lent_{window}" for window in ("hour", "day"))
     keys.extend(f"vanguard:rpc:{account_id}:listener_{window}" for window in ("hour", "day"))
     keys.extend(f"vanguard:rpc:{account_id}:critical_{kind}_{window}" for kind in ("join", "review") for window in ("hour", "day"))
-    from app.core.account.read_work import LEASE_SECONDS, current, key
+    from app.core.account.read_work import LEASE_SECONDS, current, key, lane_for
     active = current(account_id)
     if work_token is None:
         work_token = active.token if active is not None and active.claimed and (
-            lane == ('ad' if active.kind == 'renewal' else 'critical')
+            lane == lane_for(active)
         ) else ""
     keys.append(key(account_id))
     keys.extend(f"vanguard:rpc:{account_id}:sync_lent_{window}" for window in ("hour", "day"))
     keys.extend(f"vanguard:rpc:{account_id}:ad_lent_{window}" for window in ("hour", "day"))
     keys.extend(f"vanguard:rpc:{account_id}:sync_completion_{window}" for window in ("hour", "day"))
+    keys.extend(f"vanguard:rpc:{account_id}:sync_borrowed_{donor}_{window}"
+                for donor in ("ad", "survival") for window in ("hour", "day"))
+    from app.core.config import settings
+    keys.append("vanguard:metrics:v1:counters")
     args = [reads, pace, 4 if lane == "sync" else 1, (2 if lane == "listener" else LANE_INDEX[lane] + 1),
             limits["minute"], limits["hour"], limits["day"],
             *allocations(limits["hour"]), *allocations(limits["day"]),
@@ -129,7 +168,13 @@ def reservation_args(account_id: int, limits: dict, lane: str, reads: int, pace:
             limits.get('ad_refresh_hold_hour', -1), limits.get('ad_refresh_hold_day', -1),
             limits.get('ad_demand_hold_hour', -1), limits.get('ad_demand_hold_day', -1),
             int(sync_completion), min(24, allocations(limits['hour'])[1] // 2),
-            min(96, allocations(limits['day'])[1] // 3)]
+            min(96, allocations(limits['day'])[1] // 3),
+            limits.get("sync_target_hour", allocations(limits["hour"])[3]),
+            limits.get("sync_target_day", allocations(limits["day"])[3]),
+            int(limits.get("sync_idle_lending", 0) == 1),
+            int(settings.GROWTH_METRICS_ENABLED),
+            int(limits.get("sync_target_enforced", 0)),
+        ]
     return keys, args
 
 
@@ -140,6 +185,8 @@ local delay=0
 local loans={0,0}
 local sync_loans={0,0}
 local ad_loans={0,0}
+local sync_ad_loans={0,0}
+local sync_survival_loans={0,0}
 local mode=ARGV[26] or 'read'
 local completing=tonumber(ARGV[39] or '0')==1
 if completing and (lane~=2 or mode~='read' or tonumber(ARGV[20])==1) then return 60000 end
@@ -188,6 +235,13 @@ for w=1,2 do
  local ad_lent=math.min(cap[1],math.max(0,tonumber(redis.call('GET',KEYS[25+w]) or '0')))
  if redis.call('EXISTS',KEYS[w+1])==0 then ad_lent=0 end
  cap[1]=cap[1]-ad_lent;cap[3]=cap[3]+ad_lent
+ local borrowed_ad=0;local borrowed_survival=0
+ if redis.call('EXISTS',KEYS[w+1])==1 then
+  borrowed_ad=math.min(cap[1],math.max(0,tonumber(redis.call('GET',KEYS[29+w]) or '0')))
+  borrowed_survival=math.min(cap[2],math.max(0,tonumber(redis.call('GET',KEYS[31+w]) or '0')))
+ end
+ cap[1]=cap[1]-borrowed_ad;cap[2]=cap[2]-borrowed_survival
+ cap[4]=cap[4]+borrowed_ad+borrowed_survival
  local pending_survival=tonumber(redis.call('HGET',KEYS[23],'survival_'..w) or '0')
  local pending_sync=tonumber(redis.call('HGET',KEYS[23],'sync_'..w) or '0')
  local pending_ad=tonumber(redis.call('HGET',KEYS[23],'ad_'..w) or '0')
@@ -264,6 +318,34 @@ for w=1,2 do
   elseif ad_hold>=0 then allowed=math.max(0,cap[1]-used[1]-ad_hold) end
   ad_loans[w]=borrow(1,allowed)
  end
+ -- P1 sync has a hard cap in BOTH windows, even while elastic capacity is
+ -- otherwise unused.  Missing forecasts authorize no new donor loan.
+ local target=tonumber(ARGV[41+w] or '0')
+ if lane==4 and (target>tonumber(ARGV[11+(w-1)*5]) or tonumber(ARGV[46] or '0')==1) then
+  target=math.min(target,math.floor(tonumber(ARGV[5+w])*35/100))
+  if used[4]+cost>target then delay=math.max(delay,ttl(w+1)) end
+ end
+ if lane==4 and tonumber(ARGV[44] or '0')==1 then
+  local function borrow_sync(donor,allowed)
+   local original,sync=cap[donor],cap[4]
+   local low,high=0,math.max(0,allowed)
+   while low<high do
+    local middle=math.floor((low+high)/2)
+    cap[donor]=original-middle;cap[4]=sync+middle
+    if tonumber(ARGV[5+w])-total-protected()>=cost then high=middle else low=middle+1 end
+   end
+   cap[donor]=original-low;cap[4]=sync+low
+   return low
+  end
+  local ad_hold=tonumber(ARGV[36+w] or '-1')
+  local survival_hold=tonumber(ARGV[17+w] or '-1')
+  local allowed=0
+  if ad_hold>=0 then allowed=math.max(0,cap[1]-used[1]-ad_hold) end
+  sync_ad_loans[w]=borrow_sync(1,allowed)
+  allowed=0
+  if survival_hold>=0 then allowed=math.max(0,cap[2]-used[2]-math.max(survival_hold,recovery)) end
+  sync_survival_loans[w]=borrow_sync(2,allowed)
+ end
  local reserved=protected()+critical_hold
  if lane~=3 and lane==held_lane and not owns then reserved=reserved+held end
  if lane==2 and not listener then reserved=reserved+recovery end
@@ -315,6 +397,7 @@ for i=1,3 do
    redis.call('DEL',KEYS[22+i])
    redis.call('DEL',KEYS[24+i])
    redis.call('DEL',KEYS[26+i])
+   redis.call('DEL',KEYS[28+i],KEYS[30+i])
   end
  end
 end
@@ -342,6 +425,16 @@ for w=1,2 do
   redis.call('INCRBY',KEYS[25+w],ad_loans[w])
   if expiry>0 then redis.call('PEXPIRE',KEYS[25+w],expiry) end
  end
+ for _,loan in ipairs({{KEYS[29+w],sync_ad_loans[w]},{KEYS[31+w],sync_survival_loans[w]}}) do
+  if loan[2]>0 then
+   redis.call('INCRBY',loan[1],loan[2])
+   if expiry>0 then redis.call('PEXPIRE',loan[1],expiry) end
+  end
+ end
+ if tonumber(ARGV[45] or '0')==1 and sync_ad_loans[w]+sync_survival_loans[w]>0 then
+  local window='hour';if w==2 then window='day' end
+  redis.call('HINCRBY',KEYS[34],'vanguard_sync_borrowed_reads_total|'..window,sync_ad_loans[w]+sync_survival_loans[w])
+ end
  if owns then
   if loans[w]>0 then redis.call('HINCRBY',KEYS[23],'survival_'..w,-loans[w]) end
   if sync_loans[w]>0 then redis.call('HINCRBY',KEYS[23],'sync_'..w,-sync_loans[w]) end
@@ -358,6 +451,13 @@ if pace>0 then
  local due=math.max(now,tonumber(redis.call('GET',KEYS[14]) or '0'))+pace*cost
  redis.call('SET',KEYS[14],due,'PX',due-now+60000)
 end
-if owns then redis.call('HINCRBY',KEYS[23],'remaining',-cost) end
+if owns then
+ redis.call('HINCRBY',KEYS[23],'remaining',-cost)
+ local audit=redis.call('HGET',KEYS[23],'audit_id')
+ if audit then
+  local journal='vanguard:budget:consumed:'..audit
+  redis.call('INCRBY',journal,cost); redis.call('EXPIRE',journal,604800)
+ end
+end
 return 0
 """

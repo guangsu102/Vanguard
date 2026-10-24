@@ -9,7 +9,12 @@ import pytest
 from app.core.account.models import AccountOperationConfig
 from app.modules.acquisition import qualification_service as qualification
 from app.modules.acquisition.automation import AcquisitionAutomationService
-from app.modules.acquisition.models import AdCampaign, AdDeliveryLog, AdDeliveryScheduleState
+from app.modules.acquisition.models import (
+    AdCampaign,
+    AdDeliveryLog,
+    AdDeliveryScheduleState,
+    AutoJoinAttempt,
+)
 from tests.unit.test_qualification_service import setup
 
 
@@ -94,3 +99,25 @@ async def test_due_survival_keeps_priority_even_when_ad_cannot_send(test_db, mon
     monkeypatch.setattr(AcquisitionAutomationService, "_qualification_delivery_quota_reason", gate)
     assert await qualification.priority_account_ids(test_db, {}, now) == {account.id}
     gate.assert_not_awaited()
+
+
+async def test_stale_join_keeps_review_priority_when_retry_timestamp_is_future(test_db):
+    account, group, _, _ = await setup(test_db)
+    now = datetime.utcnow()
+    test_db.add(
+        AutoJoinAttempt(
+            account_id=account.id,
+            group_id=group.id,
+            telegram_group_id=group.group_id,
+            target_key="username:stale-priority",
+            status="pending",
+            request_state="sent",
+            telegram_action_attempted=True,
+            request_sent_at=now - timedelta(days=8),
+            reconciliation_status="pending",
+            reconciliation_next_at=now + timedelta(hours=12),
+        )
+    )
+    await test_db.commit()
+
+    assert await qualification.priority_account_ids(test_db, {}, now) == {account.id}

@@ -55,13 +55,29 @@ def account_capacity_limits(account: Any, config: Any, now: datetime) -> dict[st
     )
     ceiling = 0 if blocked else 10 if cautious else 30
     configured_total = getattr(config, "max_messages_per_day", None)
-    total = max(0, min(62, int(62 if configured_total is None else configured_total)))
+    configured_total = max(0, min(62, int(62 if configured_total is None else configured_total)))
+    total = configured_total
     adaptive = getattr(config, "adaptive_ads_enabled", False) is True
     pace = max(1800 if cautious else 600, int(getattr(config, "message_interval_seconds", 0) or 0))
     probe = min(ceiling, max(0, int(getattr(config, "max_ads_per_day", 30))))
-    ad_limit = (0 if blocked or probe == 0 else 86400 // pace) if adaptive else probe
+    # Adaptive pacing controls the minimum interval, while the configured
+    # account limit remains a hard ceiling.  Without the ``min`` an account
+    # configured for 30 ads/day at a 10-minute interval was admitted for
+    # 144 ads/day (86400 / 600).
+    ad_limit = (
+        0 if blocked or probe == 0 else min(probe, 86400 // pace)
+    ) if adaptive else probe
     if adaptive and not blocked:
-        total = ad_limit + min(30, max(0, int(config.max_verification_messages_per_day))) + min(2, max(0, int(config.max_diagnostic_messages_per_day)))
+        category_total = (
+            ad_limit
+            + min(30, max(0, int(getattr(config, "max_verification_messages_per_day", 30))))
+            + min(2, max(0, int(getattr(config, "max_diagnostic_messages_per_day", 2))))
+        )
+        # The account-wide setting is a hard ceiling even when adaptive
+        # category budgets are recomputed.  Without this clamp a small
+        # max_messages_per_day (for example 4) was silently widened to the
+        # sum of the category defaults after adaptive admission.
+        total = min(configured_total, category_total)
     return {
         "adaptive_ads": adaptive,
         "ad_probe": probe,
@@ -140,7 +156,12 @@ class ActionCapacityFeedbackService:
             )
         if action == "ad_delivery":
             interval = max(600, config.message_interval_seconds or 0)
-            limit = 86400 // interval if getattr(config, "adaptive_ads_enabled", False) is True else min(30, max(0, config.max_ads_per_day))
+            configured = min(30, max(0, config.max_ads_per_day))
+            limit = (
+                min(configured, 86400 // interval)
+                if getattr(config, "adaptive_ads_enabled", False) is True
+                else configured
+            )
             return limit, interval
         if action.startswith("verification_"):
             return min(30, max(0, config.max_verification_messages_per_day)), 0
@@ -244,9 +265,21 @@ async def effective_capacity_limits(
         if pause and pause > now:
             limits["action_pauses"][category] = pause.isoformat()
     if limits.get("adaptive_ads"):
-        limits["ad"] = min(limits["ad"], 86400 // max(600, limits["ad_interval_seconds"]))
+        configured_total = int(limits["total"])
+        # Keep the configured per-account cap in force after dynamic feedback
+        # changes the interval.  ``ad_probe`` is derived from max_ads_per_day;
+        # using it here also prevents a feedback recovery from widening the
+        # hard cap accidentally.
+        limits["ad"] = min(
+            limits["ad"],
+            limits["ad_probe"],
+            86400 // max(600, limits["ad_interval_seconds"]),
+        )
         limits["ad_probe"] = min(limits["ad_probe"], limits["ad"])
-        limits["total"] = limits["ad"] + limits["verification"] + limits["diagnostic"]
+        limits["total"] = min(
+            configured_total,
+            limits["ad"] + limits["verification"] + limits["diagnostic"],
+        )
     return limits
 
 
@@ -325,17 +358,64 @@ class AccountOutboundBudgetService:
         day, rolling = operating_day_start(now), now - timedelta(hours=24)
         today = [r for r in rows if self._counted(r, day, now)]
         window = [r for r in rows if self._counted(r, rolling, now)]
+
+        def category_release_at(r: Any, *, rolling_window: bool) -> datetime | None:
+            if r.state == "reserved":
+                return (
+                    r.lease_expires_at
+                    if r.lease_expires_at and r.lease_expires_at > now
+                    else None
+                )
+            if r.state not in {"succeeded", "failed"} or not r.attempted_at:
+                return None
+            return (
+                r.attempted_at + timedelta(hours=24)
+                if rolling_window
+                else day + timedelta(days=1)
+            )
+
+        def category_next_release(
+            rows_for_window: list[Any], cap_value: int, *, rolling_window: bool
+        ) -> datetime | None:
+            if cap_value <= 0 or len(rows_for_window) < cap_value:
+                return None
+            needed = len(rows_for_window) - cap_value + 1
+            finite = sorted(
+                deadline
+                for row in rows_for_window
+                if (deadline := category_release_at(row, rolling_window=rolling_window)) is not None
+            )
+            return finite[needed - 1] if len(finite) >= needed else None
+
         categories = {}
         for category in sorted(CATEGORIES):
             a, b = (
                 sum(r.category == category for r in today),
                 sum(r.category == category for r in window),
             )
+            category_today = [
+                r for r in today if r.category == category
+            ]
+            category_window = [
+                r for r in window if r.category == category
+            ]
+            category_deadlines = [
+                deadline
+                for deadline in (
+                    category_next_release(category_today, limits[category], rolling_window=False),
+                    category_next_release(category_window, limits[category], rolling_window=True),
+                )
+                if deadline is not None and deadline > now
+            ]
+            category_next_at = max(category_deadlines, default=None)
             categories[category] = {
                 "effective": limits[category],
                 "used_today": a,
                 "used_rolling_24h": b,
                 "remaining": max(0, min(limits[category] - a, limits[category] - b)),
+                "next_budget_available_at": (
+                    category_next_at.isoformat() if category_next_at else None
+                ),
             }
         ad_lanes = {}
         for lane in ("probe", "mature"):
@@ -345,11 +425,61 @@ class AccountOutboundBudgetService:
                 return r.category == "ad" and ad_lane(r) == selected_lane and (
                     r.state == "succeeded" if selected_lane == "probe" else r.state != "failed"
                 )
+
+            def release_at(r: Any, *, rolling: bool) -> datetime | None:
+                # Unknown/attempted writes are durable fences. They cannot be
+                # treated as naturally expiring budget entries because only
+                # reconciliation may release them. A live reservation has a
+                # finite lease; a confirmed attempt leaves the rolling window
+                # after 24 hours.
+                if r.state == "reserved":
+                    return (
+                        r.lease_expires_at
+                        if r.lease_expires_at and r.lease_expires_at > now
+                        else None
+                    )
+                if r.state != "succeeded" or not r.attempted_at:
+                    return None
+                return (
+                    r.attempted_at + timedelta(hours=24)
+                    if rolling
+                    else day + timedelta(days=1)
+                )
+
+            def next_release(
+                rows_for_window: list[Any], cap_value: int, *, rolling: bool
+            ) -> datetime | None:
+                if cap_value <= 0 or len(rows_for_window) < cap_value:
+                    return None
+                # If N entries occupy a cap of C, N-C+1 releases are needed
+                # before one slot becomes available. Missing release times
+                # represent unknown writes and keep the deadline unresolved
+                # until reconciliation.
+                needed = len(rows_for_window) - cap_value + 1
+                finite = sorted(
+                    deadline
+                    for row in rows_for_window
+                    if (deadline := release_at(row, rolling=rolling)) is not None
+                )
+                return finite[needed - 1] if len(finite) >= needed else None
+
             a = sum(counted(r) for r in today)
             b = sum(counted(r) for r in window)
             cap = limits.get("ad_probe", limits["ad"]) if lane == "probe" else limits["ad"]
+            daily_rows = [r for r in rows if counted(r) and self._counted(r, day, now)]
+            rolling_rows = [r for r in rows if counted(r) and self._counted(r, rolling, now)]
+            release_deadlines = [
+                deadline
+                for deadline in (
+                    next_release(daily_rows, cap, rolling=False),
+                    next_release(rolling_rows, cap, rolling=True),
+                )
+                if deadline is not None and deadline > now
+            ]
+            next_allowed_at = max(release_deadlines, default=None)
             ad_lanes[lane] = {"effective": cap, "used_today": a, "used_rolling_24h": b,
-                              "remaining": max(0, min(cap - a, cap - b))}
+                              "remaining": max(0, min(cap - a, cap - b)),
+                              "next_allowed_at": next_allowed_at.isoformat() if next_allowed_at else None}
             ad_lanes[lane]["executable_remaining"] = min(
                 ad_lanes[lane]["remaining"], categories["ad"]["remaining"]
             )
@@ -611,6 +741,10 @@ class AccountOutboundBudgetService:
         )
         row.state, row.attempted_at, row.lease_expires_at = "attempted", now, None
         await self.db.commit()
+        if row.category == "ad":
+            from app.core.metrics import record_delivery
+            await record_delivery("ad", "sent", event_key=f"outbound:{row.id}:sent",
+                                  admitted_at=row.created_at, sent_at=now)
         return row
 
     async def finish(
@@ -651,6 +785,10 @@ class AccountOutboundBudgetService:
         )
         row.completed_at, row.lease_expires_at = now, None
         await self.db.commit()
+        if row.category == "ad":
+            from app.core.metrics import record_delivery
+            await record_delivery("ad", {"succeeded": "success", "cancelled": "released"}.get(state, state),
+                                  reason=error_code, event_key=f"outbound:{row.id}:{state}")
         return row
 
     async def reconcile(
@@ -666,7 +804,7 @@ class AccountOutboundBudgetService:
     ) -> AccountOutboundAttempt:
         if not confirmed or state not in {"succeeded", "failed"}:
             raise OutboundBudgetBlocked("outbound_reconciliation_unconfirmed")
-        return await self.finish(
+        row = await self.finish(
             attempt_key,
             account_id=account_id,
             state=state,
@@ -675,3 +813,30 @@ class AccountOutboundBudgetService:
             now=now,
             reconciliation_confirmed=True,
         )
+        if row.category == "ad":
+            # Reconciliation is the only event allowed to release an
+            # unknown target fence.  Wake its durable schedule only after the
+            # ledger CAS has committed; an exception here must not undo the
+            # confirmed ledger result.
+            try:
+                from app.modules.acquisition.ad_reconciliation import (
+                    wake_schedule_after_reconciliation,
+                )
+
+                await wake_schedule_after_reconciliation(
+                    self.db,
+                    attempt_key=attempt_key,
+                    account_id=account_id,
+                    outcome=state,
+                    now=now,
+                )
+            except Exception as exc:  # pragma: no cover - defensive runtime fence
+                import structlog
+
+                structlog.get_logger().warning(
+                    "ad_schedule_reconciliation_wake_failed",
+                    account_id=account_id,
+                    attempt_key=attempt_key,
+                    error=type(exc).__name__,
+                )
+        return row

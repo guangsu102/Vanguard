@@ -27,15 +27,6 @@ def waiting_for_evidence(row: Any, now: datetime) -> bool:
     from app.modules.acquisition.adaptive_frequency import payload
     from app.modules.acquisition.review_retention import waits_for_new_evidence
 
-def waiting_for_evidence(row: Any, now: datetime) -> bool:
-    """Completed observations can wait without occupying executable capacity.
-
-    A queued callback/manual request, real maturity deadline or unfinished
-    identity work remains pressure. Technical failures also remain pressure.
-    """
-    from app.modules.acquisition.adaptive_frequency import payload
-    from app.modules.acquisition.review_retention import waits_for_new_evidence
-
     snapshot = payload(row.evidence_json)
     if (row.decision == "reject"
             and row.state == "completed"

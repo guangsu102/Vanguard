@@ -84,9 +84,24 @@ class TelegramEventInbox(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_error: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # P1 runtime reliability fields.  They are nullable/defaulted so the
+    # additive migration can coexist with historical inbox rows.
+    lane: Mapped[str] = mapped_column(String(24), default="business", nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    claim_owner: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    claim_lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    coalesce_key: Mapped[Optional[str]] = mapped_column(String(180), nullable=True)
+    coalesced_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    checkpoint_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    checkpoint_revision: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    checkpoint_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    checkpoint_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("account_id", "event_key", name="uq_telegram_event_inbox_identity"),
         Index("ix_telegram_event_inbox_pending", "state", "next_attempt_at", "id"),
         Index("ix_telegram_event_inbox_peer", "account_id", "chat_id", "id"),
+        Index("ix_telegram_event_inbox_lane_ready", "lane", "state", "available_at", "id"),
+        Index("ix_telegram_event_inbox_claim_lease", "state", "claim_lease_expires_at"),
+        Index("ix_telegram_event_inbox_coalesce", "account_id", "coalesce_key", "state"),
     )

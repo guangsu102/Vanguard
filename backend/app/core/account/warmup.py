@@ -95,7 +95,11 @@ def account_warmup_days(policy: dict[str, Any], account: Any) -> int:
     tier_policy = tiers.get(_account_asset_tier(account), {})
     if not isinstance(tier_policy, dict):
         tier_policy = {}
-    default_days = int(policy.get("default_warmup_days", 15) or 15)
+    raw_default_days = policy.get("default_warmup_days", 0)
+    try:
+        default_days = int(raw_default_days) if raw_default_days is not None else 0
+    except (TypeError, ValueError):
+        default_days = 0
     minimum_days = int(policy.get("minimum_warmup_days", 0) or 0)
     try:
         days = int(tier_policy.get("warmup_days", default_days))

@@ -301,9 +301,9 @@ async def test_each_link_restriction_must_be_cited_even_if_legacy_deny_regex_mis
         [answer(opposing_evidence_indexes=[]), answer(opposing_evidence_indexes=[])],
         pins=["no links"], ad_age_hours=1
     )
-    # Fail-closed contract: an uncited link restriction can no longer settle
-    # for observation; the row rejects with the same unconfirmed-scope reason.
-    assert row.decision == "reject" and not result.passed
+    # An uncited restriction blocks advertising while new evidence is awaited.
+    # It is not sufficient evidence for a group ban or automatic exit.
+    assert row.decision == "observe" and not result.passed and not result.should_leave
     assert row.reason == "link_or_profile_cta_scope_unconfirmed"
 
 

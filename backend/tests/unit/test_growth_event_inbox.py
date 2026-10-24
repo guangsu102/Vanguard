@@ -1,7 +1,7 @@
 """Real database boundaries for inbox replay, ordering and unknown outbound outcomes."""
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace as Obj
 
 import pytest
@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.core.account import event_inbox as inbox
 from app.core.account.models import TelegramAccount
 from app.core.account.rpc_governor import RpcDeferred
+from app.core.worker_status import TelegramEventInbox
 
 pytestmark = pytest.mark.asyncio
 
@@ -64,7 +65,7 @@ async def test_external_attempt_never_retries_even_for_later_budget_error(test_d
     assert await inbox.claim(test_db, [2]) is None
 
 
-async def test_restart_resumes_pending_but_preserves_interrupted_claim_for_reconciliation(test_db):
+async def test_restart_resumes_interrupted_claim_with_no_external_attempt(test_db):
     await account(test_db)
     await inbox.enqueue(test_db, 2, "message", event())
     await inbox.enqueue(test_db, 2, "message", event(2, -100456))
@@ -73,9 +74,35 @@ async def test_restart_resumes_pending_but_preserves_interrupted_claim_for_recon
     await test_db.commit()
     assert await inbox.recover_interrupted(test_db) == 1
     await test_db.commit()
-    assert row.state == "reconciliation_required"
+    assert row.state == "pending"
     next_row = await inbox.claim(test_db, [2])
-    assert next_row.chat_id == -100456
+    assert next_row.id == row.id
+
+
+async def test_stale_claims_retry_only_before_external_boundary(test_db):
+    await account(test_db)
+    old = datetime.utcnow() - timedelta(minutes=30)
+    safe = TelegramEventInbox(
+        account_id=2, event_key="stale-safe", kind="message", chat_id=-100123,
+        payload_json="{}", state="processing", started_at=old,
+        next_attempt_at=old, external_attempted=False,
+    )
+    unknown = TelegramEventInbox(
+        account_id=2, event_key="stale-unknown", kind="join", chat_id=-100456,
+        payload_json="{}", state="executing", started_at=old,
+        next_attempt_at=old, external_attempted=True,
+    )
+    test_db.add_all([safe, unknown])
+    await test_db.commit()
+
+    result = await inbox.recover_stale_processing(test_db)
+    await test_db.commit()
+    assert result == {"retried": 1, "reconciled": 1}
+    await test_db.refresh(safe)
+    await test_db.refresh(unknown)
+    assert safe.state == "pending" and safe.last_error == "stale_claim_retry"
+    assert unknown.state == "reconciliation_required"
+    assert unknown.last_error == "stale_external_attempt_reconciliation"
 
 
 async def test_unknown_business_failure_is_retained_not_acknowledged(test_db):
@@ -84,9 +111,10 @@ async def test_unknown_business_failure_is_retained_not_acknowledged(test_db):
     await test_db.commit()
     row = await inbox.claim(test_db, [2])
     await inbox.finish(test_db, row.id, TimeoutError())
-    assert row.state == "reconciliation_required" and row.payload_json != "{}"
+    assert row.state == "pending" and row.payload_json != "{}"
+    assert row.next_attempt_at > datetime.utcnow()
     stats = await inbox.inbox_snapshot(test_db)
-    assert stats["states"]["reconciliation_required"] == 1
+    assert stats["states"]["pending"] == 1
 
 
 @pytest.mark.parametrize('local_only', [True, None])

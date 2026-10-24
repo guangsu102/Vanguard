@@ -219,8 +219,14 @@ async def test_dynamic_candidate_uses_latest_qualification_and_preserves_real_wa
         group_id=group.id, policy_version=POLICY_VERSION, content_scope='text_profile', state='completed',
         decision='trial', membership_joined_at=member.joined_at, checked_at=now,
         expires_at=now+timedelta(hours=24), evidence_json=json.dumps(snapshot))
-    test_db.add_all([audit, SystemSetting(key=SETTING_KEY, value=json.dumps({'enabled': True,
-        'rollout_accounts': {str(account.id): {'phase': 'pilot', 'started_at': now.isoformat(), 'max_groups': 1}}}))])
+    qualification_config = {'enabled': True, 'system_account_user_ids': {str(account.id): 200},
+        'rollout_accounts': {str(account.id): {'phase': 'pilot', 'started_at': now.isoformat(), 'max_groups': 1}}}
+    from app.modules.acquisition.qualification_system_identity import covered_system_ids
+    ids, fingerprint = await covered_system_ids(test_db, qualification_config, account_id=account.id)
+    snapshot.update(system_identity_coverage=True, system_identity_fingerprint=fingerprint,
+                    system_user_ids=sorted(ids))
+    audit.evidence_json = json.dumps(snapshot)
+    test_db.add_all([audit, SystemSetting(key=SETTING_KEY, value=json.dumps(qualification_config))])
     await test_db.commit()
     candidates = await service._list_joined_groups_for_account(account.id)
     assert candidates == [member]

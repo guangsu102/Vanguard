@@ -210,7 +210,7 @@ async def test_latest_manual_result_supersedes_old_join_pending(test_db):
     account, group, member, old = await setup(test_db, decision="technical_wait")
     old.batch_id = "join-attempt:40"
     await test_db.commit()
-    assert (await read_work.initial_pending(test_db, account.id, 99))[0] == group.id
+    assert await read_work.initial_pending(test_db, account.id, 99) is None
     test_db.add(
         GroupQualificationAudit(
             batch_id="manual-newer",

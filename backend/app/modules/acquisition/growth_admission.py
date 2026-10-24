@@ -23,7 +23,7 @@ async def review_debt(db: Any, account_id: int, now: datetime, end: datetime) ->
     ).correlate(Member).scalar_subquery()
     rows = (await db.execute(select(Member, Audit).select_from(Member).outerjoin(Audit, Audit.id == latest).where(
         Member.account_id == account_id, Member.status == 'joined', Member.left_at.is_(None),
-        Member.review_status.notin_(['manual_required', 'owned_group_excluded']),
+        Member.review_status.notin_(['manual_required', 'owned_group_excluded', 'exit_pending', 'leave_failed']),
     ).limit(301))).all()
     if len(rows) > 300:
         raise ValueError('review_inventory_incomplete')
@@ -42,6 +42,10 @@ async def review_debt(db: Any, account_id: int, now: datetime, end: datetime) ->
     reads = count = 0
     for member, audit in rows:
         if audit is not None:
+            if audit.state in {'manual_required', 'waiting_membership'}:
+                continue
+            if audit.state == 'completed' and audit.next_retry_at is None:
+                continue
             if audit.decision in {'allowed', 'trial', 'protected'} or waiting_for_evidence(audit, now):
                 continue
             if audit.next_retry_at and audit.next_retry_at > end and audit.reason != 'telegram_read_budget':
@@ -101,10 +105,18 @@ async def admission_plan(db: Any, account_id: int, now: datetime, rpc: dict | No
         # reads stay charged; require only the remainder of this same job.
         outstanding = max(0, work.limit - work.reads) + work.review_reads + 24
     from app.modules.acquisition.execution_admission import execution_plan
-    execution = await execution_plan(db, now)
+    # Review pressure is an account-local admission input.  The worker's
+    # process-wide concurrency remains enforced when work is claimed; an old
+    # backlog on account 2 must not set accounts 33/34/35 to zero.
+    execution = await execution_plan(db, now, account_id=account_id)
     read_slots = max(0, room - debt) // outstanding
     slots = min(read_slots, execution["remaining"])
-    return {'remaining': slots, 'reason': None if slots else ('join_wait_inventory_review' if not read_slots else execution['reason']),
+    reason = None if slots else (
+        ('join_wait_inventory_review' if debt else 'telegram_read_budget')
+        if not read_slots else execution['reason']
+    )
+    return {'remaining': slots, 'reason': reason,
+            'retry_after_seconds': max(60, ttl) if reason == 'telegram_read_budget' else 60,
             'execution': execution,
             'review_reads_due': debt, 'pending_reviews': pending, 'available_reads': room,
             'new_group_read_cost': lifecycle, 'remaining_read_cost': outstanding, 'window_end': end.isoformat()}

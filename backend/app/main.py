@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from app.api import (
     account_personas,
@@ -83,6 +83,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception:
         pass
     await init_redis()
+    import asyncio
+    from app.core.metrics import aggregation_loop
+    app.state.metrics_task = asyncio.create_task(aggregation_loop())
     await start_account_proxy_policy_listener()
     await start_redis_bridge()
 
@@ -93,6 +96,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     # Shutdown
+    import contextlib
+    app.state.metrics_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await app.state.metrics_task
     await app.state.account_pool.close_all()
     await close_all_sub2api_clients()
     await close_all_xboard_clients()
@@ -144,6 +151,25 @@ async def health_check() -> dict:
     except Exception:
         return JSONResponse(status_code=503, content={"status": "unready", "version": "1.0.0"})
     return {"status": "healthy", "version": "1.0.0"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint(request: Request) -> Response:
+    """Internal Prometheus endpoint; Nginx must keep it off the public API."""
+    if settings.is_production and not settings.METRICS_SCRAPE_TOKEN:
+        return Response(status_code=404)
+    if settings.METRICS_SCRAPE_TOKEN:
+        import secrets
+        supplied = request.headers.get("authorization", "")
+        if not secrets.compare_digest(supplied, f"Bearer {settings.METRICS_SCRAPE_TOKEN}"):
+            return Response(status_code=404)
+    from app.core.metrics import render
+    from app.core.redis import get_redis
+    try:
+        payload = await render(await get_redis())
+    except Exception:
+        return Response(status_code=503)
+    return Response(content=payload, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/api/operations/status", dependencies=[Depends(get_current_user)])

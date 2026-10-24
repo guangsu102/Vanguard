@@ -151,11 +151,14 @@ async def record_request(account_id: int, requests: list, response: Any = None) 
             row.value = json.dumps(data)
 
 
-async def recover_missing_receipts(db: Any, now: datetime, account_id: int | None, limit: int) -> dict:
+async def recover_missing_receipts(db: Any, now: datetime, account_id: int | None, limit: int,
+                                   delivery_log_id: int | None = None,
+                                   independent: bool = False) -> dict:
     """Recover exact known IDs; unprovable sends remain isolated without retries."""
     from sqlalchemy import String, and_, cast, exists, func, literal, or_, select
 
     from app.core.account.models import AccountOutboundAttempt
+    from app.core.account.reconciliation_stream import legacy_account_filter
     from app.modules.acquisition.adaptive_frequency import payload
     from app.modules.acquisition.models import AdDeliveryLog
     from app.modules.acquisition.qualification_identity import peer_identity
@@ -164,6 +167,11 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
         AccountOutboundAttempt.message_id.is_not(None),
         AccountOutboundAttempt.message_id > 0,
+    ))
+    unknown_attempt_exists = exists(select(AccountOutboundAttempt.id).where(
+        AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
+        AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+        AccountOutboundAttempt.state == "unknown",
     ))
     logs = (await db.execute(select(AdDeliveryLog, SystemSetting).outerjoin(
         SystemSetting, SystemSetting.key == literal(RECHECK_PREFIX) + cast(AdDeliveryLog.id, String),
@@ -186,6 +194,12 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
             func.lower(AdDeliveryLog.error).contains("send_outcome_unknown"),
             AdDeliveryLog.status.in_(["unknown", "reconciliation_required"]),
             AdDeliveryLog.qualification_context_json.ilike("%receipt_evidence_required%"),
+            # A durable message ID is authoritative local proof even when a
+            # worker crashed before copying it to the delivery log. An
+            # unknown outbound ledger is also safe to enter the one-shot
+            # evidence workflow; it must never be replayed automatically.
+            proof_exists,
+            unknown_attempt_exists,
         ),
         or_(
             # The independent receipt timer remains authoritative after the
@@ -208,6 +222,8 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         AdDeliveryLog.survival_claim_expires_at.is_(None),
         AdDeliveryLog.created_at < now - timedelta(minutes=10),
         True if account_id is None else AdDeliveryLog.account_id == account_id,
+        True if delivery_log_id is None else AdDeliveryLog.id == delivery_log_id,
+        True if independent else legacy_account_filter(AdDeliveryLog.account_id),
     ).order_by(AdDeliveryLog.id).limit(limit))).all()
     recovered = waiting = manual = 0
     for log, schedule in logs:
@@ -224,27 +240,26 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         if type(message_id) is int and message_id > 0:
             log.telegram_message_id, log.survival_check_due_at = message_id, now
             was_manual = reconciliation_state(log) == MANUAL_EVIDENCE_STATE
-            if was_manual:
-                # Manual evidence is terminal for Telegram reads, but a later
-                # local ledger proof can safely restore the original delivery.
-                log.status = "success"
-                log.sent_at = log.sent_at or log.created_at or now
-                log.error = None
-                log.survival_status = "pending"
-                log.survival_stage = "two_minute"
-                log.survival_error = None
-                log.survival_retry_count = 0
-                try:
-                    from app.modules.acquisition.daily_frequency import DailyFrequencyService
+            # A matching ledger message ID is durable proof of the external
+            # write. Apply the same success transition for both a legacy
+            # ``pending`` row and a row already parked for manual evidence;
+            # leaving a proven row pending would keep the target fenced.
+            log.status = "success"
+            log.sent_at = log.sent_at or log.created_at or now
+            log.error = None
+            log.survival_status = "pending"
+            log.survival_stage = "two_minute"
+            log.survival_error = None
+            log.survival_retry_count = 0
+            try:
+                from app.modules.acquisition.daily_frequency import DailyFrequencyService
 
-                    await DailyFrequencyService(db).note_sent(log)
-                except Exception:
-                    pass
+                await DailyFrequencyService(db).note_sent(log)
+            except Exception:
+                pass
             recovered += 1
-            state = "exact_receipt_recovered"
             if schedule is not None:
                 await db.delete(schedule)
-            next_check = None
             context["send_reconciliation"] = {
                 "state": "exact_receipt_recovered",
                 "checked_at": now.isoformat(),
@@ -255,7 +270,7 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
                 "verification_terminal": True,
             }
             log.qualification_context_json = json.dumps(context, ensure_ascii=False)
-            if was_manual and log.reservation_token:
+            if log.reservation_token:
                 try:
                     from app.core.account.outbound_budget import AccountOutboundBudgetService
 
@@ -290,27 +305,57 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         "receipt_ids_recovered": recovered,
         "receipt_evidence_required": waiting,
         "manual_evidence_required": manual,
-        "abandoned_pending_closed": await _close_abandoned_pending(db, now, account_id, limit),
+        "abandoned_pending_closed": await _close_abandoned_pending(
+            db, now, account_id, limit, delivery_log_id=delivery_log_id, independent=independent,
+        ),
     }
 
 
-async def _close_abandoned_pending(db: Any, now: datetime, account_id: int | None, limit: int) -> int:
+async def _close_abandoned_pending(
+    db: Any,
+    now: datetime,
+    account_id: int | None,
+    limit: int,
+    *,
+    delivery_log_id: int | None = None,
+    independent: bool = False,
+) -> int:
     """Close pending rows whose send never reached the outbound ledger.
 
     A worker crash between the delivery-log insert and the ledger reservation
     leaves a pending row with no error marker, no receipt timer and no ledger
     attempt.  The unknown-outcome lanes deliberately ignore it, so without this
-    sweep it would stay pending forever.  Once clearly stale (one hour) and
-    provably never attempted (no ledger row for its token), close it.
+    sweep it would stay pending forever. Close a stale row without a ledger,
+    an explicit cancelled ledger, or an expired reservation that never reached
+    ``mark_attempted``. The latter is safe because Telegram RPC is only called
+    after the outbound ledger transitions to ``attempted``.
     """
-    from sqlalchemy import exists as sa_exists, literal, or_, select
+    from sqlalchemy import and_, literal, or_, select
+    from sqlalchemy import exists as sa_exists
 
     from app.core.account.models import AccountOutboundAttempt
+    from app.core.account.reconciliation_stream import legacy_account_filter
     from app.modules.acquisition.models import AdDeliveryLog
 
     ledger_attempt = sa_exists(select(AccountOutboundAttempt.id).where(
         AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
         AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+    ))
+    cancelled_before_write = sa_exists(select(AccountOutboundAttempt.id).where(
+        AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
+        AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+        AccountOutboundAttempt.state == "cancelled",
+        AccountOutboundAttempt.attempted_at.is_(None),
+        AccountOutboundAttempt.message_id.is_(None),
+    ))
+    expired_reserved_before_write = sa_exists(select(AccountOutboundAttempt.id).where(
+        AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
+        AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+        AccountOutboundAttempt.state == "reserved",
+        AccountOutboundAttempt.lease_expires_at.is_not(None),
+        AccountOutboundAttempt.lease_expires_at <= now,
+        AccountOutboundAttempt.attempted_at.is_(None),
+        AccountOutboundAttempt.message_id.is_(None),
     ))
     rows = (await db.execute(
         select(AdDeliveryLog).where(
@@ -318,13 +363,44 @@ async def _close_abandoned_pending(db: Any, now: datetime, account_id: int | Non
             AdDeliveryLog.telegram_message_id.is_(None),
             or_(AdDeliveryLog.error.is_(None), AdDeliveryLog.error == ""),
             AdDeliveryLog.reservation_token.is_not(None),
-            AdDeliveryLog.created_at < now - timedelta(hours=1),
-            ~ledger_attempt,
+            or_(cancelled_before_write,
+                expired_reserved_before_write,
+                and_(AdDeliveryLog.created_at < now - timedelta(hours=1), ~ledger_attempt)),
             True if account_id is None else AdDeliveryLog.account_id == account_id,
+            True if delivery_log_id is None else AdDeliveryLog.id == delivery_log_id,
+            True if independent else legacy_account_filter(AdDeliveryLog.account_id),
         ).order_by(AdDeliveryLog.id).limit(limit)
     )).scalars().all()
     closed = 0
     for log in rows:
+        attempt = await db.scalar(
+            select(AccountOutboundAttempt)
+            .where(
+                AccountOutboundAttempt.account_id == log.account_id,
+                AccountOutboundAttempt.attempt_key == "ad:" + str(log.reservation_token or ""),
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if attempt is not None and attempt.state == "reserved":
+            # The row may have changed after the candidate query acquired its
+            # snapshot. Re-check the proof while holding the ledger lock.
+            if (
+                attempt.lease_expires_at is None
+                or attempt.lease_expires_at > now
+                or attempt.attempted_at is not None
+                or attempt.message_id is not None
+            ):
+                continue
+            attempt.state = "cancelled"
+            attempt.completed_at = now
+            attempt.lease_expires_at = None
+            attempt.error_code = "reservation_expired_before_write"
+        elif attempt is not None and (
+            attempt.attempted_at is not None or attempt.message_id is not None
+        ):
+            # Never close a delivery row when the external write has evidence.
+            continue
         context = _context(log)
         context["send_reconciliation"] = {
             "state": "abandoned_before_attempt",

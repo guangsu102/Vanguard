@@ -323,13 +323,27 @@ def test_normalize_account_warmup_policy_settings_defaults_and_camel_case():
     )
 
     assert config["enabled"] is True
-    assert config["default_warmup_days"] == 7
-    assert config["minimum_warmup_days"] == 7
+    assert config["default_warmup_days"] == 5
+    assert config["minimum_warmup_days"] == 5
     assert config["user_initiated_private_message_multiplier"] == 1.5
-    assert config["tiers"]["year_3_plus"]["warmup_days"] == 7
+    assert config["tiers"]["year_3_plus"]["warmup_days"] == 6
     assert config["stages"]["observe"]["join_multiplier"] == 0.2
     assert config["stages"]["observe"]["ad_multiplier"] == 0
     assert config["stages"]["observe"]["allow_proactive_private_message"] is False
+
+
+def test_normalize_account_warmup_policy_preserves_zero_days():
+    config = normalize_account_warmup_policy_settings(
+        {
+            "defaultWarmupDays": 0,
+            "minimumWarmupDays": 0,
+            "tiers": {"unknown": {"warmupDays": 0}},
+        }
+    )
+
+    assert config["default_warmup_days"] == 0
+    assert config["minimum_warmup_days"] == 0
+    assert all(tier["warmup_days"] == 0 for tier in config["tiers"].values())
 
 
 def test_normalize_group_ai_interaction_settings_defaults_and_clamps():

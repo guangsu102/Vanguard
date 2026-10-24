@@ -1,0 +1,24 @@
+apiVersion: 1
+
+datasources:
+  - name: Vanguard Prometheus
+    uid: vanguard-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090/monitoring/prometheus/
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      manageAlerts: true
+      alertmanagerUid: vanguard-alertmanager
+
+  - name: Vanguard Alertmanager
+    uid: vanguard-alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093/monitoring/alertmanager/
+    editable: false
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false

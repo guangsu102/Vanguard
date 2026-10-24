@@ -253,7 +253,7 @@ async def review_semantics(
     # Scope actual configured clients to the one user-authorized destination.
     endpoint = urlsplit(str(getattr(llm, "base_url", "") or ""))
     approved_endpoint = endpoint.scheme == "https" and (
-        endpoint.hostname == "api.pipenai.xyz"
+        endpoint.hostname in {"api.pipenai.xyz", "pipenai.xyz"}
         or (
             endpoint.hostname == "ark.cn-beijing.volces.com"
             and endpoint.path.rstrip("/") == "/api/coding/v3"

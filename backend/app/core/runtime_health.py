@@ -242,6 +242,8 @@ async def operational_snapshot(db) -> dict:
     ratio = int(info.get("used_memory") or 0) / maximum if maximum else 0
     if ratio > 0.8:
         alerts.append({"code": "redis_memory_high", "severity": "critical"})
+    from app.core.metrics import cached_status
+    growth_status = await cached_status(redis)
     return {
         "checked_at": now.isoformat(),
         "status": "critical"
@@ -258,4 +260,5 @@ async def operational_snapshot(db) -> dict:
         "outbound_unknown_blocking": unknown_blocking,
         "outbound_receipt_evidence_required": receipt_evidence_required,
         "attribution_records": tracking,
+        **growth_status,
     }

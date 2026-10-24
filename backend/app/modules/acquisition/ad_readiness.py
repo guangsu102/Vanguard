@@ -15,6 +15,25 @@ class AdReadiness:
     next_allowed_at: datetime | None = None
 
 
+class AdSkipReason(str):
+    """String-compatible blocker carrying the next safe retry deadline.
+
+    Existing callers compare ad blockers with string literals and use string
+    helpers such as ``startswith``. Keeping the reason a ``str`` subclass lets
+    those callers continue to work while the scheduler retains the deadline
+    that produced the blocker.
+    """
+
+    next_allowed_at: datetime | None
+
+    def __new__(
+        cls, reason: str, next_allowed_at: datetime | None = None
+    ) -> "AdSkipReason":
+        value = str.__new__(cls, reason)
+        value.next_allowed_at = next_allowed_at
+        return value
+
+
 def schedule_readiness(state: AdDeliveryScheduleState | None, now: datetime) -> AdReadiness:
     if state is None:
         return AdReadiness()

@@ -16,16 +16,15 @@ import json
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from inspect import isawaitable
-from typing import Any, Callable, Optional
+from typing import Any
 from uuid import uuid4
 
 import structlog
-from app.core.account.rpc_governor import RpcDeferred, deferred_error
-from app.modules.acquisition.survival_reads import SurvivalReadBatch
 from sqlalchemy import and_, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +47,7 @@ from app.core.account.operation_lease import (
 )
 from app.core.account.pool import AccountPool, get_account_pool
 from app.core.account.risk_guard import AccountRiskAction, AccountRiskGuard
+from app.core.account.rpc_governor import RpcDeferred, deferred_error
 from app.core.account.telegram_execution import TelegramExecutionService
 from app.core.account.warmup import account_warmup_days
 from app.core.ai.keyword_generator import (
@@ -69,7 +69,7 @@ from app.core.automation_settings import (
     get_group_ai_interaction_settings,
 )
 from app.core.config import settings
-from app.core.group.manager import GroupManager
+from app.core.group.identity import is_owned_group_target, telegram_group_id_aliases
 from app.core.group.join_review import (
     JOIN_LEAVE_RETRY_SECONDS,
     JOIN_LEAVE_RETRY_WINDOW_SECONDS,
@@ -85,20 +85,25 @@ from app.core.group.join_review import (
     JOIN_REVIEW_TWO_HOUR_SECONDS,
     exclude_owned_group_review,
 )
-from app.core.group.identity import is_owned_group_target, telegram_group_id_aliases
+from app.core.group.manager import GroupManager
 from app.core.group.models import Group, GroupAccountMembership, GroupLevel
 from app.core.keyword.models import KeywordType
 from app.core.operating_time import operating_day_start
 from app.core.runtime_settings import DEFAULT_AD_CAPACITY_SETTINGS
 from app.core.telegram_chat_lock import telegram_chat_advisory_lock
-from app.modules.acquisition.probe_policy import in_ad_window_at, probe_day_start, write_probe_limit
+from app.modules.acquisition.ad_reconciliation import (
+    RECONCILIATION_REASON_PREFIX,
+    is_reconciliation_reason,
+    pause_unresolved_ad_schedules,
+    unresolved_ad_attempt_id,
+)
 from app.modules.acquisition.auto_reply.speaker import Speaker
 from app.modules.acquisition.auto_reply.templates import TemplateEngine
-from app.modules.acquisition.config import AcquisitionConfig
 from app.modules.acquisition.candidate_preview import (
     PREVIEW_GROUP_LIMIT,
     public_candidate_preview,
 )
+from app.modules.acquisition.config import AcquisitionConfig
 from app.modules.acquisition.dynamic_frequency import AccountDynamicFrequencyService
 from app.modules.acquisition.join_budget import (
     JoinBudgetBlocked,
@@ -131,6 +136,7 @@ from app.modules.acquisition.models import (
     SearchKeywordSource,
     SearchKeywordStatus,
 )
+from app.modules.acquisition.probe_policy import in_ad_window_at, probe_day_start, write_probe_limit
 from app.modules.acquisition.search.filters import GroupFilter, GroupFilterCriteria
 from app.modules.acquisition.search.group_finder import (
     DiscoveredGroup,
@@ -146,6 +152,7 @@ from app.modules.acquisition.search_keyword_registry import (
     normalize_group_search_keyword,
     recent_keyword_texts,
 )
+from app.modules.acquisition.survival_reads import SurvivalReadBatch
 from app.modules.owned_group.models import OwnedGroupAsset
 
 logger = structlog.get_logger()
@@ -197,6 +204,8 @@ AD_POLICY_PROBE_CONTENT_RETRY_SECONDS = 6 * 3600
 AD_POLICY_PROBE_CONTENT_RETRY_JITTER_SECONDS = 15 * 60
 AD_POLICY_PROBE_LEASE_RETRY_SECONDS = 5 * 60
 AD_POLICY_PROBE_LEASE_RETRY_JITTER_SECONDS = 10 * 60
+AD_BUDGET_RETRY_FALLBACK_SECONDS = 30 * 60
+AD_DAILY_REVIEW_RETRY_FALLBACK_SECONDS = 5 * 60
 AD_POLICY_PROBE_MESSAGES = (
     "最近在整理 GPT 和 Claude 的使用成本，有需要可以一起交流。",
     "这边在做 AI 工具和 API 的低成本方案，有兴趣可以交流一下。",
@@ -447,8 +456,20 @@ def _ad_schedule_state_for_update_query() -> Select[tuple[AdDeliveryScheduleStat
     return select(AdDeliveryScheduleState).with_for_update(of=AdDeliveryScheduleState)
 
 
-def _day_start(now: Optional[datetime] = None) -> datetime:
+def _day_start(now: datetime | None = None) -> datetime:
     return operating_day_start(now)
+
+
+def _telegram_group_id_clause(column: Any, value: int | None) -> Any:
+    """Match both legacy raw and marked Telegram peer IDs.
+
+    Discovery, membership sync, and older delivery rows do not all use the
+    same Telegram ID namespace. History checks must therefore use the same
+    alias set as the join and qualification paths; an exact comparison can
+    miss a prior send and reopen a cooldown for the same chat.
+    """
+    aliases = telegram_group_id_aliases(value)
+    return column.in_(aliases) if aliases else column == value
 
 
 @dataclass
@@ -476,7 +497,7 @@ class AutomationRunResult:
             "details": self.details,
         }
 
-    def merge(self, other: "AutomationRunResult | dict[str, Any]") -> None:
+    def merge(self, other: AutomationRunResult | dict[str, Any]) -> None:
         payload = other.as_dict() if isinstance(other, AutomationRunResult) else other
         self.processed += int(payload.get("processed") or 0)
         self.created += int(payload.get("created") or 0)
@@ -505,9 +526,9 @@ class MessageLanguageProfile:
 class GroupAdRulesAuditResult:
     """Ad policy signals extracted from group rules, announcements, and pinned text."""
 
-    ad_allowed: Optional[bool] = None
+    ad_allowed: bool | None = None
     policy_mode: str = GroupAdPolicyMode.UNKNOWN.value
-    reason: Optional[str] = None
+    reason: str | None = None
     deny_matches: list[dict[str, Any]] = field(default_factory=list)
     allow_matches: list[dict[str, Any]] = field(default_factory=list)
     approval_matches: list[dict[str, Any]] = field(default_factory=list)
@@ -515,7 +536,7 @@ class GroupAdRulesAuditResult:
     confidence: int = 0
     decision_source: str = "local_rules"
     ai_reviews: list[dict[str, Any]] = field(default_factory=list)
-    evidence_hash: Optional[str] = None
+    evidence_hash: str | None = None
     cache_hit: bool = False
 
     def details(self) -> dict[str, Any]:
@@ -541,22 +562,22 @@ class JoinedGroupAuditResult:
     """Post-join audit outcome used before a group is treated as usable."""
 
     passed: bool
-    reason: Optional[str] = None
-    can_send_messages: Optional[bool] = None
-    permission_reason: Optional[str] = None
+    reason: str | None = None
+    can_send_messages: bool | None = None
+    permission_reason: str | None = None
     language: MessageLanguageProfile = field(default_factory=MessageLanguageProfile)
     message_count: int = 0
     unique_senders: int = 0
-    member_count: Optional[int] = None
+    member_count: int | None = None
     rule_score: int = 0
     admin_score: int = 0
     history_score: int = 0
     activity_score: int = 0
     should_leave: bool = False
-    verification_action: Optional[str] = None
+    verification_action: str | None = None
     verification_details: dict[str, Any] = field(default_factory=dict)
-    ad_allowed: Optional[bool] = None
-    ad_rule_reason: Optional[str] = None
+    ad_allowed: bool | None = None
+    ad_rule_reason: str | None = None
     ad_rule_details: dict[str, Any] = field(default_factory=dict)
 
     def details(self) -> dict[str, Any]:
@@ -634,12 +655,12 @@ class JoinVerificationDecision:
     action: str = "none"
     source: str = "local"
     confidence: float = 0.0
-    button_text: Optional[str] = None
-    answer: Optional[str] = None
+    button_text: str | None = None
+    answer: str | None = None
     reason: str = ""
-    target_message_id: Optional[int] = None
-    bot_username: Optional[str] = None
-    bot_start_payload: Optional[str] = None
+    target_message_id: int | None = None
+    bot_username: str | None = None
+    bot_start_payload: str | None = None
 
     def details(self) -> dict[str, Any]:
         return {
@@ -664,21 +685,21 @@ class JoinVerificationActionResult:
     success: bool = False
     action: str = "none"
     reason: str = ""
-    error: Optional[str] = None
+    error: str | None = None
     should_retry_audit: bool = False
     should_leave: bool = True
     decision_source: str = "local"
     challenge_type: str = "none"
     confidence: float = 0.0
     decision_reason: str = ""
-    button_text: Optional[str] = None
-    answer: Optional[str] = None
-    target_message_id: Optional[int] = None
-    bot_username: Optional[str] = None
-    bot_start_payload: Optional[str] = None
+    button_text: str | None = None
+    answer: str | None = None
+    target_message_id: int | None = None
+    bot_username: str | None = None
+    bot_start_payload: str | None = None
     post_action_rechecks: list[dict[str, Any]] = field(default_factory=list)
-    post_action_final_can_send: Optional[bool] = None
-    post_action_final_permission_reason: Optional[str] = None
+    post_action_final_can_send: bool | None = None
+    post_action_final_permission_reason: str | None = None
 
     def details(self) -> dict[str, Any]:
         return {
@@ -710,8 +731,8 @@ class AcquisitionAutomationService:
     def __init__(
         self,
         db: AsyncSession,
-        account_pool: Optional[AccountPool] = None,
-        config: Optional[AcquisitionConfig] = None,
+        account_pool: AccountPool | None = None,
+        config: AcquisitionConfig | None = None,
     ):
         self.db = db
         self.account_pool = account_pool or get_account_pool()
@@ -730,13 +751,13 @@ class AcquisitionAutomationService:
                 require_username=True,
             )
         )
-        self._verification_llm_client: Optional[LLMClient] = None
-        self._ad_policy_llm_client: Optional[LLMClient] = None
+        self._verification_llm_client: LLMClient | None = None
+        self._ad_policy_llm_client: LLMClient | None = None
         self.logger = logger.bind(module="acquisition_automation")
 
     def _group_ai_warmup_window_skip_reason(
         self, now: datetime, group_ai: dict[str, Any]
-    ) -> Optional[str]:
+    ) -> str | None:
         raw_start_hour = group_ai.get("proactiveWarmupWindowStartHour", 9)
         raw_end_hour = group_ai.get("proactiveWarmupWindowEndHour", 2)
         start_hour = 9 if raw_start_hour is None else int(raw_start_hour)
@@ -753,7 +774,7 @@ class AcquisitionAutomationService:
     async def run_group_ai_warmup(
         self,
         *,
-        max_groups: Optional[int] = None,
+        max_groups: int | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Run one proactive group-AI warmup pass."""
@@ -861,7 +882,9 @@ class AcquisitionAutomationService:
                     select(
                         func.count(AcquisitionMessage.id), func.max(AcquisitionMessage.sent_at)
                     ).where(
-                        AcquisitionMessage.group_id == membership.telegram_group_id,
+                        _telegram_group_id_clause(
+                            AcquisitionMessage.group_id, membership.telegram_group_id
+                        ),
                         AcquisitionMessage.message_type == MessageType.AI_WARMUP.value,
                         AcquisitionMessage.sent_at >= day_start,
                     )
@@ -906,7 +929,9 @@ class AcquisitionAutomationService:
                 await self.db.execute(
                     select(func.max(AcquisitionMessage.sent_at)).where(
                         AcquisitionMessage.account_id == membership.account_id,
-                        AcquisitionMessage.group_id == membership.telegram_group_id,
+                        _telegram_group_id_clause(
+                            AcquisitionMessage.group_id, membership.telegram_group_id
+                        ),
                         AcquisitionMessage.message_type == MessageType.AI_WARMUP.value,
                     )
                 )
@@ -984,7 +1009,7 @@ class AcquisitionAutomationService:
     async def _record_group_ai_warmup_interaction(
         self,
         membership: GroupAccountMembership,
-        message_id: Optional[int],
+        message_id: int | None,
         now: datetime,
     ) -> None:
         """Let ad warmup reuse successful AI warmup as a low-risk interaction signal."""
@@ -1014,10 +1039,10 @@ class AcquisitionAutomationService:
     async def replenish_keywords(
         self,
         *,
-        min_per_type: Optional[dict[str, int]] = None,
-        generate_counts: Optional[dict[str, int]] = None,
+        min_per_type: dict[str, int] | None = None,
+        generate_counts: dict[str, int] | None = None,
         auto_approve: bool = False,
-        learning_hints_by_type: Optional[dict[str, dict[str, list[str]]]] = None,
+        learning_hints_by_type: dict[str, dict[str, list[str]]] | None = None,
     ) -> dict[str, Any]:
         """
         Generate missing keywords with AI and add them to the moderation queue.
@@ -1180,6 +1205,40 @@ class AcquisitionAutomationService:
         configs = (await self._list_join_enabled_account_configs(max_accounts) if account_id is None
                    else await self._list_join_enabled_account_configs(max_accounts, account_id=account_id))
         if not configs:
+            if account_id is not None:
+                # Account-scoped scheduler tickets must retain their admission
+                # outcome. Silently filtering a budget-blocked account looks
+                # like completed work and schedules another ordinary scan.
+                status = await self.join_budget.status(account_id, now=now)
+                reason = status.blocked_reasons[0] if status.blocked_reasons else "account_not_eligible"
+                detail: dict[str, Any] = {
+                    "account_id": account_id, "action": "skip", "reason": reason,
+                    "blocked_reasons": status.blocked_reasons,
+                }
+                retry_at = status.next_allowed_at
+                if reason in {
+                    "telegram_read_budget", "telegram_rpc_cooldown",
+                    "telegram_rpc_guard_unavailable", "join_flood_wait",
+                    "join_wait_inventory_review",
+                }:
+                    from math import ceil
+
+                    from app.core.account.critical_fairness import purpose_budget
+                    from app.core.account.rpc_governor import snapshot as rpc_snapshot
+
+                    budget = await rpc_snapshot(self.db, account_id, now)
+                    join_reads = purpose_budget(budget, "auto_join_search")
+                    if join_reads.get("remaining", 0) <= 0:
+                        delay = max(join_reads.get("retry_after_seconds", 0),
+                                    budget.get("retry_after_seconds", 0))
+                        if delay > 0:
+                            read_retry = now + timedelta(seconds=delay)
+                            retry_at = max(retry_at or read_retry, read_retry)
+                            detail["retry_after_seconds"] = ceil((retry_at - now).total_seconds())
+                if retry_at is not None and retry_at > now:
+                    detail["next_join_after"] = retry_at.isoformat()
+                result.skipped += 1
+                result.details.append(detail)
             return result.as_dict()
 
         config_ids = [config.id for config in configs]
@@ -1246,8 +1305,8 @@ class AcquisitionAutomationService:
         keywords_per_account: int,
         max_groups_per_keyword: int,
         dry_run: bool,
-        reserved_group_ids: Optional[set[int]] = None,
-        reserve_lock: Optional[asyncio.Lock] = None,
+        reserved_group_ids: set[int] | None = None,
+        reserve_lock: asyncio.Lock | None = None,
     ) -> AutomationRunResult:
         row = await self.db.execute(
             select(AccountOperationConfig)
@@ -1302,8 +1361,8 @@ class AcquisitionAutomationService:
         keywords_per_account: int,
         max_groups_per_keyword: int,
         dry_run: bool,
-        reserved_group_ids: Optional[set[int]] = None,
-        reserve_lock: Optional[asyncio.Lock] = None,
+        reserved_group_ids: set[int] | None = None,
+        reserve_lock: asyncio.Lock | None = None,
     ) -> AutomationRunResult:
         result = AutomationRunResult(processed=1)
         account = op_config.account
@@ -1344,7 +1403,7 @@ class AcquisitionAutomationService:
             pending_group = await self._next_pending_join_group(
                 account_id=account.id,
                 preview=not dry_run,
-                minimum_ready=3 if not dry_run else 0,
+                minimum_ready=1 if not dry_run else 0,
                 reserved_group_ids=reserved_group_ids,
                 reserve_lock=reserve_lock,
             )
@@ -1413,6 +1472,8 @@ class AcquisitionAutomationService:
                     keyword.text,
                     limit=max_groups_per_keyword,
                     account_id=account.id,
+                    raise_errors=True,
+                    purpose="auto_join_search",
                 )
                 groups, filtered_by_title = await self._filter_groups_by_title_blacklist(
                     account.id,
@@ -1450,6 +1511,29 @@ class AcquisitionAutomationService:
                     candidate_count=joinable_count,
                 )
             except Exception as exc:
+                if isinstance(exc, RpcDeferred):
+                    retry_at = _now() + timedelta(seconds=exc.retry_after_seconds)
+                    op_config.next_join_after = max(
+                        op_config.next_join_after or retry_at,
+                        retry_at,
+                    )
+                    result.skipped += 1
+                    result.details.append(
+                        {
+                            "account_id": account.id,
+                            "keyword": keyword.text,
+                            "action": "waiting_read_capacity",
+                            "reason": exc.reason,
+                            "retry_after_seconds": exc.retry_after_seconds,
+                            "resume_at": retry_at.isoformat(),
+                            "next_join_after": retry_at.isoformat(),
+                        }
+                    )
+                    # A budget wait is a scheduling outcome.  Do not mark the
+                    # keyword negative, replenish it, or report that no group
+                    # was found after the API call was intentionally skipped.
+                    account_paused = True
+                    break
                 flood_wait_seconds = self._flood_wait_seconds(exc)
                 if flood_wait_seconds is not None:
                     resume_at = await self._apply_account_flood_wait(
@@ -1486,6 +1570,22 @@ class AcquisitionAutomationService:
             {"account_id": account.id, "action": "search_results_saved", **discovered}
         )
 
+        if discovered["queued"] <= 0:
+            # The existing pool was already previewed before searching. Only
+            # preview again when this search actually adds join candidates.
+            replenish_detail = await self._ensure_keywords_after_low_hit_rate(
+                op_config,
+                search_feedback=search_feedback,
+            )
+            if replenish_detail:
+                result.updated += replenish_detail.get("created", 0)
+                result.details.append(replenish_detail)
+            result.skipped += 1
+            result.details.append(
+                {"account_id": account.id, "action": "skip", "reason": "no_joinable_group"}
+            )
+            return result
+
         try:
             pending_group = await self._next_pending_join_group(
                 account_id=account.id,
@@ -1516,19 +1616,6 @@ class AcquisitionAutomationService:
                 await self._attempt_join_queued_group(op_config, pending_group, dry_run=dry_run)
             )
             return result
-
-        if discovered["queued"] <= 0:
-            replenish_detail = await self._ensure_keywords_after_low_hit_rate(
-                op_config,
-                search_feedback=search_feedback,
-            )
-            if replenish_detail:
-                result.updated += replenish_detail.get("created", 0)
-                result.details.append(replenish_detail)
-            result.skipped += 1
-            result.details.append(
-                {"account_id": account.id, "action": "skip", "reason": "no_joinable_group"}
-            )
 
         return result
 
@@ -2008,6 +2095,10 @@ class AcquisitionAutomationService:
                 else (
                     DeliveryStatus.SKIPPED
                     if join_error_reason.startswith("risk_guard_blocked:")
+                    or join_error_reason in {
+                        "account_operation_lease_busy",
+                        "account_operation_lease_unavailable",
+                    }
                     else DeliveryStatus.FAILED
                 )
             )
@@ -2073,14 +2164,19 @@ class AcquisitionAutomationService:
 
             if join_error_status == DeliveryStatus.SKIPPED:
                 result.skipped += 1
+                waiting_for_account = join_error_reason in {
+                    "account_operation_lease_busy",
+                    "account_operation_lease_unavailable",
+                }
                 result.details.append(
                     {
                         "account_id": account.id,
                         "group_id": db_group.id,
                         "telegram_group_id": group.group_id,
                         "keyword": source_keyword,
-                        "action": "skip",
+                        "action": "waiting_account_available" if waiting_for_account else "skip",
                         "reason": join_error_reason,
+                        **({"retryable": True, "error": str(exc)} if waiting_for_account else {}),
                     }
                 )
                 return result
@@ -2134,7 +2230,7 @@ class AcquisitionAutomationService:
             return
         await self.account_pool.sync_from_db(accounts)
 
-    async def _check_join_quota(self, config: AccountOperationConfig) -> Optional[str]:
+    async def _check_join_quota(self, config: AccountOperationConfig) -> str | None:
         now = _now()
         cooldown_remaining = await self.risk_guard.peek_join_cooldown(config.account_id)
         if cooldown_remaining > 0:
@@ -2239,14 +2335,14 @@ class AcquisitionAutomationService:
                 "wait_days": round(pending / throughput, 1),
                 "join_paused": pending > throughput * max_days}
 
-    def _business_stage_or_default(self, config: Optional[AccountOperationConfig]) -> str:
+    def _business_stage_or_default(self, config: AccountOperationConfig | None) -> str:
         return self.dynamic_frequency.business_stage_or_default(config)
 
     def _business_stage_limit_multiplier(self, stage: str) -> float:
         return self.dynamic_frequency.business_stage_limit_multiplier(stage)
 
     def _account_risk_limit_multiplier(
-        self, account: Optional[TelegramAccount], now: datetime
+        self, account: TelegramAccount | None, now: datetime
     ) -> float:
         return self.dynamic_frequency.account_risk_limit_multiplier(account, now)
 
@@ -2258,11 +2354,11 @@ class AcquisitionAutomationService:
 
     async def _sync_account_business_stage(
         self,
-        config: Optional[AccountOperationConfig],
+        config: AccountOperationConfig | None,
         now: datetime,
         *,
-        health: Optional[dict[str, Any]] = None,
-        join_metrics: Optional[dict[str, Any]] = None,
+        health: dict[str, Any] | None = None,
+        join_metrics: dict[str, Any] | None = None,
     ) -> str:
         if config is None:
             return AccountBusinessStage.NEW.value
@@ -2294,7 +2390,7 @@ class AcquisitionAutomationService:
         self,
         config: AccountOperationConfig,
         now: datetime,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         cleanup_config = (await get_auto_join_scheduler_settings(self.db)).get(
             "group_capacity_cleanup", {}
         )
@@ -2325,7 +2421,7 @@ class AcquisitionAutomationService:
     ) -> int:
         row = await self.db.execute(
             select(func.count(AcquisitionTracking.id)).where(
-                AcquisitionTracking.group_id == telegram_group_id,
+                _telegram_group_id_clause(AcquisitionTracking.group_id, telegram_group_id),
                 AcquisitionTracking.converted == True,
                 AcquisitionTracking.converted_at.isnot(None),
                 AcquisitionTracking.converted_at >= since,
@@ -2397,7 +2493,7 @@ class AcquisitionAutomationService:
     async def _build_keyword_learning_hints_by_type(
         self,
         *,
-        recent_negative_keywords: Optional[list[str]] = None,
+        recent_negative_keywords: list[str] | None = None,
     ) -> dict[str, dict[str, list[str]]]:
         positive_keywords = await self._collect_positive_search_keywords(limit=80)
         negative_keywords = await self._collect_negative_search_keywords(
@@ -2454,7 +2550,7 @@ class AcquisitionAutomationService:
         self,
         *,
         limit: int,
-        recent_negative_keywords: Optional[list[str]] = None,
+        recent_negative_keywords: list[str] | None = None,
     ) -> list[str]:
         keywords = list(recent_negative_keywords or [])
         rows = await self.db.execute(
@@ -2513,7 +2609,7 @@ class AcquisitionAutomationService:
     async def _mark_search_keyword_used(self, keyword: GroupSearchKeyword) -> None:
         await self._record_search_keyword_feedback(keyword, found_count=1, candidate_count=1)
 
-    def _parse_keyword_types(self, raw: Optional[str]) -> list[KeywordType]:
+    def _parse_keyword_types(self, raw: str | None) -> list[KeywordType]:
         if not raw:
             return DEFAULT_KEYWORD_TYPES.copy()
         try:
@@ -2532,7 +2628,7 @@ class AcquisitionAutomationService:
         *,
         current_keywords: list[GroupSearchKeyword],
         target_count: int,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         if len(current_keywords) >= target_count:
             return None
 
@@ -2603,7 +2699,7 @@ class AcquisitionAutomationService:
         config: AccountOperationConfig,
         *,
         search_feedback: dict[str, Any],
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         searched = max(0, int(search_feedback.get("searched", 0)))
         if searched < KEYWORD_LOW_HIT_REPLENISH_MIN_SEARCHES:
             return None
@@ -2701,25 +2797,47 @@ class AcquisitionAutomationService:
     async def _reconcile_unresolved_join_requests(self, *, limit: int) -> dict[str, Any]:
         return await self.reconcile_join_requests(limit=limit)
 
-    async def reconcile_join_requests(self, *, limit: int = 10, account_id: int | None = None) -> dict[str, Any]:
+    async def reconcile_join_requests(self, *, limit: int = 10, account_id: int | None = None,
+                                      attempt_id: int | None = None,
+                                      independent: bool = False) -> dict[str, Any]:
         """Read outcomes of already submitted requests even while new joins are paused."""
-        from app.modules.acquisition.join_reconciliation import unresolved_join_request_due
+        from app.core.account.reconciliation_stream import legacy_account_filter
+        from app.modules.acquisition.join_reconciliation import (
+            expire_stale_join_requests,
+            unresolved_join_request_due,
+        )
 
         now = _now()
+        budget = max(1, int(limit))
+        expired = {"checked": 0, "updated": 0, "details": []} if attempt_id is not None else await expire_stale_join_requests(
+            self.db,
+            now=now,
+            limit=budget,
+            account_id=account_id,
+        )
+        result: dict[str, Any] = {
+            "checked": expired["checked"],
+            "updated": expired["updated"],
+            "details": list(expired["details"]),
+        }
+        remaining = budget - int(expired["updated"])
+        if remaining <= 0:
+            return result
         rows = await self.db.execute(
             select(AutoJoinAttempt)
             .where(
                 unresolved_join_request_due(now),
                 True if account_id is None else AutoJoinAttempt.account_id == account_id,
+                True if attempt_id is None else AutoJoinAttempt.id == attempt_id,
+                True if independent else legacy_account_filter(AutoJoinAttempt.account_id),
             )
             .order_by(func.coalesce(AutoJoinAttempt.reconciliation_checked_at,
                                    AutoJoinAttempt.request_sent_at,
                                    AutoJoinAttempt.attempted_at).asc(), AutoJoinAttempt.id.asc())
-            .limit(max(1, int(limit)))
+            .limit(remaining)
             .with_for_update(of=AutoJoinAttempt, skip_locked=True)
         )
         attempts = list(rows.scalars().all())
-        result: dict[str, Any] = {"checked": 0, "updated": 0, "details": []}
         if not attempts:
             return result
         for attempt in attempts:
@@ -2782,10 +2900,13 @@ class AcquisitionAutomationService:
 
                 wrapper = None
                 try:
-                    async with reads.borrow(attempt.account_id, "join_request_reconciliation") as wrapper:
-                        resolved = await asyncio.wait_for(
-                            self.telegram_execution.resolve_join_group_by_link_membership(wrapper, target), timeout=60,
-                        )
+                    from app.core.account.read_work import operation
+                    async with operation(attempt.account_id, attempt.group_id or 0, "join_reconciliation",
+                                         scope=f"join:{attempt.id}"):
+                        async with reads.borrow(attempt.account_id, "join_request_reconciliation") as wrapper:
+                            resolved = await asyncio.wait_for(
+                                self.telegram_execution.resolve_join_group_by_link_membership(wrapper, target), timeout=60,
+                            )
                     attempt.reconciliation_checked_at = now
                 except Exception as exc:
                     from app.core.account.rpc_governor import deferred_error
@@ -2823,18 +2944,22 @@ class AcquisitionAutomationService:
                 attempt.reconciliation_failure_count = 0
                 if resolved is None:
                     request_started = attempt.request_sent_at or attempt.attempted_at
-                    if request_started and request_started < now - timedelta(
+                    if attempt.request_state != "outcome_unknown" and request_started and request_started < now - timedelta(
                         days=JOIN_REQUEST_PENDING_TIMEOUT_DAYS
                     ):
-                        await self._abandon_timed_out_join_request(attempt, now)
+                        joined = await self._abandon_timed_out_join_request(attempt, now)
                         result["updated"] += 1
                         result["details"].append(
                             {
                                 "attempt_id": attempt.id,
                                 "account_id": attempt.account_id,
                                 "group_id": attempt.group_id,
-                                "status": "failed",
-                                "reason": "join_request_timeout",
+                                "status": "success" if joined else "failed",
+                                "reason": (
+                                    "joined_membership_reconciled"
+                                    if joined
+                                    else "join_request_timeout"
+                                ),
                             }
                         )
                         continue
@@ -2991,13 +3116,52 @@ class AcquisitionAutomationService:
         ).values(state="waiting_membership", reason="join_approval_pending", next_retry_at=None))
         await self.db.commit()
 
-    async def _abandon_timed_out_join_request(self, attempt: AutoJoinAttempt, now: datetime) -> None:
+    async def _abandon_timed_out_join_request(
+        self, attempt: AutoJoinAttempt, now: datetime
+    ) -> bool:
         """Close a join request whose approval never arrived within the timeout.
 
         The request itself may still sit in the group's admin queue on the
-        Telegram side; this only closes local tracking so the membership slot,
-        the reconciliation cadence and the join budget are released.
+        Telegram side. If membership sync already recorded a live membership,
+        preserve that success; otherwise close local tracking so the pending
+        slot and reconciliation cadence are released.
         """
+        from app.modules.acquisition.join_reconciliation import joined_membership_for_attempt
+
+        joined = await joined_membership_for_attempt(self.db, attempt, lock=True)
+        if joined is not None:
+            attempt.status = DeliveryStatus.SUCCESS.value
+            attempt.reason = "joined_membership_reconciled"
+            attempt.error = None
+            attempt.joined_at = joined.joined_at or joined.last_checked_at or attempt.request_sent_at
+            attempt.request_state = "sent"
+            attempt.reservation_released_at = None
+            attempt.reservation_expires_at = None
+            attempt.reconciliation_status = "confirmed"
+            attempt.reconciliation_checked_at = now
+            attempt.reconciliation_next_at = None
+            if settings.BUDGET_LEDGER_ENABLED:
+                from app.core.account.budget_ledger import settle
+                await settle(self.db, f"join:{attempt.id}", 0, reason="joined_membership_reconciled")
+            await self.db.execute(
+                update(GroupQualificationAudit)
+                .where(
+                    GroupQualificationAudit.batch_id == f"join-attempt:{attempt.id}:pending",
+                    GroupQualificationAudit.state.in_(
+                        ["waiting_membership", "manual_required", "queued"]
+                    ),
+                )
+                .values(
+                    state="cancelled",
+                    reason="join_membership_confirmed",
+                    next_retry_at=None,
+                )
+            )
+            await self.db.commit()
+            return True
+        if attempt.request_state == "outcome_unknown":
+            await self._defer_join_reconciliation(attempt, now, "join_outcome_requires_evidence", manual=True)
+            return False
         attempt.status = DeliveryStatus.FAILED.value
         attempt.reason = "join_request_timeout"
         attempt.request_state = "released"
@@ -3006,6 +3170,9 @@ class AcquisitionAutomationService:
         attempt.reconciliation_status = "resolved"
         attempt.reconciliation_checked_at = now
         attempt.reconciliation_next_at = None
+        if settings.BUDGET_LEDGER_ENABLED:
+            from app.core.account.budget_ledger import settle
+            await settle(self.db, f"join:{attempt.id}", 0, reason="join_request_timeout")
         if attempt.group_id:
             membership = await self.db.scalar(
                 select(GroupAccountMembership).where(
@@ -3016,12 +3183,14 @@ class AcquisitionAutomationService:
             )
             if membership is not None:
                 membership.status = "rejected"
+                membership.ad_status = MEMBERSHIP_AD_STATUS_BLOCKED
                 membership.updated_at = now
         await self.db.execute(update(GroupQualificationAudit).where(
             GroupQualificationAudit.batch_id == f"join-attempt:{attempt.id}:pending",
             GroupQualificationAudit.state.in_(["waiting_membership", "manual_required", "queued"]),
         ).values(state="cancelled", reason="join_request_timeout", next_retry_at=None))
         await self.db.commit()
+        return False
 
     @staticmethod
     def _join_review_account_block_reason(account: TelegramAccount | None, now: datetime) -> str | None:
@@ -3128,7 +3297,9 @@ class AcquisitionAutomationService:
                 JOIN_REVIEW_EXIT_PENDING,
                 JOIN_REVIEW_LEAVE_FAILED,
             }:
-                from app.modules.acquisition.qualification_service import policy as qualification_policy
+                from app.modules.acquisition.qualification_service import (
+                    policy as qualification_policy,
+                )
                 qualification = await qualification_policy(self.db)
                 if qualification.get("enabled") and not qualification.get("execute_exits"):
                     continue
@@ -3243,7 +3414,7 @@ class AcquisitionAutomationService:
                     audit.should_leave = True
                     audit.verification_details["post_action_status"] = "final_review_expired"
 
-            leave_error: Optional[str] = None
+            leave_error: str | None = None
             leave_attempted = False
             if audit.passed and audit.ad_allowed is True:
                 membership_status = "joined"
@@ -3394,7 +3565,7 @@ class AcquisitionAutomationService:
             await self.db.commit()
         return len(attempts)
 
-    def _membership_note_has_reason(self, note: Optional[str], reasons: set[str]) -> bool:
+    def _membership_note_has_reason(self, note: str | None, reasons: set[str]) -> bool:
         if not note:
             return False
         try:
@@ -3425,18 +3596,19 @@ class AcquisitionAutomationService:
         joined_account_id = await self._joined_membership_account_id(group)
         return joined_account_id == account_id
 
-    async def _joined_membership_account_id(self, group: DiscoveredGroup) -> Optional[int]:
+    async def _joined_membership_account_id(self, group: DiscoveredGroup) -> int | None:
         existing_group = await self.group_manager.get_group_by_telegram_id(group.group_id)
         if not existing_group:
             return None
         return await self._joined_membership_account_id_for_group(existing_group)
 
-    async def _joined_membership_account_id_for_group(self, group: Group) -> Optional[int]:
+    async def _joined_membership_account_id_for_group(self, group: Group) -> int | None:
         membership = await self.db.execute(
             select(GroupAccountMembership.account_id)
             .where(
                 GroupAccountMembership.group_id == group.id,
                 GroupAccountMembership.status == "joined",
+                GroupAccountMembership.left_at.is_(None),
             )
             .limit(1)
         )
@@ -3446,8 +3618,8 @@ class AcquisitionAutomationService:
     async def _reserve_auto_join_candidate(
         self,
         telegram_group_id: int,
-        reserved_group_ids: Optional[set[int]],
-        reserve_lock: Optional[asyncio.Lock],
+        reserved_group_ids: set[int] | None,
+        reserve_lock: asyncio.Lock | None,
     ) -> bool:
         if reserved_group_ids is None:
             return True
@@ -3521,7 +3693,7 @@ class AcquisitionAutomationService:
         delivery_block = await self.db.execute(
             select(AdDeliveryLog.id)
             .where(
-                AdDeliveryLog.telegram_group_id == telegram_group_id,
+                _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, telegram_group_id),
                 AdDeliveryLog.status == DeliveryStatus.FAILED.value,
                 or_(
                     AdDeliveryLog.error.like(f"{AD_GROUP_CONTROL_ERROR_PREFIX}%"),
@@ -3536,7 +3708,7 @@ class AcquisitionAutomationService:
         attempt_block = await self.db.execute(
             select(AutoJoinAttempt.id)
             .where(
-                AutoJoinAttempt.telegram_group_id == telegram_group_id,
+                _telegram_group_id_clause(AutoJoinAttempt.telegram_group_id, telegram_group_id),
                 AutoJoinAttempt.reason == "ad_group_control_blocked",
             )
             .limit(1)
@@ -3549,7 +3721,7 @@ class AcquisitionAutomationService:
         keyword: str,
         groups: list[DiscoveredGroup],
         *,
-        title_filtered_ids: Optional[set[int]] = None,
+        title_filtered_ids: set[int] | None = None,
     ) -> dict[str, int]:
         title_filtered_ids = title_filtered_ids or set()
         filter_settings = await self._search_filter_settings()
@@ -3629,11 +3801,17 @@ class AcquisitionAutomationService:
         }
 
     async def _rank_pending_join_candidates(self, account_id: int, groups: list[Group]) -> list[Group]:
+        import time
+
+        from telethon.tl.types import PeerChannel, PeerChat
+
+        from app.core.account.read_timeout import read_operation_timeout
+        from app.core.account.rpc_governor import RpcDeferred
+        from app.core.settings_models import SystemSetting
         from app.modules.acquisition import candidate_inventory as inventory
         from app.modules.acquisition.candidate_preview import CandidatePreview
-        from app.core.account.rpc_governor import RpcDeferred
-        from app.core.account.read_timeout import read_operation_timeout
-        import time
+        from app.modules.acquisition.qualification_identity import peer_identity
+        from app.modules.acquisition.qualification_join_gate import qualification_join_gate
         from app.modules.acquisition.qualification_service import policy
 
         self._candidate_preview_ready_ids = set()
@@ -3642,9 +3820,62 @@ class AcquisitionAutomationService:
             return groups
         now = _now()
         facts = await inventory.load(self.db, account_id, [group.id for group in groups])
-        due = [group for group in groups if inventory.due(facts.get(group.id, {}), group, account_id, now)]
-        ready_count = sum(inventory.fresh(facts.get(group.id, {}), group, account_id, now)
-                          and inventory.ready(facts[group.id]) for group in groups)
+        # The Telegram execution boundary has always enforced the qualification
+        # rejoin gate.  Apply the same read-only gate before ranking so a
+        # previously rejected group cannot consume entity/metadata reads and be
+        # selected repeatedly until the final RPC boundary rejects it.
+        # ``policy`` reads the same setting in production.  The explicit row
+        # check keeps isolated unit tests that mock policy() from treating a
+        # missing setting as a live qualification policy.
+        qualification_setting = await self.db.get(
+            SystemSetting, "automation.group_qualification", populate_existing=True
+        )
+        gate_enabled = bool(qualification_setting and config.get("enabled"))
+        gate_reasons: dict[int, str] = {}
+
+        async def gate_reason(group: Group, fact: dict[str, Any]) -> str | None:
+            if not gate_enabled:
+                return None
+            namespace = fact.get("namespace")
+            # A candidate without a confirmed namespace has no safe Telegram
+            # entity to pass to the local rejoin gate yet.  Let the preview
+            # establish identity; the RPC boundary remains fail-closed until
+            # that happens.
+            if namespace is None:
+                return None
+            identity = peer_identity(group.group_id, namespace=namespace)
+            if identity is None or identity[1] is None:
+                return "qualification_join_identity_unknown"
+            entity = (
+                PeerChannel(identity[0])
+                if identity[1] == "channel"
+                else PeerChat(identity[0])
+            )
+            return await qualification_join_gate(self.db, entity)
+
+        for group in groups:
+            # The rejoin decision is backed by local qualification history and
+            # does not need a Telegram read.  Apply it even when the preview
+            # fact is stale or missing so a previously rejected group cannot
+            # consume a fresh entity/metadata read while waiting for a new
+            # clearance.
+            fact = facts.get(group.id, {})
+            reason = await gate_reason(group, fact)
+            if reason:
+                gate_reasons[group.id] = reason
+
+        due = [
+            group
+            for group in groups
+            if group.id not in gate_reasons
+            and inventory.due(facts.get(group.id, {}), group, account_id, now)
+        ]
+        ready_count = sum(
+            group.id not in gate_reasons
+            and inventory.fresh(facts.get(group.id, {}), group, account_id, now)
+            and inventory.ready(facts[group.id])
+            for group in groups
+        )
         retry_at = await inventory.account_retry_at(self.db, account_id)
         if ready_count >= 3:
             due = []
@@ -3661,6 +3892,7 @@ class AcquisitionAutomationService:
         due.sort(key=lambda group: inventory.date(facts.get(group.id, {}).get("checked_at")) or datetime.min)
         wrapper = None
         if due:
+            await self.db.commit()
             try:
                 wrapper = await self.account_pool.acquire_by_id(account_id, purpose="join_candidate_preview")
             except RpcDeferred as exc:
@@ -3716,7 +3948,7 @@ class AcquisitionAutomationService:
                         hint = CandidatePreview(status="preview_" + type(exc).__name__)
                     if hint.status in {"entity_unknown", "history_unknown", "identity_unknown", "identity_unconfirmed"} and inventory.fresh(facts.get(group.id, {}), group, account_id, _now()):
                         continue
-                    fact = inventory.record(group, account_id, hint, _now())
+                    fact = inventory.record(group, account_id, hint, _now(), previous=facts.get(group.id))
                     ready_count += int(inventory.ready(fact))
                     facts[group.id] = fact
                     await inventory.save(self.db, account_id, group.id, fact)
@@ -3737,10 +3969,25 @@ class AcquisitionAutomationService:
         available = [
             group
             for group in groups
-            if inventory.fresh(facts.get(group.id, {}), group, account_id, _now())
+            if group.id not in gate_reasons
+            and inventory.fresh(facts.get(group.id, {}), group, account_id, _now())
             and not facts[group.id].get("preview_exclusion")
             and facts[group.id].get("namespace") in {"chat", "channel"}
         ]
+        # A candidate can become fresh during this pass.  Recheck the gate
+        # before exposing it to the join queue, while retaining the no-read
+        # exclusion for candidates already known to be blocked.
+        if gate_enabled:
+            gated_available = []
+            for group in available:
+                if group.id in gate_reasons:
+                    continue
+                reason = await gate_reason(group, facts[group.id])
+                if reason:
+                    gate_reasons[group.id] = reason
+                    continue
+                gated_available.append(group)
+            available = gated_available
         self._candidate_preview_ready_ids = {group.id for group in available if inventory.ready(facts[group.id])}
         self.logger.info(
             "join_candidate_inventory",
@@ -3748,6 +3995,8 @@ class AcquisitionAutomationService:
             total=len(groups),
             ready=len(self._candidate_preview_ready_ids),
             pending=len(groups) - len(available),
+            qualification_excluded=len(gate_reasons),
+            qualification_exclusion_reasons=sorted(set(gate_reasons.values())),
             previewed=min(len(due), PREVIEW_GROUP_LIMIT) if wrapper is not None else 0,
         )
         return sorted(
@@ -3761,10 +4010,20 @@ class AcquisitionAutomationService:
         account_id: int | None = None,
         preview: bool = False,
         minimum_ready: int = 0,
-        reserved_group_ids: Optional[set[int]] = None,
-        reserve_lock: Optional[asyncio.Lock] = None,
-    ) -> Optional[Group]:
-        rows = await self.db.execute(
+        reserved_group_ids: set[int] | None = None,
+        reserve_lock: asyncio.Lock | None = None,
+    ) -> Group | None:
+        from app.core.settings_models import SystemSetting
+        from app.modules.acquisition.join_claims import group_occupied
+        cursor = None
+        offset = 0
+        if preview and account_id is not None:
+            cursor = await self.db.get(SystemSetting, f"qualification.candidate_cursor.{account_id}")
+            try:
+                offset = max(0, int(cursor.value)) if cursor else 0
+            except (ValueError, TypeError):
+                offset = 0
+        query = (
             select(Group)
             .where(
                 Group.status.in_(
@@ -3775,6 +4034,7 @@ class AcquisitionAutomationService:
                     ]
                 ),
                 Group.username.isnot(None),
+                ~group_occupied(_now()),
             )
             .order_by(
                 Group.level_score.desc(),
@@ -3786,20 +4046,32 @@ class AcquisitionAutomationService:
             )
             .limit(300)
         )
-        candidates = []
-        for group in rows.scalars().all():
-            if await self._joined_membership_account_id_for_group(group) is None:
-                candidates.append(group)
+        rows = await self.db.execute(query.offset(offset))
+        # The correlated shared-occupancy predicate excludes all claimed
+        # targets in one query. The durable budget repeats the check atomically
+        # before sending; no per-candidate membership round trips are needed.
+        candidates = list(rows.scalars().all())
+        if not candidates and offset:
+            offset = 0
+            candidates = list((await self.db.scalars(query)).all())
+        window_size = len(candidates)
         if preview and account_id is not None and candidates:
             candidates = await self._rank_pending_join_candidates(account_id, candidates)
             if minimum_ready and len(self._candidate_preview_ready_ids) < minimum_ready:
-                return None
+                candidates = []
         for group in candidates:
             if not await self._reserve_auto_join_candidate(
                 group.group_id, reserved_group_ids, reserve_lock
             ):
                 continue
             return group
+        if preview and account_id is not None:
+            value = str(offset + window_size if window_size == 300 else 0)
+            if cursor is None:
+                self.db.add(SystemSetting(key=f"qualification.candidate_cursor.{account_id}", value=value))
+            else:
+                cursor.value = value
+            await self.db.commit()
         return None
 
     async def _search_filter_settings(self) -> SearchFilterSettings:
@@ -3831,7 +4103,7 @@ class AcquisitionAutomationService:
         )
 
     @staticmethod
-    def _title_has_cjk(title: Optional[str]) -> bool:
+    def _title_has_cjk(title: str | None) -> bool:
         """True when the title carries at least one CJK ideograph."""
         for char in str(title or ""):
             code = ord(char)
@@ -3841,7 +4113,7 @@ class AcquisitionAutomationService:
 
     def _title_blacklist_match(
         self, title: str, settings_config: SearchFilterSettings
-    ) -> Optional[str]:
+    ) -> str | None:
         if not settings_config.title_blacklist_enabled:
             return None
         normalized_title = (title or "").casefold()
@@ -3919,7 +4191,7 @@ class AcquisitionAutomationService:
             return
         await self.group_manager.update_group(group.id, status=status)
 
-    def _flood_wait_seconds(self, exc: Exception) -> Optional[int]:
+    def _flood_wait_seconds(self, exc: Exception) -> int | None:
         return extract_flood_wait_seconds(exc)
 
     async def _apply_account_flood_wait(
@@ -3960,7 +4232,15 @@ class AcquisitionAutomationService:
             raise_on_lease_failure=True,
         )
         if account is None:
-            raise RuntimeError("account unavailable")
+            reason = None
+            resolver = getattr(self.account_pool, "unavailability_reason", None)
+            if callable(resolver):
+                try:
+                    reason = resolver(account_id)
+                except Exception:
+                    reason = None
+            detail = f": {reason}" if reason else ""
+            raise RuntimeError(f"account unavailable{detail}")
         try:
             async def mark_join_request_sent() -> None:
                 await self.join_budget.mark_sent(reservation)
@@ -3977,6 +4257,8 @@ class AcquisitionAutomationService:
 
     def _classify_join_error(self, exc: Exception) -> str:
         text = f"{exc.__class__.__name__}: {exc}".lower()
+        if "telegram session lease is busy" in text:
+            return "account_operation_lease_busy"
         risk_guard_match = re.search(r"risk_guard_blocked:[a-z0-9_:-]+", text)
         if risk_guard_match:
             return risk_guard_match.group(0)
@@ -4084,7 +4366,7 @@ class AcquisitionAutomationService:
             )[:500],
         )
 
-    def _verification_llm(self) -> Optional[LLMClient]:
+    def _verification_llm(self) -> LLMClient | None:
         if self._verification_llm_client is not None:
             return self._verification_llm_client
         provider = (
@@ -4106,7 +4388,7 @@ class AcquisitionAutomationService:
         self,
         messages: list[Any],
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
         language: MessageLanguageProfile,
     ) -> bool:
@@ -4141,7 +4423,7 @@ class AcquisitionAutomationService:
         entity: Any,
         messages: list[Any],
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
     ) -> JoinVerificationActionResult:
         settings_config = await self._join_verification_settings()
@@ -4235,7 +4517,7 @@ class AcquisitionAutomationService:
         self,
         client: Any,
         decision: JoinVerificationDecision,
-        settings_config: Optional[JoinVerificationSettings] = None,
+        settings_config: JoinVerificationSettings | None = None,
     ) -> JoinVerificationActionResult:
         """Complete a verification that hands off to a Telegram bot.
 
@@ -4277,14 +4559,14 @@ class AcquisitionAutomationService:
                 raise TimeoutError
             return min(remaining, settings_config.action_timeout_seconds)
 
-        def message_id(message: Any) -> Optional[int]:
+        def message_id(message: Any) -> int | None:
             raw = message if isinstance(message, int) else getattr(message, "id", None)
             try:
                 return int(raw) if raw is not None else None
             except (TypeError, ValueError):
                 return None
 
-        def success_reason(text: str) -> Optional[str]:
+        def success_reason(text: str) -> str | None:
             if SECOND_HOP_SUCCESS_RE.search(text):
                 return "second_hop_bot_verified"
             if SECOND_HOP_FAILURE_RE.search(text):
@@ -4459,10 +4741,10 @@ class AcquisitionAutomationService:
         self,
         messages: list[Any],
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
         settings_config: JoinVerificationSettings,
-    ) -> tuple[Optional[JoinVerificationDecision], Optional[JoinVerificationActionResult]]:
+    ) -> tuple[JoinVerificationDecision | None, JoinVerificationActionResult | None]:
         try:
             decision = await asyncio.wait_for(
                 self._ask_join_verification_ai(
@@ -4490,7 +4772,7 @@ class AcquisitionAutomationService:
         self,
         messages: list[Any],
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
         settings_config: JoinVerificationSettings,
     ) -> JoinVerificationDecision:
@@ -4593,10 +4875,10 @@ class AcquisitionAutomationService:
         self,
         messages: list[Any],
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
         settings_config: JoinVerificationSettings,
-    ) -> Optional[JoinVerificationDecision]:
+    ) -> JoinVerificationDecision | None:
         llm = self._verification_llm()
         if llm is None:
             return None
@@ -4872,7 +5154,7 @@ class AcquisitionAutomationService:
             value = getattr(button, "text", None) or getattr(button, "label", None) or ""
         return str(value).strip()
 
-    def _message_id(self, message: Any) -> Optional[int]:
+    def _message_id(self, message: Any) -> int | None:
         if isinstance(message, dict):
             value = message.get("id") or message.get("message_id")
         else:
@@ -4886,7 +5168,7 @@ class AcquisitionAutomationService:
         self,
         messages: list[Any],
         button_text: str,
-        target_message_id: Optional[int],
+        target_message_id: int | None,
     ) -> bool:
         for message in messages:
             if target_message_id is not None and self._message_id(message) != target_message_id:
@@ -4908,7 +5190,7 @@ class AcquisitionAutomationService:
         return bool(compact and len(compact) <= 24 and SAFE_BUTTON_RE.search(compact))
 
     @staticmethod
-    def _solve_math_verification(prompt_text: str) -> Optional[str]:
+    def _solve_math_verification(prompt_text: str) -> str | None:
         """Solve a simple arithmetic challenge; None when none is present.
 
         Division keeps integer semantics for clean problems only (no
@@ -4952,7 +5234,7 @@ class AcquisitionAutomationService:
             return profile
         return "中文用户，来学习交流和找资料。"
 
-    def _extract_json_object(self, text: str) -> Optional[dict[str, Any]]:
+    def _extract_json_object(self, text: str) -> dict[str, Any] | None:
         content = (text or "").strip()
         if not content:
             return None
@@ -5033,8 +5315,8 @@ class AcquisitionAutomationService:
         client: Any,
         entity: Any,
         *,
-        message_limit: Optional[int] = None,
-    ) -> tuple[list[Any], set[Any], Optional[bool], str, MessageLanguageProfile]:
+        message_limit: int | None = None,
+    ) -> tuple[list[Any], set[Any], bool | None, str, MessageLanguageProfile]:
         if message_limit is None:
             message_limit = (await self._join_verification_settings()).message_limit
         message_limit = max(5, min(int(message_limit), JOIN_AUDIT_MESSAGE_LIMIT))
@@ -5055,9 +5337,9 @@ class AcquisitionAutomationService:
         *,
         source: str,
         text: str,
-        message_id: Optional[int] = None,
-        sender_id: Optional[int] = None,
-        age_hours: Optional[float] = None,
+        message_id: int | None = None,
+        sender_id: int | None = None,
+        age_hours: float | None = None,
     ) -> None:
         normalized = re.sub(r"\s+", " ", (text or "").strip())
         if not normalized:
@@ -5090,7 +5372,7 @@ class AcquisitionAutomationService:
         return bool(GROUP_RULE_CONTEXT_RE.search(text) and AD_RULE_TOPIC_RE.search(text))
 
     @staticmethod
-    def _message_sender_id(message: Any) -> Optional[int]:
+    def _message_sender_id(message: Any) -> int | None:
         value = (
             message.get("sender_id")
             if isinstance(message, dict)
@@ -5102,7 +5384,7 @@ class AcquisitionAutomationService:
             return None
 
     @staticmethod
-    def _message_age_hours(message: Any) -> Optional[float]:
+    def _message_age_hours(message: Any) -> float | None:
         value = message.get("date") if isinstance(message, dict) else getattr(message, "date", None)
         if not isinstance(value, datetime):
             return None
@@ -5143,7 +5425,7 @@ class AcquisitionAutomationService:
             return None
 
     async def _fetch_message_by_id(
-        self, client: Any, entity: Any, message_id: Optional[int]
+        self, client: Any, entity: Any, message_id: int | None
     ) -> Any:
         if message_id is None or not hasattr(client, "get_messages"):
             return None
@@ -5296,7 +5578,7 @@ class AcquisitionAutomationService:
         payload = {
             "version": AD_POLICY_EVIDENCE_HASH_VERSION,
             "ai_enabled": bool(capacity.get("ad_policy_ai_enabled", True)),
-            "model": str(capacity.get("ad_policy_ai_model") or "gpt-5.6-sol"),
+            "model": str(capacity.get("ad_policy_ai_model") or "gpt-6.1-sol"),
             "min_confidence": int(capacity.get("ad_policy_ai_min_confidence") or 95),
             "require_second_pass": bool(capacity.get("ad_policy_ai_require_second_pass", True)),
             "evidence": canonical_evidence,
@@ -5311,10 +5593,10 @@ class AcquisitionAutomationService:
 
     @staticmethod
     def _cached_group_ad_policy_result(
-        profile: Optional[GroupAdProfile],
+        profile: GroupAdProfile | None,
         evidence: list[dict[str, Any]],
         evidence_hash: str,
-    ) -> Optional[GroupAdRulesAuditResult]:
+    ) -> GroupAdRulesAuditResult | None:
         if profile is None or not profile.ad_policy_evidence_hash:
             return None
         if (
@@ -5328,7 +5610,7 @@ class AcquisitionAutomationService:
 
         mode = str(profile.ad_policy_mode or GroupAdPolicyMode.UNKNOWN.value)
         if mode == GroupAdPolicyMode.FORBIDDEN.value:
-            ad_allowed: Optional[bool] = False
+            ad_allowed: bool | None = False
         elif mode in {
             GroupAdPolicyMode.SOFT_AD_TRIAL.value,
             GroupAdPolicyMode.SOFT_AD_ALLOWED.value,
@@ -5414,12 +5696,12 @@ class AcquisitionAutomationService:
             evidence=evidence,
         )
 
-    def _ad_policy_llm(self) -> Optional[LLMClient]:
+    def _ad_policy_llm(self) -> LLMClient | None:
         if self._ad_policy_llm_client is not None:
             return self._ad_policy_llm_client
         dedicated_key = settings.GROUP_AD_POLICY_API_KEY
         dedicated_base_url = settings.GROUP_AD_POLICY_BASE_URL
-        if dedicated_key or dedicated_base_url:
+        if settings.GROUP_AD_POLICY_DEDICATED_ENABLED:
             if not dedicated_key or not dedicated_base_url:
                 return None
             self._ad_policy_llm_client = LLMClient(
@@ -5431,6 +5713,10 @@ class AcquisitionAutomationService:
                     if dedicated_base_url.rstrip("/") == "https://ark.cn-beijing.volces.com/api/coding/v3"
                     else None
                 ),
+                # A deliberately enabled dedicated endpoint owns its model
+                # selection. The shared production override must not silently
+                # send the global model to an incompatible provider.
+                apply_global_model_override=False,
             )
             return self._ad_policy_llm_client
         provider = (
@@ -5540,7 +5826,7 @@ class AcquisitionAutomationService:
         *,
         model: str,
         timeout_seconds: int,
-        review_of: Optional[dict[str, Any]] = None,
+        review_of: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         llm = self._ad_policy_llm()
         if llm is None:
@@ -5687,7 +5973,7 @@ class AcquisitionAutomationService:
             local_result.decision_source = "strict_gate"
             return local_result
 
-        model = str(capacity.get("ad_policy_ai_model") or "gpt-5.6-sol")[:100]
+        model = str(capacity.get("ad_policy_ai_model") or "gpt-6.1-sol")[:100]
         timeout_seconds = int(capacity.get("ad_policy_ai_timeout_seconds") or 45)
         min_confidence = int(capacity.get("ad_policy_ai_min_confidence") or 95)
         if strict_arguments:
@@ -5871,7 +6157,7 @@ class AcquisitionAutomationService:
         client: Any,
         entity: Any,
         messages: list[Any],
-        profile: Optional[GroupAdProfile] = None,
+        profile: GroupAdProfile | None = None,
     ) -> GroupAdRulesAuditResult:
         policy_messages = list(messages)
         older_messages = await self._fetch_messages_before(
@@ -5900,8 +6186,8 @@ class AcquisitionAutomationService:
         entity: Any,
         verification_result: JoinVerificationActionResult,
         settings_config: JoinVerificationSettings,
-    ) -> tuple[list[Any], set[Any], Optional[bool], str, MessageLanguageProfile]:
-        snapshot: tuple[list[Any], set[Any], Optional[bool], str, MessageLanguageProfile] = (
+    ) -> tuple[list[Any], set[Any], bool | None, str, MessageLanguageProfile]:
+        snapshot: tuple[list[Any], set[Any], bool | None, str, MessageLanguageProfile] = (
             [],
             set(),
             None,
@@ -6009,7 +6295,7 @@ class AcquisitionAutomationService:
                 permission_reason,
                 language,
             ) = await self._read_join_audit_snapshot(client, entity)
-            verification_result: Optional[JoinVerificationActionResult] = None
+            verification_result: JoinVerificationActionResult | None = None
             if await self._should_attempt_join_verification(
                 messages,
                 can_send_messages=can_send_messages,
@@ -6178,9 +6464,9 @@ class AcquisitionAutomationService:
             self.logger.debug("group_ad_policy_older_history_unavailable", error=str(exc))
             return []
 
-    async def _check_can_send_messages(self, client, entity) -> tuple[Optional[bool], str]:
+    async def _check_can_send_messages(self, client, entity) -> tuple[bool | None, str]:
         participant_permissions = None
-        participant_error: Optional[str] = None
+        participant_error: str | None = None
 
         if hasattr(client, "get_permissions"):
             user: Any = "me"
@@ -6216,7 +6502,7 @@ class AcquisitionAutomationService:
                 return False, "account_send_restricted"
 
         default_rights = None
-        default_error: Optional[str] = None
+        default_error: str | None = None
         if hasattr(client, "get_permissions"):
             try:
                 default_rights = await client.get_permissions(entity)
@@ -6239,14 +6525,14 @@ class AcquisitionAutomationService:
     def _build_join_audit_result(
         self,
         *,
-        can_send_messages: Optional[bool],
+        can_send_messages: bool | None,
         permission_reason: str,
         language: MessageLanguageProfile,
         message_count: int,
         unique_senders: int,
-        member_count: Optional[int],
+        member_count: int | None,
     ) -> JoinedGroupAuditResult:
-        reason: Optional[str] = None
+        reason: str | None = None
         if can_send_messages is False:
             reason = (
                 permission_reason
@@ -6431,14 +6717,18 @@ class AcquisitionAutomationService:
 
         return None, "entity_not_in_dialogs"
 
-    async def _leave_group(self, account_id: int, group: DiscoveredGroup) -> Optional[str]:
+    async def _leave_group(self, account_id: int, group: DiscoveredGroup) -> str | None:
         from app.modules.acquisition.qualification_service import authorize_leave, policy
         qualification = await policy(self.db)
         if qualification.get("enabled"):
-            db_group = await self.db.scalar(select(Group).where(Group.group_id == group.group_id))
+            db_group = await self.db.scalar(
+                select(Group).where(_telegram_group_id_clause(Group.group_id, group.group_id))
+            )
             membership = await self.db.scalar(select(GroupAccountMembership).where(
                 GroupAccountMembership.account_id == account_id,
-                GroupAccountMembership.telegram_group_id == group.group_id))
+                _telegram_group_id_clause(
+                    GroupAccountMembership.telegram_group_id, group.group_id
+                )))
             if db_group is None or membership is None:
                 return "qualification_membership_missing"
             allowed, reason = await authorize_leave(self.db, account_id, db_group, membership)
@@ -6490,7 +6780,10 @@ class AcquisitionAutomationService:
                 allowed, reason = await authorize_leave(self.db, account_id, db_group, membership)
                 if not allowed:
                     return reason
-                from app.modules.acquisition.qualification_exit_guard import MUTE_REASONS, recheck_mute_exit
+                from app.modules.acquisition.qualification_exit_guard import (
+                    MUTE_REASONS,
+                    recheck_mute_exit,
+                )
                 if reason in MUTE_REASONS:
                     blocked = await recheck_mute_exit(
                         self.db, account_id, db_group, membership, entity, permissions, datetime.utcnow()
@@ -6538,7 +6831,7 @@ class AcquisitionAutomationService:
         self,
         audit: JoinedGroupAuditResult,
         *,
-        leave_error: Optional[str] = None,
+        leave_error: str | None = None,
     ) -> str:
         if audit.reason in {
             "account_banned",
@@ -6696,8 +6989,8 @@ class AcquisitionAutomationService:
         *,
         status: str,
         join_method: str,
-        source_keyword: Optional[str],
-        note: Optional[str] = None,
+        source_keyword: str | None,
+        note: str | None = None,
         commit: bool = True,
     ) -> GroupAccountMembership:
         now = _now()
@@ -6857,7 +7150,7 @@ class AcquisitionAutomationService:
             leave_error=leave_error,
         )
 
-    async def _reject_group_after_failed_audit(self, group: Group, reason: Optional[str]) -> bool:
+    async def _reject_group_after_failed_audit(self, group: Group, reason: str | None) -> bool:
         if reason in {"account_banned", "group_membership_banned", "account_not_participant"}:
             return False
         if reason not in {
@@ -6904,7 +7197,7 @@ class AcquisitionAutomationService:
         self,
         *,
         success: bool,
-        error: Optional[str] = None,
+        error: str | None = None,
     ) -> None:
         """Count consecutive LLM failures in Redis and alert once per window.
 
@@ -6958,7 +7251,7 @@ class AcquisitionAutomationService:
     async def _penalize_keyword_after_audit_reject(
         self,
         group: Group,
-        reason: Optional[str],
+        reason: str | None,
     ) -> None:
         """Feed a post-join audit rejection back into its source keyword.
 
@@ -7008,7 +7301,7 @@ class AcquisitionAutomationService:
         self,
         audit: JoinedGroupAuditResult,
         *,
-        leave_error: Optional[str] = None,
+        leave_error: str | None = None,
     ) -> str:
         payload = audit.details()
         if leave_error:
@@ -7056,13 +7349,13 @@ class AcquisitionAutomationService:
         group: DiscoveredGroup,
         status: DeliveryStatus,
         *,
-        db_group: Optional[Group] = None,
-        source_keyword: Optional[str] = None,
-        reason: Optional[str] = None,
-        error: Optional[str] = None,
-        joined_at: Optional[datetime] = None,
+        db_group: Group | None = None,
+        source_keyword: str | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+        joined_at: datetime | None = None,
         telegram_action_attempted: bool = False,
-        attempt: Optional[AutoJoinAttempt] = None,
+        attempt: AutoJoinAttempt | None = None,
         outcome_unknown: bool = False,
     ) -> AutoJoinAttempt:
         if attempt is not None:
@@ -7144,6 +7437,7 @@ class AcquisitionAutomationService:
         """Run one advertisement delivery dispatcher page."""
         result = AutomationRunResult()
         if not dry_run:
+            await pause_unresolved_ad_schedules(self.db, _now(), account_id=account_id)
             await self._resume_expired_membership_ad_pauses()
             await self._reclaim_orphaned_ad_schedule_states()
         execution = await get_ad_delivery_execution_settings(self.db)
@@ -7177,10 +7471,10 @@ class AcquisitionAutomationService:
         ad_target_lock = asyncio.Lock()
 
         async def run_account_worker(
-            service: "AcquisitionAutomationService",
+            service: AcquisitionAutomationService,
             account_id: int,
         ) -> AutomationRunResult:
-            lock_token: Optional[str] = None
+            lock_token: str | None = None
             if not dry_run:
                 try:
                     lock_token = await service._claim_ad_account_worker_lock(
@@ -7276,7 +7570,7 @@ class AcquisitionAutomationService:
 
     async def _resume_expired_membership_ad_pauses(
         self,
-        now: Optional[datetime] = None,
+        now: datetime | None = None,
     ) -> int:
         """Reactivate joined memberships after their temporary ad pause expires."""
         resumed_at = now or _now()
@@ -7307,7 +7601,7 @@ class AcquisitionAutomationService:
 
     async def _reclaim_orphaned_ad_schedule_states(
         self,
-        now: Optional[datetime] = None,
+        now: datetime | None = None,
     ) -> int:
         """Reset schedule tuples whose worker died between claim and finish.
 
@@ -7436,15 +7730,21 @@ class AcquisitionAutomationService:
                 )
                 if skip_reason:
                     result.skipped += 1
-                    result.details.append(
-                        {
-                            "binding_id": binding.id,
-                            "account_id": binding.account_id,
-                            "campaign_id": campaign.id,
-                            "group_id": group.id,
-                            "reason": skip_reason,
-                        }
-                    )
+                    detail = {
+                        "binding_id": binding.id,
+                        "account_id": binding.account_id,
+                        "campaign_id": campaign.id,
+                        "group_id": group.id,
+                        "reason": skip_reason,
+                    }
+                    retry_at = getattr(skip_reason, "next_allowed_at", None)
+                    if retry_at is not None and retry_at > _now():
+                        # Keep the explicit next_retry_at name for callers that
+                        # persist task-style retry metadata. ``next_due`` also
+                        # accepts retry_at for older result producers.
+                        detail["next_retry_at"] = retry_at.isoformat()
+                        detail["retry_at"] = retry_at.isoformat()
+                    result.details.append(detail)
                     continue
 
                 creative = await self._choose_delivery_creative(
@@ -7506,10 +7806,10 @@ class AcquisitionAutomationService:
                     )
                     continue
 
-                delivery_log: Optional[AdDeliveryLog] = None
+                delivery_log: AdDeliveryLog | None = None
                 telegram_send_completed = False
-                schedule_id: Optional[int] = None
-                schedule_token: Optional[str] = None
+                schedule_id: int | None = None
+                schedule_token: str | None = None
                 try:
                     async with telegram_chat_advisory_lock(self.db, membership.telegram_group_id):
                         # The API and candidate query are only the first guard.
@@ -7594,16 +7894,19 @@ class AcquisitionAutomationService:
                                     reason=quota_reason,
                                 )
                                 result.skipped += 1
-                                result.details.append(
-                                    {
-                                        "account_id": binding.account_id,
-                                        "group_id": group.id,
-                                        "campaign_id": campaign.id,
-                                        "creative_id": creative.id,
-                                        "action": "skip",
-                                        "reason": quota_reason,
-                                    }
-                                )
+                                detail = {
+                                    "account_id": binding.account_id,
+                                    "group_id": group.id,
+                                    "campaign_id": campaign.id,
+                                    "creative_id": creative.id,
+                                    "action": "skip",
+                                    "reason": quota_reason,
+                                }
+                                retry_at = getattr(quota_reason, "next_allowed_at", None)
+                                if retry_at is not None and retry_at > _now():
+                                    detail["next_retry_at"] = retry_at.isoformat()
+                                    detail["retry_at"] = retry_at.isoformat()
+                                result.details.append(detail)
                                 continue
                         else:
                             delivery_log = await self._record_ad_delivery(
@@ -7761,6 +8064,8 @@ class AcquisitionAutomationService:
                                 "creative_id": creative.id,
                                 "action": "stop_after_risk_guard",
                                 "reason": classified_error,
+                                **({"retry_at": (_now() + timedelta(seconds=deferred_error(exc)[1])).isoformat()}
+                                   if deferred_error(exc) else {}),
                             }
                         )
                         return result
@@ -7860,7 +8165,7 @@ class AcquisitionAutomationService:
         account_id: int,
         membership: GroupAccountMembership,
         lease_seconds: int,
-    ) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    ) -> tuple[int | None, str | None, str | None]:
         now = _now()
         policy_raw = getattr(campaign, "delivery_policy", None) or AdDeliveryPolicy.GROWTH.value
         delivery_policy = str(getattr(policy_raw, "value", policy_raw))
@@ -7919,6 +8224,36 @@ class AcquisitionAutomationService:
                 )
                 state = row.scalar_one()
 
+        # The outbound ledger is account-wide and survives worker restarts.
+        # Check it again while holding this tuple's row lock so a race between
+        # the dispatcher pre-scan and this claim cannot create another
+        # delivery reservation for the same Telegram target.
+        unresolved_attempt = await unresolved_ad_attempt_id(
+            self.db, account_id, membership.telegram_group_id
+        )
+        if unresolved_attempt is not None:
+            state.status = AdScheduleStatus.PAUSED.value
+            state.next_due_at = now
+            state.lock_token = None
+            state.lease_expires_at = None
+            state.last_reason = f"{RECONCILIATION_REASON_PREFIX}:{unresolved_attempt}"[:255]
+            state.updated_at = now
+            await self.db.commit()
+            return state.id, None, RECONCILIATION_REASON_PREFIX
+
+        # A reconciliation completed outside this worker may leave a legacy
+        # retry marker behind.  Re-open it once the account-wide ledger fence
+        # is gone; the reconciliation path normally supplies the safe next
+        # deadline, while this fallback prevents a permanent deadlock.
+        if state.status in {AdScheduleStatus.PAUSED.value, AdScheduleStatus.RETRY.value} and is_reconciliation_reason(state.last_reason):
+            state.status = AdScheduleStatus.IDLE.value
+            state.next_due_at = max(state.next_due_at, now)
+            state.lock_token = None
+            state.lease_expires_at = None
+            state.last_reason = None
+            state.updated_at = now
+            await self.db.commit()
+
         if state.status == AdScheduleStatus.PAUSED.value and state.last_reason == "history_cleanup_inactive":
             # Only resume this maintenance pause when the account is enabled
             # and a joined membership reaches the normal guarded send path.
@@ -7945,13 +8280,13 @@ class AcquisitionAutomationService:
 
     async def _finish_ad_schedule_state(
         self,
-        state_id: Optional[int],
-        token: Optional[str],
+        state_id: int | None,
+        token: str | None,
         *,
         campaign: AdCampaign,
         succeeded: bool,
-        reason: Optional[str],
-        completed_at: Optional[datetime] = None,
+        reason: str | None,
+        completed_at: datetime | None = None,
     ) -> None:
         if state_id is None or token is None:
             return
@@ -7973,7 +8308,12 @@ class AcquisitionAutomationService:
             state.last_success_at = now
             state.next_due_at = await self._next_ad_schedule_due_at(campaign, now)
             if delivery_policy == AdDeliveryPolicy.GROWTH.value and await self._dynamic_qualification_mode(state.account_id):
-                from app.modules.acquisition.adaptive_frequency import FrequencyService, enabled, interval_seconds, rule_quota
+                from app.modules.acquisition.adaptive_frequency import (
+                    FrequencyService,
+                    enabled,
+                    interval_seconds,
+                    rule_quota,
+                )
                 if await enabled(self.db, state.account_id):
                     # Legacy schedules contain raw positive peer IDs. Resolve the
                     # namespace from current authorization, never from the number.
@@ -8012,6 +8352,11 @@ class AcquisitionAutomationService:
                 state.last_reason = (
                     f"ad_only_group_control_backoff:{backoff_minutes}m:{reason or 'group_control'}"
                 )[:255]
+        elif reason in {"qualification_system_identity_unconfirmed", "unknown:qualification_system_identity_unconfirmed"}:
+            from app.modules.acquisition.qualification_identity_refresh import identity_retry_at
+            state.status = AdScheduleStatus.RETRY.value
+            state.next_due_at = await identity_retry_at(self.db, state.account_id, state.group_id, now)
+            state.last_reason = str(reason)[:255]
         elif str(reason or "").startswith("risk_guard_blocked:content_"):
             state.status = AdScheduleStatus.RETRY.value
             state.next_due_at = now + timedelta(
@@ -8019,6 +8364,72 @@ class AcquisitionAutomationService:
                 + random.randint(0, AD_POLICY_PROBE_CONTENT_RETRY_JITTER_SECONDS)
             )
             state.last_reason = str(reason)[:255]
+        elif reason == "growth_group_global_cooldown":
+            # A cooldown is a durable group deadline, not a transient worker
+            # failure.  Requeueing this tuple at the dispatcher interval makes
+            # every qualified group hot-loop in the database for the whole
+            # 24-hour window after the new cross-campaign group cap is applied.
+            execution = await get_ad_delivery_execution_settings(self.db)
+            cooldown = max(
+                0, int(execution.get("growth_group_global_cooldown_seconds") or 0)
+            )
+            if await self._dynamic_qualification_mode(state.account_id):
+                cooldown = max(86400, cooldown)
+            exposure = None
+            if cooldown > 0:
+                exposure = (
+                    await self.db.execute(
+                        select(func.max(func.coalesce(AdDeliveryLog.sent_at, AdDeliveryLog.created_at)))
+                        .join(AdCampaign, AdCampaign.id == AdDeliveryLog.ad_campaign_id)
+                        .where(
+                            AdCampaign.delivery_policy == AdDeliveryPolicy.GROWTH.value,
+                            AdDeliveryLog.telegram_group_id.in_(
+                                telegram_group_id_aliases(state.telegram_group_id)
+                            ),
+                            AdDeliveryLog.status.in_(
+                                [
+                                    DeliveryStatus.SUCCESS.value,
+                                    DeliveryStatus.PENDING.value,
+                                    "sending",
+                                    "unknown",
+                                    "reconciliation_required",
+                                ]
+                            ),
+                        )
+                    )
+                ).scalar()
+            dispatcher_seconds = int(execution.get("dispatcher_interval_seconds") or 60)
+            state.status = AdScheduleStatus.RETRY.value
+            state.next_due_at = now + timedelta(seconds=max(30, dispatcher_seconds))
+            if exposure is not None:
+                state.next_due_at = max(
+                    state.next_due_at,
+                    exposure + timedelta(seconds=cooldown),
+                )
+            state.last_reason = str(reason)[:255]
+        elif reason in {
+            "campaign_account_daily_limit",
+            "campaign_group_daily_limit",
+        }:
+            # Daily campaign quotas are evaluated against the Beijing operating
+            # day in _growth_campaign_daily_quota_reason().  Treat reaching
+            # either quota as a durable calendar deadline; the generic retry
+            # path would otherwise put the tuple back after every dispatcher
+            # tick and repeatedly execute a known no-op.
+            state.status = AdScheduleStatus.RETRY.value
+            state.next_due_at = max(
+                _day_start(now) + timedelta(days=1),
+                now + timedelta(seconds=30),
+            )
+            state.last_reason = str(reason)[:255]
+        elif is_reconciliation_reason(reason):
+            # An unknown external outcome is a terminal safety fence for this
+            # target.  Do not put the tuple back into the normal retry queue;
+            # the receipt/reconciliation path will explicitly wake it after a
+            # confirmed success or failure.
+            state.status = AdScheduleStatus.PAUSED.value
+            state.next_due_at = now
+            state.last_reason = str(reason or RECONCILIATION_REASON_PREFIX)[:255]
         elif reason in {
             "account_operation_lease_busy",
             "account_operation_lease_unavailable",
@@ -8075,7 +8486,7 @@ class AcquisitionAutomationService:
         self,
         schedule_id: int,
         *,
-        resumed_by_user_id: Optional[int] = None,
+        resumed_by_user_id: int | None = None,
     ) -> AdDeliveryScheduleState:
         row = await self.db.execute(
             _ad_schedule_state_for_update_query().where(AdDeliveryScheduleState.id == schedule_id)
@@ -8201,7 +8612,7 @@ class AcquisitionAutomationService:
         now: datetime,
         *,
         timezone_offset_hours: int,
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         offset = timedelta(hours=timezone_offset_hours)
         local_now = now + offset
         candidates: list[datetime] = []
@@ -8291,10 +8702,15 @@ class AcquisitionAutomationService:
         reserved_ad_targets: set[int],
         ad_target_lock: asyncio.Lock,
     ) -> bool:
+        aliases = telegram_group_id_aliases(target_key) or {int(target_key)}
         async with ad_target_lock:
-            if target_key in reserved_ad_targets:
+            # A dispatcher page runs accounts in parallel. Legacy memberships
+            # can carry a raw ID while a freshly synced membership carries a
+            # marked peer ID; reserve the whole compatibility set so those
+            # two rows cannot send to the same Telegram chat in one page.
+            if reserved_ad_targets.intersection(aliases):
                 return False
-            reserved_ad_targets.add(target_key)
+            reserved_ad_targets.update(aliases)
             return True
 
     async def _reserve_ad_delivery_budget(
@@ -8323,8 +8739,8 @@ class AcquisitionAutomationService:
         campaign: AdCampaign,
         account_id: int,
         group: Group,
-        creative: Optional[AdCreative],
-    ) -> tuple[Optional[AdDeliveryLog], Optional[str]]:
+        creative: AdCreative | None,
+    ) -> tuple[AdDeliveryLog | None, str | None]:
         """Atomically reserve one Growth ad against all user-visible daily exposures."""
         now = _now()
         day_start = _day_start(now)
@@ -8339,6 +8755,21 @@ class AcquisitionAutomationService:
             if reason:
                 await self.db.commit()
                 return None, reason
+        # Serialize every Growth reservation for a Telegram group. The
+        # campaign row lock below only protects one campaign; without a group
+        # lock two campaigns/accounts could both observe an empty daily slot
+        # and create duplicate reservations concurrently.
+        locked_group = (
+            await self.db.execute(
+                select(Group)
+                .where(Group.id == group.id)
+                .with_for_update(of=Group)
+            )
+        ).scalar_one_or_none()
+        if locked_group is None:
+            await self.db.commit()
+            return None, "group_missing"
+        group = locked_group
         locked_campaign = (
             await self.db.execute(
                 select(AdCampaign)
@@ -8355,6 +8786,8 @@ class AcquisitionAutomationService:
             account_id=account_id,
             group=group,
             day_start=day_start,
+            now=now,
+            qualified=qualification_context is not None,
         )
         if quota_reason:
             await self.db.commit()
@@ -8377,12 +8810,15 @@ class AcquisitionAutomationService:
         campaign: AdCampaign,
         account_id: int,
         group: Group,
-        day_start: Optional[datetime] = None,
-    ) -> Optional[str]:
-        from app.modules.acquisition.adaptive_frequency import enabled
-        if await enabled(self.db, account_id):
-            return None  # Group row and outbound probe/mature ledger own adaptive quotas.
-        day_start = day_start or _day_start(_now())
+        day_start: datetime | None = None,
+        now: datetime | None = None,
+        qualified: bool = False,
+    ) -> str | None:
+        # Adaptive frequency controls the cadence for a qualified group.  It
+        # does not replace the campaign's explicit daily limits: those limits
+        # are the product contract and must also cover adaptive deliveries.
+        now = now or _now()
+        day_start = day_start or _day_start(now)
         active_reservation = or_(
             and_(
                 AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
@@ -8390,7 +8826,14 @@ class AcquisitionAutomationService:
             ),
             and_(
                 AdDeliveryLog.reservation_token.is_not(None),
-                AdDeliveryLog.status == DeliveryStatus.PENDING.value,
+                AdDeliveryLog.status.in_(
+                    [
+                        DeliveryStatus.PENDING.value,
+                        "sending",
+                        "unknown",
+                        "reconciliation_required",
+                    ]
+                ),
                 AdDeliveryLog.created_at >= day_start,
             ),
         )
@@ -8418,7 +8861,9 @@ class AcquisitionAutomationService:
                 await self.db.execute(
                     select(func.count(AdDeliveryLog.id)).where(
                         *base_filters,
-                        AdDeliveryLog.telegram_group_id == group.group_id,
+                        AdDeliveryLog.telegram_group_id.in_(
+                            telegram_group_id_aliases(group.group_id)
+                        ),
                     )
                 )
             ).scalar()
@@ -8427,6 +8872,64 @@ class AcquisitionAutomationService:
         group_limit = max(1, int(campaign.max_sends_per_group_per_day or 1))
         if group_count >= group_limit:
             return "campaign_group_daily_limit"
+
+        # Qualified Growth delivery has an explicit one-exposure-per-group
+        # safety contract. Adaptive frequency controls account pacing, but it
+        # must never turn that contract into a 48-minute loop. Count every
+        # Growth campaign and all reservations that can still result in a
+        # Telegram message, while the caller holds the group row lock.
+        execution = await get_ad_delivery_execution_settings(self.db)
+        configured_cooldown = max(
+            0, int(execution.get("growth_group_global_cooldown_seconds") or 0)
+        )
+        global_cooldown = (
+            max(86400, configured_cooldown) if qualified else configured_cooldown
+        )
+        if global_cooldown > 0:
+            # Legacy Growth keeps the existing Beijing-day accounting. The
+            # qualified lane deliberately uses a rolling 24-hour window so a
+            # day-boundary reset cannot reopen the same group early.
+            global_cutoff = (
+                now - timedelta(seconds=global_cooldown)
+                if qualified
+                else day_start
+            )
+            global_active_reservation = or_(
+                and_(
+                    AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
+                    AdDeliveryLog.sent_at >= global_cutoff,
+                ),
+                and_(
+                    AdDeliveryLog.reservation_token.is_not(None),
+                    AdDeliveryLog.status.in_(
+                        [
+                            DeliveryStatus.PENDING.value,
+                            "sending",
+                            "unknown",
+                            "reconciliation_required",
+                        ]
+                    ),
+                    AdDeliveryLog.created_at >= global_cutoff,
+                ),
+            )
+            global_count = int(
+                (
+                    await self.db.execute(
+                        select(func.count(AdDeliveryLog.id))
+                        .join(AdCampaign, AdCampaign.id == AdDeliveryLog.ad_campaign_id)
+                        .where(
+                            AdCampaign.delivery_policy == AdDeliveryPolicy.GROWTH.value,
+                            AdDeliveryLog.telegram_group_id.in_(
+                                telegram_group_id_aliases(group.group_id)
+                            ),
+                            global_active_reservation,
+                        )
+                    )
+                ).scalar()
+                or 0
+            )
+            if global_count >= 1:
+                return "growth_group_global_cooldown"
         return None
 
     def _campaign_is_active(self, campaign: AdCampaign) -> bool:
@@ -8439,7 +8942,7 @@ class AcquisitionAutomationService:
             return False
         return True
 
-    async def _choose_creative(self) -> Optional[AdCreative]:
+    async def _choose_creative(self) -> AdCreative | None:
         rows = await self.db.execute(
             select(AdCreative)
             .where(AdCreative.enabled == True)
@@ -8453,7 +8956,7 @@ class AcquisitionAutomationService:
         self,
         binding: AccountAdBinding,
         telegram_group_id: int,
-    ) -> Optional[AdCreative]:
+    ) -> AdCreative | None:
         creatives = await self._creative_pool_for_binding(binding)
         if await self._dynamic_qualification_mode(binding.account_id):
             from app.modules.acquisition.group_qualification import URL
@@ -8600,7 +9103,7 @@ class AcquisitionAutomationService:
             select(AdCreative)
             .join(AdDeliveryLog, AdDeliveryLog.creative_id == AdCreative.id)
             .where(
-                AdDeliveryLog.telegram_group_id == telegram_group_id,
+                _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, telegram_group_id),
                 AdDeliveryLog.ad_campaign_id == campaign_id,
                 AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
                 AdDeliveryLog.sent_at >= since,
@@ -8643,7 +9146,7 @@ class AcquisitionAutomationService:
         *,
         account_id: int,
         campaign: AdCampaign,
-        seed: Optional[AdCreative],
+        seed: AdCreative | None,
         count: int,
         priority: int = 0,
     ) -> list[AdCreative]:
@@ -8768,7 +9271,7 @@ class AcquisitionAutomationService:
             creatives.insert(0, binding.creative)
         return creatives
 
-    def _ad_creative_llm(self) -> Optional[LLMClient]:
+    def _ad_creative_llm(self) -> LLMClient | None:
         provider = (
             LLMProvider(settings.LLM_PROVIDER)
             if settings.LLM_PROVIDER in {item.value for item in LLMProvider}
@@ -8786,7 +9289,7 @@ class AcquisitionAutomationService:
     def _build_ad_creative_generation_prompt(
         self,
         campaign: AdCampaign,
-        seed: Optional[AdCreative],
+        seed: AdCreative | None,
         count: int,
     ) -> str:
         seed_content = seed.content if seed else "介绍产品优势，引导用户查看个人资料了解。"
@@ -8860,7 +9363,7 @@ class AcquisitionAutomationService:
         return has_profile_cta and has_link_cta
 
     @staticmethod
-    def _fallback_ad_creative_variants(seed: Optional[AdCreative], count: int) -> list[str]:
+    def _fallback_ad_creative_variants(seed: AdCreative | None, count: int) -> list[str]:
         if seed is None or not seed.content:
             return []
         content = seed.content
@@ -8995,7 +9498,7 @@ class AcquisitionAutomationService:
         ]
 
     @staticmethod
-    def _weighted_creative_choice(creatives: list[AdCreative]) -> Optional[AdCreative]:
+    def _weighted_creative_choice(creatives: list[AdCreative]) -> AdCreative | None:
         if not creatives:
             return None
         total = sum(max(1, int(item.weight or 0)) for item in creatives)
@@ -9025,7 +9528,11 @@ class AcquisitionAutomationService:
         from app.modules.acquisition.group_qualification import POLICY_VERSION
         from app.modules.acquisition.qualification_lifetime import authorization_current
         from app.modules.acquisition.qualification_service import (
-            _date, _payload, current_authorization, policy, scope_matches,
+            _date,
+            _payload,
+            current_authorization,
+            policy,
+            scope_matches,
         )
         config = await policy(self.db, fresh=True)
         if not config.get("enabled"):
@@ -9051,9 +9558,19 @@ class AcquisitionAutomationService:
         from app.modules.acquisition.qualification_events import pending
         if await pending(self.db, member):
             return None, "qualification_event_pending"
+        from app.modules.acquisition.ad_warmup import warmup_readiness
+        warmup = await warmup_readiness(self.db, account_id, member, now)
+        if warmup.reason:
+            return None, warmup.reason
         snapshot = _payload(row)
         if snapshot.get("protected") or snapshot.get("technical_errors"):
             return None, "qualification_not_approved"
+        from app.modules.acquisition.qualification_system_identity import covered_system_ids
+        system_ids, fingerprint = await covered_system_ids(self.db, config, account_id=account_id)
+        if (not fingerprint or snapshot.get("system_identity_coverage") is not True
+                or snapshot.get("system_identity_fingerprint") != fingerprint
+                or snapshot.get("system_user_ids") != sorted(system_ids)):
+            return None, "qualification_system_identity_unconfirmed"
         from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
         if snapshot.get("authorization_basis") == OWN_SOURCE and not await own_proof_valid(self.db, snapshot, member, group, now):
             return None, "qualification_own_delivery_unconfirmed"
@@ -9074,6 +9591,7 @@ class AcquisitionAutomationService:
         self, context: dict[str, Any], target: int, now: datetime, *, lock: bool = False,
     ) -> str | None:
         """Called under the shared qualification setting row lock before reserving."""
+        from app.modules.acquisition.ad_readiness import AdSkipReason
         from app.modules.acquisition.adaptive_frequency import FrequencyService, enabled, rule_quota
         shared = await FrequencyService(self.db).state(target, context)
         if shared and getattr(shared, "status", None) in {"exit_pending", "blocked"}:
@@ -9088,9 +9606,36 @@ class AcquisitionAutomationService:
                 from app.core.account.outbound_budget import AccountOutboundBudgetService
                 budget = await AccountOutboundBudgetService(self.db).snapshot(context["account_id"], now)
                 lane = "mature" if state and state.mature else "probe"
-                if (budget.get("ad_lanes") or {}).get(lane, {}).get("remaining", 0) <= 0:
-                    return "outbound_ad_" + lane + "_budget"
-            return ready.reason
+                lane_info = (budget.get("ad_lanes") or {}).get(lane, {})
+                if lane_info.get("remaining", 0) <= 0:
+                    retry_at = lane_info.get("next_allowed_at")
+                    if retry_at:
+                        try:
+                            retry_at = datetime.fromisoformat(retry_at)
+                        except (TypeError, ValueError):
+                            retry_at = None
+                    if retry_at is None or retry_at <= now:
+                        retry_at = now + timedelta(seconds=AD_BUDGET_RETRY_FALLBACK_SECONDS)
+                    return AdSkipReason("outbound_ad_" + lane + "_budget", retry_at)
+                ad_category = (budget.get("categories") or {}).get("ad", {})
+                if ad_category.get("remaining", 0) <= 0:
+                    retry_at = ad_category.get("next_budget_available_at")
+                    if retry_at:
+                        try:
+                            retry_at = datetime.fromisoformat(retry_at)
+                        except (TypeError, ValueError):
+                            retry_at = None
+                    if retry_at is None or retry_at <= now:
+                        retry_at = now + timedelta(seconds=AD_BUDGET_RETRY_FALLBACK_SECONDS)
+                    return AdSkipReason("outbound_ad_budget", retry_at)
+            if ready.reason:
+                retry_at = ready.next_allowed_at
+                if ready.reason in {"frequency_daily_review_due", "frequency_daily_review_unknown"} and (
+                    retry_at is None or retry_at <= now
+                ):
+                    retry_at = now + timedelta(seconds=AD_DAILY_REVIEW_RETRY_FALLBACK_SECONDS)
+                return AdSkipReason(ready.reason, retry_at)
+            return None
         from app.modules.acquisition.qualification_service import _date
         aliases = telegram_group_id_aliases(target)
         rows = list((await self.db.scalars(select(AdDeliveryLog).where(
@@ -9269,7 +9814,7 @@ class AcquisitionAutomationService:
         )
         return row.scalar_one_or_none() is not None
 
-    def _parse_membership_note_events(self, note: Optional[str]) -> list[dict[str, Any]]:
+    def _parse_membership_note_events(self, note: str | None) -> list[dict[str, Any]]:
         if not note:
             return []
         events: list[dict[str, Any]] = []
@@ -9294,15 +9839,15 @@ class AcquisitionAutomationService:
 
     def _membership_latest_event(
         self,
-        note: Optional[str],
+        note: str | None,
         event_names: set[str],
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         for event in reversed(self._parse_membership_note_events(note)):
             if str(event.get("event") or "") in event_names:
                 return event
         return None
 
-    def _parse_note_datetime(self, value: Any) -> Optional[datetime]:
+    def _parse_note_datetime(self, value: Any) -> datetime | None:
         if not value:
             return None
         try:
@@ -9395,7 +9940,9 @@ class AcquisitionAutomationService:
                     func.max(AcquisitionMessage.sent_at),
                 ).where(
                     AcquisitionMessage.account_id == account_id,
-                    AcquisitionMessage.group_id == membership.telegram_group_id,
+                    _telegram_group_id_clause(
+                        AcquisitionMessage.group_id, membership.telegram_group_id
+                    ),
                     AcquisitionMessage.message_type.in_(
                         [MessageType.INTERACTION.value, MessageType.AI_WARMUP.value]
                     ),
@@ -9849,8 +10396,8 @@ class AcquisitionAutomationService:
         self,
         group_id: int,
         *,
-        account_id: Optional[int] = None,
-        changed_by_user_id: Optional[int] = None,
+        account_id: int | None = None,
+        changed_by_user_id: int | None = None,
         source: str = AD_POLICY_PROBE_MANUAL_SOURCE,
     ) -> dict[str, Any]:
         identity_result = await self.db.execute(
@@ -9875,8 +10422,8 @@ class AcquisitionAutomationService:
         self,
         group_id: int,
         *,
-        account_id: Optional[int] = None,
-        changed_by_user_id: Optional[int] = None,
+        account_id: int | None = None,
+        changed_by_user_id: int | None = None,
         source: str = AD_POLICY_PROBE_MANUAL_SOURCE,
     ) -> dict[str, Any]:
         """Send one controlled no-link advertisement to an unknown-policy group."""
@@ -10021,7 +10568,7 @@ class AcquisitionAutomationService:
         policy_raw = getattr(campaign, "delivery_policy", None) or AdDeliveryPolicy.GROWTH.value
         delivery_policy = str(getattr(policy_raw, "value", policy_raw))
         exposure_filters = [
-            AdDeliveryLog.telegram_group_id == group.group_id,
+            _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, group.group_id),
             AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
         ]
         if delivery_policy != AdDeliveryPolicy.GROWTH.value:
@@ -10100,21 +10647,21 @@ class AcquisitionAutomationService:
             await self.db.rollback()
             raise RuntimeError(schedule_reason or "delivery_schedule_unavailable")
 
-        delivery_log: Optional[AdDeliveryLog] = None
-        delivery_log_id: Optional[int] = None
-        acquired_account: Optional[Any] = None
-        deferred_reason: Optional[str] = None
-        message_id: Optional[int] = None
-        reservation_token: Optional[str] = None
-        probe_attempt_event_id: Optional[int] = None
+        delivery_log: AdDeliveryLog | None = None
+        delivery_log_id: int | None = None
+        acquired_account: Any | None = None
+        deferred_reason: str | None = None
+        message_id: int | None = None
+        reservation_token: str | None = None
+        probe_attempt_event_id: int | None = None
         telegram_send_completed = False
         telegram_send_attempted = False
-        telegram_sent_at: Optional[datetime] = None
+        telegram_sent_at: datetime | None = None
 
         async def defer_probe(
             reason: str,
             *,
-            delivery_status: Optional[DeliveryStatus] = None,
+            delivery_status: DeliveryStatus | None = None,
             delete_attempt_event: bool = False,
         ) -> None:
             # A failed flush/commit or an inner workflow rollback expires every ORM
@@ -10155,7 +10702,7 @@ class AcquisitionAutomationService:
             nonlocal telegram_send_attempted
             telegram_send_attempted = True
 
-        probe_attempt_event: Optional[GroupAdPolicyEvent] = None
+        probe_attempt_event: GroupAdPolicyEvent | None = None
         try:
             await self._sync_account_pool([membership.account])
             acquired_account = await self.account_pool.acquire_by_id(
@@ -10423,7 +10970,7 @@ class AcquisitionAutomationService:
     @staticmethod
     def _probe_block_event_is_active(
         membership: GroupAccountMembership,
-        blocked_event: Optional[dict[str, Any]],
+        blocked_event: dict[str, Any] | None,
     ) -> bool:
         return bool(blocked_event) and membership.probe_status not in {
             "not_started",
@@ -10501,7 +11048,7 @@ class AcquisitionAutomationService:
         now: datetime,
         *,
         dry_run: bool,
-    ) -> Optional[str]:
+    ) -> str | None:
         if await self._dynamic_qualification_mode(account_id):
             if membership.ad_pause_until and membership.ad_pause_until > now:
                 return "membership_ad_paused"
@@ -10643,8 +11190,8 @@ class AcquisitionAutomationService:
         account_id: int,
         now: datetime,
         *,
-        health_score: Optional[float] = None,
-        op_config: Optional[AccountOperationConfig] = None,
+        health_score: float | None = None,
+        op_config: AccountOperationConfig | None = None,
     ) -> dict[str, Any]:
         return await self.dynamic_frequency.ad_probe_budget_metrics(
             account_id,
@@ -10684,7 +11231,7 @@ class AcquisitionAutomationService:
             local_start -= timedelta(days=1)
         return local_start - timedelta(hours=int(capacity.get("timezone_offset_hours", 8)))
 
-    def _ad_window_skip_reason(self, now: datetime, capacity: dict[str, Any]) -> Optional[str]:
+    def _ad_window_skip_reason(self, now: datetime, capacity: dict[str, Any]) -> str | None:
         if not capacity.get("enabled", True):
             return None
         local_hour = self._ad_local_time(now, capacity).hour
@@ -11251,7 +11798,7 @@ class AcquisitionAutomationService:
     async def auto_probe_unknown_group_ad_policies(
         self,
         *,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """Automatically run controlled ad probes for eligible unknown groups."""
@@ -11499,7 +12046,7 @@ class AcquisitionAutomationService:
         }
 
     async def _get_or_create_group_ad_profile(
-        self, group: Group, capacity: Optional[dict[str, Any]] = None
+        self, group: Group, capacity: dict[str, Any] | None = None
     ) -> GroupAdProfile:
         row = await self.db.execute(
             select(GroupAdProfile).where(GroupAdProfile.group_id == group.id)
@@ -11678,7 +12225,7 @@ class AcquisitionAutomationService:
             )
             conversion_row = await self.db.execute(
                 select(func.count(AcquisitionTracking.id)).where(
-                    AcquisitionTracking.group_id == group.group_id,
+                    _telegram_group_id_clause(AcquisitionTracking.group_id, group.group_id),
                     AcquisitionTracking.converted == True,
                     AcquisitionTracking.converted_at.isnot(None),
                     AcquisitionTracking.converted_at >= sample_start,
@@ -11753,8 +12300,8 @@ class AcquisitionAutomationService:
         self,
         *,
         since: datetime,
-        account_id: Optional[int] = None,
-        telegram_group_id: Optional[int] = None,
+        account_id: int | None = None,
+        telegram_group_id: int | None = None,
     ) -> int:
         query = select(func.count(AdDeliveryLog.id)).where(
             AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
@@ -11763,13 +12310,15 @@ class AcquisitionAutomationService:
         if account_id is not None:
             query = query.where(AdDeliveryLog.account_id == account_id)
         if telegram_group_id is not None:
-            query = query.where(AdDeliveryLog.telegram_group_id == telegram_group_id)
+            query = query.where(
+                _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, telegram_group_id)
+            )
         row = await self.db.execute(query)
         return int(row.scalar() or 0)
 
     async def _new_ad_group_quota_skip_reason(
         self, account_id: int, now: datetime
-    ) -> Optional[str]:
+    ) -> str | None:
         capacity = await get_ad_capacity_settings(self.db)
         account = await self.db.get(TelegramAccount, account_id)
         limit = write_probe_limit(capacity, account, now)
@@ -11817,14 +12366,14 @@ class AcquisitionAutomationService:
         self,
         binding: AccountAdBinding,
         campaign: AdCampaign,
-        creative: Optional[AdCreative],
+        creative: AdCreative | None,
         membership: GroupAccountMembership,
         *,
         dry_run: bool = False,
         read_only: bool = False,
         now: datetime | None = None,
         check_account_throttle: bool = True,
-    ) -> Optional[str]:
+    ) -> str | None:
         del creative
         group = membership.group
         if group is None:
@@ -11979,7 +12528,9 @@ class AcquisitionAutomationService:
 
         group_recent_sent = await self.db.execute(
             select(func.max(AdDeliveryLog.sent_at)).where(
-                AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
+                _telegram_group_id_clause(
+                    AdDeliveryLog.telegram_group_id, membership.telegram_group_id
+                ),
                 AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
             )
         )
@@ -11987,7 +12538,11 @@ class AcquisitionAutomationService:
 
         if delivery_policy == AdDeliveryPolicy.GROWTH.value:
             execution = await get_ad_delivery_execution_settings(self.db)
-            from app.modules.acquisition.adaptive_frequency import FrequencyService, enabled, interval_seconds
+            from app.modules.acquisition.adaptive_frequency import (
+                FrequencyService,
+                enabled,
+                interval_seconds,
+            )
             if qualified_mode and await enabled(self.db, binding.account_id):
                 frequency = await FrequencyService(self.db).state(membership.telegram_group_id, context)
                 cooldown_seconds = interval_seconds(frequency.quota if frequency else 1)
@@ -12000,7 +12555,9 @@ class AcquisitionAutomationService:
         else:
             campaign_last_sent_row = await self.db.execute(
                 select(func.max(AdDeliveryLog.sent_at)).where(
-                    AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
+                    _telegram_group_id_clause(
+                        AdDeliveryLog.telegram_group_id, membership.telegram_group_id
+                    ),
                     AdDeliveryLog.ad_campaign_id == campaign.id,
                     AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
                 )
@@ -12021,7 +12578,9 @@ class AcquisitionAutomationService:
                     return "scheduled_time_not_due"
                 scheduled_slot_sent = await self.db.execute(
                     select(func.count(AdDeliveryLog.id)).where(
-                        AdDeliveryLog.telegram_group_id == membership.telegram_group_id,
+                        _telegram_group_id_clause(
+                            AdDeliveryLog.telegram_group_id, membership.telegram_group_id
+                        ),
                         AdDeliveryLog.ad_campaign_id == campaign.id,
                         AdDeliveryLog.status == DeliveryStatus.SUCCESS.value,
                         AdDeliveryLog.sent_at >= scheduled_slot_start - timedelta(minutes=5),
@@ -12079,10 +12638,10 @@ class AcquisitionAutomationService:
 
     async def _ad_account_throttle_skip_reason(
         self, config: AccountOperationConfig, now: datetime, *, delivery_policy: str,
-    ) -> Optional[str]:
+    ) -> str | None:
         return (await self._ad_account_throttle_readiness(config, now)).reason
 
-    async def _ad_account_risk_skip_reason(self, account_id: int, now: datetime) -> Optional[str]:
+    async def _ad_account_risk_skip_reason(self, account_id: int, now: datetime) -> str | None:
         row = await self.db.execute(select(TelegramAccount).where(TelegramAccount.id == account_id))
         account = row.scalar_one_or_none()
         if account is None:
@@ -12125,13 +12684,13 @@ class AcquisitionAutomationService:
         telegram_group_id: int,
         *,
         delivery_policy: str = AdDeliveryPolicy.GROWTH.value,
-    ) -> Optional[str]:
+    ) -> str | None:
         since = _now() - timedelta(hours=AD_GROUP_UNDELIVERABLE_FAILURE_LOOKBACK_HOURS)
         rows = await self.db.execute(
             select(AdDeliveryLog.error)
             .where(
                 AdDeliveryLog.account_id == account_id,
-                AdDeliveryLog.telegram_group_id == telegram_group_id,
+                _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, telegram_group_id),
                 AdDeliveryLog.ad_campaign_id == campaign_id,
                 AdDeliveryLog.status == DeliveryStatus.FAILED.value,
                 AdDeliveryLog.created_at >= since,
@@ -12151,12 +12710,12 @@ class AcquisitionAutomationService:
 
     async def _ad_recent_inflight_delivery_reason(
         self,
-        account_id: Optional[int],
-        campaign_id: Optional[int],
+        account_id: int | None,
+        campaign_id: int | None,
         telegram_group_id: int,
-    ) -> Optional[str]:
+    ) -> str | None:
         filters = [
-            AdDeliveryLog.telegram_group_id == telegram_group_id,
+            _telegram_group_id_clause(AdDeliveryLog.telegram_group_id, telegram_group_id),
             AdDeliveryLog.status == DeliveryStatus.PENDING.value,
             AdDeliveryLog.created_at >= _now() - timedelta(hours=6),
         ]
@@ -12212,7 +12771,7 @@ class AcquisitionAutomationService:
         account_id: int,
         *,
         lease_seconds: int,
-    ) -> Optional[str]:
+    ) -> str | None:
         token = uuid4().hex
         client = await self._new_ad_delivery_redis_client()
         try:
@@ -12247,7 +12806,7 @@ class AcquisitionAutomationService:
         finally:
             await self._close_ad_delivery_redis_client(client)
 
-    async def _get_ad_delivery_cooldown_until(self, account_id: int) -> Optional[float]:
+    async def _get_ad_delivery_cooldown_until(self, account_id: int) -> float | None:
         client = await self._new_ad_delivery_redis_client()
         try:
             raw = await client.get(f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:cooldown_until")
@@ -12273,7 +12832,7 @@ class AcquisitionAutomationService:
         finally:
             await self._close_ad_delivery_redis_client(client)
 
-    async def _get_ad_delivery_last_sent_at(self, account_id: int) -> Optional[float]:
+    async def _get_ad_delivery_last_sent_at(self, account_id: int) -> float | None:
         client = await self._new_ad_delivery_redis_client()
         try:
             raw = await client.get(f"{AD_DELIVERY_THROTTLE_KEY_PREFIX}:{account_id}:last_sent_at")
@@ -12323,7 +12882,7 @@ class AcquisitionAutomationService:
 
     async def _get_account_operation_config(
         self, account_id: int
-    ) -> Optional[AccountOperationConfig]:
+    ) -> AccountOperationConfig | None:
         row = await self.db.execute(
             select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id)
             .execution_options(populate_existing=True)
@@ -12336,11 +12895,11 @@ class AcquisitionAutomationService:
         now: datetime,
         *,
         timezone_offset_hours: int = 8,
-    ) -> Optional[datetime]:
+    ) -> datetime | None:
         offset = timedelta(hours=timezone_offset_hours)
         local_now = now + offset
-        closest: Optional[datetime] = None
-        closest_delta: Optional[float] = None
+        closest: datetime | None = None
+        closest_delta: float | None = None
         for item in campaign.get_scheduled_times():
             try:
                 hour, minute = item.split(":", 1)
@@ -12380,8 +12939,49 @@ class AcquisitionAutomationService:
         )
 
     async def _ad_send_target(self, telegram_group_id: int) -> int | str:
-        row = await self.db.execute(select(Group).where(Group.group_id == telegram_group_id))
-        group = row.scalar_one_or_none()
+        # Legacy raw IDs and marked peer IDs can both be present for the same
+        # Telegram chat.  Do not use ``scalar_one_or_none`` here: an alias
+        # collision must resolve to the live canonical group instead of
+        # turning an otherwise valid delivery into a database error.
+        groups = list(
+            (
+                await self.db.scalars(
+                    select(Group)
+                    .where(_telegram_group_id_clause(Group.group_id, telegram_group_id))
+                    .order_by(Group.id)
+                )
+            ).all()
+        )
+        group = next(
+            (
+                candidate
+                for candidate in groups
+                if candidate.group_id == telegram_group_id
+                and str(candidate.status or "").lower() == "active"
+            ),
+            None,
+        )
+        if group is None:
+            group = next(
+                (
+                    candidate
+                    for candidate in groups
+                    if str(candidate.status or "").lower() == "active"
+                ),
+                None,
+            )
+        if group is None:
+            # Preserve the existing username fallback for a non-terminal
+            # record, while never selecting a rejected/left/banned duplicate.
+            terminal_statuses = {"rejected", "left", "banned", "leave_failed"}
+            group = next(
+                (
+                    candidate
+                    for candidate in groups
+                    if str(candidate.status or "").lower() not in terminal_statuses
+                ),
+                None,
+            )
         if group and group.username:
             username = group.username.strip()
             if username:
@@ -12393,8 +12993,8 @@ class AcquisitionAutomationService:
     async def _send_ad(
         self, account_id: int, telegram_group_id: int, creative: AdCreative, *,
         delivery_policy: str = AdDeliveryPolicy.GROWTH.value,
-        reservation_token: Optional[str] = None,
-    ) -> Optional[int]:
+        reservation_token: str | None = None,
+    ) -> int | None:
         from app.modules.acquisition.read_costs import measure
         async with measure(account_id, "delivery") as cost:
             result = await self._send_ad_measured(
@@ -12411,8 +13011,8 @@ class AcquisitionAutomationService:
         creative: AdCreative,
         *,
         delivery_policy: str = AdDeliveryPolicy.GROWTH.value,
-        reservation_token: Optional[str] = None,
-    ) -> Optional[int]:
+        reservation_token: str | None = None,
+    ) -> int | None:
         content = self._render_ad_content(creative)
         if not content.strip() or "{{link_url}}" in content:
             raise ValueError("ad creative contains unresolved content")
@@ -12453,10 +13053,10 @@ class AcquisitionAutomationService:
         content: str,
         *,
         source: str,
-        acquired_account: Optional[Any] = None,
-        on_send_attempted: Optional[Callable[[], None]] = None,
-        reservation_token: Optional[str] = None,
-    ) -> Optional[int]:
+        acquired_account: Any | None = None,
+        on_send_attempted: Callable[[], None] | None = None,
+        reservation_token: str | None = None,
+    ) -> int | None:
         if not content.strip():
             raise ValueError("ad probe content is empty")
         owns_account = acquired_account is None
@@ -12504,6 +13104,8 @@ class AcquisitionAutomationService:
             return "account_operation_lease_busy"
         if isinstance(exc, AccountOperationLeaseUnavailable):
             return "account_operation_lease_unavailable"
+        if "telegram session lease is busy" in text:
+            return "account_operation_lease_busy"
 
         if (
             "peer_flood" in text
@@ -12585,12 +13187,12 @@ class AcquisitionAutomationService:
 
         return f"unknown:{raw}"
 
-    def _is_group_control_ad_error(self, error: Optional[str]) -> bool:
+    def _is_group_control_ad_error(self, error: str | None) -> bool:
         return bool(error and error.startswith(AD_GROUP_CONTROL_ERROR_PREFIX))
 
     def _is_retryable_ad_only_group_control_error(
         self,
-        error: Optional[str],
+        error: str | None,
     ) -> bool:
         if not self._is_group_control_ad_error(error):
             return False
@@ -12624,7 +13226,7 @@ class AcquisitionAutomationService:
         )
         return any(marker in normalized for marker in retryable_markers)
 
-    def _is_group_undeliverable_ad_error(self, error: Optional[str]) -> bool:
+    def _is_group_undeliverable_ad_error(self, error: str | None) -> bool:
         if not error:
             return False
         normalized = error.lower()
@@ -12645,7 +13247,7 @@ class AcquisitionAutomationService:
         )
         return any(marker in normalized for marker in markers)
 
-    def _is_ad_delivery_stop_error(self, error: Optional[str]) -> bool:
+    def _is_ad_delivery_stop_error(self, error: str | None) -> bool:
         if not error:
             return False
         if error.startswith(AD_GROUP_CONTROL_ERROR_PREFIX) or error.startswith(
@@ -12654,7 +13256,7 @@ class AcquisitionAutomationService:
             return False
         return error.startswith("account_issue:") or "risk_guard_blocked:" in error
 
-    def _append_membership_note(self, existing_note: Optional[str], event: dict[str, Any]) -> str:
+    def _append_membership_note(self, existing_note: str | None, event: dict[str, Any]) -> str:
         payload = {"at": _now().isoformat(), **event}
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         note = f"{existing_note.rstrip()}\n{line}" if existing_note else line
@@ -12662,7 +13264,7 @@ class AcquisitionAutomationService:
             return note
         return note[-MEMBERSHIP_NOTE_MAX_CHARS:]
 
-    def _leave_error_means_not_joined(self, error: Optional[str]) -> bool:
+    def _leave_error_means_not_joined(self, error: str | None) -> bool:
         if not error:
             return False
         normalized = error.lower()
@@ -12712,12 +13314,12 @@ class AcquisitionAutomationService:
         group: Group,
         *,
         reason: str,
-        error: Optional[str] = None,
+        error: str | None = None,
         event: str = "ad_group_blocked",
-        profile: Optional[GroupAdProfile] = None,
+        profile: GroupAdProfile | None = None,
         record_event: bool = True,
         leave: bool = False,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Persist a group-level ad block and optionally leave one membership.
 
         Blocking and leaving are deliberately separate decisions.  Probe
@@ -12759,7 +13361,7 @@ class AcquisitionAutomationService:
                 )
             )
         ).scalar_one_or_none()
-        leave_error: Optional[str] = None
+        leave_error: str | None = None
         if leave:
             leave_error = await self._leave_group(
                 account_id, self._discovered_group_from_model(group)
@@ -12824,9 +13426,9 @@ class AcquisitionAutomationService:
         group: Group,
         *,
         reason: str,
-        error: Optional[str] = None,
+        error: str | None = None,
         event: str = "ad_group_blocked",
-    ) -> Optional[str]:
+    ) -> str | None:
         """Compatibility wrapper for an explicit block-and-leave operation."""
 
         return await self._block_group_ads(
@@ -13196,7 +13798,7 @@ class AcquisitionAutomationService:
                 membership.updated_at = now
 
             if unknown_policy_probe and membership is not None:
-                leave_error: Optional[str] = None
+                leave_error: str | None = None
                 if leave_on_deleted_ad and not membership_inactive:
                     leave_error = await self._leave_group(
                         log.account_id,
@@ -13254,7 +13856,7 @@ class AcquisitionAutomationService:
             if membership is not None and membership.ad_failure_streak >= int(
                 capacity.get("membership_delete_block_count") or 2
             ):
-                leave_error: Optional[str] = None
+                leave_error: str | None = None
                 if leave_on_deleted_ad and membership.status == "joined":
                     leave_error = await self._leave_group(
                         log.account_id, self._discovered_group_from_model(log.group)
@@ -13327,6 +13929,8 @@ class AcquisitionAutomationService:
         from telethon.tl import types
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.functions.messages import GetFullChatRequest
+
+        from app.core.account.read_cache import FeatureFlags, TelegramReadCache
         from app.modules.acquisition.qualification_identity import entity_identity, peer_identity
         facts: dict[str, Any] = {"exists": None, "member": None, "can_send": None,
                                  "group_accessible": None, "ttl_period": None, "errors": []}
@@ -13394,7 +13998,31 @@ class AcquisitionAutomationService:
         except Exception as exc:
             facts["errors"].append("ttl:" + type(exc).__name__)
         try:
-            message = await client.get_messages(entity, ids=int(log.telegram_message_id))
+            # The wrapper is already held by ``SurvivalReadBatch``.  Cache
+            # misses therefore submit to this owning Actor/client and never
+            # acquire a second session lease.  Force-refresh callers (P2
+            # reconciliation) still bypass the cache through the same API.
+            async def actor_reader(**payload: Any) -> Any:
+                if payload.get("kind") != "survival":
+                    raise ValueError("survival_read_kind_unsupported")
+                return await client.get_messages(entity, ids=int(payload["message_key"]))
+
+            survival_cache = TelegramReadCache(
+                actor_reader,
+                flags=FeatureFlags.from_env(),
+            )
+            survival_result = await survival_cache.get_ad_survival(
+                log.account_id,
+                str(log.telegram_group_id),
+                int(log.telegram_message_id),
+            )
+            facts["survival_read_status"] = survival_result.status
+            if survival_result.status != "fresh":
+                if survival_result.error:
+                    facts["errors"].append("message_query:" + survival_result.error[:200])
+                message = None
+            else:
+                message = survival_result.data
             if isinstance(message, (list, tuple)):
                 message = message[0] if len(message) == 1 else None
             facts["exists"] = bool(message and not isinstance(message, types.MessageEmpty)
@@ -13436,7 +14064,13 @@ class AcquisitionAutomationService:
         from app.modules.acquisition.read_costs import measure
         kind = kind or (log.survival_stage if purpose == "ad_survival_check" else "reconciliation")
         async with measure(log.account_id, kind) as cost:
-            facts = await self._read_survival_facts_measured(log, purpose, reads)
+            from app.core.account import read_work
+            if settings.BUDGET_LEDGER_ENABLED and read_work.current(log.account_id) is None:
+                work_kind = "survival" if purpose == "ad_survival_check" else "ad_reconciliation"
+                async with read_work.operation(log.account_id, log.id, work_kind):
+                    facts = await self._read_survival_facts_measured(log, purpose, reads)
+            else:
+                facts = await self._read_survival_facts_measured(log, purpose, reads)
             cost.complete = not facts.get("errors")
             return facts
 
@@ -13516,7 +14150,11 @@ class AcquisitionAutomationService:
         if not isinstance(context, dict):
             context = {}
         observations = list(context.get("survival_observations") or [])[-9:]
-        from app.modules.acquisition.adaptive_frequency import FrequencyService, frequency_context, negative_observation
+        from app.modules.acquisition.adaptive_frequency import (
+            FrequencyService,
+            frequency_context,
+            negative_observation,
+        )
         negative = negative_observation(facts, observations, checked_at) if frequency_context(current) else None
         observations.append({"stage": stage, "checked_at": checked_at.isoformat(), "facts": facts, "reason": reason})
         context["survival_observations"] = observations
@@ -13555,6 +14193,10 @@ class AcquisitionAutomationService:
         self, log: AdDeliveryLog, now: datetime, *, reads: SurvivalReadBatch | None = None,
     ) -> str:
         """Reconcile one original ID once; never search by content or resend."""
+        from app.core.account.reconciliation_handlers import verification_only
+        from app.core.account.reconciliation_stream import active_for
+        if active_for(log.account_id) and not verification_only.get():
+            return "independent_reconciliation"
         claim = await self._claim_survival_check(log.id, now, reconciliation=True)
         if claim is None:
             return "claim_unavailable"
@@ -13715,13 +14357,14 @@ class AcquisitionAutomationService:
         await self._reconcile_observed_ad_budget(current)
         return "send_reconciled"
 
-    async def check_ad_survival(self, *, limit: Optional[int] = None, account_id: int | None = None) -> dict[str, Any]:
+    async def check_ad_survival(self, *, limit: int | None = None, account_id: int | None = None) -> dict[str, Any]:
         from app.modules.acquisition.mature_survival import retire_mature_checkpoints
         await retire_mature_checkpoints(self.db, _now(), include_probes=True)
         await self.db.commit()
         capacity = await get_ad_capacity_settings(self.db)
         batch_size = max(1, int(limit or capacity.get("survival_check_batch_size") or 50))
         from app.core.account.send_receipts import recover_missing_receipts
+        from app.core.account.reconciliation_stream import legacy_account_filter
         from app.modules.acquisition.daily_frequency import run_daily_frequency_reviews
 
         receipts = await recover_missing_receipts(self.db, _now(), account_id, batch_size)
@@ -13742,6 +14385,7 @@ class AcquisitionAutomationService:
                          func.coalesce(AdDeliveryLog.survival_stage, "two_minute") != "daily",
                          eligible_check(now, capacity)),
                     and_(AdDeliveryLog.status.in_(["pending", "unknown", "sending", "reconciliation_required"]),
+                         legacy_account_filter(AdDeliveryLog.account_id),
                          AdDeliveryLog.telegram_message_id.is_not(None),
                          AdDeliveryLog.survival_status != AdSurvivalStatus.CHECK_FAILED.value,
                          or_(AdDeliveryLog.survival_check_due_at.is_(None), AdDeliveryLog.survival_check_due_at <= now)),
@@ -13817,9 +14461,9 @@ class AcquisitionAutomationService:
         log: AdDeliveryLog,
         status: DeliveryStatus,
         *,
-        telegram_message_id: Optional[int] = None,
-        error: Optional[str] = None,
-        sent_at: Optional[datetime] = None,
+        telegram_message_id: int | None = None,
+        error: str | None = None,
+        sent_at: datetime | None = None,
         survival_required: bool = False,
     ) -> AdDeliveryLog:
         delivery_sent_at = sent_at or _now()
@@ -13853,14 +14497,14 @@ class AcquisitionAutomationService:
         account_id: int,
         group: Group,
         campaign: AdCampaign,
-        creative: Optional[AdCreative],
+        creative: AdCreative | None,
         status: DeliveryStatus,
         *,
-        telegram_message_id: Optional[int] = None,
-        error: Optional[str] = None,
-        sent_at: Optional[datetime] = None,
+        telegram_message_id: int | None = None,
+        error: str | None = None,
+        sent_at: datetime | None = None,
         survival_required: bool = False,
-        reservation_token: Optional[str] = None,
+        reservation_token: str | None = None,
         qualification_context: dict[str, Any] | None = None,
     ) -> AdDeliveryLog:
         capacity = await get_ad_capacity_settings(self.db) if survival_required else {}

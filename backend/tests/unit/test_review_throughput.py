@@ -25,17 +25,20 @@ from tests.unit.test_review_efficiency import ai_snapshot
 
 
 @pytest.mark.asyncio
-async def test_permission_denial_stops_additional_pages_without_proving_absence():
+@pytest.mark.parametrize("roster", [False, True])
+async def test_permission_denial_stops_additional_pages_without_proving_absence(roster):
     history = [message(4000-i, age=i/100, sender=100+i,
                        text=f"服务优惠联系 https://offer-{i}.example") for i in range(1500)]
     client = ResumeClient(history)
     client.role_exception = ChatAdminRequiredError(None)
+    if roster:
+        client.get_participants = AsyncMock(return_value=[])
     result = await EvidenceCollector(client, identity_limit=12, priority_identities=8).collect(ENTITY, now=NOW)
     history_calls = [kw for kind, kw in client.calls if kind == "messages" and "offset_date" in kw]
     assert len(history_calls) == 3
     assert result["sample_count"] == 100
     assert result["sampling_stopped_reason"] == "member_identity_unavailable"
-    assert result["permission_queries"] == 3
+    assert result["permission_queries"] == 1
     assert not result["history_complete"] and not trial_evidence(result["evidence"])
     assert result["coverage"][0]["unknown_reason"] == "member_identity_unavailable"
     assert result["collection_progress"]["permission_failures"]

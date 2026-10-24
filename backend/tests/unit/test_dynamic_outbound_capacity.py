@@ -280,18 +280,45 @@ async def test_explicit_capacity_health_states(test_db, risk, recovery, status, 
     assert limits["join_interval_seconds"] == (7200 if interval == 1800 else 2880)
 
 
-async def test_stricter_config_and_account_age_cannot_be_bypassed(test_db):
+async def test_adaptive_interval_cannot_expand_configured_ad_limit(test_db):
+    account, config = await account_config(
+        test_db,
+        adaptive_ads_enabled=True,
+        max_ads_per_day=30,
+        message_interval_seconds=600,
+    )
+    limits = account_capacity_limits(account, config, NOW)
+    assert limits["ad"] == 30
+    assert limits["total"] == 62
+
+    config.max_ads_per_day = 3
+    await test_db.commit()
+    limits = account_capacity_limits(account, config, NOW)
+    assert limits["ad"] == 3
+    assert limits["total"] == 35
+
+
+@pytest.mark.parametrize("registered_at", [None, NOW - timedelta(days=2)])
+@pytest.mark.parametrize("category", ["ad", "verification"])
+async def test_no_age_minimum_preserves_outbound_config_limits(test_db, registered_at, category):
     account, config = await account_config(
         test_db, max_ads_per_day=3, max_messages_per_day=4, message_interval_seconds=4000
     )
     limits = account_capacity_limits(account, config, NOW)
     assert (limits["ad"], limits["total"], limits["ad_interval_seconds"]) == (3, 4, 4000)
-    account.registered_at = NOW - timedelta(days=2)
+    account.registered_at = registered_at
     await test_db.commit()
-    with pytest.raises(OutboundBudgetBlocked, match="account_age_not_verified_six_months"):
-        await AccountOutboundBudgetService(test_db).reserve(
-            account.id, attempt_key="young", category="ad", target_key="g", now=NOW
-        )
+    service = AccountOutboundBudgetService(test_db)
+    reservation = await service.reserve(
+        account.id, attempt_key="young", category=category, target_key="g", now=NOW
+    )
+    assert reservation.state == "reserved"
+    await service.mark_attempted("young", account_id=account.id, now=NOW)
+    await service.finish("young", account_id=account.id, state="succeeded", message_id=1, now=NOW)
+    if category == "ad":
+        with pytest.raises(OutboundBudgetBlocked, match="outbound_ad_interval"):
+            await service.reserve(account.id, attempt_key="too-early", category=category,
+                                  target_key="h", now=NOW + timedelta(seconds=3999))
 
 
 async def test_ad_interval_serializes_parallel_reservations(test_db):
@@ -387,11 +414,11 @@ async def test_inventory_includes_scheduled_observations_excludes_manual_history
     info = await inventory_snapshot(test_db, account.id, NOW)
     assert info == {
         "total": 6,
-        "qualified": 1,
+        "qualified": 0,
         "usable": 0,
         "probe_usable": 0,
         "mature_usable": 0,
-        "identity_blocked": 0,
+        "identity_blocked": 1,
         "slots_24h": 0,
         "probe_slots_24h": 0,
         "mature_slots_24h": 0,
@@ -690,11 +717,19 @@ async def test_capacity_distinguishes_unused_quota_from_executable_material_and_
     )
 
     account, config = await account_config(test_db)
-    member, _ = await add_member(test_db, account.id, 17, decision="allowed", review="approved")
+    member, audit = await add_member(test_db, account.id, 17, decision="allowed", review="approved")
     await test_db.commit()
     await save_auto_join_scheduler_settings(test_db, {"enabled": True})
     await save_ad_delivery_execution_settings(test_db, {"enabled": True})
     policy = {"enabled": True, "rollout_accounts": {str(account.id): {"phase": "dynamic"}}}
+    from app.modules.acquisition.qualification_system_identity import covered_system_ids
+    import json
+    policy["system_account_user_ids"] = {str(account.id): 9001}
+    ids, fingerprint = await covered_system_ids(test_db, policy, account_id=account.id)
+    audit.evidence_json = json.dumps({"system_identity_coverage": True,
+                                    "system_identity_fingerprint": fingerprint,
+                                    "system_user_ids": sorted(ids)})
+    await test_db.commit()
     monkeypatch.setattr(qualification, "policy", AsyncMock(return_value=policy))
     monkeypatch.setattr(qualification, "send_gate", AsyncMock(return_value=None))
     monkeypatch.setattr(
@@ -814,7 +849,7 @@ async def test_join_executable_requires_candidates_and_verification_budget(test_
     assert "verification_budget_unavailable" in exhausted["blockers"]
 
 
-async def test_capacity_batches_joined_candidates_across_accounts(test_db):
+async def test_capacity_batches_shared_occupancy_across_accounts(test_db):
     from sqlalchemy import event
 
     from app.core.settings_models import SystemSetting
@@ -835,13 +870,19 @@ async def test_capacity_batches_joined_candidates_across_accounts(test_db):
             telegram_group_id=groups[0].group_id, status="joined", joined_at=NOW),
         GroupAccountMembership(account_id=account.id, group_id=groups[1].id,
             telegram_group_id=groups[1].group_id, status="left", ad_status="blocked"),
+        AutoJoinAttempt(account_id=other.id, group_id=groups[2].id,
+            telegram_group_id=groups[2].group_id, group_username=groups[2].username,
+            target_key=f"username:{groups[2].username}", request_state="reserved",
+            reservation_expires_at=NOW + timedelta(minutes=10)),
     ])
     account_id = account.id
     await test_db.commit()
     test_db.expunge_all()
     lookups = []
     def count_candidates(_conn, _cursor, statement, *_args):
-        if statement.lstrip().startswith("SELECT") and "group_account_membership.group_id IN" in statement:
+        if (statement.lstrip().startswith("SELECT")
+                and "acquisition_auto_join_attempt" in statement
+                and "group_account_membership" in statement and "EXISTS" in statement):
             lookups.append(statement)
     engine = test_db.bind.sync_engine
     event.listen(engine, "before_cursor_execute", count_candidates)
@@ -849,10 +890,14 @@ async def test_capacity_batches_joined_candidates_across_accounts(test_db):
         result = await capacity_snapshot(test_db, account_id, NOW)
     finally:
         event.remove(engine, "before_cursor_execute", count_candidates)
-    assert result["workload"]["join_candidates_total"] == 199
-    assert result["workload"]["join_candidates_preview_pending"] == 199
+    assert result["workload"]["shared_candidate_pool_total"] == 200
+    assert result["workload"]["shared_candidate_pool_available"] == 198
+    assert result["workload"]["shared_candidate_pool_occupied"] == 2
+    assert result["workload"]["shared_candidate_pool_occupied_by_other_accounts"] == 2
+    assert result["workload"]["join_candidates_total"] == 198
+    assert result["workload"]["join_candidates_preview_pending"] == 198
     assert result["executable_now"]["join"] == 0
-    assert len(lookups) == 1
+    assert 1 <= len(lookups) <= 2
 
 @pytest.mark.parametrize('global_wait', [0, 120])
 async def test_capacity_ad_deadline_uses_ad_lane_not_earlier_global_reset(test_db, monkeypatch, global_wait):

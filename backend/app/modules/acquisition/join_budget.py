@@ -22,6 +22,7 @@ from app.core.account.telegram_execution import (
     parse_telegram_group_link,
 )
 from app.core.automation_settings import get_auto_join_scheduler_settings
+from app.core.config import settings
 from app.core.group.identity import telegram_group_id_aliases
 from app.core.group.models import Group, GroupAccountMembership
 from app.core.operating_time import operating_day_start
@@ -628,6 +629,7 @@ class JoinRequestBudgetService:
         target_key: str | None = None,
         source: str,
         require_auto_join_enabled: bool = True,
+        commit: bool = True,
         now: datetime | None = None,
     ) -> AutoJoinAttempt:
         now = now or datetime.utcnow()
@@ -641,6 +643,34 @@ class JoinRequestBudgetService:
         if config is None:
             raise JoinBudgetBlocked("account_operation_config_missing", status=status)
 
+        # A search result is a shared resource.  Lock its stable target before
+        # checking memberships/requests so two accounts cannot both pass the
+        # check and create reservations in separate workers.
+        normalized_target_key = self.normalize_target_key(
+            group_id=group_id,
+            telegram_group_id=telegram_group_id,
+            group_username=group_username,
+            target_key=target_key,
+        )
+        from app.modules.acquisition.join_claims import lock_target, resolve_target, target_blocker
+        target = await resolve_target(
+            self.db,
+            group_id=group_id,
+            telegram_group_id=telegram_group_id,
+            group_username=group_username,
+            target_key=normalized_target_key,
+        )
+        await lock_target(self.db, target)
+        blocker = await target_blocker(
+            self.db, target, account_id, now,
+            # Explicit advertising handovers join the replacement before the
+            # source leaves; automatic search-pool acquisition remains unique.
+            include_memberships=not source.startswith(("ad_only_", "manual_ad_only_")),
+        )
+        if blocker:
+            await self.db.commit()
+            raise JoinBudgetBlocked(blocker, status=status)
+
         stale = await self.db.execute(
             select(AutoJoinAttempt)
             .where(
@@ -653,6 +683,11 @@ class JoinRequestBudgetService:
         for item in stale.scalars().all():
             item.request_state = "released"
             item.reservation_released_at = now
+            item.reservation_expires_at = None
+            item.status = DeliveryStatus.SKIPPED.value
+            item.reconciliation_status = "resolved"
+            item.reconciliation_checked_at = now
+            item.reconciliation_next_at = None
             item.reason = item.reason or "reservation_expired_before_send"
 
         pending_review, overdue_review = await self._review_backlog(account_id, now)
@@ -704,12 +739,6 @@ class JoinRequestBudgetService:
             reasons.append("join_review_overdue")
         if next_allowed_at is not None and next_allowed_at > now:
             reasons.append("join_interval")
-        normalized_target_key = self.normalize_target_key(
-            group_id=group_id,
-            telegram_group_id=telegram_group_id,
-            group_username=group_username,
-            target_key=target_key,
-        )
         if await self._unresolved_target_exists(
             account_id, normalized_target_key, group_id=group_id,
             telegram_group_id=telegram_group_id, group_username=group_username,
@@ -762,8 +791,17 @@ class JoinRequestBudgetService:
             attempted_at=now,
         )
         self.db.add(attempt)
-        await self.db.commit()
-        await self.db.refresh(attempt)
+        if settings.BUDGET_LEDGER_ENABLED:
+            from app.core.account.budget_ledger import reserve
+            await self.db.flush()
+            await reserve(self.db, f"join:{attempt.id}", account_id=account_id,
+                          workload="join_request", lane="critical", reserved_reads=0,
+                          lease_expires_at=attempt.reservation_expires_at)
+        if commit:
+            await self.db.commit()
+            await self.db.refresh(attempt)
+        else:
+            await self.db.flush()
         return attempt
 
     async def mark_sent(
@@ -773,8 +811,17 @@ class JoinRequestBudgetService:
         now: datetime | None = None,
     ) -> None:
         now = now or datetime.utcnow()
-        # Keep the same lock order as reserve(): account, config, then attempt.
+        # Keep the same order as reserve(): account, config, target, attempt.
         account, config = await self._lock_account_and_config(attempt.account_id)
+        from app.modules.acquisition.join_claims import lock_target, resolve_target, target_blocker
+        target = await resolve_target(
+            self.db,
+            group_id=attempt.group_id,
+            telegram_group_id=attempt.telegram_group_id,
+            group_username=attempt.group_username,
+            target_key=attempt.target_key,
+        )
+        await lock_target(self.db, target)
         row = (
             await self.db.execute(
                 select(AutoJoinAttempt)
@@ -788,9 +835,22 @@ class JoinRequestBudgetService:
         if row.reservation_expires_at is None or row.reservation_expires_at <= now:
             row.request_state = "released"
             row.reservation_released_at = now
+            row.reservation_expires_at = None
+            row.status = DeliveryStatus.SKIPPED.value
+            row.reconciliation_status = "resolved"
+            row.reconciliation_checked_at = now
+            row.reconciliation_next_at = None
             row.reason = "reservation_expired_before_send"
             await self.db.commit()
             raise JoinBudgetBlocked("join_reservation_expired")
+        source = (row.reason or "").removeprefix("join_request_reserved:")
+        blocker = await target_blocker(
+            self.db, target, row.account_id, now,
+            exclude_attempt_id=row.id,
+            include_memberships=not source.startswith(("ad_only_", "manual_ad_only_")),
+        )
+        if blocker:
+            raise JoinBudgetBlocked(blocker)
         global_enabled = await self._global_join_enabled()
         eligibility = await self.eligibility_reason(
             account,
@@ -864,6 +924,9 @@ class JoinRequestBudgetService:
         attempt.request_state = row.request_state
         attempt.telegram_action_attempted = True
         attempt.request_sent_at = now
+        from app.core.metrics import record_delivery
+        await record_delivery("join", "sent", event_key=f"join:{row.id}:sent",
+                              admitted_at=row.reserved_at, sent_at=now)
 
     async def release(
         self,
@@ -888,7 +951,14 @@ class JoinRequestBudgetService:
         row.request_state = "released"
         row.reservation_released_at = now
         row.reservation_expires_at = None
+        row.status = DeliveryStatus.SKIPPED.value
+        row.reconciliation_status = "resolved"
+        row.reconciliation_checked_at = now
+        row.reconciliation_next_at = None
         row.reason = reason[:255]
+        if settings.BUDGET_LEDGER_ENABLED:
+            from app.core.account.budget_ledger import settle
+            await settle(self.db, f"join:{row.id}", 0, state="released", reason="request_not_sent")
         if commit:
             await self.db.commit()
         else:
@@ -943,9 +1013,20 @@ class JoinRequestBudgetService:
             row.request_state = "released"
             row.reservation_released_at = datetime.utcnow()
             row.reservation_expires_at = None
+            row.status = DeliveryStatus.SKIPPED.value
+            row.reconciliation_status = "resolved"
+            row.reconciliation_checked_at = datetime.utcnow()
+            row.reconciliation_next_at = None
+        if settings.BUDGET_LEDGER_ENABLED:
+            from app.core.account.budget_ledger import settle
+            await settle(self.db, f"join:{row.id}", 0, reason="request_finished")
         if commit:
             await self.db.commit()
             await self.db.refresh(row)
         else:
             await self.db.flush()
+        if commit:
+            from app.core.metrics import record_delivery
+            await record_delivery("join", "unknown" if outcome_unknown else row.status,
+                                  reason=reason, event_key=f"join:{row.id}:{row.status}:{outcome_unknown}")
         return row

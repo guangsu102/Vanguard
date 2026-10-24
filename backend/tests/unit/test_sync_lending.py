@@ -6,6 +6,7 @@ from app.core.account.sync_lending import add_idle_sync_headroom
 
 from app.core.account import rpc_governor as rpc
 from app.core.worker_status import TelegramWorkerStatus
+from app.core.config import settings
 from tests.unit.test_ad_read_reserve import empty_usage
 
 
@@ -58,3 +59,41 @@ async def test_only_fresh_idle_listener_lends_bounded_sync_capacity(test_db, con
         assert budget["sync_lending"]["available"]["hour"] == 0
     else:
         assert "sync_lending" not in budget
+
+
+@pytest.mark.asyncio
+async def test_p1_sync_target_is_allowlisted_and_keeps_protection_floor(test_db, monkeypatch):
+    now = datetime.utcnow()
+    item = {
+        "account_id": 2,
+        "state": "connected",
+        "connected": True,
+        "checkpoint_scope": "durable_session_and_inbox",
+        "update_queue_size": 0,
+        "update_handler_tasks": 0,
+        "raw_journal": {"available": True, "states": {}, "queues": {}, "checkpoint": {"count": 1}},
+    }
+    test_db.add(
+        TelegramWorkerStatus(
+            worker_id="p1-sync-test",
+            role="growth_user_worker",
+            status="online",
+            last_heartbeat_at=now,
+            metadata_json=json.dumps({"runtime": {"listeners": [item]}}),
+        )
+    )
+    await test_db.commit()
+    monkeypatch.setattr(settings, "P1_RUNTIME_RELIABILITY_ENABLED", True)
+    monkeypatch.setattr(settings, "P1_SYNC_CANARY_ACCOUNT_IDS", "2")
+    monkeypatch.setattr(settings, "P1_SYNC_TARGET_PERCENT", 35)
+    limits = rpc.limits_for({}, now, 2)
+    budget = {"usage": empty_usage(), "retry_after_seconds": 0, "lanes": {"critical": {}}}
+    await add_idle_sync_headroom(test_db, 2, now, limits, budget)
+    assert limits["sync_target_percent"] == 35
+    assert limits["sync_idle_lending"] == 1
+    assert limits["sync_target_hour"] == 84
+    assert budget["sync_lending"]["target_percent"] == 35
+    # The target is a cap; ad/survival/critical floors remain unchanged.
+    assert rpc.limits_for({}, now, 2)["ad_hour"] == 84
+    assert rpc.limits_for({}, now, 2)["survival_hour"] == 36
+    assert rpc.limits_for({}, now, 2)["critical_hour"] == 60

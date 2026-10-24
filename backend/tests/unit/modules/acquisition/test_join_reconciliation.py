@@ -15,7 +15,11 @@ from app.modules.acquisition.automation import (
     JoinedGroupAuditResult,
     JoinVerificationSettings,
 )
-from app.modules.acquisition.join_reconciliation import reconcile_joined_auto_join_attempts
+from app.modules.acquisition.join_reconciliation import (
+    expire_stale_join_requests,
+    reconcile_joined_auto_join_attempts,
+    unresolved_join_request_due,
+)
 from app.modules.acquisition.models import AutoJoinAttempt
 
 
@@ -247,6 +251,157 @@ async def test_sync_leaves_still_unapproved_request_pending(test_db):
     assert result["details"][0]["reason"] == "account_not_participant"
     service._join_group.assert_not_awaited()
     service._leave_group.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_approval_is_released_without_telegram_read(test_db):
+    attempt, membership, _ = await make_case(test_db, member_status="pending")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.status = "pending"
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "sent"
+    attempt.request_sent_at = now - timedelta(days=8)
+    membership.ad_status = "blocked"
+    await test_db.commit()
+
+    result = await expire_stale_join_requests(test_db, now=now, limit=10)
+
+    assert result["updated"] == 1
+    await test_db.refresh(attempt)
+    await test_db.refresh(membership)
+    assert attempt.status == "failed"
+    assert attempt.reason == "join_request_timeout"
+    assert attempt.request_state == "released"
+    assert attempt.reconciliation_status == "resolved"
+    assert membership.status == "rejected"
+    assert membership.ad_status == "blocked"
+    assert (await expire_stale_join_requests(test_db, now=now, limit=10))["updated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_unknown_request_stays_fenced_without_telegram_read(test_db):
+    attempt, membership, group = await make_case(test_db, member_status="pending")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.status = "failed"
+    attempt.group_id = None
+    attempt.telegram_group_id = group.group_id
+    attempt.target_key = None
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "outcome_unknown"
+    # Older rows may have lost the explicit send timestamp; attempted_at is
+    # still the durable lower bound for the timeout calculation.
+    attempt.request_sent_at = None
+    attempt.attempted_at = now - timedelta(days=8)
+    attempt.reconciliation_next_at = now + timedelta(hours=12)
+    await test_db.commit()
+
+    result = await expire_stale_join_requests(test_db, now=now, limit=10)
+
+    # An unknown external outcome is never released by a local clock. It stays
+    # fenced until an exact Telegram fact or operator evidence resolves it.
+    assert result["updated"] == 0
+    await test_db.refresh(attempt)
+    await test_db.refresh(membership)
+    assert attempt.status == "failed"
+    assert attempt.request_state == "outcome_unknown"
+    assert attempt.reconciliation_status != "resolved"
+    assert membership.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_stale_request_with_live_membership_is_reconciled_not_rejected(test_db):
+    attempt, membership, _ = await make_case(test_db, member_status="joined")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.status = "pending"
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "sent"
+    attempt.request_sent_at = now - timedelta(days=8)
+    membership.joined_at = attempt.request_sent_at + timedelta(minutes=1)
+    membership.last_checked_at = now - timedelta(minutes=1)
+    await test_db.commit()
+
+    result = await expire_stale_join_requests(test_db, now=now, limit=10)
+
+    assert result["updated"] == 1
+    assert result["details"][0]["status"] == "success"
+    await test_db.refresh(attempt)
+    await test_db.refresh(membership)
+    assert attempt.status == "success"
+    assert attempt.reason == "joined_membership_reconciled"
+    assert attempt.request_state == "sent"
+    assert attempt.reconciliation_status == "confirmed"
+    assert membership.status == "joined"
+    assert membership.left_at is None
+
+
+@pytest.mark.asyncio
+async def test_stale_pending_request_is_due_even_when_retry_timestamp_is_in_future(test_db):
+    attempt, _, _ = await make_case(test_db, member_status="pending")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.status = "pending"
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "sent"
+    attempt.target_key = "username:stale-join"
+    attempt.request_sent_at = now - timedelta(days=8)
+    attempt.reconciliation_next_at = now + timedelta(hours=12)
+    await test_db.commit()
+
+    due = await test_db.scalar(
+        select(AutoJoinAttempt.id).where(
+            AutoJoinAttempt.id == attempt.id,
+            unresolved_join_request_due(now),
+        )
+    )
+
+    assert due == attempt.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity_field", ["group_id", "telegram_group_id"])
+async def test_stale_request_without_target_key_is_still_due(test_db, identity_field):
+    attempt, _, group = await make_case(test_db, member_status="pending")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.target_key = None
+    attempt.group_id = group.id if identity_field == "group_id" else None
+    attempt.telegram_group_id = group.group_id if identity_field == "telegram_group_id" else None
+    attempt.status = "pending"
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "sent"
+    attempt.request_sent_at = now - timedelta(days=8)
+    attempt.reconciliation_next_at = now + timedelta(hours=12)
+    await test_db.commit()
+
+    due = await test_db.scalar(
+        select(AutoJoinAttempt.id).where(
+            AutoJoinAttempt.id == attempt.id,
+            unresolved_join_request_due(now),
+        )
+    )
+
+    assert due == attempt.id
+
+
+@pytest.mark.asyncio
+async def test_timeout_abandon_preserves_live_membership(test_db):
+    attempt, membership, _ = await make_case(test_db, member_status="joined")
+    now = datetime(2026, 10, 17, 1, 0)
+    attempt.status = "pending"
+    attempt.telegram_action_attempted = True
+    attempt.request_state = "sent"
+    attempt.request_sent_at = now - timedelta(days=8)
+    membership.joined_at = attempt.request_sent_at + timedelta(minutes=1)
+    membership.last_checked_at = now - timedelta(minutes=1)
+    await test_db.commit()
+
+    service = AcquisitionAutomationService(test_db)
+    preserved = await service._abandon_timed_out_join_request(attempt, now)
+
+    assert preserved is True
+    await test_db.refresh(attempt)
+    await test_db.refresh(membership)
+    assert attempt.status == "success"
+    assert attempt.request_state == "sent"
+    assert membership.status == "joined"
 
 
 @pytest.mark.asyncio

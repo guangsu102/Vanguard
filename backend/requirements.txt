@@ -52,6 +52,7 @@ anthropic>=0.18.0
 # Logging & Monitoring
 structlog>=24.1.0
 sentry-sdk>=2.0.0
+prometheus-client>=0.21.0,<1.0
 
 # Testing
 pytest>=8.0.0

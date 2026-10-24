@@ -490,6 +490,61 @@ async def test_private_message_enters_existing_handler_when_auto_reply_is_on(
 
 
 @pytest.mark.asyncio
+async def test_durable_message_handler_failure_does_not_mark_external_write(
+    monkeypatch,
+):
+    """The inbox boundary belongs to the first non-read Telegram RPC.
+
+    Persisting/routing/AI failures happen before any Telegram write and must
+    remain retryable.  The RPC governor owns the marker once a write request
+    is actually about to run.
+    """
+    worker = TelegramWorker(TelegramWorkerRole.GROWTH_USER, worker_id="test-growth")
+    db = object()
+
+    @asynccontextmanager
+    async def fake_db_session():
+        yield db
+
+    handler = MagicMock()
+    handler.initialize = AsyncMock()
+    handler.on_message = AsyncMock(side_effect=RuntimeError("local_handler_failed"))
+    handler_class = MagicMock(return_value=handler)
+    mark_external = AsyncMock()
+    monkeypatch.setattr(telegram_worker_module, "get_db_session", fake_db_session)
+    monkeypatch.setattr(
+        telegram_worker_module,
+        "persist_incoming_private_message",
+        AsyncMock(return_value=(object(), object(), True)),
+    )
+    monkeypatch.setattr(
+        telegram_worker_module,
+        "is_conversation_auto_reply_enabled",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        telegram_worker_module, "serialize_conversation", lambda _value: {"id": 1}
+    )
+    monkeypatch.setattr(
+        telegram_worker_module, "serialize_private_message", lambda _value: {"id": 2}
+    )
+    monkeypatch.setattr(
+        telegram_worker_module, "publish_private_chat_event", AsyncMock()
+    )
+    monkeypatch.setattr(telegram_worker_module, "AcquisitionEventHandler", handler_class)
+    monkeypatch.setattr(
+        "app.core.account.event_inbox.mark_external_attempt", mark_external
+    )
+
+    event = _private_event()
+    event._vanguard_durable_event = True
+    with pytest.raises(RuntimeError, match="local_handler_failed"):
+        await worker._handle_growth_new_message(9, event)
+
+    mark_external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_private_media_message_is_persisted_without_auto_reply(
     monkeypatch,
 ):

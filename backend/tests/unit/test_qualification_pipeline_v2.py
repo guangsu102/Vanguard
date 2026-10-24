@@ -576,6 +576,29 @@ async def test_approved_ark_coding_destination_reaches_ai_queue(test_db, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_approved_shared_pipenai_destination_reaches_ai_queue(test_db, monkeypatch):
+    from app.core.ai.llm_client import LLMClient
+
+    llm = object.__new__(LLMClient)
+    llm.base_url = "https://pipenai.xyz/v1"
+    service = Obj(
+        db=test_db, _ad_policy_llm=lambda: llm, _evaluate_group_ad_rules_with_ai=AsyncMock()
+    )
+    monkeypatch.setattr(ai, "claim_slot", AsyncMock(return_value=None))
+    snapshot = {"evidence": evidence()}
+    result = await ai.review_semantics(
+        service,
+        snapshot,
+        Obj(id=2, profile_bio=""),
+        GroupAdRulesAuditResult(),
+        {"ad_policy_ai_enabled": True, "ad_policy_ai_model": "gpt-6.1-sol"},
+    )
+    assert result.reason == "group_rules_ai_capacity_unavailable"
+    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
+    service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_wrong_ark_coding_path_cannot_receive_group_evidence(test_db):
     from app.core.ai.llm_client import LLMClient
 

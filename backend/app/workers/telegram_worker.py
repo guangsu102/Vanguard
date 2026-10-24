@@ -21,6 +21,8 @@ from typing import Any, Literal, Optional
 
 import structlog
 from sqlalchemy import func, select
+from sqlalchemy.exc import DBAPIError, OperationalError
+from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from telethon import events as telethon_events
@@ -67,7 +69,6 @@ from app.modules.acquisition.models import (
 )
 from app.modules.guardian.keyword_reply import handle_pp_ai_keyword_reply
 from app.modules.guardian.main import create_guardian_bot
-from app.modules.guardian.verification import runtime as pp_ai_verification
 from app.modules.guardian.models import (
     ManagedGroupBinding,
     ManagedGroupBindingStatus,
@@ -80,6 +81,7 @@ from app.modules.guardian.sync import (
     guardian_role_and_status_from_member,
     sync_managed_group_binding,
 )
+from app.modules.guardian.verification import runtime as pp_ai_verification
 from app.modules.owned_group.governance_worker import (
     add_owned_governance_audit,
     evaluate_guardian_member,
@@ -113,6 +115,12 @@ ENTITY_NAME_CACHE_TTL_SECONDS = 30 * 60
 ENTITY_NAME_CACHE_MAX_SIZE = 5000
 GROWTH_EVENT_CONCURRENCY_CAP = 8
 GROWTH_EVENT_DB_CONNECTION_RESERVE = 2
+# The growth worker shares a deliberately small per-process pool with the
+# listener inbox, private-message outbox and heartbeat/configuration reads.
+# Keep two connections available for those lanes so a long-running stage
+# cannot consume every slot and make an advertisement or join wait for the
+# pool timeout.
+SESSION_EXEC_DB_CONNECTION_RESERVE = 2
 TELETHON_ACCOUNT_LOGGER_PREFIX = "vanguard.telethon.account."
 TELEGRAM_PLATFORM_RESTRICTION_LOG_COOLDOWN_SECONDS = 5 * 60
 TELEGRAM_PLATFORM_RESTRICTION_MARKERS = (
@@ -201,8 +209,25 @@ class TelegramWorker:
         self._running = True
         try:
             await self._heartbeat(TelegramWorkerStatusValue.STARTING.value, {"phase": "startup"})
+            database_failures = 0
             while self._running:
-                await self.run_once()
+                try:
+                    await self.run_once()
+                    database_failures = 0
+                except (DatabaseTimeoutError, OperationalError, DBAPIError) as exc:
+                    if isinstance(exc, DBAPIError) and not (
+                        isinstance(exc, OperationalError) or exc.connection_invalidated
+                    ):
+                        raise
+                    database_failures += 1
+                    delay = min(30, 2 ** min(database_failures, 5))
+                    logger.warning(
+                        "telegram_worker_database_retry", worker_id=self.worker_id,
+                        error_type=type(exc).__name__, attempts=database_failures,
+                        retry_seconds=delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 if (
                     self.role == TelegramWorkerRole.GROWTH_USER
                     and self._private_outbox_task is None
@@ -718,11 +743,10 @@ class TelegramWorker:
                     errors.append({"account_id": account.id, "error": "account_not_connectable"})
                     continue
                 if wrapper.client is not previous_client:
-                    # A generation marker does not fan out group review work.
-                    # Only due advertisement targets request bounded repair.
-                    from app.modules.acquisition.qualification_events import account_gap
-                    async with get_db_session() as db:
-                        await account_gap(db, account.id)
+                    # Replacing a client is ordinary transport recovery.  The
+                    # listener journal emits scoped ``gap`` facts when a real
+                    # Telegram difference is missing; a reconnect alone must
+                    # never fan out qualification work for every group.
                     self._attach_growth_event_handlers(wrapper)
                     await wrapper.client.catch_up()
                 self._growth_listener_sessions[account.id] = wrapper.session_name
@@ -824,7 +848,16 @@ class TelegramWorker:
         """
         from app.core.account.session_exec import serve_requests
         from app.core.redis import get_redis
+        from app.core.scheduler.growth_dispatch import (
+            PROTECTED_STAGES,
+            SESSION_EXEC_PARALLEL_STAGES,
+            SESSION_EXEC_QUEUED_STAGES,
+        )
         from app.core.scheduler.growth_dispatch import execute as execute_stage
+        from app.modules.account_spam.service import (
+            SPAM_CHECK_OWNER_STAGE,
+            execute_forwarded_spam_check,
+        )
 
         client = await get_redis()
 
@@ -833,14 +866,59 @@ class TelegramWorker:
             return pool is not None and pool.peek_connected(account_id)
 
         async def run_stage(account_id: int, stage: str):
+            if stage.startswith("p3_read:"):
+                from app.core.account.actor_reads import execute_owner_batch
+
+                return await execute_owner_batch(self._account_pool, account_id, stage)
             async with get_db_session() as db:
+                if stage in {"p2_outbox:join_group", "p2_outbox:send_ad"}:
+                    from app.modules.acquisition.p2_dispatch import execute_owner_outbox
+
+                    return await execute_owner_outbox(
+                        db, account_id, stage.split(":", 1)[1], account_pool=self._account_pool,
+                    )
+                if stage.startswith("reconciliation:"):
+                    from app.core.account.reconciliation_handlers import execute_task
+                    _prefix, task_id, owner = stage.split(":", 2)
+                    return await execute_task(db, int(task_id), owner, account_id,
+                                              account_pool=self._account_pool), 30
+                if stage.startswith("group_metadata:"):
+                    from app.core.group.collection import sync_stale_groups
+                    return await sync_stale_groups(
+                        db, limit=1, pool=self._account_pool, account_id=account_id,
+                        group_id=int(stage.split(":", 1)[1]),
+                    ), 30
+                if stage.startswith(f"{SPAM_CHECK_OWNER_STAGE}:"):
+                    return await execute_forwarded_spam_check(
+                        db,
+                        account_id,
+                        stage,
+                        account_pool=self._account_pool,
+                    )
                 return await execute_stage(
                     db, stage, account_id, account_pool=self._account_pool
                 )
 
         while self._running:
             try:
-                await serve_requests(client, owns=owns, execute_stage=run_stage)
+                # Joins and advertisements share the owner with reviews, but
+                # one executor slot is reserved for these protected stages.
+                # The account lock still serializes a single Telegram session;
+                # the executor reservation prevents review throughput from
+                # consuming every slot before a protected operation arrives.
+                connections = settings.DATABASE_POOL_SIZE + settings.DATABASE_MAX_OVERFLOW
+                concurrency = min(
+                    settings.SESSION_EXEC_CONCURRENCY,
+                    max(1, connections - SESSION_EXEC_DB_CONNECTION_RESERVE),
+                )
+                await serve_requests(
+                    client, owns=owns, execute_stage=run_stage,
+                    max_concurrency=concurrency, defer_if_busy=True,
+                    parallel_stages=SESSION_EXEC_PARALLEL_STAGES,
+                    priority_stages=PROTECTED_STAGES,
+                    priority_reserved_slots=1,
+                    queued_stages=SESSION_EXEC_QUEUED_STAGES,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -863,7 +941,8 @@ class TelegramWorker:
                 # Local facts are consumed in bounded batches below. Business
                 # events remain single-event transactions because their handler
                 # may cross the Telegram side-effect boundary.
-                for _ in range(32 if local_only else 1):
+                for _ in range((settings.P1_INBOX_CLAIM_BATCH_SIZE if settings.P1_RUNTIME_RELIABILITY_ENABLED else 32)
+                               if local_only else 1):
                     if not self._running:
                         break
                     if not await self._process_growth_inbox_once(local_only=local_only):
@@ -881,7 +960,7 @@ class TelegramWorker:
             else:
                 await asyncio.sleep(0)
 
-    async def _process_growth_inbox_local_batch(self, *, limit: int = 32) -> bool:
+    async def _process_growth_inbox_local_batch(self, *, limit: int | None = None) -> bool:
         """Apply local listener facts in one transaction with per-fact savepoints.
 
         Listener facts are projections of durable local state and never perform
@@ -891,20 +970,28 @@ class TelegramWorker:
         a malformed or stale fact is retried without rolling back successful
         facts from the same batch.
         """
-        from app.core.account.event_inbox import claim_batch, finish
+        from app.core.account.event_inbox import claim_batch, finish, observe_claim, restore_event, rotation_cursor
         from app.core.account.listener_facts import apply_fact
+        from app.modules.acquisition.adaptive_frequency import queue_deleted_observation
 
         if self._account_pool is None:
             return False
         cursors = getattr(self, "_growth_inbox_cursors", {})
+        after = await rotation_cursor(
+            list(set(self._growth_listener_sessions) | set(getattr(self, "_growth_runtime_account_ids", set()))),
+            local_only=True, fallback=cursors.get(True, 0),
+        )
         async with get_db_session() as db:
             rows = await claim_batch(
                 db,
                 list(self._growth_listener_sessions),
                 local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
-                after_account_id=cursors.get(True, 0),
+                after_account_id=after,
                 local_only=True,
-                limit=limit,
+                limit=(limit or settings.P1_INBOX_CLAIM_BATCH_SIZE)
+                if settings.P1_RUNTIME_RELIABILITY_ENABLED else (limit or 32),
+                owner=self.worker_id,
+                lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS,
             )
             if not rows:
                 return False
@@ -913,7 +1000,24 @@ class TelegramWorker:
                 try:
                     data = json.loads(row.payload_json or "{}")
                     async with db.begin_nested():
-                        await apply_fact(db, row.account_id, data)
+                        # Projection helpers may commit internally. Join this
+                        # connection through a savepoint so those commits cannot
+                        # commit the batch claims or another fact's changes.
+                        async with AsyncSession(
+                            bind=await db.connection(),
+                            join_transaction_mode="create_savepoint",
+                            expire_on_commit=False,
+                        ) as fact_db:
+                            if row.kind == "deleted":
+                                # SDK deletion payloads contain chat_id and all
+                                # deleted_ids, unlike typed listener facts.
+                                event = restore_event(data, None, retry=row.attempts > 1)
+                                await queue_deleted_observation(
+                                    fact_db, row.account_id, event, confirmed=True,
+                                )
+                            else:
+                                await apply_fact(fact_db, row.account_id, data)
+                            await fact_db.commit()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -921,9 +1025,11 @@ class TelegramWorker:
                 # ``finish`` only changes the inbox row. It is deliberately
                 # outside the savepoint so a failed fact remains pending while
                 # the other facts in this transaction can be acknowledged.
-                await finish(db, row.id, error)
+                await finish(db, row.id, error, owner=row.claim_owner)
             cursors[True] = rows[-1].account_id
             self._growth_inbox_cursors = cursors
+        for row in rows:
+            await observe_claim(row)
         return True
 
     async def _project_growth_listener_facts(self) -> None:
@@ -957,21 +1063,42 @@ class TelegramWorker:
     async def _process_growth_inbox_once(self, *, local_only: bool | None = None) -> bool:
         if local_only is True:
             return await self._process_growth_inbox_local_batch()
-        from app.core.account.event_inbox import claim, finish, restore_event, current_event_id
+        from app.core.account.event_inbox import (
+            claim, current_claim_owner, current_event_id, finish, observe_claim,
+            restore_event, rotation_cursor,
+        )
         from app.core.account.rpc_governor import RpcDeferred
         if self._account_pool is None:
             return False
         cursors = getattr(self, "_growth_inbox_cursors", {})
+        after = await rotation_cursor(list(self._growth_listener_sessions), local_only=local_only,
+                                      fallback=cursors.get(local_only, 0))
         async with get_db_session() as db:
             row = await claim(db, list(self._growth_listener_sessions),
                               local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
-                              after_account_id=cursors.get(local_only, 0), local_only=local_only)
+                              after_account_id=after, local_only=local_only,
+                              owner=self.worker_id,
+                              lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS)
+            if row is None and local_only is False:
+                # Deletion updates are local facts, but this lane historically
+                # accepted them while the local projection lane was paused.
+                # Keep that recovery path alive without letting business work
+                # claim listener facts ahead of an available business event.
+                row = await claim(
+                    db, list(self._growth_listener_sessions),
+                    local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
+                    after_account_id=after, local_only=True,
+                    owner=self.worker_id,
+                    lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS,
+                )
             if row is None:
                 return False
             event_id, account_id = row.id, row.account_id
+            claim_owner = row.claim_owner
             kind, data, attempts = row.kind, json.loads(row.payload_json), row.attempts
         cursors[local_only] = account_id
         self._growth_inbox_cursors = cursors
+        await observe_claim(row)
         if kind == 'listener_fact':
             from app.core.account.listener_facts import apply_fact
             error = None
@@ -981,26 +1108,37 @@ class TelegramWorker:
             except Exception as exc:
                 error = exc
             async with get_db_session() as db:
-                await finish(db, event_id, error)
+                await finish(db, event_id, error, owner=claim_owner)
             return True
         error = None
         token = current_event_id.set(event_id)
+        claim_token = current_claim_owner.set(claim_owner)
         try:
-            wrapper = await self._account_pool.get_account_by_id(account_id)
-            if wrapper is None or wrapper.client is None:
-                raise RpcDeferred("telegram_rpc_guard_unavailable", 30)
-            event = restore_event(data, wrapper.client, retry=attempts > 1)
-            from app.core.account.listener_filter import keep_message
-            discard_chat = kind == "message" and not keep_message(event, self._growth_ingress_policy)
             if kind == "deleted":
+                # A durable exact deletion is a local fact. It must still
+                # update delivery state while the account/session is offline.
+                event = restore_event(data, None, retry=attempts > 1)
                 from app.modules.acquisition.adaptive_frequency import queue_deleted_observation
                 async with get_db_session() as db:
                     await queue_deleted_observation(db, account_id, event, confirmed=True)
-            elif discard_chat:
-                self._growth_filtered_messages += 1
             else:
-                handler = self._handle_growth_new_message if kind == "message" else self._handle_growth_chat_action
-                await self._run_growth_event(handler, account_id, event)
+                wrapper = await self._account_pool.get_account_by_id(account_id)
+                if wrapper is None or wrapper.client is None:
+                    raise RpcDeferred("telegram_rpc_guard_unavailable", 30)
+                event = restore_event(data, wrapper.client, retry=attempts > 1)
+                from app.core.account.listener_filter import keep_message
+                discard_chat = kind == "message" and not keep_message(event, self._growth_ingress_policy)
+                if discard_chat:
+                    self._growth_filtered_messages += 1
+                else:
+                    handler = self._handle_growth_new_message if kind == "message" else self._handle_growth_chat_action
+                    if claim_owner is not None:
+                        # Stop before the lease expires. A cancelled external
+                        # write retains its marker and goes to reconciliation.
+                        async with asyncio.timeout(max(1, settings.P1_INBOX_CLAIM_LEASE_SECONDS - 5)):
+                            await self._run_growth_event(handler, account_id, event)
+                    else:
+                        await self._run_growth_event(handler, account_id, event)
         except asyncio.CancelledError:
             # A claimed event is retained for reconciliation on restart.
             raise
@@ -1008,8 +1146,9 @@ class TelegramWorker:
             error = exc
         finally:
             current_event_id.reset(token)
+            current_claim_owner.reset(claim_token)
         async with get_db_session() as db:
-            await finish(db, event_id, error)
+            await finish(db, event_id, error, owner=claim_owner)
         return True
 
     async def _run_growth_event(
@@ -1316,9 +1455,6 @@ class TelegramWorker:
             async with get_db_session() as db:
                 handler = AcquisitionEventHandler(db=db, account_pool=self._account_pool)
                 await handler.initialize(**self._growth_handler_init_options)
-                if getattr(event, "_vanguard_durable_event", False):
-                    from app.core.account.event_inbox import mark_external_attempt
-                    await mark_external_attempt()
                 if text.strip().startswith("/"):
                     await handler.on_command(message_event)
                 else:
@@ -1477,9 +1613,6 @@ class TelegramWorker:
                 async with get_db_session() as db:
                     handler = AcquisitionEventHandler(db=db, account_pool=self._account_pool)
                     await handler.initialize(**self._growth_handler_init_options)
-                    if getattr(event, "_vanguard_durable_event", False):
-                        from app.core.account.event_inbox import mark_external_attempt
-                        await mark_external_attempt()
                     await handler.on_member_joined(join_event)
             except Exception as exc:
                 if getattr(event, "_vanguard_durable_event", False):

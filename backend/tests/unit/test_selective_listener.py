@@ -210,6 +210,7 @@ async def test_local_facts_deduplicate_retry_and_bypass_unknown_external_actions
             kind="message",
             chat_id=PEER,
             state="reconciliation_required",
+            external_attempted=True,
             payload_json="{}",
         )
     )

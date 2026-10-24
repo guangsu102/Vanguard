@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import Select, case, func, or_, select
 
 from app.core.account.models import AccountOperationConfig, TelegramAccount
 from app.core.account.operation_lease import (
@@ -332,7 +332,9 @@ class DailyFrequencyService:
                 # changed membership cannot borrow this receipt's authorization.
                 if log.group_id is not None:
                     from app.core.group.models import GroupAccountMembership
-                    from app.modules.acquisition.qualification_continuity import restore_own_authorization
+                    from app.modules.acquisition.qualification_continuity import (
+                        restore_own_authorization,
+                    )
                     await self.db.flush()
                     member = await self.db.scalar(select(GroupAccountMembership).where(
                         GroupAccountMembership.group_id == log.group_id,
@@ -370,100 +372,133 @@ class DailyFrequencyService:
         return "daily_" + (negative or "survived")
 
 
+def _daily_review_candidates(now: datetime, account_id: int | None) -> Select[tuple[int, datetime]]:
+    key = GroupAdFrequency.telegram_group_id
+    order_at = func.coalesce(GroupAdFrequency.daily_review_due_at, GroupAdFrequency.epoch_started_at)
+    query = select(key, order_at.label("review_order_at")).where(
+        GroupAdFrequency.status == "active",
+        or_(
+            GroupAdFrequency.daily_review_due_at <= now,
+            GroupAdFrequency.daily_review_due_at.is_(None) & (GroupAdFrequency.epoch_started_at <= now - DAY),
+        ),
+        or_(
+            GroupAdFrequency.daily_review_retry_at.is_(None),
+            GroupAdFrequency.daily_review_retry_at <= now,
+            GroupAdFrequency.daily_review_error == "telegram_read_budget",
+        ),
+        or_(
+            GroupAdFrequency.daily_review_token.is_(None),
+            GroupAdFrequency.daily_review_expires_at <= now,
+        ),
+    )
+    if account_id is not None:
+        # Delivery history predates a single Telegram peer-ID namespace. A
+        # frequency state may be keyed by a marked channel ID, a basic-chat
+        # ID, or a positive raw ID, so the first-cycle receipt query must
+        # consider every compatibility form. ``DailyFrequencyService.plan``
+        # still performs the typed namespace check before promoting a cycle.
+        raw_id = case(
+            (key < -1_000_000_000_000, -key - 1_000_000_000_000),
+            else_=func.abs(key),
+        )
+        marked_id = -1_000_000_000_000 - raw_id
+        # Receipts discover first cycles before any observation event exists.
+        # Raw IDs are lookup candidates; claim() verifies namespace and last sender.
+        receipts = select(AdDeliveryLog.id).where(
+            AdDeliveryLog.account_id == account_id,
+            AdDeliveryLog.status == "success",
+            AdDeliveryLog.telegram_message_id.is_not(None),
+            AdDeliveryLog.sent_at >= GroupAdFrequency.epoch_started_at,
+            or_(
+                AdDeliveryLog.telegram_group_id == key,
+                AdDeliveryLog.telegram_group_id == raw_id,
+                AdDeliveryLog.telegram_group_id == -raw_id,
+                AdDeliveryLog.telegram_group_id == marked_id,
+            ),
+        ).correlate(GroupAdFrequency)
+        query = query.where(receipts.exists())
+    return query.order_by(order_at, key)
+
+
 async def run_daily_frequency_reviews(service: Any, *, limit: int = 50, account_id: int | None = None) -> dict[str, int]:
     """Use the existing account pool and governed read channel, outside DB transactions."""
     from app.core.account.rpc_governor import RpcDeferred
     from app.modules.acquisition.survival_reads import SurvivalReadBatch
 
     db = service.db
-    now = datetime.utcnow()
+    query = _daily_review_candidates(datetime.utcnow(), account_id)
+    order_at = query.selected_columns[1]
+    batch_size = max(1, limit) if account_id is None else max(20, limit)
+    cursor: tuple[datetime, int] | None = None
     daily = DailyFrequencyService(db)
-    from app.modules.acquisition.models import GroupAdFrequencyEvent
-    account_keys = select(GroupAdFrequencyEvent.telegram_group_id).join(
-        AdDeliveryLog, AdDeliveryLog.id == GroupAdFrequencyEvent.log_id
-    ).where(AdDeliveryLog.account_id == account_id)
-    keys = list(
-        (
-            await db.scalars(
-                select(GroupAdFrequency.telegram_group_id)
-                .where(
-                    GroupAdFrequency.status == "active",
-                    True if account_id is None else GroupAdFrequency.telegram_group_id.in_(account_keys),
-                    or_(
-                        GroupAdFrequency.daily_review_due_at <= now,
-                        (
-                            GroupAdFrequency.daily_review_due_at.is_(None)
-                            & (GroupAdFrequency.epoch_started_at <= now - DAY)
-                        ),
-                    ),
-                    or_(
-                        GroupAdFrequency.daily_review_retry_at.is_(None),
-                        GroupAdFrequency.daily_review_retry_at <= now,
-                        GroupAdFrequency.daily_review_error == "telegram_read_budget",
-                    ),
-                    or_(
-                        GroupAdFrequency.daily_review_token.is_(None),
-                        GroupAdFrequency.daily_review_expires_at <= now,
-                    ),
-                )
-                .order_by(GroupAdFrequency.daily_review_due_at, GroupAdFrequency.epoch_started_at)
-                .limit(max(1, limit) if account_id is None else max(20, limit))
-            )
-        ).all()
-    )
     result: dict[str, int] = {"daily_processed": 0}
-    await db.commit()
     reads = SurvivalReadBatch(service.account_pool)
     try:
-        for key in keys:
-            if result["daily_processed"] >= limit:
-                break
-            claim = await daily.claim(key, datetime.utcnow(), account_id=account_id)
+        while result["daily_processed"] < limit:
+            batch_query = query
+            if cursor is not None:
+                batch_query = batch_query.where(or_(
+                    order_at > cursor[0],
+                    (order_at == cursor[0]) & (GroupAdFrequency.telegram_group_id > cursor[1]),
+                ))
+            candidates = list((await db.execute(batch_query.limit(batch_size))).all())
             await db.commit()
-            if claim is None:
-                continue
-            result["daily_processed"] += 1
-            try:
-                account = await db.scalar(
-                    select(TelegramAccount).where(
-                        TelegramAccount.id == claim.account_id,
-                    )
-                )
-                log = await db.scalar(select(AdDeliveryLog).where(AdDeliveryLog.id == claim.log_id))
+            if not candidates:
+                break
+            for key, _ in candidates:
+                if result["daily_processed"] >= limit:
+                    break
+                claim = await daily.claim(key, datetime.utcnow(), account_id=account_id)
                 await db.commit()
-                await service._sync_account_pool([account] if account else [])
-                facts: dict[str, Any] = {}
-                reason = None
-                retry_seconds = 120
+                if claim is None:
+                    continue
+                result["daily_processed"] += 1
                 try:
-                    facts = await service._read_survival_facts(log, "ad_survival_check", reads, kind="daily")
-                    reason = service._survival_unknown_reason(facts, log, datetime.utcnow())
-                except RpcDeferred as exc:
-                    reason = exc.reason
-                    retry_seconds = exc.retry_after_seconds
-                except (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable) as exc:
-                    reason = type(exc).__name__
-                    retry_seconds = 60
+                    account = await db.scalar(
+                        select(TelegramAccount).where(
+                            TelegramAccount.id == claim.account_id,
+                        )
+                    )
+                    log = await db.scalar(select(AdDeliveryLog).where(AdDeliveryLog.id == claim.log_id))
+                    await db.commit()
+                    await service._sync_account_pool([account] if account else [])
+                    facts: dict[str, Any] = {}
+                    reason = None
+                    retry_seconds = 120
+                    try:
+                        facts = await service._read_survival_facts(log, "ad_survival_check", reads, kind="daily")
+                        reason = service._survival_unknown_reason(facts, log, datetime.utcnow())
+                    except RpcDeferred as exc:
+                        reason = exc.reason
+                        retry_seconds = exc.retry_after_seconds
+                    except (AccountOperationLeaseBusy, AccountOperationLeaseUnavailable) as exc:
+                        reason = type(exc).__name__
+                        retry_seconds = 60
+                    except Exception as exc:
+                        reason = "daily_read_unknown:" + type(exc).__name__
+                    outcome = await daily.finish(
+                        claim,
+                        facts,
+                        reason,
+                        datetime.utcnow(),
+                        retry_seconds=retry_seconds,
+                    )
+                    await db.commit()
+                    result[outcome] = result.get(outcome, 0) + 1
                 except Exception as exc:
-                    reason = "daily_read_unknown:" + type(exc).__name__
-                outcome = await daily.finish(
-                    claim,
-                    facts,
-                    reason,
-                    datetime.utcnow(),
-                    retry_seconds=retry_seconds,
-                )
-                await db.commit()
-                result[outcome] = result.get(outcome, 0) + 1
-            except Exception as exc:
-                await reads.close()
-                await db.rollback()
-                result["daily_check_failed"] = result.get("daily_check_failed", 0) + 1
-                logger.error(
-                    "daily_frequency_review_failed",
-                    log_id=claim.log_id,
-                    error_type=type(exc).__name__,
-                )
+                    await reads.close()
+                    await db.rollback()
+                    result["daily_check_failed"] = result.get("daily_check_failed", 0) + 1
+                    logger.error(
+                        "daily_frequency_review_failed",
+                        log_id=claim.log_id,
+                        error_type=type(exc).__name__,
+                    )
+            # A different account may own every last message in the first batch.
+            # Advance by stable due/key order until this account's quantum is full.
+            if account_id is None or len(candidates) < batch_size:
+                break
+            cursor = (candidates[-1][1], candidates[-1][0])
     finally:
         await reads.close()
     return result

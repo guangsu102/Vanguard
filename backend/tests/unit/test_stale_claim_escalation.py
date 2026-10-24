@@ -1,17 +1,24 @@
 """Non-converging review claims must escape the loop after bounded attempts."""
+import json
 from datetime import datetime, timedelta
 
-from app.modules.acquisition.qualification_service import stale_claim_action
+from app.modules.acquisition.qualification_service import (
+    recover_stale_review_row,
+    stale_claim_action,
+)
 
 NOW = datetime(2026, 10, 8, 12, 0, 0)
 
 
 class Row:
-    def __init__(self, *, state="queued", decision="observe", reason="x", attempts=0):
+    def __init__(self, *, state="queued", decision="observe", reason="x", attempts=0,
+                 next_retry_at=None, evidence=None):
         self.state = state
         self.decision = decision
         self.reason = reason
         self.attempts = attempts
+        self.next_retry_at = next_retry_at
+        self.evidence_json = json.dumps(evidence or {})
 
 
 def test_continuity_trial_graduates_after_three_verifications():
@@ -67,3 +74,62 @@ def test_normal_reviews_never_escalate():
     ]
     for row in cases:
         assert stale_claim_action(row, now=NOW) is None, row.reason
+
+
+def test_expired_worker_claim_is_recovered_after_grace_period():
+    row = Row(
+        state="running",
+        decision="unknown",
+        next_retry_at=NOW - timedelta(seconds=91),
+    )
+    assert stale_claim_action(row, now=NOW) == "recover_stale_claim"
+    action = recover_stale_review_row(row, None, now=NOW)
+    assert action == "requeue_stale_claim"
+    assert row.state == "queued"
+    assert row.next_retry_at == NOW + timedelta(seconds=60)
+    assert json.loads(row.evidence_json)["review_recovery"][-1]["previous_state"] == "running"
+
+
+def test_terminal_ai_reject_releases_claim_without_reopening_admission():
+    row = Row(
+        state="running",
+        decision="reject",
+        reason="group_rules_ai_unresolved_conflict",
+        attempts=1000,
+        next_retry_at=NOW - timedelta(minutes=5),
+        evidence={"ai_final": True, "ai_decision": "fail"},
+    )
+    assert stale_claim_action(row, now=NOW) == "recover_stale_claim"
+    action = recover_stale_review_row(row, None, now=NOW)
+    assert action == "close_terminal_ai_reject"
+    assert row.state == "completed" and row.next_retry_at is None
+
+
+def test_expired_terminal_ai_reject_requeues_as_observation_for_fresh_evidence():
+    row = Row(
+        state="running",
+        decision="reject",
+        reason="group_rules_ai_unresolved_conflict",
+        attempts=1000,
+        next_retry_at=NOW - timedelta(minutes=5),
+        evidence={
+            "ai_final": True,
+            "ai_decision": "fail",
+            "next_evidence_maturity_at": (NOW - timedelta(minutes=1)).isoformat(),
+            "collection_complete": True,
+            "collection_operation_key": "stale",
+        },
+    )
+
+    assert stale_claim_action(row, now=NOW) == "recover_stale_claim"
+    action = recover_stale_review_row(row, None, now=NOW)
+
+    assert action == "requeue_stale_claim"
+    assert row.state == "queued"
+    assert row.decision == "observe"
+    assert row.next_retry_at == NOW + timedelta(seconds=60)
+    snapshot = json.loads(row.evidence_json)
+    assert snapshot["review_trigger"] == "evidence_maturity_recovery"
+    assert snapshot["collection_needs_refresh"] is True
+    assert snapshot["collection_complete"] is False
+    assert "collection_operation_key" not in snapshot

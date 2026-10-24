@@ -73,6 +73,28 @@ async def test_unfunded_plan_changes_no_hold_without_a_due_repair(monkeypatch):
     assert limits == before_limits and budget == before_budget
 
 
+async def test_all_blocked_targets_release_send_floor_for_one_renewal(monkeypatch):
+    """A blocked grant must be able to buy its own 16-read repair."""
+    now = datetime.utcnow()
+    limits = rpc.limits_for({}, now)
+    usage = {
+        "day": 2069, "ad_day": 747, "survival_day": 174,
+        "join_reserved_day": 660, "sync_reserved_day": 399, "flex_reserved_day": 89,
+    }
+    mock_usage(monkeypatch, {name: (used, 60000) for name, used in usage.items()})
+    budget = await rpc.read_budget_state(2, limits, now)
+    demand = {
+        "delivery_cost": 6, "renewal_cost": 16,
+        # ``sends`` represents the legacy forecast; ``ready_sends`` proves
+        # that none of those planned targets is currently runnable.
+        "hour": {"sends": 5, "ready_sends": 0, "renewals": 1},
+        "day": {"sends": 103, "ready_sends": 0, "renewals": 1},
+    }
+    add_refresh_demand_headroom(limits, budget, demand)
+    assert budget["lanes"]["ad_refresh"]["remaining"] >= 16
+    assert budget["ad_dependency_recovery"]["unfunded_delivery_plan"]["day"]["send_floor"] == 0
+
+
 @pytest.mark.parametrize("late_proof", [False, True])
 async def test_receipt_rechecks_after_its_independent_timer_expires(test_db, late_proof):
     account, group, _, _ = await setup(test_db)
@@ -119,6 +141,62 @@ async def test_receipt_rechecks_after_its_independent_timer_expires(test_db, lat
         assert result["manual_evidence_required"] == 0
         assert schedule is None
         assert log.telegram_message_id is None and log.survival_check_due_at is None
+
+
+async def test_pending_delivery_with_successful_ledger_is_promoted_locally(test_db):
+    """A durable outbound message ID must release a stale pending target."""
+    account, group, _, _ = await setup(test_db)
+    now = datetime.utcnow()
+    sent_at = now - timedelta(days=2)
+    log = AdDeliveryLog(
+        account_id=account.id, group_id=group.id, telegram_group_id=group.group_id,
+        ad_campaign_id=1, status="pending", created_at=sent_at,
+        reservation_token="ledger-proof", survival_status="not_required",
+        survival_stage="complete",
+    )
+    attempt = AccountOutboundAttempt(
+        account_id=account.id, attempt_key="ad:ledger-proof", category="ad",
+        target_key="group:test", state="succeeded", attempted_at=sent_at,
+        message_id=4321,
+    )
+    test_db.add_all([log, attempt])
+    await test_db.commit()
+
+    result = await recover_missing_receipts(test_db, now, account.id, 10)
+
+    assert result["receipt_ids_recovered"] == 1
+    assert result["manual_evidence_required"] == 0
+    assert log.status == "success"
+    assert log.telegram_message_id == 4321
+    assert log.sent_at == sent_at
+    assert log.error is None
+    assert log.survival_status == "pending"
+    assert log.survival_check_due_at == now
+
+
+async def test_pending_delivery_with_unknown_ledger_enters_manual_evidence(test_db):
+    """An unknown write is fenced for evidence and never automatically replayed."""
+    account, group, _, _ = await setup(test_db)
+    now = datetime.utcnow()
+    log = AdDeliveryLog(
+        account_id=account.id, group_id=group.id, telegram_group_id=group.group_id,
+        ad_campaign_id=1, status="pending", created_at=now - timedelta(days=2),
+        reservation_token="unknown-ledger", survival_status="not_required",
+        survival_stage="complete",
+    )
+    attempt = AccountOutboundAttempt(
+        account_id=account.id, attempt_key="ad:unknown-ledger", category="ad",
+        target_key="group:test", state="unknown", attempted_at=now - timedelta(days=2),
+    )
+    test_db.add_all([log, attempt])
+    await test_db.commit()
+
+    result = await recover_missing_receipts(test_db, now, account.id, 10)
+
+    assert result["receipt_ids_recovered"] == 0
+    assert result["manual_evidence_required"] == 1
+    assert log.status == "failed"
+    assert log.error.startswith("manual_evidence_required:")
 
 
 async def test_due_receipt_recheck_never_steals_a_claimed_reader(test_db):

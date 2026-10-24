@@ -3,6 +3,7 @@
 import asyncio
 import json
 import random
+from copy import deepcopy
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -92,6 +93,42 @@ async def test_forecast_includes_future_sends_and_event_repairs_and_fails_closed
     schedule.status, schedule.lease_expires_at = 'sending', now + timedelta(seconds=45)
     await test_db.flush()
     assert await ad_demand(test_db, 2, now, budget) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remaining", [23, 15])
+async def test_blocked_ad_forecast_funds_repair_only_from_real_remaining_reads(test_db, monkeypatch, remaining):
+    from app.core.account.demand_lending import add_refresh_demand_headroom
+
+    _, _, _, member, _, config = await configured(test_db)
+    config.adaptive_ads_enabled = True
+    await request(test_db, member, "rules", message_ids=[99], source_token="rules-99")
+    await test_db.commit()
+    monkeypatch.setattr(rpc.settings, "TELEGRAM_READ_BUDGET_PERCENT", 250)
+    monkeypatch.setattr("app.modules.acquisition.read_costs.operation_costs", AsyncMock(
+        return_value={"delivery_read_cost": 6, "renewal_read_cost": 16},
+    ))
+    spent = 23 - remaining
+    mock_usage(monkeypatch, {name: (used, 3600) for name, used in {
+        "day": 5818 + spent, "ad_day": 34 + spent, "ad_lent_day": 2043,
+        "survival_day": 900, "join_reserved_day": 3000,
+        "sync_reserved_day": 1200, "flex_reserved_day": 684,
+    }.items()})
+    now = datetime.utcnow()
+    limits = rpc.limits_for({}, now)
+    budget = await rpc.read_budget_state(2, limits, now)
+    original_usage = deepcopy(budget["usage"])
+    assert budget["lanes"]["ad"]["remaining"] == remaining
+
+    demand = await ad_demand(test_db, 2, now, budget)
+    assert demand["day"]["sends"] == demand["day"]["ready_sends"] == 0
+    assert demand["day"]["renewals"] == 1
+    add_refresh_demand_headroom(limits, budget, demand)
+
+    assert budget["lanes"]["ad_refresh"]["remaining"] == min(16, remaining)
+    assert limits["ad_refresh_hold_day"] == max(0, remaining - 16)
+    assert budget["usage"] == original_usage
+    assert limits["day"] == 6000
 
 
 @pytest.mark.asyncio

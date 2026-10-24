@@ -177,7 +177,7 @@ async def test_repeated_permission_failure_has_group_capability_backoff():
     client = ResumeClient(history)
     client.role_exception = ChatAdminRequiredError(request=None)
     first = await EvidenceCollector(client).collect(ENTITY, now=NOW)
-    assert first["permission_queries"] == 3
+    assert first["permission_queries"] == 1
     client2 = ResumeClient(history)
     collector = EvidenceCollector(client2)
     collector.previous = first

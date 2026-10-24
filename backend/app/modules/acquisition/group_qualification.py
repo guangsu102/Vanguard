@@ -358,6 +358,8 @@ class EvidenceCollector:
         self.history_progress: list[dict[str, Any]] = []
         self.history_pending_ids: list[int] = []
         self.full_chat: Any = None
+        self.roster_roles: dict[int, str] | None = None
+        self.role_sources: dict[int, str] = {}
         self.identity_limit = min(MAX_IDENTITIES, max(1, identity_limit)) if identity_limit is not None else MAX_IDENTITIES
         self.priority_identities = min(MAX_PRIORITY_IDENTITIES, max(0, priority_identities)) if priority_identities is not None else MAX_PRIORITY_IDENTITIES
 
@@ -438,6 +440,10 @@ class EvidenceCollector:
         self.roles[sender_id] = "unknown"
         from app.modules.acquisition.evidence_progress import date
         if self.permission_capability_retry_at and self.permission_capability_retry_at > self.collection_now:
+            found = await self.roster_role(entity, sender_id)
+            if found != "unknown":
+                self.roles[sender_id] = found
+                return found
             self.role_errors[sender_id] = "ChatAdminRequiredError"
             return "unknown"
         prior_failure = self.permission_failures.get(str(sender_id), {})
@@ -502,8 +508,11 @@ class EvidenceCollector:
             self.role_errors[sender_id] = type(exc).__name__
             if type(exc).__name__ == "ChatAdminRequiredError":
                 self.permission_denials += 1
-                if self.permission_denials >= 3:
-                    self.permission_capability_retry_at = self.collection_now + timedelta(hours=2)
+                self.permission_capability_retry_at = self.collection_now + timedelta(hours=2)
+                found = await self.roster_role(entity, sender_id)
+                if found != "unknown":
+                    self.roles[sender_id] = found
+                    self.role_errors.pop(sender_id, None)
                 failures = min(4, int(prior_failure.get("attempts") or 0) + 1)
                 self.permission_failures[str(sender_id)] = {
                     "attempts": failures,
@@ -512,6 +521,34 @@ class EvidenceCollector:
             if _flood_wait(exc):
                 raise
         return self.roles[sender_id]
+
+    async def roster_role(self, entity: Any, sender_id: int) -> str:
+        """A fresh participant object can prove a role; absence proves nothing."""
+        from telethon.tl import types
+        if self.roster_roles is None:
+            get_participants = getattr(self.client, "get_participants", None)
+            if not callable(get_participants):
+                return "unknown"
+            self.roster_roles = {}
+            try:
+                from app.core.account.read_timeout import read_operation_timeout
+                async with read_operation_timeout(network_seconds=15, total_seconds=30):
+                    participants = await get_participants(entity, limit=100)
+                for user in participants or []:
+                    item = getattr(user, "participant", None)
+                    role = ("admin" if isinstance(item, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator))
+                            else "ordinary" if isinstance(item, (types.ChannelParticipant, types.ChannelParticipantSelf))
+                            else "unknown")
+                    if (type(getattr(user, "id", None)) is int and not getattr(user, "bot", False)
+                            and not getattr(user, "deleted", False) and role != "unknown"):
+                        self.roster_roles[user.id] = role
+            except Exception as exc:
+                if _flood_wait(exc):
+                    raise
+        role = self.roster_roles.get(sender_id, "unknown")
+        if role != "unknown":
+            self.role_sources[sender_id] = "fresh_participant_roster"
+        return role
 
     async def messages(self, entity: Any, **kwargs: Any) -> list[Any]:
         return [item async for item in self.client.iter_messages(entity, **kwargs)]
@@ -551,6 +588,7 @@ class EvidenceCollector:
             "history_cursors": self.history_progress or (self.previous.get("collection_progress") or {}).get("history_cursors", []),
         }
         result["roles"] = {str(key): value for key, value in self.roles.items()}
+        result["role_sources"] = {str(key): value for key, value in self.role_sources.items()}
         result["identity_errors"] = {str(key): value for key, value in self.role_errors.items()}
         result["permission_queries"] = self.permission_queries
         result["sender_resolution_queries"] = self.sender_resolution_queries
@@ -685,7 +723,11 @@ class EvidenceCollector:
                     # or the IDs needed for the next fresh identity lookup.
                     result.update(probe)
                     break
-                if self.permission_denials >= 3:
+                capability_blocked = (
+                    self.permission_capability_retry_at is not None
+                    and self.permission_capability_retry_at > self.collection_now
+                )
+                if self.permission_denials >= 3 or (capability_blocked and missing):
                     # More history cannot restore participant lookup rights.
                     # Keep the three-day sample, rule evidence and sender-specific
                     # retry deadlines, without claiming complete coverage.
@@ -781,6 +823,19 @@ class EvidenceCollector:
         return list(messages.values())
 
     async def collect(self, entity: Any, *, now: datetime | None = None) -> dict[str, Any]:
+        from app.core.account.read_timeout import read_operation_timeout
+        self.active_result = None
+        try:
+            async with read_operation_timeout(network_seconds=60, total_seconds=120):
+                return await self._collect(entity, now=now)
+        except TimeoutError:
+            if self.active_result is None:
+                raise
+            self.active_result["technical_errors"].append("collection:TimeoutError")
+            self.active_result["collection_halted"] = "collection_deadline"
+            return self._finish(self.active_result)
+
+    async def _collect(self, entity: Any, *, now: datetime | None = None) -> dict[str, Any]:
         from telethon.tl.functions.channels import GetFullChannelRequest
         from telethon.tl.functions.messages import GetFullChatRequest, GetOnlinesRequest
         from telethon.tl.types import InputMessagesFilterPinned
@@ -837,6 +892,7 @@ class EvidenceCollector:
             ),
             "migrated_to": getattr(getattr(entity, "migrated_to", None), "channel_id", None),
         }
+        self.active_result = result
         full = None
         try:
             request = (

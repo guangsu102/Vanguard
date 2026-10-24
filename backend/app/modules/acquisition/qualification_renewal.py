@@ -36,6 +36,15 @@ async def eligible(db: Any, account: Any, group: Any, membership: Any,
             or previous.get("quality_status") != "qualified"
             or (previous.get("advertising_audit") or {}).get("ad_allowed") is not True):
         return False
+    from app.modules.acquisition.qualification_service import policy
+    from app.modules.acquisition.qualification_identity_refresh import reusable_identity_context
+    identity = await reusable_identity_context(db, await policy(db, fresh=True), account.id, previous)
+    if not identity:
+        return False
+    from app.modules.acquisition.qualification_lifetime import authorization_current
+    if (previous.get("system_identity_fingerprint") != identity["fingerprint"]
+            and not authorization_current(row, datetime.utcnow())):
+        return False
     return (previous.get("authorization_basis") != OWN_SOURCE
             or await own_proof_valid(db, previous, membership, group))
 
@@ -87,6 +96,12 @@ async def try_light_renewal(service: Any, account: Any, group: Any, membership: 
                                "qualification_protected_membership",
                                "qualification_paid_messages_not_authorized"}
         row.next_retry_at = None if terminal else datetime.utcnow() + timedelta(seconds=delay)
+        from app.modules.acquisition.review_waits import clear, record
+        if terminal:
+            await clear(service.db, row.id)
+        else:
+            await record(service.db, row.id, getattr(exc, "reason", str(exc)) or type(exc).__name__,
+                         0, row.next_retry_at, datetime.utcnow())
         if isinstance(exc, RpcDeferred) and (progress or {}).get('checked'):
             saved = json.loads(row.evidence_json or '{}')
             saved['renewal_progress'] = progress
@@ -98,6 +113,25 @@ async def try_light_renewal(service: Any, account: Any, group: Any, membership: 
             await service.account_pool.release(wrapper)
 
     snapshot = json.loads(row.evidence_json or "{}")
+    from app.modules.acquisition.qualification_service import policy
+    from app.modules.acquisition.qualification_identity_refresh import reusable_identity_context, wake_identity_schedule
+    identity = await reusable_identity_context(
+        service.db, await policy(service.db, fresh=True), account.id, snapshot,
+    )
+    if identity is None:
+        row.state, row.next_retry_at = "completed", datetime.utcnow() + timedelta(minutes=5)
+        from app.modules.acquisition.review_waits import record
+        await record(service.db, row.id, "qualification_system_identity_unconfirmed", 0,
+                     row.next_retry_at, datetime.utcnow())
+        return JoinedGroupAuditResult(passed=False, reason="qualification_system_identity_unconfirmed")
+    if snapshot.get("system_identity_fingerprint") != identity["fingerprint"]:
+        snapshot["system_identity_revalidation"] = {
+            "previous_fingerprint": snapshot.get("system_identity_fingerprint"),
+            "basis": identity["basis"], "checked_at": datetime.utcnow().isoformat(),
+        }
+        snapshot["system_identity_fingerprint"] = identity["fingerprint"]
+    snapshot["system_identity_managed_account_ids"] = identity["managed_account_ids"]
+    snapshot.pop("identity_refresh", None)
     snapshot.pop('renewal_progress', None)
     snapshot.pop('renewal_wait_reason', None)
     snapshot["authorization_mode"] = "events"
@@ -105,8 +139,11 @@ async def try_light_renewal(service: Any, account: Any, group: Any, membership: 
         snapshot["event_reconciled_at"] = datetime.utcnow().isoformat()
     row.evidence_json = json.dumps(snapshot, ensure_ascii=False)
     row.state, row.next_retry_at = "completed", None
+    from app.modules.acquisition.review_waits import clear
+    await clear(service.db, row.id)
     # Retain collection timestamps; processing an event is not fresh AI evidence.
     await service.db.flush()
+    await wake_identity_schedule(service.db, account.id, group.id)
     return JoinedGroupAuditResult(
         passed=True, can_send_messages=True, ad_allowed=True,
         ad_rule_details={**snapshot["advertising_audit"], "qualification": snapshot},

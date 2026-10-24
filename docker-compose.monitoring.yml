@@ -1,0 +1,158 @@
+# Merge with the canonical runtime Compose only. Start named NEW services with
+# up -d --no-deps; this overlay defines no database or Redis server.
+name: vanguard
+
+x-monitoring-defaults: &monitoring-defaults
+  restart: unless-stopped
+  networks: [vanguard-internal]
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+  security_opt: [no-new-privileges:true]
+
+services:
+  reconciliation:
+    <<: *monitoring-defaults
+    image: ${VANGUARD_RUNTIME_IMAGE:?Set the verified Vanguard application image}
+    container_name: vanguard-reconciliation
+    env_file: ["${VANGUARD_MONITORING_ENV_FILE:-/opt/vanguard/monitoring/private/runtime.env}"]
+    environment:
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "0"
+    command: [python, -m, app.core.reconciliation_worker]
+    volumes:
+      - ${VANGUARD_ROOT:-/opt/vanguard}/sessions:/app/sessions
+      - ${VANGUARD_ROOT:-/opt/vanguard}/data/logs:/app/logs
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+    cpus: "0.5"
+
+  prometheus:
+    <<: *monitoring-defaults
+    image: prom/prometheus:v3.5.0
+    container_name: vanguard-prometheus
+    user: "0:0" # Reads the root-only scrape credential file; no Linux capabilities.
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --storage.tsdb.retention.size=3GB
+      - --web.external-url=https://vanguard.pipenai.xyz/monitoring/prometheus/
+      - --web.route-prefix=/monitoring/prometheus/
+    volumes:
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/private/metrics.token:/run/secrets/metrics.token:ro
+      - vanguard-prometheus:/prometheus
+    ports: ["127.0.0.1:19090:9090"]
+    mem_limit: 256m
+    cpus: "0.5"
+
+  alertmanager:
+    <<: *monitoring-defaults
+    image: prom/alertmanager:v0.28.1
+    container_name: vanguard-alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=https://vanguard.pipenai.xyz/monitoring/alertmanager/
+      - --web.route-prefix=/monitoring/alertmanager/
+      - --cluster.listen-address=
+    volumes:
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - vanguard-alertmanager:/alertmanager
+    ports: ["127.0.0.1:19093:9093"]
+    mem_limit: 64m
+    cpus: "0.2"
+
+  grafana:
+    <<: *monitoring-defaults
+    image: grafana/grafana:12.1.1
+    container_name: vanguard-grafana
+    env_file: ["${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/private/grafana.env"]
+    environment:
+      GF_SERVER_ROOT_URL: https://vanguard.pipenai.xyz/monitoring/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - vanguard-grafana:/var/lib/grafana
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/grafana-dashboard.json:/var/lib/grafana/dashboards/growth.json:ro
+    ports: ["127.0.0.1:13001:3000"]
+    mem_limit: 256m
+    cpus: "0.5"
+
+  node-exporter:
+    <<: *monitoring-defaults
+    image: prom/node-exporter:v1.9.1
+    container_name: vanguard-node-exporter
+    command: [--path.rootfs=/host, --path.procfs=/host/proc, --path.sysfs=/host/sys]
+    pid: host
+    volumes: ["/:/host:ro,rslave"]
+    mem_limit: 48m
+    cpus: "0.2"
+
+  cadvisor:
+    <<: *monitoring-defaults
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    container_name: vanguard-cadvisor
+    privileged: true
+    command: [--docker_only=true, --store_container_labels=false, --housekeeping_interval=30s]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    devices: [/dev/kmsg:/dev/kmsg]
+    mem_limit: 192m
+    cpus: "0.3"
+
+  postgres-exporter:
+    <<: *monitoring-defaults
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: vanguard-postgres-exporter
+    env_file: ["${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/private/postgres.env"]
+    # The dedicated vanguard_monitor role has CONNECT + pg_monitor, no writes.
+    command: [--no-collector.stat_statements]
+    mem_limit: 64m
+    cpus: "0.2"
+
+  redis-exporter:
+    <<: *monitoring-defaults
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: vanguard-redis-exporter
+    env_file: ["${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/private/redis.env"]
+    mem_limit: 32m
+    cpus: "0.2"
+
+  blackbox-exporter:
+    <<: *monitoring-defaults
+    image: prom/blackbox-exporter:v0.26.0
+    container_name: vanguard-blackbox-exporter
+    command: [--config.file=/etc/blackbox/config.yml]
+    volumes:
+      - ${VANGUARD_MONITORING_ROOT:-/opt/vanguard/monitoring}/blackbox.yml:/etc/blackbox/config.yml:ro
+    mem_limit: 32m
+    cpus: "0.2"
+
+networks:
+  vanguard-internal:
+    external: true
+    name: ${VANGUARD_NETWORK:-vanguard_vanguard-internal}
+
+volumes:
+  vanguard-prometheus:
+  vanguard-alertmanager:
+  vanguard-grafana:

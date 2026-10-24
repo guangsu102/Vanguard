@@ -54,6 +54,9 @@ const reasons: Record<string, string> = {
   account_auto_ads_disabled: '账号广告暂停', account_auto_join_disabled: '账号加群暂停',
   account_capacity_unavailable: '账号状态或风险暂停', join_interval: '未到下次加群时间',
   join_review_backlog: '活动审核队列已满', qualification_disabled: '审核调度暂停',
+  join_wait_execution_capacity: '本账号待处理审核已占满加群准入',
+  join_target_occupied: '该群已被账号占用，等待加入或结果核对',
+  already_joined_by_other_account: '该群已有其他账号加入',
   account_age_not_verified_six_months: '缺少满 180 天的有效证据',
   account_age_evidence_conflict: '号龄声明与注册日期冲突',
   outbound_total_budget: '总外发额度用尽', rollout_paused: '尚未启用试投',
@@ -146,7 +149,7 @@ onMounted(refresh)
       <el-table-column label="阶段" width="110"><template #default="{ row }">{{ row.execution?.state === 'quarantined' ? '账号已隔离' : row.execution?.state === 'paused' ? '广告已暂停' : row.execution?.state === 'waiting_conditions' ? '等待业务条件' : row.execution?.state === 'budget_wait' ? '读取预算等待' : row.execution?.state === 'unavailable' ? '预算服务异常' : row.execution?.state === 'cooldown' ? '限流冷却' : ({ paused: '暂停', pilot: '受控试投', dynamic: '动态运行' } as Record<string, string>)[row.workload?.rollout_phase || 'paused'] || '暂停' }}</template></el-table-column>
       <el-table-column label="已核实可执行" min-width="145"><template #default="{ row }">广告 {{ row.executable_now?.ad ?? 0 }} / 加群 {{ row.executable_now?.join ?? 0 }}</template></el-table-column>
       <el-table-column label="24 小时广告回执" min-width="145"><template #default="{ row }">{{ row.ad_output?.sent_24h ?? 0 }}；1h 存活 {{ row.ad_output?.confirmed_1h ?? 0 }}</template></el-table-column>
-      <el-table-column label="待加群候选" min-width="240"><template #default="{ row }">共 {{ row.workload?.join_candidates_total ?? 0 }}；新鲜优质 {{ row.workload?.join_candidates ?? 0 }}；待核实 {{ row.workload?.join_candidates_preview_pending ?? 0 }}；已排除 {{ row.workload?.join_candidates_excluded ?? 0 }}</template></el-table-column>
+      <el-table-column label="共享候选群／本账号预览" min-width="290"><template #default="{ row }">共享池 {{ row.workload?.shared_candidate_pool_total ?? row.workload?.join_candidates_total ?? 0 }}；已占用 {{ row.workload?.shared_candidate_pool_occupied ?? 0 }}（其他账号 {{ row.workload?.shared_candidate_pool_occupied_by_other_accounts ?? 0 }}）；本账号已就绪 {{ row.workload?.join_candidates ?? 0 }}；待预览 {{ row.workload?.join_candidates_preview_pending ?? 0 }}；已排除 {{ row.workload?.join_candidates_excluded ?? 0 }}</template></el-table-column>
       <el-table-column label="今日／滚动广告" min-width="140"><template #default="{ row }">{{ row.used_today.ad ?? 0 }} / {{ row.used_rolling_24h.ad ?? 0 }}（{{ row.outbound?.ad_lanes ? "账号节奏容量" : "上限" }} {{ row.effective.ad ?? 0 }}）</template></el-table-column>
       <el-table-column label="总外发剩余" width="110"><template #default="{ row }">{{ row.remaining.total ?? 0 }}</template></el-table-column>
       <el-table-column label="为什么现在不能执行" min-width="240"><template #default="{ row }">{{ row.blockers.map((reason: string) => reasons[reason] || reason).join('；') || '缓存条件已满足，等待执行前复核' }}</template></el-table-column>

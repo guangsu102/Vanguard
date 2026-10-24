@@ -450,6 +450,14 @@ class AccountRiskGuard:
             AccountOperationConfig.account_id == account_id
         ))
         dynamic_enabled = getattr(dynamic_config, "dynamic_capacity_enabled", None) is True
+        if dynamic_enabled and action == AccountRiskAction.AD_DELIVERY and getattr(db_account, "managed_started_at", None):
+            warmup_policy = await get_account_warmup_policy_settings(self.db)
+            warmup = account_warmup_context(warmup_policy, db_account, now, action=action, details=details)
+            warmup_reason = account_warmup_block_reason(warmup, action, details)
+            if warmup_reason:
+                end = warmup.managed_started_at + timedelta(days=warmup.warmup_days) if warmup.managed_started_at else now
+                return await self._block(account, action, warmup_reason, target_type, target_id, details,
+                    retry_after_seconds=max(1, int((end - now).total_seconds()) + 1))
         feedback = {}
         if dynamic_enabled:
             from app.core.account.outbound_budget import (

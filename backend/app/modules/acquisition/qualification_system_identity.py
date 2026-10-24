@@ -30,6 +30,15 @@ def parse_identity_map(value: Any) -> dict[int, int] | None:
     return result
 
 
+def identity_fingerprint(managed: set[int], mapping: dict[int, int], extras: list[int]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {"managed": sorted(managed), "mapping": sorted(mapping.items()), "extras": sorted(extras)},
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
 async def covered_system_ids(
     db: Any, config: dict[str, Any], *, account_id: int, live_user_id: int | None = None
 ) -> tuple[set[int], str | None]:
@@ -59,12 +68,7 @@ async def covered_system_ids(
     if not isinstance(extras, list) or any(type(value) is not int or value <= 0 for value in extras):
         return set(), None
     ids = set(mapping.values()) | set(extras)
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {"managed": sorted(managed), "mapping": sorted(mapping.items()), "extras": sorted(extras)},
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    fingerprint = identity_fingerprint(managed, mapping, extras)
     return ids, fingerprint
 
 
@@ -76,10 +80,12 @@ async def ensure_system_identities(service: Any, *, limit: int = 2) -> dict[str,
     """
     import asyncio
     from datetime import datetime, timedelta
-    from sqlalchemy import update, func
+
+    from sqlalchemy import func, update
+
     from app.core.settings_models import SystemSetting
-    from app.modules.acquisition.models import GroupQualificationAudit
     from app.modules.acquisition.group_qualification import POLICY_VERSION
+    from app.modules.acquisition.models import GroupQualificationAudit
 
     key = "automation.group_qualification"
     record = await service.db.get(SystemSetting, key, populate_existing=True)

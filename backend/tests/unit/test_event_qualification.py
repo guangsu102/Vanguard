@@ -123,16 +123,33 @@ async def test_reconnect_marker_does_not_enqueue_all_groups(test_db):
     from app.modules.acquisition.qualification_events import account_gap
     _, account, _, member, row, _ = await fixture(test_db)
     old_state, old_retry = row.state, row.next_retry_at
+    first = await pending(test_db, member)
+    assert first is None
+    assert (row.state, row.next_retry_at) == (old_state, old_retry)
+    # An explicit, observed account gap is still a real event and is bounded
+    # by the normal queue; only a client reconnect skips this call entirely.
     await account_gap(test_db, account.id)
     await test_db.flush()
     first = await pending(test_db, member)
-    assert first["kinds"] == ["gap"]
-    assert (row.state, row.next_retry_at) == (old_state, old_retry)
+    assert first and first["kinds"] == ["gap"]
     await account_gap(test_db, account.id)
     await test_db.flush()
     assert not await acknowledge(test_db, member, first)
     assert await acknowledge(test_db, member, await pending(test_db, member))
     assert await pending(test_db, member) is None
+
+
+async def test_real_scoped_gap_remains_pending_after_reconnect_marker(test_db):
+    from app.modules.acquisition.qualification_events import account_gap, request
+    _, account, _, member, _, _ = await fixture(test_db)
+    await request(test_db, member, "gap", source_token="telegram-difference-1")
+    await test_db.flush()
+    event = await pending(test_db, member)
+    assert event and event["kinds"] == ["gap"]
+    await account_gap(test_db, account.id)
+    await test_db.flush()
+    current = await pending(test_db, member)
+    assert current and current["kinds"] == ["gap"]
 
 
 async def test_due_gap_queue_claims_at_most_two_and_is_idempotent(test_db):

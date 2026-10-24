@@ -92,6 +92,8 @@ class SessionLease:
             ex=max(10, int(self.ttl_seconds)),
         )
         if not ok:
+            from app.core.metrics import record_session_contention
+            await record_session_contention()
             return False
         await self.redis.set(
             self.owner_key,

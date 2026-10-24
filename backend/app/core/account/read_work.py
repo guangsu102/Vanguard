@@ -49,6 +49,7 @@ class ReadWork:
     defer_reason: str | None = None
     methods: Counter = field(default_factory=Counter)
     failures: Counter = field(default_factory=Counter)
+    ledger_id: str | None = None
     started: float = field(default_factory=time.monotonic)
 
     def summary(self) -> dict[str, Any]:
@@ -80,6 +81,10 @@ def current(account_id: int | None = None) -> ReadWork | None:
         and (account_id is None or work.account_id == account_id)
         else None
     )
+
+
+def lane_for(work: ReadWork) -> str:
+    return {"renewal": "ad", "ad_reconciliation": "ad", "survival": "survival"}.get(work.kind, "critical")
 
 
 def charged(account_id: int, methods: list[str]) -> None:
@@ -180,6 +185,8 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
             usage[f"survival_lent_{window}"]["used"],
             usage.get(f"sync_lent_{window}", {}).get("used", 0),
             usage.get(f"ad_lent_{window}", {}).get("used", 0),
+            usage.get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
+            usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
         lane = 'ad' if purpose == 'ad_qualification_refresh' else 'critical'
         caps = lending_caps(
@@ -207,7 +214,11 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
 
 
 async def initial_pending(db: Any, account_id: int, group_id: int) -> tuple[int, datetime] | None:
-    """One unfinished new join at a time; established observations do not veto joins."""
+    """Report initial work only when account-local execution capacity is full."""
+    from app.modules.acquisition.execution_admission import execution_plan
+
+    if (await execution_plan(db, datetime.utcnow(), account_id=account_id))["remaining"] > 0:
+        return None
     from sqlalchemy import func, select
 
     from app.core.group.models import GroupAccountMembership
@@ -270,12 +281,6 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
     from app.core.account.rpc_governor import RpcDeferred
 
     if work.kind == "join":
-        blocked = await initial_pending(db, account_id, work.group_id)
-        if blocked:
-            raise RpcDeferred(
-                "join_initial_review_pending",
-                max(1, math.ceil((blocked[1] - datetime.utcnow()).total_seconds())),
-            )
         from sqlalchemy import select
 
         from app.core.account.models import AccountOperationConfig
@@ -284,12 +289,12 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
             from app.modules.acquisition.growth_admission import admission_plan
             admission = await admission_plan(db, account_id, datetime.utcnow())
             if admission['reason']:
-                raise RpcDeferred(admission['reason'], 60)
+                raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
     try:
         samples = await cache.lrange(sample_key(account_id, work.kind), 0, 199)
         work.limit = estimate(
             samples,
-            DEFAULT_JOIN_READS if work.kind == "join" else DEFAULT_REVIEW_READS,
+            {"join": DEFAULT_JOIN_READS, "join_reconciliation": 8, "survival": 8, "ad_reconciliation": 8}.get(work.kind, DEFAULT_REVIEW_READS),
             time.time(),
         )
         if work.kind == "join":
@@ -307,10 +312,10 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
         keys, args = reservation_args(
             account_id,
             limits,
-            'ad' if work.kind == 'renewal' else "critical",
+            lane_for(work),
             reserve,
             0,
-            workload="join" if work.kind == "join" else "review",
+            workload="join" if work.kind in {"join", "join_reconciliation"} else "review",
             work_token=work.token,
             work_mode="reserve",
             work_group=work.group_id,
@@ -324,6 +329,17 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
         remaining = int(await cache.hget(key(account_id), "remaining") or 0)
         if work.kind == "review":
             work.limit = min(work.limit, remaining)
+        from app.core.account.budget_ledger import reserve_read_work
+        try:
+            await reserve_read_work(db, cache, work, remaining)
+        except BaseException:
+            # Includes cancellation after Redis succeeded and PG failed. Only
+            # this generation's reservation is released; spent quotas stay.
+            await cache.eval(
+                "if redis.call('HGET',KEYS[1],'token')==ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
+                1, key(account_id), work.token,
+            )
+            raise
         work.claimed = True
     except RpcDeferred:
         raise
@@ -409,6 +425,8 @@ async def operation(account_id: int, group_id: int, kind: str, *, scope: str = "
     finally:
         work.closed = True
         _current.reset(token)
+        from app.core.account.budget_ledger import finish_read_work
+        await finish_read_work(work)
         if work.claimed or work.reads:
             try:
                 from app.core.redis import get_redis

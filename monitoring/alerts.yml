@@ -1,106 +1,220 @@
-# ===========================================
-# Prometheus Alert Rules for Vanguard
-# ===========================================
-
 groups:
-  - name: vanguard_alerts
+  - name: vanguard-p0-slo
+    interval: 30s
     rules:
-      # High error rate
-      - alert: HighErrorRate
-        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected"
-          description: "Error rate is {{ $value | humanizePercentage }}"
-
-      # Backend down
-      - alert: BackendDown
+      - alert: VanguardBackendDown
         expr: up{job="vanguard-backend"} == 0
-        for: 1m
-        labels:
-          severity: critical
+        for: 2m
+        labels: {severity: critical, service: backend}
         annotations:
-          summary: "Backend is down"
-          description: "Vanguard backend has been down for more than 1 minute"
+          summary: Vanguard backend metrics endpoint is down
+          description: The backend has not been scrapeable for two minutes.
 
-      # High response time
-      - alert: HighResponseTime
-        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job="vanguard-backend"}[5m])) by (le)) > 2
-        for: 5m
-        labels:
-          severity: warning
+      - alert: VanguardPublicHealthDown
+        expr: probe_success{job="vanguard-blackbox"} == 0
+        for: 2m
+        labels: {severity: critical, service: public-health}
         annotations:
-          summary: "High response time"
-          description: "95th percentile response time is {{ $value }}s"
+          summary: Vanguard public health check is failing
+          description: The public HTTPS health endpoint has failed for two minutes.
 
-      # Database connection pool exhausted
-      - alert: DatabaseConnectionsHigh
-        expr: pg_stat_database_numbackends{datname="vanguard"} / pg_settings_max_connections > 0.8
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High database connections"
-          description: "Database connections are at {{ $value | humanizePercentage }} of maximum"
-
-      # Redis memory high
-      - alert: RedisMemoryHigh
-        expr: redis_memory_used_bytes{job="redis"} / redis_memory_max_bytes{job="redis"} > 0.9
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Redis memory usage high"
-          description: "Redis memory usage is at {{ $value | humanizePercentage }}"
-
-      # No messages processed
-      - alert: NoMessagesProcessed
-        expr: increase(vanguard_messages_processed_total[10m]) == 0
-        for: 30m
-        labels:
-          severity: info
-        annotations:
-          summary: "No messages processed"
-          description: "No messages have been processed in the last 30 minutes"
-
-      # High violation rate
-      - alert: HighViolationRate
-        expr: rate(vanguard_violations_total[5m]) > 100
+      - alert: VanguardJoinAdmissionToSendSLO
+        expr: histogram_quantile(0.95, sum(rate(vanguard_join_admission_to_send_seconds_bucket[15m])) by (le)) > 120
         for: 10m
-        labels:
-          severity: warning
+        labels: {severity: warning, service: growth}
         annotations:
-          summary: "High violation rate"
-          description: "Violation detection rate is unusually high: {{ $value }}/s"
+          summary: Join admission to send P95 exceeds 120 seconds
+          description: The join send latency SLO has been breached for ten minutes.
 
-      # Docker container down
-      - alert: ContainerDown
-        expr: up{job=~"vanguard-.*"} == 0
-        for: 1m
-        labels:
-          severity: critical
+      - alert: VanguardAdAdmissionToSendSLO
+        expr: histogram_quantile(0.95, sum(rate(vanguard_ad_admission_to_send_seconds_bucket[30m])) by (le)) > 900
+        for: 15m
+        labels: {severity: warning, service: growth}
         annotations:
-          summary: "Container is down"
-          description: "Container {{ $labels.job }} has been down for more than 1 minute"
+          summary: Ad admission to send P95 exceeds 15 minutes
+          description: The advertising send latency SLO has been breached.
 
-      # Disk space low
-      - alert: DiskSpaceLow
-        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) < 0.1
+      - alert: VanguardReconciliationSLO
+        expr: (histogram_quantile(0.95, sum(rate(vanguard_reconciliation_duration_seconds_bucket[15m])) by (le)) > 300) and on() (vanguard_reconciliation_shadow_mode == 0) and on() (vanguard_reconciliation_enabled == 1)
+        for: 10m
+        labels: {severity: warning, service: reconciliation}
+        annotations:
+          summary: Reconciliation P95 exceeds five minutes
+          description: Reconciliation task completion latency is above target.
+
+      - alert: VanguardReconciliationStalled
+        expr: (max(vanguard_reconciliation_oldest_age_seconds) > 1800) and on() (vanguard_reconciliation_shadow_mode == 0) and on() (vanguard_reconciliation_enabled == 1)
         for: 5m
-        labels:
-          severity: warning
+        labels: {severity: critical, service: reconciliation}
         annotations:
-          summary: "Disk space is low"
-          description: "Disk space is at {{ $value | humanizePercentage }}"
+          summary: Reconciliation task has been pending for over 30 minutes
+          description: Inspect the reconciliation stream consumer and database leases.
 
-      # Certificate expiring soon
-      - alert: TLSCertificateExpiringSoon
-        expr: probe_ssl_earliest_cert_expiry{job="vanguard-https"} - time() < 604800
-        for: 1h
-        labels:
-          severity: warning
+      - alert: VanguardAdUnknownWarning
+        expr: vanguard_ad_unresolved_oldest_age_seconds > 900
+        for: 5m
+        labels: {severity: warning, service: growth}
         annotations:
-          summary: "TLS certificate expiring soon"
-          description: "Certificate expires in {{ $value | humanizeDuration }}"
+          summary: Unresolved advertising delivery is older than 15 minutes
+          description: Unknown outcomes remain fenced and require fact verification.
+
+      - alert: VanguardAdUnknownCritical
+        expr: vanguard_ad_unresolved_oldest_age_seconds > 3600
+        for: 5m
+        labels: {severity: critical, service: growth}
+        annotations:
+          summary: Unresolved advertising delivery is older than one hour
+          description: Escalate the evidence workflow in the monitoring console.
+
+      - alert: VanguardSurvivalOverdue
+        expr: vanguard_survival_overdue > 0
+        for: 5m
+        labels: {severity: critical, service: growth}
+        annotations:
+          summary: Advertising survival checks are overdue
+          description: The survival overdue count must remain zero.
+
+      - alert: VanguardSessionLeaseContention
+        expr: increase(vanguard_session_lease_contention_total[15m]) > 0
+        for: 1m
+        labels: {severity: critical, service: telegram}
+        annotations:
+          summary: Session lease contention detected
+          description: A Telegram account lease was contested in the last 15 minutes.
+
+      - alert: VanguardParentGroupInvariant
+        expr: vanguard_parent_group_invariant_failures > 0
+        for: 1m
+        labels: {severity: critical, service: growth}
+        annotations:
+          summary: Parent group state invariant failed
+          description: A joined approved active membership points to a non-active parent group.
+
+      - alert: VanguardInboxLag
+        expr: vanguard_queue_lag_seconds{queue="inbox"} > 120
+        for: 5m
+        labels: {severity: warning, service: inbox}
+        annotations:
+          summary: Oldest ordinary inbox event exceeds two minutes
+          description: Check the Telegram event inbox consumer and reconciliation producer.
+
+      - alert: VanguardInboxBaselineBacklog
+        expr: vanguard_inbox_baseline_pending > 0
+        for: 5m
+        labels: {severity: warning, service: inbox}
+        annotations:
+          summary: Historical inbox backlog requires acknowledgement
+          description: Events before the fixed baseline remain durable and require investigation or explicit operator acknowledgement.
+
+      - alert: VanguardP1SyncShareExceeded
+        expr: (vanguard_sync_max_actual_percent > 35) and on() (vanguard_p1_enabled == 1)
+        for: 1m
+        labels: {severity: critical, service: budget}
+        annotations:
+          summary: A P1 canary account exceeded the sync budget target
+          description: Disable P1 and inspect the per-account budget snapshot; the total Telegram budget must remain unchanged.
+
+      - alert: VanguardP1InboxClaimSLO
+        expr: histogram_quantile(0.95, sum(rate(vanguard_inbox_claim_wait_seconds_bucket{lane="business"}[15m])) by (le)) > 120
+        for: 5m
+        labels: {severity: warning, service: inbox}
+        annotations:
+          summary: New business inbox event claim P95 exceeds two minutes
+          description: Check account fairness and business lane leases; the fixed historical baseline is reported separately.
+
+      - alert: VanguardBudgetSnapshotStale
+        expr: vanguard_budget_ledger_enabled == 1 and vanguard_budget_ledger_snapshot_age_seconds > 180
+        for: 5m
+        labels: {severity: warning, service: budget}
+        annotations:
+          summary: Budget ledger snapshot is stale
+          description: Budget snapshots have not refreshed within three minutes.
+
+      - alert: VanguardMonitoringTargetDown
+        expr: up{job=~"vanguard-(reconciliation|node|cadvisor|postgres|redis|blackbox)"} == 0
+        for: 5m
+        labels: {severity: warning, service: monitoring}
+        annotations:
+          summary: Monitoring target is down
+          description: One monitoring exporter has been unreachable for five minutes.
+
+      - alert: VanguardReconciliationHeartbeatStale
+        expr: vanguard_reconciliation_worker_heartbeat_age_seconds > 120
+        for: 2m
+        labels: {severity: critical, service: reconciliation}
+        annotations:
+          summary: Reconciliation maintenance heartbeat is stale
+          description: The durable task scanner and budget snapshot loop have stopped progressing.
+
+      - alert: VanguardMetricsSnapshotStale
+        expr: vanguard_metrics_snapshot_age_seconds > 120
+        for: 5m
+        labels: {severity: warning, service: monitoring}
+        annotations:
+          summary: Business metrics aggregation snapshot is stale
+          description: Scraping is available but the cross-process snapshot is not refreshing.
+
+  - name: vanguard-p4-pacing-governance
+    interval: 30s
+    rules:
+      - alert: VanguardP4MetricsEnabledWithoutData
+        expr: vanguard_p4_admin_metrics_enabled == 1 and vanguard_metrics_snapshot_age_seconds > 300
+        for: 10m
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: P4 admin metrics are enabled but the snapshot is stale
+          description: The P4 gauges are not refreshing; check the metrics aggregation loop and Redis.
+
+      - alert: VanguardP4ReceiptLatencySLO
+        expr: vanguard_p4_receipt_latency_p95_seconds > 900
+        for: 15m
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: P4 provider receipt latency P95 exceeds 15 minutes
+          description: Send-to-receipt confirmation is slower than the SLO; inspect reconciliation clears and Actor receipts.
+
+      - alert: VanguardP4AdOutboxOldest
+        expr: vanguard_p4_ad_outbox_oldest_age_seconds > 1800
+        for: 10m
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: Advertising Outbox oldest pending row is older than 30 minutes
+          description: The ads Outbox is not draining; check the Actor dispatch lane and account leases.
+
+      - alert: VanguardP4DuplicateTargetRate
+        expr: |
+          sum(rate(vanguard_p4_duplicate_targets_total[15m])) /
+          clamp_min(sum(rate(vanguard_ad_deliveries_total[15m])), 0.001) > 0.05
+        for: 15m
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: Duplicate advertising target rate exceeds 5 percent
+          description: Repeated attempts against targets with active or unresolved operations; inspect target blocking.
+
+      - alert: VanguardP4PacingConcentrated
+        expr: |
+          max(vanguard_p4_pacing_score) - min(vanguard_p4_pacing_score) > 0
+          and on() count(vanguard_p4_pacing_score) > 0
+          and on() sum(rate(vanguard_p4_pacing_decisions_total{reason="selected"}[1h]))
+              by () / clamp_min(sum(rate(vanguard_p4_pacing_decisions_total[reason="eligible"]}[1h])), 0.001) > 0.8
+        for: 1h
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: Pacing selections concentrate on a single account
+          description: More than 80 percent of recent pacing windows selected one account; verify fairness gap inputs and account health.
+
+      - alert: VanguardP4HistoryCleanupFailures
+        expr: increase(vanguard_p4_history_batches_total{outcome="failed"}[1h]) > 0
+        for: 5m
+        labels: {severity: warning, service: p4}
+        annotations:
+          summary: History governance batches are failing
+          description: At least one archive or cleanup batch failed within the hour; the next pass retries safely, but inspect the batch error.
+
+      - alert: VanguardP4HistoryEligibleBacklog
+        expr: vanguard_p4_history_eligible_operations > 5000
+        for: 24h
+        labels: {severity: info, service: p4}
+        annotations:
+          summary: History archive backlog exceeds 5000 operations
+          description: Enable archiving (disable dry-run) or increase the batch size; eligible rows are past their hot retention.

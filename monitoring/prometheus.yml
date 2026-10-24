@@ -1,50 +1,60 @@
-# ===========================================
-# Prometheus Configuration for Vanguard
-# ===========================================
-
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
+  scrape_interval: 30s
+  evaluation_interval: 30s
   external_labels:
-    cluster: 'vanguard'
-    environment: 'production'
+    service: vanguard
+
+rule_files:
+  - /etc/prometheus/alerts.yml
 
 alerting:
   alertmanagers:
-    - static_configs:
-        - targets: []
-
-rule_files:
-  - 'alerts.yml'
+    - path_prefix: /monitoring/alertmanager/
+      static_configs:
+        - targets: [alertmanager:9093]
 
 scrape_configs:
-  # ==================== Vanguard Backend ====================
-  - job_name: 'vanguard-backend'
+  - job_name: vanguard-backend
+    metrics_path: /metrics
+    bearer_token_file: /run/secrets/metrics.token
     static_configs:
-      - targets: ['backend:8000']
-    metrics_path: '/metrics'
-    scrape_interval: 10s
+      - targets: [backend:8000]
+        labels: {service: backend}
 
-  # ==================== PostgreSQL Exporter ====================
-  - job_name: 'postgres'
+  - job_name: vanguard-reconciliation
+    metrics_path: /metrics
+    bearer_token_file: /run/secrets/metrics.token
     static_configs:
-      - targets: ['postgres-exporter:9187']
-    scrape_interval: 30s
+      - targets: [reconciliation:8000]
+        labels: {service: reconciliation}
 
-  # ==================== Redis Exporter ====================
-  - job_name: 'redis'
+  - job_name: vanguard-node
     static_configs:
-      - targets: ['redis-exporter:9121']
-    scrape_interval: 30s
+      - targets: [node-exporter:9100]
 
-  # ==================== Nginx Exporter ====================
-  - job_name: 'nginx'
+  - job_name: vanguard-cadvisor
     static_configs:
-      - targets: ['nginx-exporter:9113']
-    scrape_interval: 30s
+      - targets: [cadvisor:8080]
 
-  # ==================== Docker Containers ====================
-  - job_name: 'cadvisor'
+  - job_name: vanguard-postgres
     static_configs:
-      - targets: ['cadvisor:8080']
-    scrape_interval: 1m
+      - targets: [postgres-exporter:9187]
+
+  - job_name: vanguard-redis
+    static_configs:
+      - targets: [redis-exporter:9121]
+
+  - job_name: vanguard-blackbox
+    metrics_path: /probe
+    params:
+      module: [https_health]
+    static_configs:
+      - targets: [https://vanguard.pipenai.xyz/health]
+        labels: {service: public-health}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

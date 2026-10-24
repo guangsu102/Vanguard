@@ -308,6 +308,11 @@ async def test_internal_policy_block_does_not_increase_telegram_risk(test_db):
 
 @pytest.mark.asyncio
 async def test_risk_guard_blocks_ad_delivery_during_managed_warmup(test_db):
+    from app.core.automation_settings import save_account_warmup_policy_settings
+
+    await save_account_warmup_policy_settings(
+        test_db, {"default_warmup_days": 1, "minimum_warmup_days": 1}
+    )
     account = TelegramAccount(
         phone="+15559990049",
         identifier="+15559990049",

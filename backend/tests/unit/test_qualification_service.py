@@ -179,7 +179,8 @@ def test_three_technical_failures_do_not_start_observation_or_authorize_exit():
     now = datetime.utcnow()
     result = snapshot("technical_wait", technical_errors=["TimeoutError"])
     verdict, _, state, retry = service.review_schedule(result, {"technical_failures": 2}, now)
-    assert (verdict, state, retry) == ("technical_wait", "completed", now + timedelta(hours=2))
+    assert (verdict, state, retry) == ("technical_wait", "completed", None)
+    assert result["technical_recovery_exhausted"] is True
     assert result["observation_started_at"] is None
 
 
@@ -208,7 +209,8 @@ def test_account_lease_busy_retries_soon_without_spending_read_failure_limit():
     _, _, state, retry = service.review_schedule(
         expired, {"lease_wait_started_at": now.isoformat()}, now + timedelta(hours=24)
     )
-    assert (state, retry) == ("completed", now + timedelta(hours=26))
+    assert (state, retry) == ("completed", None)
+    assert expired["technical_recovery_exhausted"] is True
     timeout = snapshot("technical_wait", reason="TimeoutError")
     assert service.review_schedule(timeout, {}, now)[3] == now + timedelta(hours=2)
 
@@ -517,6 +519,55 @@ async def test_queue_retries_due_technical_evidence_three_times_without_exit(tes
     assert member.review_started_at is None
     assert len(json.loads(row.evidence_json)["previous_checks"]) == 2
     assert not (await service.authorize_leave(test_db, 2, group, member))[0]
+
+
+@pytest.mark.asyncio
+async def test_durable_approval_reactivates_parent_group(test_db, monkeypatch):
+    _, group, member, row = await setup(test_db)
+    group.status = "pending"
+    row.next_retry_at = datetime.utcnow() - timedelta(seconds=1)
+    await test_db.commit()
+
+    async def approved_review(actor, account_id, target, *, row):
+        now = datetime.utcnow()
+        row.state = "completed"
+        row.decision = "allowed"
+        row.reason = "explicit_permission_verified"
+        row.checked_at = now
+        row.next_retry_at = now + timedelta(hours=2)
+        row.evidence_json = json.dumps(
+            {
+                "decision": "allowed",
+                "permissions": {"member": True},
+                "system_identity_coverage": True,
+                "evidence": [],
+            }
+        )
+        return SimpleNamespace(passed=True, reason=None)
+
+    monkeypatch.setattr(service, "assess", approved_review)
+    monkeypatch.setattr(service, "ai_evidence_reusable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        "app.core.account.read_schedule.read_wait", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(
+        "app.modules.acquisition.qualification_identity_refresh.queue_identity_refreshes",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(service, "ensure_membership_reviews", AsyncMock())
+    actor = SimpleNamespace(
+        db=test_db,
+        _sync_group_ad_policy_from_audit=AsyncMock(),
+    )
+
+    result = await service.run_reviews(actor, account_id=2, limit=1)
+
+    assert result["processed"] == 1
+    await test_db.refresh(group)
+    await test_db.refresh(member)
+    assert group.status == "active"
+    assert (member.review_status, member.ad_status) == ("approved", "active")
+    actor._sync_group_ad_policy_from_audit.assert_awaited_once()
 
 
 @pytest.mark.asyncio

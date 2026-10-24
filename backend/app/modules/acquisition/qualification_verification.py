@@ -148,7 +148,7 @@ async def _claim(db: Any, membership_id: int) -> tuple[str, dict[str, Any]] | No
 
 
 async def _session_lease_active(account_id: int) -> bool:
-    """Return whether the listener currently owns the account session.
+    """Defer only when a different process owns the account session.
 
     Verification must not repeatedly contend with a connected listener.  This
     is only a Redis metadata check; it never opens Telegram or consumes read
@@ -156,10 +156,14 @@ async def _session_lease_active(account_id: int) -> bool:
     the safety boundary.
     """
     try:
+        from app.core.account.session_exec import owner_id
+        from app.core.account.session_lease import PROCESS_ID
         from app.core.redis import get_redis
 
         redis = await get_redis()
-        return bool(await redis.exists(f"vanguard:telegram:lease:{int(account_id)}"))
+        if not await redis.exists(f"vanguard:telegram:lease:{int(account_id)}"):
+            return False
+        return await owner_id(redis, account_id) != PROCESS_ID
     except Exception:
         return False
 
@@ -201,7 +205,7 @@ async def _current_context(service: Any, audit_id: int, token: str):
     row = await db.get(GroupQualificationAudit, audit_id, populate_existing=True)
     if (
         row is None
-        or row.state != "completed"
+        or row.state not in {"completed", "queued"}
         or row.decision not in {"observe", "wait"}
         or row.policy_version != POLICY_VERSION
         or row.content_scope != "text_profile"
@@ -239,6 +243,9 @@ async def _current_context(service: Any, audit_id: int, token: str):
         or ledger.get("membership_version") != membership.joined_at.isoformat()
     ):
         return None
+    # All values are snapshots. Every write revalidates this context; do not
+    # hold a database connection through Telegram reads or lease acquisition.
+    await db.commit()
     return row, membership, group, account, ledger
 
 
@@ -492,7 +499,7 @@ async def run_verifications(service: Any, *, limit: int = 1, account_id: int | N
             GroupAccountMembership.id == GroupQualificationAudit.membership_id,
         )
         .where(
-            GroupQualificationAudit.state == "completed",
+            GroupQualificationAudit.state.in_(["completed", "queued"]),
             GroupQualificationAudit.policy_version == POLICY_VERSION,
             GroupQualificationAudit.content_scope == "text_profile",
             GroupQualificationAudit.decision.in_(["observe", "wait"]),

@@ -296,16 +296,16 @@ DEFAULT_ACCOUNT_ASSET_POLICY_SETTINGS: dict[str, Any] = {
 }
 DEFAULT_ACCOUNT_WARMUP_POLICY_SETTINGS: dict[str, Any] = {
     "enabled": True,
-    "default_warmup_days": 15,
-    "minimum_warmup_days": 7,
+    "default_warmup_days": 0,
+    "minimum_warmup_days": 0,
     "user_initiated_private_message_multiplier": 1.0,
     "tiers": {
-        "unknown": {"warmup_days": 15},
-        "month_1": {"warmup_days": 18},
-        "month_3_6": {"warmup_days": 12},
-        "year_1": {"warmup_days": 9},
-        "year_2": {"warmup_days": 7},
-        "year_3_plus": {"warmup_days": 7},
+        "unknown": {"warmup_days": 0},
+        "month_1": {"warmup_days": 0},
+        "month_3_6": {"warmup_days": 0},
+        "year_1": {"warmup_days": 0},
+        "year_2": {"warmup_days": 0},
+        "year_3_plus": {"warmup_days": 0},
     },
     "stages": {
         "observe": {
@@ -420,7 +420,7 @@ DEFAULT_AD_CAPACITY_SETTINGS: dict[str, Any] = {
     "leave_on_deleted_ad": True,
     "block_group_on_probe_failure": True,
     "ad_policy_ai_enabled": True,
-    "ad_policy_ai_model": "gpt-6-sol",
+    "ad_policy_ai_model": "gpt-6.1-sol",
     "ad_policy_ai_timeout_seconds": 45,
     "ad_policy_ai_min_confidence": 95,
     # Two-pass doubles latency (sol is ~40s per pass on the 2k-token floor).

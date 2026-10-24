@@ -9,6 +9,7 @@ from telethon.tl import types
 from telethon.tl.functions.updates import GetDifferenceRequest
 
 from app.core.account import rpc_governor as rpc
+from app.core.account.critical_fairness import workload
 from app.core.account.rpc_budget_policy import read_lane, window_plan
 
 pytestmark = pytest.mark.asyncio
@@ -17,6 +18,8 @@ pytestmark = pytest.mark.asyncio
 async def test_preview_has_critical_headroom_without_borrowing_ad_or_survival():
     limits = rpc.limits_for({}, datetime.utcnow())
     assert read_lane([], "join_candidate_preview") == "critical"
+    assert read_lane([], "auto_join_search") == "critical"
+    assert workload("auto_join_search") == "join"
     assert read_lane([], "group_metadata_sync") == "background"
     windows = dict((name, cap) for name, _, cap in window_plan(limits, "critical"))
     assert windows["non_survival_day"] == 1200
@@ -77,13 +80,23 @@ async def test_catchup_keeps_all_shared_budget_windows(monkeypatch, test_db):
 
 async def test_metadata_yields_to_trial_replenishment_before_acquiring_telegram(test_db, monkeypatch):
     from app.core.group.collection import sync_stale_groups
+    from app.core.settings_models import SystemSetting
     from app.modules.acquisition import ad_output_plan
     from tests.unit.test_dynamic_outbound_capacity import account_config, add_member
     account, config = await account_config(test_db)
     config.auto_join_enabled = True
     config.dynamic_capacity_enabled = True
-    await add_member(test_db, account.id, 51, decision="allowed", review="approved")
-    monkeypatch.setattr(ad_output_plan, "ad_output_plan", AsyncMock(return_value={"group_deficit": 30}))
+    member, _ = await add_member(test_db, account.id, 51, decision="allowed", review="approved")
+    # Metadata older than six hours is due, but yields to replenishment until
+    # the existing 24-hour cap. Never-collected metadata must remain eligible.
+    test_db.add(SystemSetting(
+        key=f"group.collection.{member.telegram_group_id}",
+        value="{}",
+        updated_at=datetime.utcnow() - timedelta(hours=7),
+    ))
+    await test_db.commit()
+    monkeypatch.setattr(ad_output_plan, "ad_output_plan", AsyncMock(
+        return_value={"group_deficit": 30, "join_blocker": None}))
     pool = Obj(sync_from_db=AsyncMock(), acquire_by_id=AsyncMock())
     result = await sync_stale_groups(test_db, pool=pool)
     assert result["details"][0]["reason"] == "metadata_wait_probe_replenishment"

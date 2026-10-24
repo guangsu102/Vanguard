@@ -41,7 +41,9 @@ def add_refresh_demand_headroom(limits: dict, budget: dict, demand: dict) -> Non
         base = allocations(limits[window])
         caps = transferred_caps(base, usage['survival_lent_' + window]['used'],
                                 usage.get('sync_lent_' + window, {}).get('used', 0),
-                                usage.get('ad_lent_' + window, {}).get('used', 0))
+                                usage.get('ad_lent_' + window, {}).get('used', 0),
+                                usage.get('sync_borrowed_ad_' + window, {}).get('used', 0),
+                                usage.get('sync_borrowed_survival_' + window, {}).get('used', 0))
         used = [usage[lane + '_' + window]['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
         delivery_work = demand[window]['sends'] * demand['delivery_cost']
         # Keep at least two extra deliveries, or a 20% buffer when larger.
@@ -53,9 +55,15 @@ def add_refresh_demand_headroom(limits: dict, budget: dict, demand: dict) -> Non
         if demand[window]['renewals'] or budget.get('ad_dependency_recovery', {}).get('blocked_grants'):
             # An unfunded future delivery plan must not consume the reads
             # needed to make its own targets deliverable. Admit one complete
-            # renewal while retaining two sends and 20% of real headroom.
+            # renewal; retain a send floor only for currently usable targets.
             renewal_reads = max(DEFAULT_RENEWAL_READS, demand['renewal_cost'])
-            send_floor = max(2 * demand['delivery_cost'], math.ceil(remaining / 5))
+            ready_sends = demand[window].get('ready_sends', demand[window]['sends'])
+            # A send reserve is useful only when a target can actually send.
+            # Keeping it while every target is blocked creates a deadlock:
+            # renewal needs 16 reads, but the reserve strands the final 12.
+            send_floor = 0 if ready_sends <= 0 else max(
+                2 * demand['delivery_cost'], math.ceil(remaining / 5)
+            )
             feasible_hold = max(send_floor, remaining - renewal_reads)
             if holds[window] > feasible_hold:
                 holds[window] = feasible_hold
@@ -127,12 +135,18 @@ async def ad_demand(db: Any, account_id: int, now: datetime, budget: dict) -> di
     costs = {'survival_read_cost': 10, 'daily_review_read_cost': 10, **costs}
     delivery = max(1, costs['delivery_read_cost'])
     renewal = max(1, costs.get("renewal_read_cost", DEFAULT_RENEWAL_READS))
-    # Match the sending planner's sustainable pace, including groups whose
-    # existing grants need repair. Configured outbound ceilings are not plans.
+    # Match the sending planner's sustainable pace from usable grants. Blocked
+    # grants contribute repair demand below, not send inventory.
     inventory = {'mature_usable': 0, 'mature_slots_24h': 0, 'probe_slots_24h': 0}
     for member, audit in rows:
-        state = frequencies.get(canonical(member.telegram_group_id, payload(audit.evidence_json)))
-        quota = min(state.quota if state else 1, rule_quota(payload(audit.evidence_json)))
+        context = payload(audit.evidence_json)
+        pending_event = pending_value(
+            markers.get(key(member.id)), member.joined_at, markers.get(account_key(account_id))
+        )
+        if not authorization_current(audit, now) or pending_event:
+            continue
+        state = frequencies.get(canonical(member.telegram_group_id, context))
+        quota = min(state.quota if state else 1, rule_quota(context))
         if state and state.mature:
             inventory['mature_usable'] += 1
             inventory['mature_slots_24h'] += quota
@@ -148,9 +162,10 @@ async def ad_demand(db: Any, account_id: int, now: datetime, budget: dict) -> di
             return {}
         horizon = min(duration, max(1, ttl)) if ttl >= 0 else duration
         end = now + timedelta(seconds=horizon)
-        sends = repairs = 0
+        sends = repairs = ready_sends = 0
         for member, audit in rows:
-            peer = canonical(member.telegram_group_id, payload(audit.evidence_json))
+            context = payload(audit.evidence_json)
+            peer = canonical(member.telegram_group_id, context)
             state = frequencies.get(peer)
             if state and state.status != 'active':
                 continue
@@ -162,14 +177,23 @@ async def ad_demand(db: Any, account_id: int, now: datetime, budget: dict) -> di
                       state.pause_until if state and state.pause_until else now)
             if due > end:
                 continue
-            quota = min(state.quota if state else 1, rule_quota(payload(audit.evidence_json)))
+            pending_event = pending_value(
+                markers.get(key(member.id)), member.joined_at, markers.get(account_key(account_id))
+            )
+            blocked = not authorization_current(audit, now) or pending_event
+            quota = min(state.quota if state else 1, rule_quota(context))
             group_interval = max(interval, math.ceil(86400 / max(1, quota)))
-            sends += 1 + int((end - due).total_seconds() // group_interval)
-            repairs += int(not authorization_current(audit, now) or bool(pending_value(
-                markers.get(key(member.id)), member.joined_at, markers.get(account_key(account_id)))))
+            slots = 1 + int((end - due).total_seconds() // group_interval)
+            if blocked:
+                repairs += 1
+            else:
+                sends += slots
+                if audit.state in {'completed', 'running'}:
+                    ready_sends += slots
         sends = min(sends, 1 + horizon // interval, max(0, planned))
-        repairs = min(repairs, sends)
-        result[window] = {'sends': sends, 'renewals': repairs, 'horizon_seconds': horizon,
+        repairs = min(repairs, max(1, planned)) if repairs else 0
+        result[window] = {'sends': sends, 'ready_sends': min(ready_sends, sends), 'renewals': repairs,
+                          'horizon_seconds': horizon,
                           'hold': projected_hold(sends, repairs, delivery, renewal)}
     return {**result, 'delivery_cost': delivery, 'renewal_cost': renewal}
 
@@ -192,7 +216,9 @@ async def add_ad_demand_headroom(db: Any, account_id: int, now: datetime, limits
         limits['ad_demand_hold_' + window] = demand[window]['hold']
         caps = transferred_caps(allocations(limits[window]), usage['survival_lent_' + window]['used'],
                                 usage.get('sync_lent_' + window, {}).get('used', 0),
-                                usage.get('ad_lent_' + window, {}).get('used', 0))
+                                usage.get('ad_lent_' + window, {}).get('used', 0),
+                                usage.get('sync_borrowed_ad_' + window, {}).get('used', 0),
+                                usage.get('sync_borrowed_survival_' + window, {}).get('used', 0))
         used = [usage[lane + '_' + window]['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
         adjusted = lending_caps(caps, used, 'critical', limits.get('survival_hold_' + window, -1),
                                 limits.get('sync_hold_' + window, -1), demand[window]['hold'])

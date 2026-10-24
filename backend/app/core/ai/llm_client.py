@@ -230,6 +230,7 @@ class LLMClient:
         base_url: str | None = None,
         openai_extra_body: dict[str, Any] | None = None,
         cache_ttl: int = 3600,
+        apply_global_model_override: bool = True,
     ):
         """
         Initialize LLM client.
@@ -240,6 +241,8 @@ class LLMClient:
             base_url: Optional OpenAI-compatible API base URL
             openai_extra_body: Optional provider-specific OpenAI request parameters
             cache_ttl: Cache TTL in seconds
+            apply_global_model_override: Whether ``LLM_MODEL_OVERRIDE`` should
+                replace an explicitly requested OpenAI model for this client.
         """
         self.provider = provider
         self.api_key = api_key or (
@@ -251,6 +254,7 @@ class LLMClient:
         if provider == LLMProvider.OPENAI and settings.LLM_REASONING_EFFORT.strip():
             self.openai_extra_body["reasoning_effort"] = settings.LLM_REASONING_EFFORT.strip()
         self.openai_extra_body.update(openai_extra_body or {})
+        self.apply_global_model_override = bool(apply_global_model_override)
         self.cache = RedisCache()
         self.cache_ttl = cache_ttl
         self.stats = CostStats()
@@ -259,7 +263,7 @@ class LLMClient:
     def model_for(self, tier: str) -> str:
         """Resolve a model tier using runtime configuration where applicable."""
         if self.provider == LLMProvider.OPENAI:
-            if settings.LLM_MODEL_OVERRIDE.strip():
+            if self.apply_global_model_override and settings.LLM_MODEL_OVERRIDE.strip():
                 return settings.LLM_MODEL_OVERRIDE.strip()
             if tier == "fast":
                 return settings.LLM_FAST_MODEL
@@ -269,7 +273,11 @@ class LLMClient:
 
     def _effective_model(self, model: str | None) -> str:
         """Resolve the production model before cache lookup, logging, and provider I/O."""
-        if self.provider == LLMProvider.OPENAI and settings.LLM_MODEL_OVERRIDE.strip():
+        if (
+            self.provider == LLMProvider.OPENAI
+            and self.apply_global_model_override
+            and settings.LLM_MODEL_OVERRIDE.strip()
+        ):
             return settings.LLM_MODEL_OVERRIDE.strip()
         return model if model is not None else self.model_for("balanced")
 

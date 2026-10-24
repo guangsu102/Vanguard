@@ -15,8 +15,9 @@ describe('automation configuration defaults', () => {
     expect(createDefaultAutoJoinScheduler().scan_interval_minutes).toBe(5)
 
     const warmup = createDefaultWarmupPolicy()
-    expect(warmup.minimum_warmup_days).toBe(7)
-    expect(Object.values(warmup.tiers).every((tier) => tier.warmup_days >= 7)).toBe(true)
+    expect(warmup.default_warmup_days).toBe(0)
+    expect(warmup.minimum_warmup_days).toBe(0)
+    expect(Object.values(warmup.tiers).every((tier) => tier.warmup_days === 0)).toBe(true)
   })
 
   it('uses policy-specific delivery pacing and dispatcher settings', () => {
@@ -34,7 +35,7 @@ describe('automation configuration defaults', () => {
     const capacity = createDefaultAdCapacity()
     expect(capacity.max_groups_per_account).toBe(100)
     expect(capacity.max_new_ad_groups_per_day).toBe(2)
-    expect(capacity.ad_policy_ai_model).toBe('glm-5.3-flash')
+    expect(capacity.ad_policy_ai_model).toBe('gpt-6.1-sol')
     expect(capacity.survival_check_delay_seconds).toBe(120)
     expect('account_ad_daily_hard_cap' in capacity).toBe(false)
     expect('tier_daily_capacities' in capacity).toBe(false)

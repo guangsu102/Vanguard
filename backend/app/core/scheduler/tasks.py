@@ -2012,3 +2012,27 @@ def runtime_recovery_task() -> dict[str, Any]:
         await redis.set("vanguard:runtime_recovery:last_run_at", now.isoformat(), ex=600)
         return {"recovered": [account.id for account in rows], "checked_at": now.isoformat()}
     return _run_async(_run_with_db(handler))
+
+
+@celery_app.task(
+    name="app.core.scheduler.tasks.p4_history_governance_task",
+    time_limit=600,
+    soft_time_limit=540,
+)
+def p4_history_governance_task() -> dict[str, Any]:
+    """Run one P4 history governance pass (dry-run first, then archive)."""
+    async def handler(db: AsyncSession) -> dict[str, Any]:
+        from app.modules.acquisition.history_governance import run_pass
+
+        return await run_pass(db)
+
+    try:
+        return _run_async(_run_with_db(handler))
+    except Exception as exc:
+        logger.error("p4_history_governance_failed", error=str(exc))
+        get_alert_manager().send_task_alert(
+            task_name="p4_history_governance_task",
+            error=str(exc),
+            severity=AlertSeverity.ERROR,
+        )
+        raise

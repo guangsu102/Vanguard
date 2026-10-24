@@ -75,3 +75,15 @@ def test_openai_pin_does_not_change_other_provider_models(pinned):
     client = LLMClient(provider=LLMProvider.ANTHROPIC, api_key="test")
     assert client._effective_model("claude-test") == "claude-test"
     assert client.openai_extra_body == {}
+
+
+def test_client_can_opt_out_of_global_model_override(pinned):
+    client = LLMClient(
+        provider=LLMProvider.OPENAI,
+        api_key="test",
+        base_url="https://ark.example/v1",
+        apply_global_model_override=False,
+    )
+
+    assert client.model_for("balanced") == settings.LLM_MODEL
+    assert client._effective_model("glm-5.3-flash") == "glm-5.3-flash"

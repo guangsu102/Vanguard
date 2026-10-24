@@ -188,7 +188,9 @@ async def add_idle_survival_headroom(
         caps = transferred_caps(
             allocations(limits[window]), budget["usage"][f"survival_lent_{window}"]["used"],
             budget["usage"].get(f"sync_lent_{window}", {}).get("used", 0),
-            budget["usage"].get(f"ad_lent_{window}", {}).get("used", 0)
+            budget["usage"].get(f"ad_lent_{window}", {}).get("used", 0),
+            budget["usage"].get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
+            budget["usage"].get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
         adjusted = lending_caps(caps, used, "critical", holds[window])
         room = available(limits[window], used, adjusted, "critical")

@@ -23,6 +23,7 @@ from app.core.account.operation_lease import (
     AccountOperationLeaseBusy,
     AccountOperationLeaseUnavailable,
 )
+from app.core.account.rpc_governor import RpcDeferred
 from app.core.account.telegram_execution import TelegramExecutionService
 from app.core.ai.keyword_generator import KeywordGenerator
 from app.core.automation_settings import save_auto_join_scheduler_settings
@@ -368,6 +369,27 @@ class TestGroupFinder:
 
         assert [group.group_id for group in result] == [2]
         assert result[0].title == "Etsy Sellers Group"
+
+    @pytest.mark.asyncio
+    async def test_auto_join_search_uses_join_budget_and_propagates_defer(self):
+        account_pool = MagicMock()
+        account_pool.acquire_by_id = AsyncMock(
+            side_effect=RpcDeferred("telegram_read_budget", 900)
+        )
+        finder = GroupFinder(account_pool=account_pool)
+
+        with pytest.raises(RpcDeferred, match="telegram_read_budget"):
+            await finder.search_by_keyword(
+                "etsy",
+                account_id=33,
+                purpose="auto_join_search",
+                raise_errors=True,
+            )
+
+        account_pool.acquire_by_id.assert_awaited_once_with(
+            33,
+            purpose="auto_join_search",
+        )
 
     @pytest.mark.asyncio
     async def test_join_group_rejects_broadcast_channel_before_join(self):
@@ -988,6 +1010,42 @@ class TestAutoJoinStateHandling:
         service._schedule_next_join.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_session_lease_busy_text_keeps_queued_group_retryable(self):
+        account, config, group = self._queued_join_fixture()
+        service = AcquisitionAutomationService(db=MagicMock())
+        service._qualification_workflow_enabled = AsyncMock(return_value=False)
+        service._dynamic_qualification_mode = AsyncMock(return_value=False)
+        service._joined_membership_account_id_for_group = AsyncMock(return_value=None)
+        service.dynamic_frequency.join_candidate_decision = AsyncMock(
+            return_value={"allowed": True}
+        )
+        service._join_group = AsyncMock(
+            side_effect=RuntimeError("Telegram session lease is busy for account 7")
+        )
+        service._record_join_attempt = AsyncMock()
+        service.join_budget.reserve = AsyncMock(
+            return_value=SimpleNamespace(
+                id=1,
+                request_state="reserved",
+                telegram_action_attempted=False,
+            )
+        )
+        service._set_discovered_group_status = AsyncMock()
+
+        result = await service._attempt_join_queued_group(config, group, dry_run=False)
+
+        assert result.skipped == 1
+        assert result.failed == 0
+        assert result.details[0]["action"] == "waiting_account_available"
+        assert result.details[0]["reason"] == "account_operation_lease_busy"
+        assert result.details[0]["retryable"] is True
+        attempt = service._record_join_attempt.await_args
+        assert attempt.args[2] == DeliveryStatus.SKIPPED
+        assert attempt.kwargs["reason"] == "account_operation_lease_busy"
+        assert attempt.kwargs["telegram_action_attempted"] is False
+        service._set_discovered_group_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_non_lease_account_unavailable_still_fails_closed(self):
         account, config, group = self._queued_join_fixture()
         service = AcquisitionAutomationService(db=MagicMock())
@@ -1050,6 +1108,32 @@ class TestAutoJoinStateHandling:
         )
         service.telegram_execution.join_group.assert_not_awaited()
         pool.release.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_join_group_surfaces_pool_unavailability_reason(self):
+        pool = SimpleNamespace(
+            acquire_by_id=AsyncMock(return_value=None),
+            release=AsyncMock(),
+            unavailability_reason=lambda _account_id:
+                "static_proxy_unavailable:Static proxy 1 is unhealthy",
+        )
+        service = AcquisitionAutomationService(db=MagicMock(), account_pool=pool)
+        service.telegram_execution.join_group = AsyncMock()
+        group = DiscoveredGroup(
+            group_id=900010,
+            title="Pool reason",
+            username="pool_reason",
+            member_count=500,
+            is_private=False,
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="account unavailable: static_proxy_unavailable:Static proxy 1 is unhealthy",
+        ):
+            await service._join_group(7, group, reservation=SimpleNamespace())
+
+        service.telegram_execution.join_group.assert_not_awaited()
 
     def test_risk_guard_blocked_ad_is_classified_without_unknown_prefix(self):
         service = AcquisitionAutomationService(db=MagicMock())
@@ -1234,6 +1318,150 @@ class TestAutoJoinStateHandling:
         assert [group.group_id for group in groups] == [91001, 91002, 91003]
         assert {group.status for group in groups} == {"pending_join"}
         assert [record.group_id for record in records] == [91001, 91002, 91003]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["telegram_read_budget", "join_wait_inventory_review"])
+    async def test_account_join_admission_skip_reports_reason_and_read_deadline(self, monkeypatch, reason):
+        from app.core.account import rpc_governor
+        from app.core.scheduler.growth_dispatch import next_due
+
+        now = datetime.utcnow()
+        monkeypatch.setattr(acquisition_automation, "_now", lambda: now)
+        snapshot = AsyncMock(return_value={
+            "critical_workloads": {"join": {"remaining": 0, "retry_after_seconds": 900}},
+        })
+        monkeypatch.setattr(rpc_governor, "snapshot", snapshot)
+        service = AcquisitionAutomationService.__new__(AcquisitionAutomationService)
+        service.db = SimpleNamespace()
+        service._list_join_enabled_account_configs = AsyncMock(return_value=[])
+        service._sync_account_pool = AsyncMock()
+        service.join_budget = SimpleNamespace(status=AsyncMock(return_value=SimpleNamespace(
+            blocked_reasons=[reason], next_allowed_at=now + timedelta(seconds=60),
+        )))
+
+        result = await service.run_auto_join(account_id=34, max_accounts=1)
+
+        assert result["skipped"] == 1
+        assert result["details"][0]["reason"] == reason
+        assert result["details"][0]["blocked_reasons"] == [reason]
+        assert result["details"][0]["retry_after_seconds"] == 900
+        stamp = (now - datetime(1970, 1, 1)).total_seconds()
+        assert next_due(result, 300, now=stamp) == stamp + 900
+        service._sync_account_pool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_account_join_disabled_is_reported_without_read_forecast(self, monkeypatch):
+        from app.core.account import rpc_governor
+
+        snapshot = AsyncMock()
+        monkeypatch.setattr(rpc_governor, "snapshot", snapshot)
+        service = AcquisitionAutomationService.__new__(AcquisitionAutomationService)
+        service._list_join_enabled_account_configs = AsyncMock(return_value=[])
+        service._sync_account_pool = AsyncMock()
+        service.join_budget = SimpleNamespace(status=AsyncMock(return_value=SimpleNamespace(
+            blocked_reasons=["account_operation_disabled"], next_allowed_at=None,
+        )))
+
+        result = await service.run_auto_join(account_id=34, max_accounts=1)
+
+        assert result["skipped"] == 1
+        assert result["details"][0]["reason"] == "account_operation_disabled"
+        assert "retry_after_seconds" not in result["details"][0]
+        snapshot.assert_not_awaited()
+        service._sync_account_pool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_auto_join_search_budget_wait_is_not_reported_as_no_group(self, test_db):
+        now = datetime.utcnow()
+        account = TelegramAccount(
+            phone="+10000000002",
+            identifier="+10000000002",
+            session_name="auto_join_budget_wait_test",
+            account_type=AccountType.PROMOTER,
+            status=AccountStatus.ONLINE,
+            is_active=True,
+            registered_at=now - timedelta(days=365),
+            asset_verified_at=now - timedelta(days=1),
+        )
+        config = AccountOperationConfig(
+            account=account,
+            auto_join_enabled=True,
+            keyword_auto_replenish_enabled=False,
+            join_interval_min_seconds=60,
+            join_interval_max_seconds=60,
+        )
+        keyword = GroupSearchKeyword(
+            text="预算等待",
+            normalized_text="预算等待",
+            keyword_type=KeywordType.DEMAND.value,
+            status=SearchKeywordStatus.APPROVED,
+            source=SearchKeywordSource.MANUAL,
+            enabled=True,
+        )
+        test_db.add_all([account, config, keyword])
+        await test_db.commit()
+        await test_db.refresh(config)
+
+        service = AcquisitionAutomationService(db=test_db)
+        service._maybe_run_periodic_group_cleanup = AsyncMock(return_value=None)
+        service._sync_account_business_stage = AsyncMock()
+        service._check_join_quota = AsyncMock(return_value=None)
+        service._next_pending_join_group = AsyncMock(return_value=None)
+        service._get_search_keywords = AsyncMock(return_value=[keyword])
+        service.group_finder.search_by_keyword = AsyncMock(
+            side_effect=RpcDeferred("telegram_read_budget", 900)
+        )
+        service._ensure_keywords_after_low_hit_rate = AsyncMock()
+        service._record_search_keyword_feedback = AsyncMock()
+
+        result = await service._run_auto_join_for_account_config(
+            config,
+            now=now,
+            keywords_per_account=1,
+            max_groups_per_keyword=10,
+            dry_run=False,
+        )
+
+        assert result.skipped == 1
+        assert result.errors == []
+        assert result.details[-1]["action"] == "waiting_read_capacity"
+        assert result.details[-1]["reason"] == "telegram_read_budget"
+        assert result.details[-1]["retry_after_seconds"] == 900
+        assert config.next_join_after >= now + timedelta(seconds=900)
+        assert not any(item.get("reason") == "no_joinable_group" for item in result.details)
+        service._next_pending_join_group.assert_awaited_once()
+        service._ensure_keywords_after_low_hit_rate.assert_not_awaited()
+        service._record_search_keyword_feedback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("search_groups", [[], [DiscoveredGroup(91001, "Existing", "existing", 500, False)]])
+    async def test_search_without_new_candidates_does_not_repeat_previews(self, test_db, search_groups):
+        account = SimpleNamespace(id=33)
+        config = SimpleNamespace(account=account, account_id=33, next_join_after=None)
+        keyword = SimpleNamespace(text="search")
+        service = AcquisitionAutomationService(db=test_db)
+        service._maybe_run_periodic_group_cleanup = AsyncMock(return_value=None)
+        service._sync_account_business_stage = AsyncMock()
+        service._check_join_quota = AsyncMock(return_value=None)
+        service._next_pending_join_group = AsyncMock(return_value=None)
+        service._get_search_keywords = AsyncMock(return_value=[keyword])
+        service.group_finder.search_by_keyword = AsyncMock(return_value=search_groups)
+        service._filter_groups_by_title_blacklist = AsyncMock(return_value=(search_groups, []))
+        service._persist_search_results_for_queue = AsyncMock(return_value={
+            "saved": len(search_groups), "queued": 0, "rejected": 0,
+            "skipped_existing": len(search_groups),
+        })
+        service._record_search_keyword_feedback = AsyncMock()
+        service._ensure_keywords_after_low_hit_rate = AsyncMock(return_value=None)
+
+        result = await service._run_auto_join_for_account_config(
+            config, now=datetime.utcnow(), keywords_per_account=1,
+            max_groups_per_keyword=10, dry_run=False,
+        )
+
+        service._next_pending_join_group.assert_awaited_once()
+        assert result.failed == 0
+        assert result.details[-1]["reason"] == "no_joinable_group"
 
 
 class FakeAuditClient:
@@ -3504,7 +3732,8 @@ class TestAdDeliveryFailureHandling:
 
 
 @pytest.mark.asyncio
-async def test_account_ad_warmup_days_uses_warmup_policy_with_seven_day_floor(monkeypatch):
+@pytest.mark.parametrize(("days", "expected"), [(0, 0), (1, 1), (3, 3)])
+async def test_account_ad_warmup_days_uses_warmup_policy_without_day_floor(monkeypatch, days, expected):
     service = AcquisitionAutomationService.__new__(AcquisitionAutomationService)
     service.db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(asset_tier="year_2")))
 
@@ -3512,7 +3741,7 @@ async def test_account_ad_warmup_days_uses_warmup_policy_with_seven_day_floor(mo
         return {
             "enabled": True,
             "tiers": {
-                "year_2": {"warmup_days": 3},
+                "year_2": {"warmup_days": days},
             },
         }
 
@@ -3522,7 +3751,7 @@ async def test_account_ad_warmup_days_uses_warmup_policy_with_seven_day_floor(mo
         low_warmup_policy,
     )
 
-    assert await service._account_ad_warmup_days(1) == 7
+    assert await service._account_ad_warmup_days(1) == expected
 
 
 class TestDiscoveryCjkPrefilter:

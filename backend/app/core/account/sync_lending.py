@@ -70,7 +70,9 @@ def day_blocked_listener(item: dict, limits: dict, budget: dict) -> bool:
     if hour_horizon <= 0 or day_ttl <= hour_horizon + 60:
         return False
     caps = transferred_caps(allocations(limits['day']), usage['survival_lent_day']['used'],
-                            usage['sync_lent_day']['used'], usage.get('ad_lent_day', {}).get('used', 0))
+                            usage['sync_lent_day']['used'], usage.get('ad_lent_day', {}).get('used', 0),
+                            usage.get('sync_borrowed_ad_day', {}).get('used', 0),
+                            usage.get('sync_borrowed_survival_day', {}).get('used', 0))
     used = [usage[lane + '_day']['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
     return used[3] >= caps[3] and available(limits['day'], used, caps, 'sync') == 0
 
@@ -94,8 +96,10 @@ async def add_idle_sync_headroom(
         allocations,
         available,
         lending_caps,
+        sync_target_limit,
         transferred_caps,
     )
+    from app.core.config import settings
 
     rows = list(
         (
@@ -144,7 +148,9 @@ async def add_idle_sync_headroom(
             holds[window] = -1
         caps = transferred_caps(
             base, usage[f"survival_lent_{window}"]["used"], usage[f"sync_lent_{window}"]["used"],
-            usage.get(f"ad_lent_{window}", {}).get("used", 0)
+            usage.get(f"ad_lent_{window}", {}).get("used", 0),
+            usage.get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
+            usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
         adjusted = lending_caps(
             caps, used, "critical", limits.get(f"survival_hold_{window}", -1), holds[window]
@@ -155,8 +161,27 @@ async def add_idle_sync_headroom(
         if room <= 0:
             waits.append(max(1, ttl) if ttl >= 0 else duration)
     limits.update({f"sync_hold_{window}": value for window, value in holds.items()})
+    # P1 only widens sync for an explicitly enabled account after the listener
+    # is proven caught up.  The Lua allocator still checks the forecast holds
+    # atomically; this flag merely enables that bounded path.
+    if settings.p1_sync_enabled_for(account_id) and idle:
+        limits["sync_idle_lending"] = 1
+        limits["sync_target_hour"] = sync_target_limit(
+            limits["hour"], settings.P1_SYNC_TARGET_PERCENT
+        )
+        limits["sync_target_day"] = sync_target_limit(
+            limits["day"], settings.P1_SYNC_TARGET_PERCENT
+        )
+    else:
+        limits["sync_idle_lending"] = 0
+        limits["sync_target_hour"] = allocations(limits["hour"])[3]
+        limits["sync_target_day"] = allocations(limits["day"])[3]
     budget["sync_lending"] = {"holds": holds, "available": loans, "listener_caught_up": idle,
-                              "reason": "sync_day_exhausted" if day_blocked else "listener_caught_up"}
+                              "reason": "sync_day_exhausted" if day_blocked else "listener_caught_up",
+                              "target_percent": settings.P1_SYNC_TARGET_PERCENT if settings.p1_sync_enabled_for(account_id) else 20,
+                              "idle_lending_enabled": bool(limits["sync_idle_lending"]),
+                              "target_hour": limits["sync_target_hour"],
+                              "target_day": limits["sync_target_day"]}
     budget["lanes"]["critical"] = {
         "remaining": min(budget["usage"]["minute"]["remaining"], *rooms),
         "retry_after_seconds": max(budget["retry_after_seconds"], *waits, 0),

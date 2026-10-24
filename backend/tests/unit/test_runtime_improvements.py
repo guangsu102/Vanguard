@@ -144,7 +144,10 @@ async def test_preview_count_live_source_beats_cached_count():
 
 
 async def test_sync_live_refresh_and_skip_fresh(test_db, monkeypatch):
+    from app.core import redis
     from app.modules.acquisition import ad_output_plan
+    monkeypatch.setattr(redis, "get_redis", AsyncMock(return_value=SimpleNamespace(
+        get=AsyncMock(return_value=None), exists=AsyncMock(return_value=False))))
     monkeypatch.setattr(ad_output_plan, "ad_output_plan", AsyncMock(
         return_value={"group_deficit": 0, "join_blocker": None}))
     account, config = await account_config(test_db)

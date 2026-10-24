@@ -276,6 +276,7 @@ def test_dedicated_group_policy_endpoint_does_not_replace_global_llm(monkeypatch
 
     monkeypatch.setattr(automation.settings, "OPENAI_API_KEY", "global-test-key")
     monkeypatch.setattr(automation.settings, "OPENAI_BASE_URL", "https://api.pipenai.xyz/v1")
+    monkeypatch.setattr(automation.settings, "GROUP_AD_POLICY_DEDICATED_ENABLED", True)
     monkeypatch.setattr(automation.settings, "GROUP_AD_POLICY_API_KEY", "dedicated-test-key")
     monkeypatch.setattr(
         automation.settings,
@@ -288,11 +289,15 @@ def test_dedicated_group_policy_endpoint_does_not_replace_global_llm(monkeypatch
     assert client.api_key == "dedicated-test-key"
     assert client.base_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
     assert client.openai_extra_body == {"reasoning_effort": "low"}
+    assert client.apply_global_model_override is False
     assert automation.settings.OPENAI_API_KEY == "global-test-key"
 
     service._ad_policy_llm_client = None
-    monkeypatch.setattr(automation.settings, "GROUP_AD_POLICY_API_KEY", None)
-    assert service._ad_policy_llm() is None
+    monkeypatch.setattr(automation.settings, "GROUP_AD_POLICY_DEDICATED_ENABLED", False)
+    client = service._ad_policy_llm()
+    assert client is not None
+    assert client.api_key == "global-test-key"
+    assert client.base_url == "https://api.pipenai.xyz/v1"
 
 
 @pytest.mark.asyncio

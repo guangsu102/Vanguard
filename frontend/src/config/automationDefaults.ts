@@ -81,10 +81,10 @@ const createDefaultWarmupStages = (): AccountWarmupPolicySettings['stages'] => (
 
 export const createDefaultWarmupPolicy = (): AccountWarmupPolicySettings => ({
   enabled: true,
-  default_warmup_days: 15,
-  minimum_warmup_days: 7,
+  default_warmup_days: 0,
+  minimum_warmup_days: 0,
   user_initiated_private_message_multiplier: 1,
-  tiers: { unknown: { warmup_days: 15 }, month_1: { warmup_days: 18 }, month_3_6: { warmup_days: 12 }, year_1: { warmup_days: 9 }, year_2: { warmup_days: 7 }, year_3_plus: { warmup_days: 7 } },
+  tiers: { unknown: { warmup_days: 0 }, month_1: { warmup_days: 0 }, month_3_6: { warmup_days: 0 }, year_1: { warmup_days: 0 }, year_2: { warmup_days: 0 }, year_3_plus: { warmup_days: 0 } },
   stages: createDefaultWarmupStages(),
 })
 
@@ -108,7 +108,7 @@ export const createDefaultAdCapacity = (): AdCapacitySettings => ({
   survival_check_batch_size: 50, survival_retry_max_attempts: 3, survival_retry_base_seconds: 300,
   max_groups_per_account: 100, max_new_ad_groups_per_day: 2, probe_backlog_max_days: 3,
   leave_on_deleted_ad: true, block_group_on_probe_failure: true, ad_policy_ai_enabled: true,
-  ad_policy_ai_model: 'glm-5.3-flash', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
+  ad_policy_ai_model: 'gpt-6.1-sol', ad_policy_ai_timeout_seconds: 45, ad_policy_ai_min_confidence: 95,
   ad_policy_ai_require_second_pass: true, ad_policy_auto_probe_enabled: true,
   ad_policy_auto_probe_daily_limit_per_account: 10, ad_policy_auto_probe_interval_hours: 24, ad_policy_auto_ttl_days: 7,
   ad_policy_manual_ttl_days: 30, premium_min_samples: 20, premium_min_conversions: 1, premium_survival_rate_percent: 95,

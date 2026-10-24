@@ -23,6 +23,7 @@ from app.core.account.models import (
     SpamCheckOperationStatus,
     TelegramAccount,
 )
+from app.core.account.operation_lease import AccountOperationLeaseBusy
 from app.core.account.pool import (
     AccountPool,
     get_account_pool,
@@ -38,6 +39,10 @@ from app.modules.account_spam.classifier import (
     classify_spambot_reply,
     summarize_spambot_reply,
 )
+
+SPAM_CHECK_OWNER_STAGE = "account_spam_check"
+SPAM_CHECK_OWNER_TIMEOUT_SECONDS = 120
+SPAM_CHECK_BUSY_RETRY_SECONDS = 30
 
 ACTIVE_OPERATION_STATUSES = {
     SpamCheckOperationStatus.QUEUED.value,
@@ -373,9 +378,19 @@ class AccountSpamCheckService:
         await self.db.commit()
         return item.id, lease_id
 
-    async def _execute_claim(self, item_id: int, lease_id: str) -> None:
+    async def _execute_claim(
+        self,
+        item_id: int,
+        lease_id: str,
+        *,
+        route_to_owner: bool = True,
+    ) -> None:
         item = await self.db.get(AccountSpamCheckItem, item_id)
-        if item is None or item.lease_id != lease_id:
+        if (
+            item is None
+            or item.lease_id != lease_id
+            or item.status != SpamCheckItemStatus.IN_PROGRESS.value
+        ):
             return
         operation = await self.db.get(
             AccountSpamCheckOperation,
@@ -394,6 +409,9 @@ class AccountSpamCheckService:
                 TelegramExecutionError("account_no_longer_eligible"),
                 force_permanent=True,
             )
+            return
+
+        if route_to_owner and await self._forward_claim_to_owner(item_id, lease_id, account.id):
             return
 
         wrapper = None
@@ -447,7 +465,12 @@ class AccountSpamCheckService:
                 )
                 applied_result = classified_result
         except Exception as exc:
-            await self._finish_error(item_id, lease_id, exc)
+            if isinstance(exc, AccountOperationLeaseBusy) or str(exc).startswith(
+                "Telegram session lease is busy for account "
+            ):
+                await self._defer_busy_claim(item_id, lease_id)
+            else:
+                await self._finish_error(item_id, lease_id, exc)
         finally:
             if wrapper is not None:
                 await self.account_pool.release(wrapper)
@@ -458,6 +481,69 @@ class AccountSpamCheckService:
                     account.id,
                     reason=f"spambot_{applied_result}",
                 )
+
+    async def _forward_claim_to_owner(self, item_id: int, lease_id: str, account_id: int) -> bool:
+        """Keep the diagnostic on the process holding the Telegram session."""
+        from app.core.account import session_exec
+        from app.core.redis import get_redis
+
+        try:
+            client = await get_redis()
+        except RuntimeError:
+            return False
+        owner = await session_exec.owner_id(client, account_id)
+        if owner is None or owner == session_exec.PROCESS_ID:
+            return False
+
+        # Do not hold a shared PostgreSQL connection while the owner works.
+        # Only the owner persists the verdict, using this exact item claim.
+        await self.db.rollback()
+        try:
+            reply = await session_exec.forward(
+                account_id,
+                f"{SPAM_CHECK_OWNER_STAGE}:{item_id}:{lease_id}",
+                timeout=SPAM_CHECK_OWNER_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            reply = None
+        if reply is not None and reply.get("error") == "not_owner":
+            await self._defer_busy_claim(item_id, lease_id)
+        elif reply is None or reply.get("error"):
+            await self._finish_error(
+                item_id,
+                lease_id,
+                TelegramExecutionError("spambot_owner_unreachable"),
+            )
+        elif not (reply.get("result") or {}).get("processed"):
+            await self._defer_busy_claim(item_id, lease_id)
+        return True
+
+    async def _defer_busy_claim(self, item_id: int, lease_id: str) -> None:
+        """Waiting for an account operation does not consume a check attempt."""
+        item = await self._locked_claim(item_id, lease_id)
+        if item is None:
+            return
+        operation = await self.db.get(AccountSpamCheckOperation, item.operation_id)
+        if operation is None or operation.cancel_requested_at is not None:
+            await self._finish_cancelled(item_id, lease_id)
+            return
+
+        now = datetime.utcnow()
+        summary = "Waiting for this account's active operation to finish"
+        item.status = SpamCheckItemStatus.RETRY_WAIT.value
+        item.attempts = max(0, item.attempts - 1)
+        item.reason_code = "account_operation_busy"
+        item.response_summary = summary
+        item.next_retry_at = now + timedelta(seconds=SPAM_CHECK_BUSY_RETRY_SECONDS)
+        item.lease_id = None
+        item.lease_expires_at = None
+        item.updated_at = now
+        account = await self.db.get(TelegramAccount, item.account_id)
+        if account is not None:
+            account.spam_check_status = SpamCheckAccountStatus.QUEUED.value
+            account.spam_check_summary = summary
+        await self._recompute_operation(item.operation_id, now=now)
+        await self.db.commit()
 
     async def _finish_result(
         self,
@@ -904,6 +990,44 @@ class AccountSpamCheckService:
             operation.status = SpamCheckOperationStatus.FAILED.value
         else:
             operation.status = SpamCheckOperationStatus.SUCCEEDED.value
+
+
+async def execute_forwarded_spam_check(
+    db: AsyncSession,
+    account_id: int,
+    stage: str,
+    *,
+    account_pool: AccountPool,
+) -> tuple[dict[str, int | str], int]:
+    """Execute only the current claim forwarded for this owner's account."""
+    parts = stage.split(":")
+    if (
+        len(parts) != 3
+        or parts[0] != SPAM_CHECK_OWNER_STAGE
+        or not parts[1].isdigit()
+        or int(parts[1]) <= 0
+        or not parts[2]
+    ):
+        return {"processed": 0, "reason": "invalid_spam_check_claim"}, 30
+
+    item_id, lease_id = int(parts[1]), parts[2]
+    item = await db.get(AccountSpamCheckItem, item_id)
+    if (
+        item is None
+        or item.account_id != account_id
+        or item.lease_id != lease_id
+        or item.status != SpamCheckItemStatus.IN_PROGRESS.value
+        or item.lease_expires_at is None
+        or item.lease_expires_at <= datetime.utcnow()
+    ):
+        return {"processed": 0, "reason": "stale_spam_check_claim"}, 30
+    if not account_pool.peek_connected(account_id):
+        return {"processed": 0, "reason": "spam_check_owner_disconnected"}, 30
+
+    await AccountSpamCheckService(db, account_pool=account_pool)._execute_claim(
+        item_id, lease_id, route_to_owner=False
+    )
+    return {"processed": 1}, 30
 
 
 async def run_account_spam_check_tick(

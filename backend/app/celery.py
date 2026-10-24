@@ -314,6 +314,13 @@ celery_app.conf.beat_schedule = {
         "kwargs": {"batch_size": 500, "dry_run": False},
         "options": {"queue": "owned_group"},
     },
+    # P4 history governance: report candidates first; archiving stays a pure
+    # database lane that can never trigger Telegram operations.
+    "p4-history-governance-daily": {
+        "task": "app.core.scheduler.tasks.p4_history_governance_task",
+        "schedule": crontab(hour=4, minute=37),
+        "options": {"queue": "default", "expires": 3600},
+    },
 }
 
 # =============================================================================

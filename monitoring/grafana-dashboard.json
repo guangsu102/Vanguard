@@ -1,102 +1,666 @@
-# ===========================================
-# Grafana Dashboard for Vanguard
-# ===========================================
-
 {
-  "dashboard": {
-    "title": "Vanguard Dashboard",
-    "tags": ["vanguard", "telegram", "bot"],
-    "timezone": "browser",
-    "refresh": "30s",
-    "panels": [
-      {
-        "id": 1,
-        "title": "API Response Time",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"vanguard-backend\"}[5m])) by (le))",
-            "legendFormat": "p95"
-          },
-          {
-            "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{job=\"vanguard-backend\"}[5m])) by (le))",
-            "legendFormat": "p99"
-          }
-        ],
-        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8}
-      },
-      {
-        "id": 2,
-        "title": "Request Rate",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "sum(rate(http_requests_total{job=\"vanguard-backend\"}[5m]))",
-            "legendFormat": "Requests/sec"
-          }
-        ],
-        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8}
-      },
-      {
-        "id": 3,
-        "title": "Error Rate",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "sum(rate(http_requests_total{status=~\"5..\",job=\"vanguard-backend\"}[5m])) / sum(rate(http_requests_total{job=\"vanguard-backend\"}[5m])) * 100",
-            "legendFormat": "Error Rate %"
-          }
-        ],
-        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8}
-      },
-      {
-        "id": 4,
-        "title": "Active Users",
-        "type": "graph",
-        "targets": [
-          {
-            "expr": "vanguard_active_users",
-            "legendFormat": "Active Users"
-          }
-        ],
-        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8}
-      },
-      {
-        "id": 5,
-        "title": "Database Connections",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "pg_stat_database_numbackends{datname=\"vanguard\"}",
-            "legendFormat": "Connections"
-          }
-        ],
-        "gridPos": {"x": 0, "y": 16, "w": 8, "h": 8}
-      },
-      {
-        "id": 6,
-        "title": "Redis Memory",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "redis_memory_used_bytes{job=\"redis\"} / redis_memory_max_bytes{job=\"redis\"} * 100",
-            "legendFormat": "Memory Usage %"
-          }
-        ],
-        "gridPos": {"x": 8, "y": 16, "w": 8, "h": 8}
-      },
-      {
-        "id": 7,
-        "title": "CPU Usage",
-        "type": "gauge",
-        "targets": [
-          {
-            "expr": "rate(process_cpu_seconds_total{job=\"vanguard-backend\"}[5m]) * 100",
-            "legendFormat": "CPU %"
-          }
-        ],
-        "gridPos": {"x": 16, "y": 16, "w": 8, "h": 8}
-      }
-    ]
+ "uid": "vanguard-p0",
+ "title": "Vanguard P0 growth SLO",
+ "tags": [
+  "vanguard",
+  "growth",
+  "slo"
+ ],
+ "timezone": "browser",
+ "schemaVersion": 39,
+ "refresh": "30s",
+ "panels": [
+  {
+   "id": 1,
+   "type": "timeseries",
+   "title": "Join admission to send P95",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.95, sum(rate(vanguard_join_admission_to_send_seconds_bucket[15m])) by (le))",
+     "legendFormat": "seconds",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "Ad admission to send P95",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "expr": "histogram_quantile(0.95, sum(rate(vanguard_ad_admission_to_send_seconds_bucket[30m])) by (le))",
+     "legendFormat": "seconds",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "Reconciliation oldest task",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "expr": "vanguard_reconciliation_oldest_age_seconds",
+     "legendFormat": "{{kind}}",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "Budget remaining",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "expr": "vanguard_budget_remaining",
+     "legendFormat": "{{lane}} / {{window}}",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 5,
+   "type": "stat",
+   "title": "Survival overdue",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 6,
+    "h": 5
+   },
+   "targets": [
+    {
+     "expr": "vanguard_survival_overdue",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 6,
+   "type": "stat",
+   "title": "Parent group invariant failures",
+   "gridPos": {
+    "x": 6,
+    "y": 16,
+    "w": 6,
+    "h": 5
+   },
+   "targets": [
+    {
+     "expr": "vanguard_parent_group_invariant_failures",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 7,
+   "type": "stat",
+   "title": "Inbox lag",
+   "gridPos": {
+    "x": 12,
+    "y": 16,
+    "w": 6,
+    "h": 5
+   },
+   "targets": [
+    {
+     "expr": "vanguard_queue_lag_seconds{queue=\"inbox\"}",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 8,
+   "type": "stat",
+   "title": "Budget snapshot age",
+   "gridPos": {
+    "x": 18,
+    "y": 16,
+    "w": 6,
+    "h": 5
+   },
+   "targets": [
+    {
+     "expr": "vanguard_budget_ledger_snapshot_age_seconds",
+     "refId": "A"
+    }
+   ],
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   }
+  },
+  {
+   "id": 9,
+   "type": "timeseries",
+   "title": "Reconciliation completion P95",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 21,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "histogram_quantile(0.95, sum(rate(vanguard_reconciliation_duration_seconds_bucket[15m])) by (le))",
+     "legendFormat": "seconds"
+    }
+   ]
+  },
+  {
+   "id": 10,
+   "type": "timeseries",
+   "title": "Reconciliation tasks",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 21,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_reconciliation_tasks",
+     "legendFormat": "{{kind}} / {{state}}"
+    }
+   ]
+  },
+  {
+   "id": 11,
+   "type": "timeseries",
+   "title": "Telegram RPC reads by lane",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 29,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(vanguard_rpc_reads_total[5m])) by (lane, outcome)",
+     "legendFormat": "{{lane}} / {{outcome}}"
+    }
+   ]
+  },
+  {
+   "id": 12,
+   "type": "timeseries",
+   "title": "Join outcomes",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 29,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(increase(vanguard_join_attempts_total[15m])) by (status)",
+     "legendFormat": "{{status}}"
+    }
+   ]
+  },
+  {
+   "id": 13,
+   "type": "timeseries",
+   "title": "Advertising outcomes",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 37,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(increase(vanguard_ad_deliveries_total[15m])) by (status)",
+     "legendFormat": "{{status}}"
+    }
+   ]
+  },
+  {
+   "id": 14,
+   "type": "timeseries",
+   "title": "Queue waiting time",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 37,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_queue_lag_seconds",
+     "legendFormat": "{{queue}}"
+    }
+   ]
+  },
+  {
+   "id": 15,
+   "type": "stat",
+   "title": "Session lease contention in 15m",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 45,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "increase(vanguard_session_lease_contention_total[15m])",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 16,
+   "type": "stat",
+   "title": "Business metrics snapshot age",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 45,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_metrics_snapshot_age_seconds",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 17,
+   "type": "stat",
+   "title": "P4 pacing enabled",
+   "gridPos": {
+    "x": 0,
+    "y": 53,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_ad_pacing_enabled",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 18,
+   "type": "stat",
+   "title": "P4 pacing shadow",
+   "gridPos": {
+    "x": 6,
+    "y": 53,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_ad_pacing_shadow",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 19,
+   "type": "stat",
+   "title": "P4 history governance enabled",
+   "gridPos": {
+    "x": 12,
+    "y": 53,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_history_governance_enabled",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 20,
+   "type": "stat",
+   "title": "P4 admin metrics enabled",
+   "gridPos": {
+    "x": 18,
+    "y": 53,
+    "w": 6,
+    "h": 4
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_admin_metrics_enabled",
+     "legendFormat": ""
+    }
+   ]
+  },
+  {
+   "id": 21,
+   "type": "timeseries",
+   "title": "Pacing decisions by reason",
+   "gridPos": {
+    "x": 0,
+    "y": 57,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(vanguard_p4_pacing_decisions_total[15m])) by (reason)",
+     "legendFormat": "{{reason}}"
+    }
+   ]
+  },
+  {
+   "id": 22,
+   "type": "timeseries",
+   "title": "Per-account pacing score (top 10)",
+   "gridPos": {
+    "x": 12,
+    "y": 57,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "topk(10, vanguard_p4_pacing_score)",
+     "legendFormat": "account {{account_id}}"
+    }
+   ]
+  },
+  {
+   "id": 23,
+   "type": "timeseries",
+   "title": "Ad Outbox pending / oldest age",
+   "gridPos": {
+    "x": 0,
+    "y": 65,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_ad_outbox_pending",
+     "legendFormat": "pending"
+    },
+    {
+     "refId": "B",
+     "expr": "vanguard_p4_ad_outbox_oldest_age_seconds",
+     "legendFormat": "oldest seconds"
+    }
+   ]
+  },
+  {
+   "id": 24,
+   "type": "timeseries",
+   "title": "Receipt latency P95 / duplicate target rate",
+   "gridPos": {
+    "x": 12,
+    "y": 65,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_receipt_latency_p95_seconds",
+     "legendFormat": "receipt p95 seconds"
+    },
+    {
+     "refId": "B",
+     "expr": "sum(rate(vanguard_p4_duplicate_targets_total[15m]))",
+     "legendFormat": "duplicate/s"
+    }
+   ]
+  },
+  {
+   "id": 25,
+   "type": "timeseries",
+   "title": "Survival backlog vs overdue",
+   "gridPos": {
+    "x": 0,
+    "y": 73,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_survival_backlog",
+     "legendFormat": "backlog"
+    },
+    {
+     "refId": "B",
+     "expr": "vanguard_survival_overdue",
+     "legendFormat": "overdue"
+    },
+    {
+     "refId": "C",
+     "expr": "vanguard_p4_ad_unresolved",
+     "legendFormat": "unresolved sends"
+    }
+   ]
+  },
+  {
+   "id": 26,
+   "type": "timeseries",
+   "title": "Reconciliation aging and overdue",
+   "gridPos": {
+    "x": 12,
+    "y": 73,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "vanguard_p4_reconciliation_overdue",
+     "legendFormat": "overdue tasks"
+    },
+    {
+     "refId": "B",
+     "expr": "max by (kind) (vanguard_reconciliation_oldest_age_seconds)",
+     "legendFormat": "oldest {{kind}} seconds"
+    }
+   ]
+  },
+  {
+   "id": 27,
+   "type": "timeseries",
+   "title": "Fair share vs actual share (top accounts)",
+   "gridPos": {
+    "x": 0,
+    "y": 81,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "topk(10, vanguard_p4_actual_share)",
+     "legendFormat": "actual account {{account_id}}"
+    },
+    {
+     "refId": "B",
+     "expr": "topk(10, vanguard_p4_fair_share)",
+     "legendFormat": "fair account {{account_id}}"
+    }
+   ]
+  },
+  {
+   "id": 28,
+   "type": "timeseries",
+   "title": "History governance batches and eligible backlog",
+   "gridPos": {
+    "x": 12,
+    "y": 81,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "vanguard-prometheus"
+   },
+   "targets": [
+    {
+     "refId": "A",
+     "expr": "sum(rate(vanguard_p4_history_batches_total[1h])) by (mode, outcome)",
+     "legendFormat": "{{mode}} {{outcome}}"
+    },
+    {
+     "refId": "B",
+     "expr": "vanguard_p4_history_eligible_operations",
+     "legendFormat": "eligible operations"
+    },
+    {
+     "refId": "C",
+     "expr": "vanguard_p4_history_oldest_eligible_age_seconds",
+     "legendFormat": "oldest eligible seconds"
+    }
+   ]
   }
+ ]
 }

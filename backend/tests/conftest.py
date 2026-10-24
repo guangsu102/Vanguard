@@ -24,6 +24,7 @@ TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 def _import_models() -> None:
     for model_module in (
         "app.core.account.models",
+        "app.core.account.control_models",
         "app.core.group.models",
         "app.core.keyword.models",
         "app.core.user.models",
@@ -32,6 +33,9 @@ def _import_models() -> None:
         "app.core.settings_models",
         "app.modules.guardian.models",
         "app.modules.acquisition.models",
+        "app.modules.acquisition.qualification_snapshot",
+                "app.modules.acquisition.p2_models",
+        "app.modules.acquisition.p4_models",
         "app.modules.private_chat.models",
         "app.modules.qq.models",
         "app.modules.owned_group.models",

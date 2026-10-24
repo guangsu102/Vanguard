@@ -232,7 +232,7 @@ class AccountAssetPolicyUpdate(BaseModel):
 
 
 class AccountWarmupTierPolicyUpdate(BaseModel):
-    warmup_days: int = Field(default=15, ge=7, le=120)
+    warmup_days: int = Field(default=0, ge=0, le=120)
 
 
 class AccountWarmupStagePolicyUpdate(BaseModel):
@@ -249,8 +249,8 @@ class AccountWarmupStagePolicyUpdate(BaseModel):
 
 class AccountWarmupPolicyUpdate(BaseModel):
     enabled: bool = True
-    default_warmup_days: int = Field(default=15, ge=7, le=120)
-    minimum_warmup_days: int = Field(default=7, ge=7, le=120)
+    default_warmup_days: int = Field(default=0, ge=0, le=120)
+    minimum_warmup_days: int = Field(default=0, ge=0, le=120)
     user_initiated_private_message_multiplier: float = Field(default=1.0, ge=0.0, le=2.0)
     tiers: dict[str, AccountWarmupTierPolicyUpdate] = Field(default_factory=dict)
     stages: dict[str, AccountWarmupStagePolicyUpdate] = Field(default_factory=dict)
@@ -292,7 +292,7 @@ class AdCapacityUpdate(BaseModel):
         description="写权限探针失败或探针广告被删除时是否封禁整个群的广告",
     )
     ad_policy_ai_enabled: bool = True
-    ad_policy_ai_model: str = Field(default="gpt-6-sol", min_length=1, max_length=100)
+    ad_policy_ai_model: str = Field(default="gpt-6.1-sol", min_length=1, max_length=100)
     ad_policy_ai_timeout_seconds: int = Field(default=45, ge=5, le=120)
     ad_policy_ai_min_confidence: int = Field(default=95, ge=90, le=100)
     ad_policy_ai_require_second_pass: bool = Field(

@@ -175,6 +175,10 @@ async def test_failed_or_left_request_stays_counted_but_unsent_release_does_not(
         now=now + timedelta(hours=1),
     )
     await persisted.release(released, reason="local_filter_rejected")
+    await test_db.refresh(released)
+    assert released.status == DeliveryStatus.SKIPPED.value
+    assert released.reconciliation_status == "resolved"
+    assert released.reconciliation_next_at is None
     after_release = await persisted.status(account.id, now=now + timedelta(hours=1))
     assert after_release.requested_today == 1
     assert after_release.active_reservations == 0
@@ -206,6 +210,10 @@ async def test_expired_reservation_is_replaced_without_allowing_late_send(test_d
     )
 
     assert expired.request_state == "released"
+    await test_db.refresh(expired)
+    assert expired.status == DeliveryStatus.SKIPPED.value
+    assert expired.reconciliation_status == "resolved"
+    assert expired.reservation_expires_at is None
     assert replacement.request_state == "reserved"
     with pytest.raises(JoinBudgetBlocked, match="join_reservation_not_active"):
         await service.mark_sent(expired, now=now + timedelta(minutes=11))
@@ -295,7 +303,7 @@ async def test_review_backlog_hysteresis_and_overdue_review_pause_new_joins(test
     assert "join_review_overdue" in overdue_status.blocked_reasons
 
 
-async def test_global_pause_age_gate_owner_protection_and_interval_are_fail_closed(test_db):
+async def test_global_pause_owner_protection_and_interval_without_age_minimum(test_db):
     now = datetime(2026, 9, 21, 12, 0, 0)
     account, _config = await _eligible_account(test_db, "guards", now=now)
     service = _service(test_db)
@@ -314,10 +322,13 @@ async def test_global_pause_age_gate_owner_protection_and_interval_are_fail_clos
     ) is None
     await save_auto_join_scheduler_settings(test_db, {"enabled": True})
 
-    account.registered_at = now - timedelta(days=179)
-    await test_db.commit()
-    too_young = await service.status(account.id, now=now)
-    assert "account_age_not_verified_six_months" in too_young.blocked_reasons
+    for registered_at in [None, now - timedelta(days=2)]:
+        account.registered_at = registered_at
+        await test_db.commit()
+        age_unrestricted = await service.status(account.id, now=now)
+        assert age_unrestricted.blocked_reasons == []
+        age_reservation = await service.reserve(account.id, source="age-unrestricted", now=now)
+        await service.release(age_reservation, reason="age-check-only")
 
     account.registered_at = now - timedelta(days=365)
     owner_asset = OwnedGroupAsset(

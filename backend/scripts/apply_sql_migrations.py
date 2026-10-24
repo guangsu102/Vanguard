@@ -50,6 +50,14 @@ DEFAULT_MIGRATIONS = [
     "063_listener_inbox_qualification_lifetime.sql",
     "064_daily_group_frequency.sql",
     "065_qq_growth_automation.sql",
+    "066_unify_group_ad_policy_model.sql",
+    "067_growth_slo_budget_reconciliation.sql",
+    "068_reconciliation_verification_slo.sql",
+    "069_p1_runtime_reliability.sql",
+    "070_p2_growth_operation_outbox.sql",
+    "071_p3_qualification_snapshots.sql",
+    "072_p4_pacing_and_history.sql",
+    "073_preserve_growth_operation_identity.sql",
 ]
 
 
@@ -167,6 +175,10 @@ async def _apply(files: list[str]) -> None:
     """
 
     async with db_module.get_db_session() as session:
+        # A deployment can start more than one application task. Serialize the
+        # curated runner inside PostgreSQL so two processes cannot race the
+        # additive DDL or write conflicting history checksums.
+        await session.execute(text("SELECT pg_advisory_xact_lock(781246903)"))
         await session.execute(text(history_table_sql))
         # Migration files are trusted raw PostgreSQL, not parameterized ORM
         # statements.  ``sqlalchemy.text()`` scans colon-prefixed tokens even
@@ -176,6 +188,8 @@ async def _apply(files: list[str]) -> None:
         # through the driver while retaining the surrounding session
         # transaction and the checksum/history bookkeeping below.
         for filename in files:
+            # Each file commits independently and releases its transaction lock.
+            await session.execute(text("SELECT pg_advisory_xact_lock(781246903)"))
             path = MIGRATIONS_DIR / filename
             if not path.exists():
                 raise FileNotFoundError(f"Migration not found: {path}")

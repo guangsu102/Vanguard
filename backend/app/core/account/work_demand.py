@@ -16,8 +16,9 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
     """
     from telethon.tl.types import PeerChannel, PeerChat
 
-    from app.core.group.models import Group, GroupAccountMembership
+    from app.core.group.models import Group
     from app.modules.acquisition import candidate_inventory
+    from app.modules.acquisition.join_claims import occupied_group_ids
     from app.modules.acquisition.models import AutoJoinAttempt
     from app.modules.acquisition.qualification_identity import peer_identity
     from app.modules.acquisition.qualification_join_gate import qualification_join_gate
@@ -37,18 +38,7 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
     )
     candidate_rows = rows[:300]
     candidate_ids = [group.id for group in candidate_rows]
-    joined_ids = set(
-        (
-            await db.scalars(
-                select(GroupAccountMembership.group_id)
-                .where(
-                    GroupAccountMembership.group_id.in_(candidate_ids),
-                    GroupAccountMembership.status == "joined",
-                )
-                .distinct()
-            )
-        ).all()
-    ) if candidate_ids else set()
+    joined_ids = await occupied_group_ids(db, candidate_ids, now)
     facts = await candidate_inventory.load(db, account_id, candidate_ids)
     retry_at = await candidate_inventory.account_retry_at(db, account_id)
     retry_wait = bool(retry_at and retry_at > now)
@@ -180,7 +170,9 @@ async def add_work_demand(db: Any, account_id: int, now: datetime, limits: dict,
         used = [budget['usage'][lane + '_' + window]['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
         adjusted = transferred_caps(caps, budget['usage']['survival_lent_' + window]['used'],
                                     budget['usage'].get('sync_lent_' + window, {}).get('used', 0),
-                                    budget['usage'].get('ad_lent_' + window, {}).get('used', 0))
+                                    budget['usage'].get('ad_lent_' + window, {}).get('used', 0),
+                                    budget['usage'].get('sync_borrowed_ad_' + window, {}).get('used', 0),
+                                    budget['usage'].get('sync_borrowed_survival_' + window, {}).get('used', 0))
         room = max(0, available(limits[window], used, adjusted, 'ad') - hold)
         rooms.append(room)
         if not room:
