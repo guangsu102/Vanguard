@@ -1,7 +1,6 @@
 # 生产 P6.3/P6.4 直接核查结果
 
-日期：2026-10-25（Asia/Shanghai）  
-方式：通过 `oracle4c24g` 上生产 backend 的既有数据库连接和内部 metrics 端点执行只读核查。未执行迁移、部署、Telegram API 调用、Outbox 写入或 Redis 修改。
+日期：2026-10-25（Asia/Shanghai）\r\n方式：通过 `oracle4c24g` 上生产 backend 的既有数据库连接和内部 metrics 端点执行只读核查。未执行迁移、部署、Telegram API 调用、Outbox 写入或 Redis 修改。
 
 ## 生产版本与数据面
 
