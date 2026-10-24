@@ -208,9 +208,10 @@ async def preview_canary(db, now: datetime) -> dict:
 async def run(args: argparse.Namespace) -> int:
     from app.core import database as db_module
     from app.core.config import settings
-    from app.core.redis import get_redis
+    from app.core.redis import close_redis, get_redis, init_redis
 
     await db_module.init_db(create_tables=False)
+    await init_redis()
     cache = await get_redis()
     now = datetime.utcnow()
     checks: list[dict] = []
@@ -272,6 +273,7 @@ async def run(args: argparse.Namespace) -> int:
                     except ValueError as exc:
                         report["freeze"] = {"ok": False, "error": str(exc)}
     print(json.dumps(report, indent=2, default=str))
+    await close_redis()
     await db_module.close_db()
     return 0 if not critical_failures else 1
 
