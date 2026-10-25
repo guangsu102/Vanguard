@@ -82,3 +82,11 @@ backend、Celery、Telegram workers、Redis 和共享 PostgreSQL 未重启。公
 复核窗口仍显示主流程阻塞，不能进入任何 P2–P6 灰度：最近一小时 Celery 出现大量 `session_owner_capacity_wait` 和 `account_operation_lease_busy`；growth worker 出现账号 35 `wrong session ID`、`Static proxy 20 is not loaded`、代理获取失败，以及账号 2 的 join/ad 执行超时。生产数据库中的账号 2、4、33、34、35 仍绑定静态代理 16–20，代理记录本身存在且 active，因此下一步应先修复 account pool 的静态代理加载/失效路径并单独恢复账号 session，再观察容量和租约错误是否下降。
 
 在上述错误连续一个完整业务窗口下降前，保持所有 P2–P5 业务开关关闭；不得通过重发未知任务、手工插入资格快照或直接调用 Telegram 来制造验收结果。
+
+## 2026-10-25 静态代理修复发布结论
+
+本地提交 `b739dd9` 为账号池静态代理 fallback 增加了回归测试（`test_account_pool_persistent.py` 全部 23 项通过）。生产验证时发现运行镜像 `throughput-20261025-r3` 与 `/opt/vanguard` 源目录不是同一版本：只复制 `pool.py` 构建会因 `session_guard` 接口不匹配而启动失败；基于生产旧源构建的兼容镜像虽然能加载账号 35 的 proxy 20，但进一步暴露了 `Settings.p2_outbox_enabled_for` 缺失。两个候选镜像均已回滚，未保留在运行服务上。
+
+当前 growth worker 已恢复 `local/vanguard:throughput-20261025-r3`，`RestartCount=0`，公网健康检查正常；最近复核无新的 `Static proxy`、`proxy_acquisition_error`、`telegram_session_quarantined` 或 session timeout。账号 2、33、34、35 的 session lease 在启动交接期间短暂 busy，随后均出现 `account_connected_by_id`。这证明代理加载修复方向正确，但必须先发布完整匹配的源代码和镜像，再重新验证，不能在版本漂移的生产源目录上单文件热补丁。
+
+因此当前生产保持 legacy 镜像和 P2–P5 关闭；下一步是建立完整 release manifest（源代码 commit、镜像 digest、Compose override 一致）后，在不触碰共享 PostgreSQL/Redis 的前提下重新发布代理 fallback，并继续观察 lease/capacity 指标。
