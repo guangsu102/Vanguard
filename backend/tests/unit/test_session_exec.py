@@ -197,7 +197,7 @@ async def test_local_protected_stage_hydrates_empty_worker_pool(monkeypatch):
     """A Celery worker must recover an account wrapper before sending."""
     from app.core.scheduler import growth_dispatch
 
-    account = object()
+    account = type("Account", (), {"id": 35})()
     pool = type(
         "Pool",
         (),
