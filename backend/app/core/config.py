@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     P1_SYNC_ROLLOUT_MODE: str = "account_allowlist"
     P1_INBOX_CLAIM_BATCH_SIZE: int = Field(default=20, ge=1, le=128)
     P1_INBOX_CLAIM_LEASE_SECONDS: int = Field(default=90, ge=30, le=900)
+    # Legacy inbox values are independent of P1 so changing a disabled P1
+    # rollout cannot silently change the production event path.
+    LEGACY_INBOX_CLAIM_BATCH_SIZE: int = Field(default=32, ge=1, le=128)
+    LEGACY_INBOX_CLAIM_LEASE_SECONDS: int = Field(default=90, ge=30, le=900)
     P1_INBOX_COALESCE_SECONDS: int = Field(default=30, ge=0, le=300)
     P1_INBOX_BASELINE_AT: str | None = Field(
         default=None,
@@ -316,6 +320,22 @@ class Settings(BaseSettings):
         if mode in {"all", "all_accounts"}:
             return True
         return account_id in self.p1_sync_canary_accounts
+
+    @property
+    def growth_inbox_claim_batch_size(self) -> int:
+        return (
+            self.P1_INBOX_CLAIM_BATCH_SIZE
+            if self.P1_RUNTIME_RELIABILITY_ENABLED
+            else self.LEGACY_INBOX_CLAIM_BATCH_SIZE
+        )
+
+    @property
+    def growth_inbox_claim_lease_seconds(self) -> int:
+        return (
+            self.P1_INBOX_CLAIM_LEASE_SECONDS
+            if self.P1_RUNTIME_RELIABILITY_ENABLED
+            else self.LEGACY_INBOX_CLAIM_LEASE_SECONDS
+        )
 
     @property
     def p2_canary_accounts(self) -> set[int]:

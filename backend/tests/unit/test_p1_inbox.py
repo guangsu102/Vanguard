@@ -135,6 +135,21 @@ async def test_disabled_flag_keeps_legacy_claims_without_short_lease(test_db, mo
     assert row.checkpoint_stage is None
 
 
+async def test_disabled_p1_uses_independent_legacy_inbox_settings(monkeypatch):
+    monkeypatch.setattr(settings, "P1_RUNTIME_RELIABILITY_ENABLED", False)
+    monkeypatch.setattr(settings, "P1_INBOX_CLAIM_BATCH_SIZE", 7)
+    monkeypatch.setattr(settings, "P1_INBOX_CLAIM_LEASE_SECONDS", 300)
+    monkeypatch.setattr(settings, "LEGACY_INBOX_CLAIM_BATCH_SIZE", 32)
+    monkeypatch.setattr(settings, "LEGACY_INBOX_CLAIM_LEASE_SECONDS", 90)
+
+    assert settings.growth_inbox_claim_batch_size == 32
+    assert settings.growth_inbox_claim_lease_seconds == 90
+
+    monkeypatch.setattr(settings, "P1_RUNTIME_RELIABILITY_ENABLED", True)
+    assert settings.growth_inbox_claim_batch_size == 7
+    assert settings.growth_inbox_claim_lease_seconds == 300
+
+
 async def test_metrics_fixed_baseline_actual_share_and_checkpoint_counter(test_db, monkeypatch):
     from app.core import metrics
     from app.core.account.control_models import AccountBudgetSnapshot

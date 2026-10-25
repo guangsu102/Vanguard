@@ -941,7 +941,7 @@ class TelegramWorker:
                 # Local facts are consumed in bounded batches below. Business
                 # events remain single-event transactions because their handler
                 # may cross the Telegram side-effect boundary.
-                for _ in range((settings.P1_INBOX_CLAIM_BATCH_SIZE if settings.P1_RUNTIME_RELIABILITY_ENABLED else 32)
+                for _ in range(settings.growth_inbox_claim_batch_size
                                if local_only else 1):
                     if not self._running:
                         break
@@ -988,10 +988,9 @@ class TelegramWorker:
                 local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
                 after_account_id=after,
                 local_only=True,
-                limit=(limit or settings.P1_INBOX_CLAIM_BATCH_SIZE)
-                if settings.P1_RUNTIME_RELIABILITY_ENABLED else (limit or 32),
+                limit=limit or settings.growth_inbox_claim_batch_size,
                 owner=self.worker_id,
-                lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS,
+                lease_seconds=settings.growth_inbox_claim_lease_seconds,
             )
             if not rows:
                 return False
@@ -1078,7 +1077,7 @@ class TelegramWorker:
                               local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
                               after_account_id=after, local_only=local_only,
                               owner=self.worker_id,
-                              lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS)
+                              lease_seconds=settings.growth_inbox_claim_lease_seconds)
             if row is None and local_only is False:
                 # Deletion updates are local facts, but this lane historically
                 # accepted them while the local projection lane was paused.
@@ -1089,7 +1088,7 @@ class TelegramWorker:
                     local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
                     after_account_id=after, local_only=True,
                     owner=self.worker_id,
-                    lease_seconds=settings.P1_INBOX_CLAIM_LEASE_SECONDS,
+                    lease_seconds=settings.growth_inbox_claim_lease_seconds,
                 )
             if row is None:
                 return False
@@ -1135,7 +1134,7 @@ class TelegramWorker:
                     if claim_owner is not None:
                         # Stop before the lease expires. A cancelled external
                         # write retains its marker and goes to reconciliation.
-                        async with asyncio.timeout(max(1, settings.P1_INBOX_CLAIM_LEASE_SECONDS - 5)):
+                        async with asyncio.timeout(max(1, settings.growth_inbox_claim_lease_seconds - 5)):
                             await self._run_growth_event(handler, account_id, event)
                     else:
                         await self._run_growth_event(handler, account_id, event)
