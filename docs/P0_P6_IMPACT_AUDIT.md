@@ -66,3 +66,19 @@
 - legacy 广告预算等待现在包含明确的 `retry_at` 和 `counts_as_business_skip=false`，便于调度重试和指标区分。
 
 上述改造只改变本地代码和测试；生产 flags、Telegram、共享 PostgreSQL/Redis 均未改变。
+
+## 2026-10-25 生产复核与运行时对齐
+
+本次只修改了 reconciliation 监控服务的私有运行时配置，并保留了回滚副本：
+
+- `TELEGRAM_READ_BUDGET_PERCENT=150`；
+- `RECONCILIATION_SHADOW_MODE=true`；
+- `RECONCILIATION_STREAM_ENABLED=true`；
+- `P1_RUNTIME_RELIABILITY_ENABLED=false`；
+- 通过 `/opt/shared-postgres/stacks/vanguard/compose.json` 与 monitoring overlay 对 `reconciliation` 执行 `up -d --no-deps`。
+
+backend、Celery、Telegram workers、Redis 和共享 PostgreSQL 未重启。公网 `/health` 返回 `healthy`，reconciliation 容器恢复 `running/healthy`；Redis 认证只读检查 `vanguard:p5:rollout:v1:stopped` 返回不存在。P2/P3/P4/P5 业务开关仍按默认值关闭，`P2_JOIN_OUTBOX_ENABLED` 未启用。
+
+复核窗口仍显示主流程阻塞，不能进入任何 P2–P6 灰度：最近一小时 Celery 出现大量 `session_owner_capacity_wait` 和 `account_operation_lease_busy`；growth worker 出现账号 35 `wrong session ID`、`Static proxy 20 is not loaded`、代理获取失败，以及账号 2 的 join/ad 执行超时。生产数据库中的账号 2、4、33、34、35 仍绑定静态代理 16–20，代理记录本身存在且 active，因此下一步应先修复 account pool 的静态代理加载/失效路径并单独恢复账号 session，再观察容量和租约错误是否下降。
+
+在上述错误连续一个完整业务窗口下降前，保持所有 P2–P5 业务开关关闭；不得通过重发未知任务、手工插入资格快照或直接调用 Telegram 来制造验收结果。
