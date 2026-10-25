@@ -287,8 +287,16 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
         config = await db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
         if config is not None and config.dynamic_capacity_enabled:
             from app.modules.acquisition.growth_admission import admission_plan
+            from app.modules.acquisition.join_budget import is_hard_join_admission_blocker
+
             admission = await admission_plan(db, account_id, datetime.utcnow())
-            if admission['reason']:
+            # Execution capacity is a scheduling signal.  It must remain
+            # visible in admission telemetry, but it cannot veto the join's
+            # own bounded read reservation: the durable review watermark and
+            # the RPC budget below are the safety gates.  Keeping this check
+            # aligned with JoinRequestBudgetService avoids reintroducing the
+            # old hard gate at the Telegram preflight layer.
+            if is_hard_join_admission_blocker(admission['reason']):
                 raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
     try:
         samples = await cache.lrange(sample_key(account_id, work.kind), 0, 199)

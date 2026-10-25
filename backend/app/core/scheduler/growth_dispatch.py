@@ -27,7 +27,9 @@ ACCOUNT_RUN_TTL = RUN_SECONDS + 30
 # account fence while the current operation finishes. It is deliberately
 # shorter than the run lease so a crashed waiter cannot strand an account.
 ACCOUNT_PRIORITY_TTL = 90
-ACCOUNT_BUSY_RETRY_SECONDS = 30
+# A short retry keeps a freed account slot useful without creating a hot loop;
+# protected joins/ads already have a single outstanding ticket per account.
+ACCOUNT_BUSY_RETRY_SECONDS = 15
 PROTECTED_RETRY_SECONDS = 15
 BROKER_CAP = 8
 PROTECTED_STAGES = frozenset({"ads", "join"})

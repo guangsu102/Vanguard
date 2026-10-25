@@ -426,8 +426,15 @@ class RpcGovernor:
                         # Preview shares the same account-local admission as
                         # joining. One parked technical retry is not a veto.
                         from app.modules.acquisition.growth_admission import admission_plan
+                        from app.modules.acquisition.join_budget import is_hard_join_admission_blocker
+
                         admission = await admission_plan(db, self.account_id, now, rpc=current)
-                        if admission['reason']:
+                        # Keep execution capacity as a scheduler signal. The
+                        # durable review watermark and the reservation check
+                        # below remain the safety gates; applying this same
+                        # classifier as read_work.ensure prevents candidate
+                        # preview from silently restoring the old hard stop.
+                        if is_hard_join_admission_blocker(admission['reason']):
                             raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
                         required = read_work.DEFAULT_JOIN_READS + read_work.DEFAULT_REVIEW_READS + reads
                         if purpose_budget(current, purpose).get("remaining", 0) < required:

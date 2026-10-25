@@ -65,6 +65,38 @@ async def test_reservation_is_atomic_without_precharging_and_preserves_ads(queue
 
 
 @pytest.mark.asyncio
+async def test_join_execution_capacity_signal_does_not_veto_read_reservation(monkeypatch):
+    """A soft review-capacity signal must not stop an otherwise valid join."""
+
+    config = type("Config", (), {"dynamic_capacity_enabled": True})()
+    db = type("DB", (), {"scalar": AsyncMock(return_value=config)})()
+    cache = type(
+        "Cache",
+        (),
+        {
+            "lrange": AsyncMock(return_value=[]),
+            "eval": AsyncMock(return_value=0),
+            "hget": AsyncMock(return_value="100"),
+        },
+    )()
+    monkeypatch.setattr(
+        "app.modules.acquisition.growth_admission.admission_plan",
+        AsyncMock(return_value={"reason": "join_wait_execution_capacity", "retry_after_seconds": 60}),
+    )
+    monkeypatch.setattr(
+        "app.core.account.budget_ledger.reserve_read_work",
+        AsyncMock(),
+    )
+    work = read_work.ReadWork(2, 40, "join")
+    token = read_work._current.set(work)
+    try:
+        await read_work.ensure(db, 2, rpc.limits_for({}, datetime.utcnow()), cache)
+        assert work.claimed
+    finally:
+        read_work._current.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_join_handoff_is_membership_scoped_and_cannot_be_stolen(queue_store, monkeypatch):
     monkeypatch.setattr("app.core.redis.get_redis", AsyncMock(return_value=queue_store))
     assert await allocate(queue_store, cost=36, token="joining", mode="reserve", kind="join") == 0
