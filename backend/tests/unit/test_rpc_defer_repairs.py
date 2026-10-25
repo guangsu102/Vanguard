@@ -65,6 +65,8 @@ async def test_ad_dispatch_does_not_walk_groups_or_create_failure_rows_during_co
     service._list_enabled_ad_bindings_for_account=AsyncMock()
     result=await service._run_ad_delivery_for_account(account.id,binding_ids=[],dry_run=False,delivery_budget={'remaining':1},delivery_budget_lock=asyncio.Lock(),reserved_ad_targets=set(),ad_target_lock=asyncio.Lock(),max_deliveries_per_account=1,stop_after_success=False,stop_after_failure=False)
     assert result.failed==0 and result.skipped==1
+    assert result.details[0]["counts_as_business_skip"] is False
+    assert result.details[0]["retry_at"]
     service._list_enabled_ad_bindings_for_account.assert_not_awaited()
     service.account_pool.acquire_by_id.assert_not_awaited()
 

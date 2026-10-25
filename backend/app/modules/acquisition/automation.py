@@ -7661,9 +7661,16 @@ class AcquisitionAutomationService:
             from app.core.account.rpc_governor import check_dispatch_ready
             await check_dispatch_ready(self.db, account_id)
         except RpcDeferred as exc:
+            retry_at = _now() + timedelta(seconds=exc.retry_after_seconds + 1)
             result.skipped = 1
-            result.details.append({"account_id": account_id, "action": "deferred",
-                                   "reason": exc.reason, "retry_after_seconds": exc.retry_after_seconds})
+            result.details.append({
+                "account_id": account_id,
+                "action": "deferred",
+                "reason": exc.reason,
+                "retry_after_seconds": exc.retry_after_seconds,
+                "retry_at": retry_at.isoformat(),
+                "counts_as_business_skip": False,
+            })
             return result
         from app.modules.acquisition.qualification_events import queue_due_gaps
         await queue_due_gaps(self.db, account_id)
