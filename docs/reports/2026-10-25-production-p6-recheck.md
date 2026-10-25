@@ -47,5 +47,7 @@ Prometheus 当前值：
 
 ## 结论
 
-P6.3/P6.4 仍不能开始。迁移已经部署不等于灰度可放行。必须先解释并清理 join/inbox 老化任务、将 session lease contention 降至 0，提供并验证最多两个账号/两个群/一个批准 campaign-run 的 scope guard 或隔离数据集，并由真实 producer 产生版本匹配的 fresh 入群前快照。完成这些条件前继续保持所有 P2/P3/P4/P5 rollout flags 关闭。
+初次重查时的 4 条老化 reconciliation 已按现有安全路径处理：2 条账号 2 的 inbox 外部尝试记录转为 `manual_required`，2 条账号 34 的加群未知结果在重复 `RuntimeError` 且超过年龄阈值后转为 `manual_required`。没有删除源记录、释放 reservation、伪造外部成功或重发 Telegram 操作。处理后重新运行生产 preflight（2026-10-25 01:49 UTC，使用容器内 metrics token）结果为 `preflight_passed=true`：49 个 canonical migrations、依赖、过期租约、FloodWait、reconciliation 老化、广告 pending/unknown、health、metrics 和鉴权检查均通过。
+
+P6.3/P6.4 仍不能开始。迁移和 preflight 通过不等于灰度可放行。生产仍缺少最多两个账号/两个群/一个批准 campaign-run 的 scope guard 或隔离数据集，也没有由真实 producer 产生的版本匹配 fresh 入群前资格快照；当前 P2/P3/P4/P5 rollout flags 继续全部关闭。`session_lease_contention_total` 是历史累计 47，不能通过重置指标伪造为零，需在后续真实观察窗口确认无新增竞争。
 
