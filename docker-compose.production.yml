@@ -67,7 +67,10 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      # Keep the production fallback at the base Telegram read allowance.
+      # A higher value can consume capacity reserved for join/ad execution
+      # when the runtime env does not explicitly set this variable.
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
@@ -108,7 +111,7 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       CELERY_WORKER_CONCURRENCY: "2"
       CELERY_MULTI_WORKER_MAX_CONCURRENCY: "2"
       CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
@@ -146,7 +149,7 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       CELERY_WORKER_CONCURRENCY: "1"
       CELERY_WORKER_PREFETCH_MULTIPLIER: "1"
       CELERY_WORKER_MAX_TASKS_PER_CHILD: "20"
@@ -174,7 +177,7 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       P0_SAFETY_GATE_ENABLED: ${P0_SAFETY_GATE_ENABLED:-true}
       P0_SAFETY_GATE_FAIL_CLOSED: ${P0_SAFETY_GATE_FAIL_CLOSED:-true}
       OWNED_GROUP_MODULE_ENABLED: ${OWNED_GROUP_MODULE_ENABLED:-true}
@@ -206,7 +209,7 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       OWNED_GROUP_MESSAGING_ENABLED: ${OWNED_GROUP_MESSAGING_ENABLED:-false}
       OWNED_GROUP_AI_PERSONA_ENABLED: ${OWNED_GROUP_AI_PERSONA_ENABLED:-false}
     restart: unless-stopped
@@ -233,7 +236,7 @@ services:
     env_file:
       - .env.production
     environment:
-      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-150}
+      TELEGRAM_READ_BUDGET_PERCENT: ${TELEGRAM_READ_BUDGET_PERCENT:-100}
       OWNED_GROUP_GOVERNANCE_ENABLED: ${OWNED_GROUP_GOVERNANCE_ENABLED:-false}
     restart: unless-stopped
     command:
