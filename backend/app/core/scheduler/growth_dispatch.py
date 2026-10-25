@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from sqlalchemy import or_, select
 
-from app.core.account.models import AccountOperationConfig, TelegramAccount
+from app.core.account.models import AccountOperationConfig, AccountStatus, TelegramAccount
 
 PREFIX = "vanguard:growth_dispatch:v1:"
 TASK = "app.core.scheduler.growth_dispatch.account_quantum_task"
@@ -589,8 +589,7 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
         account_pool = get_account_pool()
     if should_hydrate_pool:
         try:
-            if await account_pool.get_account_by_id(account_id) is None:
-                await account_pool.sync_from_db([account])
+            await ensure_growth_account_pool(account_pool, account)
             if await account_pool.get_account_by_id(account_id) is None:
                 return {
                     "processed": 0,
@@ -645,6 +644,37 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
     if stage == "survival":
         return await service.check_ad_survival(account_id=account_id, limit=spec.quantum), spec.interval
     raise ValueError("unknown_growth_stage")
+
+
+async def ensure_growth_account_pool(account_pool: Any, account: TelegramAccount) -> None:
+    """Refresh a stale targeted wrapper before a legacy growth quantum.
+
+    Celery workers keep a process-local pool while listener actors own the
+    long-lived sessions.  A wrapper can therefore survive a failed connect or
+    proxy/session policy refresh in an error state.  Refresh recoverable
+    wrappers, but leave a live WORKING wrapper alone so this repair cannot race
+    an in-flight Telegram operation.
+    """
+
+    account_id = int(account.id)
+    pooled_account = await account_pool.get_account_by_id(account_id)
+    pool_reason = None
+    reason_reader = getattr(account_pool, "unavailability_reason", None)
+    if callable(reason_reader):
+        pool_reason = reason_reader(account_id)
+    status_raw = getattr(pooled_account, "status", None)
+    status_value = str(getattr(status_raw, "value", status_raw) or "").lower()
+    refresh_pool_account = (
+        pooled_account is None
+        or pool_reason in {"account_not_in_pool", "account_session_missing"}
+        or status_value in {
+            AccountStatus.ERROR.value,
+            AccountStatus.BANNED.value,
+            AccountStatus.RESTRICTED.value,
+        }
+    )
+    if refresh_pool_account:
+        await account_pool.sync_from_db([account])
 
 
 async def run_ticket(stage: str, account_id: int, token: str) -> dict:

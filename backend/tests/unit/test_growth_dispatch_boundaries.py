@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from app.core.account.models import TelegramAccount
 from app.core.account import event_inbox
 from app.core.worker_status import TelegramEventInbox
 from tests.integration.test_growth_account_scheduler import add_accounts
@@ -104,3 +105,20 @@ async def test_each_execution_stage_preserves_account_scope(test_db, monkeypatch
     result, _ = await scheduler.execute(test_db, "join", 1)
     assert result["reason"] == "scheduler_disabled"
     assert actor.run_auto_join.await_count == 1
+
+
+async def test_growth_pool_refreshes_stale_error_wrapper_before_protected_stage(test_db):
+    from app.core.account.models import AccountStatus
+    from app.core.scheduler.growth_dispatch import ensure_growth_account_pool
+
+    account = await test_db.get(TelegramAccount, 1)
+    stale = Obj(status=AccountStatus.ERROR)
+    pool = Obj(
+        get_account_by_id=AsyncMock(return_value=stale),
+        sync_from_db=AsyncMock(),
+        unavailability_reason=Mock(return_value="account_status:error"),
+    )
+
+    await ensure_growth_account_pool(pool, account)
+
+    pool.sync_from_db.assert_awaited_once_with([account])
