@@ -14,7 +14,7 @@ P5_RELEASE_ID=<immutable release id>            # 每次修复后的发布必须
 
 - **governing 模式**(canary/cohort/full)下,P5 cohort 是唯一的 release-unit 作用域:它取代 `P2_ACCOUNT_IDS` 与 `P4_AD_PACING_ACCOUNT_IDS` 的 allowlist;`P2_OUTBOX_ENABLED`、lane 旗标、`P4_AD_PACING` 等主开关仍然必须打开。
 - **shadow** 模式运行选号与 cohort 预演,但不激活发布、不触碰流量。
-- **off** 模式对底层旗标透明;若仍有 active release,observer 会把它标记 rolled_back 并让 kill switch 继续生效(这就是人工回滚开关)。
+- **off** 模式对底层旗标透明;若仍有 active release,observer 会把它标记 rolled_back、清除遗留 stopped 状态并保持 legacy ads/join admission 可用。off 不会写入或保留 P5 kill switch。
 - **kill switch** 是 observer 写入的 Redis stopped 状态(`vanguard:p5:rollout:v1:stopped`):被 stop 的 cohort 账号不再获得新的 ads/join 派发(dispatch 候选层过滤 + 已发布 ticket 的执行守卫),review/survival/verify/reconcile/exit 等维护通道继续运行,未确认结果进入 reconciliation,绝不自动重发。stopped 状态在新的 `P5_RELEASE_ID` 激活时自动清除,并给上一条 release 记录写入 `recovered_at`。
 - 生产环境 governing 模式要求 `P5_RELEASE_ID` 非空(`validate_production_defaults` 启动校验);部署 governing 模式但没有匹配的冻结记录时,observer 会在一分钟内 fail closed(stop 无记录 cohort)。
 
@@ -74,18 +74,18 @@ full(或 cohort 100)→ 持续观察 24–48 小时
 
 - cohort 由稳定 hash(`config.p5_cohort_rank`)生成:扩容只增加成员,已加入账号永不移除;canary 账号在所有百分比下保持成员。
 - 每次部署后 observer 检测 cohort 变化,追加 `stage_history_json` 并记录 `cohort_changed` 事件。
-- gate 上一阶段有未恢复的 hold 时不要扩大;硬停止触发后 stopped cohort 会保持封锁,即使部署了更大的百分比也不会放行新流量。
+- gate 上一阶段有未恢复的 hold 时不要扩大;硬停止触发后 stopped cohort 会保持封锁,即使部署了更大的百分比也不会放行新流量。将模式切回 off 会清除该 P5 stop，以避免旧 stop 状态继续影响 legacy ads/join。
 
 ## 3. 回滚
 
-1. 停止扩大:把 `P5_ROLLOUT_MODE` 改回 `off`(人工 kill switch;observer 把 active release 标记 rolled_back,写 `rollback_at/rollback_reason/rollback_metrics_json/affected_cohort_json`,cohort 继续被封锁)。
+1. 停止扩大:把 `P5_ROLLOUT_MODE` 改回 `off`;observer 把 active release 标记 rolled_back,写 `rollback_at/rollback_reason/rollback_metrics_json/affected_cohort_json`,并清除 P5 stopped 状态，确保 legacy ads/join 不被阻断。硬停止触发时产生的 cohort 封锁只在 governing 模式下有效。
 2. 关闭异常 P4 lane:按需把 `P4_AD_PACING=false`(以及相关 lane 旗标);observer 会以 `release_flags_drift` hold 记录这次刻意关闭。
 3. 从 allowlist 移除异常账号:清空/修改 `P5_CANARY_ACCOUNT_IDS` 后重新部署(仅影响后续 cohort 计算)。
 4. 已创建的 Outbox、attempt、receipt、reconciliation 记录全部保留,不做任何删除。
 5. 未确认操作继续进入 reconciliation,禁止自动重发(P2 语义保持)。
 6. 只有当应用健康检查或 API 兼容性失败时,才回切上一个 immutable image digest(`docker compose ... up -d --no-deps backend`,使用上一 digest);数据库只执行向前兼容迁移,**绝不执行 `alembic downgrade`**。
 7. `P5_HISTORY_APPLY=false` 在整个 P5 期间保持不变,因此不存在需要回滚的归档删除。
-8. 回滚后用**新的 release id** 重新走冻结与预检;新 release 激活会清除 stopped 状态并为上一条记录写 `recovered_at`。
+8. 若此前是 governing 模式硬停止，回滚后用**新的 release id** 重新走冻结与预检;新 release 激活会清除 stopped 状态并为上一条记录写 `recovered_at`。单纯切回 off 不会产生 stopped 记录，也不需要 recovery 事件。
 
 ## 4. 完成条件与历史治理批准
 
@@ -103,7 +103,7 @@ curl -s https://vanguard.pipenai.xyz/api/operations/status | jq .p5
 curl -s -H "Authorization: Bearer $(cat /run/secrets/metrics.token)" \
     https://vanguard.pipenai.xyz/metrics | grep vanguard_p5
 
-# 手动清除 stopped(仅在新 release 无法激活的排障场景;正常流程用新 release id)
+# 手动清除 governing 模式遗留 stopped(通常切回 off 会自动清除)
 redis-cli DEL vanguard:p5:rollout:v1:stopped
 
 # 部署(共享 PostgreSQL canonical compose,仅应用服务)
@@ -120,4 +120,4 @@ docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-d
 | 发布记录 | 表 `p5_release_record`(release_id 唯一,image digest/迁移 revision/flag 快照/基线/阶段历史/回滚证据) |
 | gate 审计 | 表 `p5_gate_evaluation`(每个观察窗口一行:结果、原因、指标向量、cohort) |
 | 事件计数 | `vanguard_p5_events_total{event}` |
-| 结构化日志 | `p5_release_frozen` / `p5_release_started` / `p5_cohort_stage` / `p5_gate_hold` / `p5_rollout_stopped` / `p5_previous_stop_cleared` / `p5_release_completed` |
+| 结构化日志 | `p5_release_frozen` / `p5_release_started` / `p5_cohort_stage` / `p5_gate_hold` / `p5_rollout_stopped` / `p5_rollout_disabled_without_legacy_stop` / `p5_previous_stop_cleared` / `p5_release_completed` |
