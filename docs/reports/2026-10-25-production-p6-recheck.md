@@ -51,3 +51,12 @@ Prometheus 当前值：
 
 P6.3/P6.4 仍不能开始。迁移和 preflight 通过不等于灰度可放行。生产仍缺少最多两个账号/两个群/一个批准 campaign-run 的 scope guard 或隔离数据集，也没有由真实 producer 产生的版本匹配 fresh 入群前资格快照；当前 P2/P3/P4/P5 rollout flags 继续全部关闭。`session_lease_contention_total` 是历史累计 47，不能通过重置指标伪造为零，需在后续真实观察窗口确认无新增竞争。
 
+## 01:57 UTC 再次生产验证
+
+- 带容器内 metrics token 的 `p5_preflight.py --check` 再次返回 `preflight_passed=true`。
+- 当前 flags 解析值仍为全关闭：P2 Outbox/join/ad、P3 四类缓存/快照、P4 pacing 均为 `false`；P2 shadow 为 `true`；P5 mode 为 `off`、cohort 为 0、canary 为空。
+- 数据库摘要：`growth_operation=0`、`growth_outbox=0`、`qualification_snapshot=0`、`qualification_fact_version=0`、`campaign_execution=0`、reconciliation `pending/leased=0`、`manual_required=5`。
+- Prometheus：`ad_deliveries_total{status="unknown"}=1`（历史累计）、`ad_unresolved_oldest_age_seconds=0`、`session_lease_contention_total=47`、`p5_release_active=0`、`p5_gate_result=-1`。
+
+因此本次仍未创建 Outbox、资格快照或 campaign/run，也未调用 Telegram 发送路径；P6.3/P6.4 继续保持阻塞。
+
