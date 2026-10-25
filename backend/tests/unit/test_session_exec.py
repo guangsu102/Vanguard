@@ -193,6 +193,59 @@ async def test_execute_defers_when_owner_unreachable(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_local_protected_stage_hydrates_empty_worker_pool(monkeypatch):
+    """A Celery worker must recover an account wrapper before sending."""
+    from app.core.scheduler import growth_dispatch
+
+    account = object()
+    pool = type(
+        "Pool",
+        (),
+        {
+            "get_account_by_id": AsyncMock(side_effect=[None, object()]),
+            "sync_from_db": AsyncMock(),
+        },
+    )()
+
+    async def fake_get_redis():
+        return FakeRedis()
+
+    async def fake_owner_id(client, account_id):
+        return None
+
+    monkeypatch.setattr("app.core.redis.get_redis", fake_get_redis)
+    monkeypatch.setattr(session_exec, "owner_id", fake_owner_id)
+    monkeypatch.setattr("app.core.account.pool.get_account_pool", lambda: pool)
+    monkeypatch.setattr(
+        "app.modules.acquisition.qualification_service.account_block_reason",
+        lambda account, now: None,
+    )
+
+    class FakeService:
+        def __init__(self, db, account_pool=None):
+            assert account_pool is pool
+
+        async def run_ad_delivery(self, *, account_id, max_deliveries):
+            return {"processed": 1, "succeeded": 1}
+
+    import app.modules.acquisition.automation as automation
+
+    monkeypatch.setattr(automation, "AcquisitionAutomationService", FakeService)
+    monkeypatch.setattr(
+        "app.core.automation_settings.get_ad_delivery_execution_settings",
+        AsyncMock(return_value={"dispatcher_interval_seconds": 60}),
+    )
+    db = AsyncMock()
+    db.get = AsyncMock(return_value=account)
+
+    result, interval = await growth_dispatch.execute(db, "ads", 35)
+
+    assert result["succeeded"] == 1
+    assert interval == 60
+    pool.sync_from_db.assert_awaited_once_with([account])
+
+
+@pytest.mark.asyncio
 async def test_execute_falls_back_locally_on_stale_owner(monkeypatch):
     from app.core.scheduler import growth_dispatch
 

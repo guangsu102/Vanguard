@@ -573,6 +573,38 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
                     "error_type": reply.get("error_type"), "retryable": True}, 30
         else:
             return reply.get("result") or {"processed": 0}, int(reply.get("interval") or 30)
+    # Celery growth workers do not own the long-lived listener session and may
+    # start with an empty local AccountPool.  The legacy path still needs a
+    # hydrated wrapper when no session owner is registered; otherwise every
+    # otherwise-eligible ad/join is reported as ``account_not_in_pool`` before
+    # it can reach the Telegram client.  Hydrate only the targeted account and
+    # only on this fallback path so owner forwarding remains the single
+    # session-execution boundary.
+    should_hydrate_pool = stage in {"ads", "join"}
+    if account_pool is None:
+        from app.core.account.pool import get_account_pool
+
+        account_pool = get_account_pool()
+    if should_hydrate_pool:
+        try:
+            if await account_pool.get_account_by_id(account_id) is None:
+                await account_pool.sync_from_db([account])
+            if await account_pool.get_account_by_id(account_id) is None:
+                return {
+                    "processed": 0,
+                    "reason": "account_pool_hydration_deferred",
+                    "retryable": True,
+                }, 30
+        except Exception as exc:
+            # Pool hydration is recoverable.  Preserve the existing scheduler
+            # retry semantics and make the reason observable instead of
+            # turning a transient refresh failure into a Telegram operation.
+            return {
+                "processed": 0,
+                "reason": "account_pool_hydration_deferred",
+                "retryable": True,
+                "error_type": type(exc).__name__,
+            }, 30
     # P2 rows are consumed only by the session-owning Actor.  Keep this gate
     # after the forwarding branch so a Celery worker can never fall through to
     # a direct Telegram call when a P2 lane is enabled for its account.

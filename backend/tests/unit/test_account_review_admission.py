@@ -9,6 +9,7 @@ from app.core.account.models import TelegramAccount
 from app.core.group.models import Group, GroupAccountMembership
 from app.modules.acquisition.execution_admission import execution_plan
 from app.modules.acquisition.growth_admission import admission_plan, review_debt
+from app.modules.acquisition.join_budget import is_hard_join_admission_blocker
 from app.modules.acquisition.models import GroupQualificationAudit
 
 NOW = datetime(2026, 10, 10)
@@ -97,3 +98,16 @@ async def test_real_account_backlog_still_blocks_its_own_joins(test_db):
     assert plan["pending"] == 4
     assert plan["remaining"] == 0
     assert plan["reason"] == "join_wait_execution_capacity"
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("join_wait_execution_capacity", False),
+        ("telegram_read_budget", True),
+        ("join_outcome_reconciliation_required", True),
+        (None, False),
+    ],
+)
+def test_execution_capacity_is_telemetry_not_a_hard_join_blocker(reason, expected):
+    assert is_hard_join_admission_blocker(reason) is expected

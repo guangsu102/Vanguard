@@ -38,6 +38,15 @@ JOIN_REVIEW_BACKLOG_HIGH_WATERMARK = 30
 JOIN_REVIEW_BACKLOG_LOW_WATERMARK = 20
 JOIN_REVIEW_OVERDUE_GRACE_SECONDS = 60 * 60
 JOIN_REVIEW_INITIAL_DUE_SECONDS = 2 * 60 * 60
+# The execution horizon is queue pressure, not a safety verdict.  The
+# durable review backlog watermark below remains the hard stop.
+SOFT_JOIN_ADMISSION_REASONS = frozenset({"join_wait_execution_capacity"})
+
+
+def is_hard_join_admission_blocker(reason: str | None) -> bool:
+    """Return whether an admission reason must stop a new join."""
+
+    return bool(reason) and reason not in SOFT_JOIN_ADMISSION_REASONS
 
 _COUNTED_REQUEST_STATES = ("sent", "outcome_unknown")
 _WAITING_REVIEW_STATES = (
@@ -196,7 +205,15 @@ class JoinRequestBudgetService:
                 return plan["join_blocker"]
             from app.modules.acquisition.growth_admission import admission_plan
             admission = await admission_plan(self.db, account.id, now)
-            if admission['reason']:
+            # Review execution capacity is a soft scheduler signal.  The
+            # worker already serializes Telegram work and the durable review
+            # backlog watermark below remains the hard safety stop.  Treating
+            # the small first-review horizon as a second hard gate caused an
+            # account with only four queued reviews to stop discovering and
+            # joining entirely, even while Telegram and the account budget
+            # were healthy.  Preserve the reason in the admission telemetry;
+            # only real read/risk/reconciliation blockers stop a join.
+            if is_hard_join_admission_blocker(admission['reason']):
                 return admission['reason']
         return None
 
