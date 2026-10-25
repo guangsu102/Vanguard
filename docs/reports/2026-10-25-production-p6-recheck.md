@@ -1,0 +1,51 @@
+# 生产 P6.3/P6.4 重查结果
+
+日期：2026-10-25（Asia/Shanghai）  
+方式：通过 `oracle4c24g` 上运行中的 backend、PostgreSQL 和 Prometheus 执行只读查询。未执行迁移、部署、Telegram API 调用、Outbox 写入或 Redis 修改。
+
+## 当前版本与开关
+
+- backend 容器健康，镜像：`local/vanguard:p6-20261025-r2`。
+- `schema_migration_history` 已应用至 `074_p5_release_control`，其中 070 P2、071 P3、072 P4、074 P5 已存在。
+- P2/P3/P5 表已存在，但 `growth_operation`、`growth_outbox`、`growth_operation_attempt`、`qualification_snapshot`、`qualification_fact_version`、`p5_release_record`、`p5_gate_evaluation` 当前均为 0 行。
+- 有效开关仍为 fail-closed：
+
+  ```text
+  P2_OUTBOX_ENABLED=false
+  P2_JOIN_OUTBOX_ENABLED=false
+  P2_AD_OUTBOX_ENABLED=false
+  P2_SHADOW_MODE=true
+  P3_ENTITY_CACHE=false
+  P3_GROUP_FACT_CACHE=false
+  P3_SURVIVAL_CACHE=false
+  P3_QUALIFICATION_SNAPSHOT=false
+  P4_AD_PACING=false
+  P5_ROLLOUT_MODE=off
+  P5_CANARY_ACCOUNT_IDS=""
+  P5_COHORT_PERCENT=0
+  P5_RELEASE_ID=""
+  ```
+
+## 灰度范围与数据
+
+- 生产有 8 个 Telegram 账号；当前在线 promoter 账号 ID 为 2、4、33、34、35。
+- `ad_campaign` 有 2 条记录：ID 1 active/enabled，ID 2 active/disabled；ID 1 为每个在线 promoter 绑定 6 条广告绑定。
+- `campaign` 和 `campaign_execution` 均为 0；没有可直接用于 P6.3 的该类 campaign/run。
+- 群总数为 1087，状态包含 active 240、pending 348、pending_join 223；账号已加入群数量为 2→207、4→75、33→106、34→105、35→99。
+- 当前资格快照和事实版本均为 0。生产没有真实 fresh 入群前资格快照证据。
+- 代码和 release control plane 仍只有账号 cohort scope，没有 group/campaign/run allowlist。仅设置两个账号不能限制到两个群或一个运行批次。
+
+## 当前门禁
+
+Prometheus 当前值：
+
+- `vanguard_session_lease_contention_total=47`，要求为 0。
+- reconciliation：join pending=2，最老年龄约 149974 秒（约 41.7 小时）；inbox pending=2、manual_required=1。
+- inbox queue lag 约 524989 秒（约 6.08 天）。
+- `vanguard_ad_unresolved_oldest_age_seconds=0`，ad reconciliation overdue=0；但累计 `vanguard_ad_deliveries_total{status="unknown"}=1`。
+- P5 `release_active=0`、`gate_result=-1`、`cohort_size=0`。
+
+## 结论
+
+P6.3/P6.4 仍不能开始。迁移已经部署不等于灰度可放行。必须先解释并清理 join/inbox 老化任务、将 session lease contention 降至 0，提供并验证最多两个账号/两个群/一个批准 campaign-run 的 scope guard 或隔离数据集，并由真实 producer 产生版本匹配的 fresh 入群前快照。完成这些条件前继续保持所有 P2/P3/P4/P5 rollout flags 关闭。
+
