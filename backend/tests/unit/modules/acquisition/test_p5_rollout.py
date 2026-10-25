@@ -751,6 +751,13 @@ async def test_mode_off_rolls_back_the_active_release(test_db):
     release = await _freeze(test_db, mode="canary")
     cache = FakeCache()
     await p5_rollout.observe_cycle(test_db, cache, now=NOW, infra_ready=True)
+    # Simulate a stale stop written by an earlier P5 build.  Turning P5 off
+    # must remove it so the legacy dispatcher remains unblocked.
+    await cache.set(p5_rollout.STOPPED_KEY, json.dumps({
+        "release_id": release.release_id,
+        "cohort_account_ids": [5],
+        "reasons": ["legacy_stop"],
+    }))
     settings.P5_ROLLOUT_MODE = "off"
     summary = await p5_rollout.observe_cycle(test_db, cache, now=NOW + timedelta(minutes=2))
     assert summary["result"] == "off"
