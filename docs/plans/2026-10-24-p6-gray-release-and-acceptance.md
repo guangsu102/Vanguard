@@ -1,14 +1,14 @@
-# P6：验收、灰度发布与上线门禁计划
+# P6：验收、直接生产验证与上线门禁计划
 
 ## 目标
 
-P6 在 P0–P5 代码交付完成后，验证共享 PostgreSQL/Redis、P2 Outbox、P3 读取缓存、P4 广告 pacing 以及 P5 群运营中心在真实运行条件下的可用性，并通过受控 Telegram 灰度完成上线。P6 产出的是可审计的发布决定、监控基线和可执行回滚路径。
+P6 在 P0–P5 代码交付完成后，验证共享 PostgreSQL/Redis、P2 Outbox、P3 读取缓存、P4 广告 pacing 以及 P5 群运营中心在真实运行条件下的可用性，并通过直接生产验证完成上线决定。P6 产出的是可审计的发布决定、监控基线和可执行回滚路径。
 
 P6 不重新实现 P0–P5 的业务能力，不扩大 Telegram 配额，不增加发送并发，不绕过账号 Actor、预算账本、fencing token 或 reconciliation 保护。
 
 ## 前置依赖与责任
 
-P5 必须先提供并由 Codex 验收：成员分类、Guardian/owned group 统一入口、成员与审计 API、RBAC/脱敏/分页、前端深链和能力状态。glm5.3 负责 P5 实现及交接说明；Codex 负责 P6 的验收编排、门禁记录、灰度和发布决定。运维负责 test 环境与生产观察，业务负责人负责灰度范围和最终放量批准。
+P5 必须先提供并由 Codex 验收：成员分类、Guardian/owned group 统一入口、成员与审计 API、RBAC/脱敏/分页、前端深链和能力状态。glm5.3 负责 P5 实现及交接说明；Codex 负责 P6 的验收编排、门禁记录、直接生产验证和发布决定。运维负责 test 环境与生产观察，业务负责人负责生产范围和最终放量批准。
 
 生产 feature flag 在 P6 开始时保持：`P2_OUTBOX_ENABLED=false`、`P2_JOIN_OUTBOX_ENABLED=false`、`P2_SHADOW_MODE=true`、`P3_QUALIFICATION_SNAPSHOT=false`。除非对应门禁通过，否则不得打开下一级开关。
 
@@ -54,25 +54,25 @@ P5 必须先提供并由 Codex 验收：成员分类、Guardian/owned group 统�
 
 **停止条件**：session lease 竞争大于 0、广告 pending/unknown 增长、加群未知结果增长、reconciliation 存在未解释老化任务、P5 API 出现未授权数据或 5xx 回归。
 
-### P6.3：受控 Telegram 灰度
+### P6.3：直接生产验证（替代原 Telegram 灰度）
 
-**范围**：最多 2 个指定账号、最多 2 个 owned/Guardian 群，使用已批准的测试 campaign/run；不扩大账号数、群数或发送并发。
+原“受控 Telegram 灰度”阶段废弃。直接生产验证仍必须使用显式范围：最多 2 个账号、最多 2 个 owned/Guardian 群、一个批准的 campaign/run；生产范围不得通过全局账号 cohort 推断。
 
 **顺序**：
 
-1. 打开 `P3_ENTITY_CACHE`，确认 entity cache 命中和失效正确。
-2. 打开 `P3_GROUP_FACT_CACHE`，确认成员/权限增量核验和强制刷新正确。
-3. 打开 `P3_SURVIVAL_CACHE`，确认广告 survival 强制刷新、unknown 保护和 reconciliation 正常。
-4. 由业务负责人确认前置资格 producer 已产出 fresh 快照后，才可在灰度范围内打开 `P3_QUALIFICATION_SNAPSHOT`。
-5. 先打开广告 P2 Outbox；连续观察通过后，最后才允许打开 `P2_JOIN_OUTBOX_ENABLED`。加群开关仍以真实前置快照为硬条件，不得伪造或复用入群后资格结果。
+1. 先运行带 metrics token 的生产 preflight，并确认 reconciliation 无未解释老化、广告 pending/unknown 为 0、session contention 没有新增。
+2. 写入可审计的账号、群、campaign/run scope guard；scope 缺失时保持所有发送 flags 关闭。
+3. 依次验证 `P3_ENTITY_CACHE`、`P3_GROUP_FACT_CACHE`、`P3_SURVIVAL_CACHE`，每次只改变一个 flag。
+4. 真实资格 producer 产出版本匹配的 fresh 入群前快照后，才允许启用 `P3_QUALIFICATION_SNAPSHOT`。
+5. 先验证广告 P2 Outbox；只有广告门禁稳定且 scope guard 仍匹配，才允许最后启用 `P2_JOIN_OUTBOX_ENABLED`。禁止伪造或复用入群后资格结果。
 
-每次只改变一个开关，观察至少一个稳定窗口；任何未知结果必须进入 reconciliation，禁止自动重发。
+每个 flag 变更都要记录 UTC 时间、镜像 digest、迁移 revision、账号/群/campaign/run scope 和回滚点。任何未知结果必须进入 reconciliation，禁止自动重发。
 
-**停止条件**：广告 pending/unknown 非零且不能在一个 reconciliation 窗口内解释、加群未知结果持续增加、预算跳过率或 flood wait 显著回归、重复目标率上升、Actor fencing 或 lease contention 非零，立即关闭最近启用的开关并保持 shadow。
+**停止条件**：广告 pending/unknown、加群未知结果、预算跳过率、flood wait、重复目标率、Actor fencing 或 lease contention 任一回归，立即关闭最近启用的 flag 并回到 shadow。
 
-### P6.4：放量、观察与验收
+### P6.4：直接生产观察与验收
 
-灰度通过后，按账号和群逐步扩大范围，每次扩展不超过一倍，保持原有预算和发送并发。连续观察 24–48 小时，完成日报和最终验收记录。
+直接生产验证通过后连续观察 24–48 小时，保持原有预算和发送并发，记录日报、门禁指标和回滚触发器。观察窗口未完成前，P6 不得标记完成。
 
 ## 发布门禁
 
@@ -107,18 +107,18 @@ P5 必须先提供并由 Codex 验收：成员分类、Guardian/owned group 统�
 2. 对未知结果目标暂停同目标新任务，等待 reconciliation 核验；保留 attempt、receipt、evidence 和审计记录。
 3. 应用回滚只回滚应用镜像和可逆配置；数据库仅执行已验证的向后兼容迁移，不删除已写入操作、回执或快照。
 4. 若 P5 前端或 API 回归，单独回滚前端/API 版本，保持 P2/P3 数据和审计链完整。
-5. 回滚后重新运行 P6.1 约束检查和 P6.2 shadow 观察，连续稳定后才允许重试灰度。
+5. 回滚后重新运行 P6.1 约束检查和 P6.2 shadow 观察，连续稳定后才允许重试直接生产验证。
 
 ## 预计工期
 
 - P6.0 交接与代码冻结：1–2 人日。
 - P6.1 隔离 PostgreSQL/Redis 验收：1–2 人日。
 - P6.2 test 环境 Shadow：1–2 人日，含一个高峰窗口。
-- P6.3 Telegram 灰度：2–4 人日，视账号和群的观察窗口而定。
+- P6.3 直接生产验证：2–4 人日，视账号和群的观察窗口而定。
 - P6.4 24–48 小时观察与最终验收：2–3 人日。
 
-总计约 7–13 人日；真实 Telegram 灰度受账号登录、群权限和外部 flood wait 影响，不能承诺固定时长。
+总计约 7–13 人日；直接生产验证受账号登录、群权限和外部 flood wait 影响，不能承诺固定时长。
 
 ## 完成定义
 
-只有在 P5 交付确认、隔离数据库门禁通过、test shadow 稳定、受控灰度通过、24–48 小时观察无门禁回归，并完成回滚演练与审计记录后，P6 才标记为完成。代码通过不等于生产放行；生产放行必须保留独立的变更记录和业务负责人批准。
+只有在 P5 交付确认、隔离数据库门禁通过、test shadow 稳定、直接生产验证通过、24–48 小时观察无门禁回归，并完成回滚演练与审计记录后，P6 才标记为完成。代码通过不等于生产放行；生产放行必须保留独立的变更记录和业务负责人批准。
