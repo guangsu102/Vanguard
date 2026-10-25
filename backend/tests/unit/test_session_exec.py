@@ -373,6 +373,7 @@ async def test_busy_owner_defers_without_leaving_a_stale_waiting_write():
         await asyncio.wait_for(started.wait(), 1)
         second = await asyncio.wait_for(forward(2, "join", client=client, timeout=2), 1)
         assert second["result"]["reason"] == "session_owner_capacity_wait"
+        assert second["interval"] == session_exec.CAPACITY_WAIT_RETRY_SECONDS
         assert executed == [1]
         release.set()
         assert (await first)["result"]["processed"] == 1

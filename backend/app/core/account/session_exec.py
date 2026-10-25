@@ -48,6 +48,10 @@ REPLY_MARGIN_SECONDS = 15.0
 # Non-blocking poll cadence on the owner side; blocking BRPOP would hold a
 # pooled connection and collide with the shared client's socket timeout.
 POLL_INTERVAL_SECONDS = 0.5
+# Capacity contention is transient: retry sooner than the old 30 second
+# cadence so a freed owner slot is not left idle for a full scheduler tick.
+# Keep this bounded and explicit; callers still apply their own queue/backoff.
+CAPACITY_WAIT_RETRY_SECONDS = 15
 
 
 @dataclass
@@ -370,7 +374,8 @@ async def serve_requests(
                     queued.append((request, reply_key))
                     continue
                 await _reply(client, reply_key, {"result": {"processed": 0,
-                    "reason": "session_owner_capacity_wait", "retryable": True}, "interval": 30})
+                    "reason": "session_owner_capacity_wait", "retryable": True},
+                    "interval": CAPACITY_WAIT_RETRY_SECONDS})
                 continue
             task = asyncio.create_task(execute_and_reply(request, reply_key))
             inflight.add(task)
