@@ -111,7 +111,9 @@ async def test_growth_pool_refreshes_stale_error_wrapper_before_protected_stage(
     from app.core.account.models import AccountStatus
     from app.core.scheduler.growth_dispatch import ensure_growth_account_pool
 
-    account = await test_db.get(TelegramAccount, 1)
+    # The shared test DB does not guarantee a seeded account id; the helper
+    # only needs the durable identity before handing it to ``sync_from_db``.
+    account = TelegramAccount(id=1, session_name="growth-test-account")
     stale = Obj(status=AccountStatus.ERROR)
     pool = Obj(
         get_account_by_id=AsyncMock(return_value=stale),
