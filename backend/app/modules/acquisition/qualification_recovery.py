@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.orm import lazyload
 
 
 async def repair(db: Any, client: Any, now: datetime) -> dict[str, int]:
@@ -104,10 +105,16 @@ async def _recover_stale_claims(db: Any, *, now: datetime, limit: int = 32) -> i
     )
     recovered = 0
     for row in rows:
-        membership = await db.get(
-            GroupAccountMembership,
-            row.membership_id,
-            with_for_update=True,
+        # ``GroupAccountMembership.account`` uses joined loading.  A plain
+        # ``Session.get(..., with_for_update=True)`` therefore emits an outer
+        # join and PostgreSQL rejects the lock as applying to its nullable
+        # side.  This repair only needs membership columns, so suppress the
+        # relationship load and lock the membership row directly.
+        membership = await db.scalar(
+            select(GroupAccountMembership)
+            .options(lazyload(GroupAccountMembership.account))
+            .where(GroupAccountMembership.id == row.membership_id)
+            .with_for_update(skip_locked=True)
         )
         action = recover_stale_review_row(row, membership, now=now)
         if row.next_retry_at is None:
