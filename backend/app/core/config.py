@@ -693,6 +693,12 @@ class Settings(BaseSettings):
             errors.append(
                 "P5_RELEASE_ID must be set when P5_ROLLOUT_MODE is canary, cohort or full in production"
             )
+        if self.P2_OUTBOX_ENABLED and (
+            self.P2_JOIN_OUTBOX_ENABLED or self.P2_AD_OUTBOX_ENABLED
+        ) and not self.P3_QUALIFICATION_SNAPSHOT:
+            errors.append(
+                "P3_QUALIFICATION_SNAPSHOT must be enabled before enabling a P2 Outbox lane"
+            )
         if self.P2_DIRECT_SCOPE_ENABLED:
             if not self.p2_direct_scope_accounts:
                 errors.append("P2_DIRECT_SCOPE_ACCOUNT_IDS must contain at least one account")

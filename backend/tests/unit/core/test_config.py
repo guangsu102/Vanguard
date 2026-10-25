@@ -81,6 +81,21 @@ def test_production_direct_scope_is_limited_to_two_accounts_and_groups():
             P2_DIRECT_SCOPE_GROUP_IDS="231,178",
             P2_DIRECT_SCOPE_RUN_ID="p6-direct-20261025",
         )
+
+
+def test_production_p2_outbox_requires_immutable_qualification_snapshots():
+    with pytest.raises(ValueError, match="P3_QUALIFICATION_SNAPSHOT"):
+        _production_settings(
+            P2_OUTBOX_ENABLED=True,
+            P2_JOIN_OUTBOX_ENABLED=True,
+            P3_QUALIFICATION_SNAPSHOT=False,
+        )
+    with pytest.raises(ValueError, match="P3_QUALIFICATION_SNAPSHOT"):
+        _production_settings(
+            P2_OUTBOX_ENABLED=True,
+            P2_AD_OUTBOX_ENABLED=True,
+            P3_QUALIFICATION_SNAPSHOT=False,
+        )
     with pytest.raises(ValueError, match="at most two groups"):
         _production_settings(
             P2_DIRECT_SCOPE_ENABLED=True,
