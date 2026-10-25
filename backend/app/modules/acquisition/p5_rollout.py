@@ -734,8 +734,13 @@ async def _reconciliation_health(db: Any, now: datetime) -> dict[str, Any]:
     discovered = func.coalesce(
         ReconciliationTask.first_discovered_at, ReconciliationTask.created_at
     )
+    # ``scalars()`` only returns the first selected expression.  This query
+    # needs both the threshold and discovery timestamp, so use ``execute()``
+    # and keep the row tuples intact.  Production databases created before
+    # P2 may contain NULL discovery timestamps; those remain safely ignored
+    # below while the preflight still reports the rest of the queue.
     rows = (
-        await db.scalars(
+        await db.execute(
             select(
                 ReconciliationTask.age_threshold_seconds,
                 discovered,
