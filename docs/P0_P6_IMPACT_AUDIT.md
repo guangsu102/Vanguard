@@ -57,3 +57,12 @@
 ## 结论
 
 当前 P0–P6 方案存在可验证的结构性问题：共享预算和容量门禁会直接影响加群/广告，P2 关闭时 legacy 发送没有统一幂等保护，P3/P4 关闭时读取与发送仍争抢资源，P5/P6 缺少一致的发布安全网。故生产安全结论为：继续使用已恢复的 legacy 主流程，保持 P2–P5 关闭，废弃 P6.3/P6.4，不进行生产灰度；先修复共享门禁、镜像一致性、历史积压和回归门禁，再重新评估。
+
+## 已执行的安全改造
+
+- P5 `mode=off` 会清理遗留 `STOPPED_KEY`，只记录 rollback 审计，不阻断 legacy 加群/广告。
+- P2 Outbox 在未启用 P3 immutable qualification snapshot 时被配置校验拒绝。
+- P1 关闭时 legacy inbox 使用独立的 batch/lease 配置，避免 rollout 参数改变旧路径。
+- legacy 广告预算等待现在包含明确的 `retry_at` 和 `counts_as_business_skip=false`，便于调度重试和指标区分。
+
+上述改造只改变本地代码和测试；生产 flags、Telegram、共享 PostgreSQL/Redis 均未改变。
