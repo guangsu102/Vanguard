@@ -1402,12 +1402,10 @@ class AccountPool:
         try:
             if account.proxy_mode == ProxyMode.STATIC:
                 if account.static_proxy is None:
-                    if account.static_proxy_id is None or self._static_proxy_resolver is None:
-                        raise RuntimeError(
-                            f"Static proxy {account.static_proxy_id} is not loaded for account {account.account_id}"
-                        )
-                    account.static_proxy = await self._static_proxy_resolver(
-                        account.static_proxy_id
+                    account.static_proxy = await self._resolve_account_static_proxy(
+                        account_id=account.account_id,
+                        proxy_mode=ProxyMode.STATIC,
+                        static_proxy_id=account.static_proxy_id,
                     )
                 return account.static_proxy.to_proxy_info()
 

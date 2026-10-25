@@ -471,6 +471,57 @@ async def test_add_account_from_db_rejects_unavailable_static_proxy(
 
 
 @pytest.mark.asyncio
+async def test_acquire_proxy_loads_static_proxy_from_database_without_injected_resolver(
+    monkeypatch,
+):
+    """A runtime pool must resolve a static proxy when no custom resolver is wired."""
+    authoritative_proxy = SimpleNamespace(
+        id=20,
+        protocol="socks5",
+        host="authoritative.proxy.test",
+        port=1080,
+        username="user",
+        password="pass",
+        is_active=True,
+        consecutive_failures=0,
+    )
+
+    class FakeDb:
+        async def get(self, _model, proxy_id):
+            assert proxy_id == 20
+            return authoritative_proxy
+
+    @asynccontextmanager
+    async def fake_get_db_session():
+        yield FakeDb()
+
+    monkeypatch.setattr("app.core.config.get_settings", lambda: SimpleNamespace(PROXY_PROVIDER="evomi"))
+    monkeypatch.setattr("app.core.database.get_db_session", fake_get_db_session)
+
+    pool = AccountPool()
+    account = await pool.add_account(
+        account_id=35,
+        phone="+10000000035",
+        session_name="static_proxy_fallback",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        session_string="session",
+        proxy_mode=ProxyMode.STATIC,
+        static_proxy_id=20,
+    )
+
+    proxy = await pool._acquire_proxy(account)
+
+    assert proxy is not None
+    assert proxy.host == "authoritative.proxy.test"
+    assert proxy.port == 1080
+    assert proxy.username == "user"
+    assert account.static_proxy is not None
+    assert account.static_proxy.proxy_id == 20
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("proxy_is_active", "consecutive_failures"),
     [(False, 0), (True, 3)],
