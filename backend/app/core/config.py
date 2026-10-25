@@ -164,6 +164,17 @@ class Settings(BaseSettings):
     P2_OUTBOX_LEASE_SECONDS: int = Field(default=300, ge=30, le=1800)
     P2_RECONCILIATION_MAX_AGE_SECONDS: int = Field(default=3600, ge=60, le=604800)
 
+    # Explicit P2/P6 direct-production scope.  It is disabled by default and
+    # therefore cannot widen a normal P2 canary.  When enabled, producers are
+    # structurally limited to the two approved accounts/groups and campaign;
+    # an operator supplied run id is mandatory before any operation can be
+    # enqueued.
+    P2_DIRECT_SCOPE_ENABLED: bool = Field(default=False)
+    P2_DIRECT_SCOPE_ACCOUNT_IDS: str = Field(default="33,35")
+    P2_DIRECT_SCOPE_GROUP_IDS: str = Field(default="231,178")
+    P2_DIRECT_SCOPE_CAMPAIGN_ID: int = Field(default=1, ge=1)
+    P2_DIRECT_SCOPE_RUN_ID: str = Field(default="")
+
     # P3 Telegram read-cache and immutable qualification snapshot rollout.
     # Each lane is independently reversible; disabling a flag retains cache,
     # evidence and snapshots while falling back to the existing Actor/read
@@ -339,6 +350,48 @@ class Settings(BaseSettings):
         if mode == "shadow":
             return False
         return self.p5_cohort_member(int(account_id))
+
+    @staticmethod
+    def _positive_ids(value: str) -> set[int]:
+        return {
+            int(item.strip())
+            for item in (value or "").split(",")
+            if item.strip().isdigit() and int(item.strip()) > 0
+        }
+
+    @property
+    def p2_direct_scope_accounts(self) -> set[int]:
+        return self._positive_ids(self.P2_DIRECT_SCOPE_ACCOUNT_IDS)
+
+    @property
+    def p2_direct_scope_groups(self) -> set[int]:
+        return self._positive_ids(self.P2_DIRECT_SCOPE_GROUP_IDS)
+
+    def p2_direct_scope_allows(
+        self,
+        *,
+        account_id: int,
+        group_id: int,
+        campaign_id: int | None = None,
+        run_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Apply the explicit direct-production account/group/campaign fence."""
+
+        if not self.P2_DIRECT_SCOPE_ENABLED:
+            return True, None
+        if int(account_id) not in self.p2_direct_scope_accounts:
+            return False, "p2_direct_scope_account_blocked"
+        if int(group_id) not in self.p2_direct_scope_groups:
+            return False, "p2_direct_scope_group_blocked"
+        if campaign_id is not None and int(campaign_id) != int(self.P2_DIRECT_SCOPE_CAMPAIGN_ID):
+            return False, "p2_direct_scope_campaign_blocked"
+        configured_run = (self.P2_DIRECT_SCOPE_RUN_ID or "").strip()
+        supplied_run = (run_id or "").strip()
+        if not configured_run:
+            return False, "p2_direct_scope_run_id_required"
+        if supplied_run != configured_run:
+            return False, "p2_direct_scope_run_id_mismatch"
+        return True, None
 
     @property
     def p5_canary_accounts(self) -> set[int]:
@@ -640,6 +693,19 @@ class Settings(BaseSettings):
             errors.append(
                 "P5_RELEASE_ID must be set when P5_ROLLOUT_MODE is canary, cohort or full in production"
             )
+        if self.P2_DIRECT_SCOPE_ENABLED:
+            if not self.p2_direct_scope_accounts:
+                errors.append("P2_DIRECT_SCOPE_ACCOUNT_IDS must contain at least one account")
+            elif len(self.p2_direct_scope_accounts) > 2:
+                errors.append("P2_DIRECT_SCOPE_ACCOUNT_IDS may contain at most two accounts")
+            if not self.p2_direct_scope_groups:
+                errors.append("P2_DIRECT_SCOPE_GROUP_IDS must contain at least one group")
+            elif len(self.p2_direct_scope_groups) > 2:
+                errors.append("P2_DIRECT_SCOPE_GROUP_IDS may contain at most two groups")
+            if not self.P2_DIRECT_SCOPE_RUN_ID.strip():
+                errors.append(
+                    "P2_DIRECT_SCOPE_RUN_ID must be set when P2_DIRECT_SCOPE_ENABLED is enabled in production"
+                )
         if errors:
             raise ValueError("; ".join(errors))
         return self

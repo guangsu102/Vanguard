@@ -42,6 +42,7 @@ async def produce_join_outbox(
     *,
     account_pool: Any = None,
     limit: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Materialize pre-join candidates into the durable P2 Outbox.
 
@@ -61,6 +62,16 @@ async def produce_join_outbox(
     # without its ledger row cannot satisfy enqueue_operation's invariant.
     if not settings.BUDGET_LEDGER_ENABLED:
         return {"enqueued": 0, "skipped": 0, "reason": "budget_ledger_disabled"}
+    direct_run_id = (run_id or settings.P2_DIRECT_SCOPE_RUN_ID or "").strip() or None
+    if settings.P2_DIRECT_SCOPE_ENABLED and not direct_run_id:
+        return {"enqueued": 0, "skipped": 0, "reason": "p2_direct_scope_run_id_required"}
+    if settings.P2_DIRECT_SCOPE_ENABLED:
+        allowed, reason = settings.p2_direct_scope_allows(
+            account_id=int(account_id), group_id=next(iter(settings.p2_direct_scope_groups), 0),
+            run_id=direct_run_id,
+        )
+        if not allowed and reason == "p2_direct_scope_account_blocked":
+            return {"enqueued": 0, "skipped": 0, "reason": reason}
 
     from app.core.group.models import Group, GroupAccountMembership
     from app.modules.acquisition.automation import (
@@ -124,6 +135,18 @@ async def produce_join_outbox(
         if stats["enqueued"] >= maximum:
             break
         target_key = str(int(group.group_id))
+        if settings.P2_DIRECT_SCOPE_ENABLED:
+            scope_group_id = (
+                int(group.id)
+                if int(group.id) in settings.p2_direct_scope_groups
+                else int(group.group_id)
+            )
+            allowed, reason = settings.p2_direct_scope_allows(
+                account_id=int(account_id), group_id=scope_group_id, run_id=direct_run_id,
+            )
+            if not allowed:
+                stats["skipped"] += 1
+                continue
         fact = facts.get(int(group.id)) or {}
         if not fresh(fact, group, int(account_id), now) or not ready(fact):
             stats["skipped"] += 1
@@ -194,7 +217,7 @@ async def produce_join_outbox(
             kind="join_group",
             account_id=int(account_id),
             target_key=target_key,
-            run_id=f"group:{int(group.id)}",
+            run_id=direct_run_id or f"group:{int(group.id)}",
             campaign_id=None,
             snapshot_id=snapshot.snapshot_id,
             group_version=snapshot.group_version,
@@ -261,7 +284,7 @@ async def produce_join_outbox(
                 budget_reservation_id=reservation_id,
                 idempotency_key=idem,
                 priority=10,
-                run_id=f"group:{int(group.id)}",
+                run_id=direct_run_id or f"group:{int(group.id)}",
                 now=now,
             )
             if reused:
@@ -298,6 +321,7 @@ async def produce_ad_outbox(
     *,
     account_pool: Any = None,
     limit: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Materialize eligible ad candidates into the durable P2 Outbox.
 
@@ -311,6 +335,11 @@ async def produce_ad_outbox(
         return {"enqueued": 0, "skipped": 0, "reason": "p2_outbox_disabled"}
     if not settings.P3_QUALIFICATION_SNAPSHOT:
         return {"enqueued": 0, "skipped": 0, "reason": "p3_snapshot_disabled"}
+    direct_run_id = (run_id or settings.P2_DIRECT_SCOPE_RUN_ID or "").strip() or None
+    if settings.P2_DIRECT_SCOPE_ENABLED and not direct_run_id:
+        return {"enqueued": 0, "skipped": 0, "reason": "p2_direct_scope_run_id_required"}
+    if settings.P2_DIRECT_SCOPE_ENABLED and int(account_id) not in settings.p2_direct_scope_accounts:
+        return {"enqueued": 0, "skipped": 0, "reason": "p2_direct_scope_account_blocked"}
 
     from app.core.account.budget_ledger import reserve
     from app.modules.acquisition.automation import AcquisitionAutomationService
@@ -354,6 +383,22 @@ async def produce_ad_outbox(
             if group is None:
                 stats["skipped"] += 1
                 continue
+            operation_run_id = direct_run_id
+            if settings.P2_DIRECT_SCOPE_ENABLED:
+                scope_group_id = (
+                    int(group.id)
+                    if int(group.id) in settings.p2_direct_scope_groups
+                    else int(group.group_id)
+                )
+                allowed, reason = settings.p2_direct_scope_allows(
+                    account_id=int(account_id),
+                    group_id=scope_group_id,
+                    campaign_id=int(campaign.id),
+                    run_id=operation_run_id,
+                )
+                if not allowed:
+                    stats["skipped"] += 1
+                    continue
             # Qualification snapshots are keyed by the canonical Group
             # telegram id (the same value used by qualification_service),
             # while the membership may carry a marked peer alias.
@@ -379,6 +424,7 @@ async def produce_ad_outbox(
                 target_key=target_key,
                 account_id=int(account_id),
                 campaign_id=int(campaign.id),
+                run_id=operation_run_id,
                 required_scope="ad",
             )
             if snapshot is None:
@@ -425,7 +471,7 @@ async def produce_ad_outbox(
                 kind="send_ad",
                 account_id=int(account_id),
                 target_key=target_key,
-                run_id=None,
+                run_id=operation_run_id,
                 campaign_id=int(campaign.id),
                 snapshot_id=snapshot.snapshot_id,
                 group_version=snapshot.group_version,
@@ -489,6 +535,7 @@ async def produce_ad_outbox(
                     budget_reservation_id=reservation_id,
                     idempotency_key=idem,
                     priority=70,
+                    run_id=operation_run_id,
                     now=now,
                 )
                 await db.commit()
@@ -780,6 +827,7 @@ async def execute_owner_outbox(
             int(account_id),
             account_pool=account_pool,
             limit=settings.P2_OUTBOX_BATCH_SIZE,
+            run_id=(settings.P2_DIRECT_SCOPE_RUN_ID or "").strip() or None,
         )
     else:
         produced = await produce_join_outbox(
@@ -787,6 +835,7 @@ async def execute_owner_outbox(
             int(account_id),
             account_pool=account_pool,
             limit=settings.P2_OUTBOX_BATCH_SIZE,
+            run_id=(settings.P2_DIRECT_SCOPE_RUN_ID or "").strip() or None,
         )
     actor_owner = f"p2-actor:{PROCESS_ID}:{int(account_id)}"
     row = await dispatch_outbox_once(

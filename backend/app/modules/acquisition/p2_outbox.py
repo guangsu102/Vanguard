@@ -173,6 +173,35 @@ def _validate_snapshot(
         raise ValueError("p2_evidence_hash_invalid")
 
 
+def direct_scope_error(
+    *,
+    account_id: int,
+    group_ids: list[int],
+    campaign_id: int | None,
+    run_id: str | None,
+) -> str | None:
+    """Return a direct-production scope violation, or ``None`` when allowed."""
+
+    from app.core.config import settings
+
+    if not settings.P2_DIRECT_SCOPE_ENABLED:
+        return None
+    if not group_ids:
+        return "p2_direct_scope_group_blocked"
+    for group_id in group_ids:
+        allowed, reason = settings.p2_direct_scope_allows(
+            account_id=int(account_id),
+            group_id=int(group_id),
+            campaign_id=campaign_id,
+            run_id=run_id,
+        )
+        if allowed:
+            return None
+        if reason != "p2_direct_scope_group_blocked":
+            return reason
+    return "p2_direct_scope_group_blocked"
+
+
 async def _validate_p3_snapshot(
     db: Any,
     *,
@@ -247,6 +276,32 @@ async def enqueue_operation(
         raise ValueError("p2_target_key_invalid")
     if not budget_reservation_id:
         raise ValueError("p2_budget_reservation_required")
+    # The direct-production release fence is enforced again at the durable
+    # write boundary so an alternate caller cannot bypass producer filtering.
+    # Payloads may carry both the internal Group id and the Telegram id; either
+    # one is sufficient to identify an explicitly approved target.
+    scope_group_ids: list[int] = []
+    for value in (
+        payload.get("group_db_id"),
+        payload.get("group_id"),
+        payload.get("telegram_group_id"),
+    ):
+        try:
+            if value is not None:
+                scope_group_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not scope_group_ids:
+        try:
+            scope_group_ids.append(int(target_key))
+        except (TypeError, ValueError):
+            pass
+    scope_error = direct_scope_error(
+        account_id=int(account_id), group_ids=scope_group_ids,
+        campaign_id=campaign_id, run_id=run_id,
+    )
+    if scope_error:
+        raise P2OperationError(scope_error)
     _validate_snapshot(
         snapshot_id=snapshot_id,
         group_version=group_version,
@@ -1355,6 +1410,34 @@ async def dispatch_outbox_once(
     envelope = json.loads(row.payload_json or "{}")
     payload = envelope.get("payload") if isinstance(envelope, dict) else {}
     payload = payload if isinstance(payload, dict) else {}
+    scope_group_ids: list[int] = []
+    for value in (
+        payload.get("group_db_id"),
+        payload.get("group_id"),
+        payload.get("telegram_group_id"),
+    ):
+        try:
+            if value is not None:
+                scope_group_ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    if not scope_group_ids:
+        try:
+            scope_group_ids.append(int(operation.target_key))
+        except (TypeError, ValueError):
+            pass
+    scope_error = direct_scope_error(
+        account_id=operation.account_id,
+        group_ids=scope_group_ids,
+        campaign_id=operation.campaign_id,
+        run_id=operation.run_id,
+    )
+    if scope_error:
+        await finish_outbox(
+            db, row.id, owner=owner, fencing_token=fencing_token,
+            state="dead", error=scope_error, now=now,
+        )
+        return row
     await _owned_outbox(db, row.id, owner, fencing_token, datetime.utcnow())
     try:
         await _validate_p3_snapshot(

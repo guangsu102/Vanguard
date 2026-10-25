@@ -29,6 +29,7 @@ from app.modules.acquisition.p2_outbox import (
     P2TargetBlocked,
     UnknownExternalOutcome,
     claim_outbox,
+    direct_scope_error,
     dispatch_outbox_once,
     enqueue_operation,
     mark_reconciliation_required,
@@ -43,6 +44,39 @@ from app.modules.acquisition.qualification_snapshot import (
 )
 
 EVIDENCE_HASH = hashlib.sha256(b"p2-evidence").hexdigest()
+
+
+def test_direct_scope_error_fails_closed_for_durable_and_dispatch_boundaries(monkeypatch):
+    monkeypatch.setattr(settings, "P2_DIRECT_SCOPE_ENABLED", True)
+    monkeypatch.setattr(settings, "P2_DIRECT_SCOPE_ACCOUNT_IDS", "33,35")
+    monkeypatch.setattr(settings, "P2_DIRECT_SCOPE_GROUP_IDS", "231,178")
+    monkeypatch.setattr(settings, "P2_DIRECT_SCOPE_CAMPAIGN_ID", 1)
+    monkeypatch.setattr(settings, "P2_DIRECT_SCOPE_RUN_ID", "p6-direct-20261025")
+
+    assert direct_scope_error(
+        account_id=33,
+        group_ids=[231, 1226537673],
+        campaign_id=1,
+        run_id="p6-direct-20261025",
+    ) is None
+    assert direct_scope_error(
+        account_id=2,
+        group_ids=[231],
+        campaign_id=1,
+        run_id="p6-direct-20261025",
+    ) == "p2_direct_scope_account_blocked"
+    assert direct_scope_error(
+        account_id=33,
+        group_ids=[999],
+        campaign_id=1,
+        run_id="p6-direct-20261025",
+    ) == "p2_direct_scope_group_blocked"
+    assert direct_scope_error(
+        account_id=33,
+        group_ids=[231],
+        campaign_id=1,
+        run_id="wrong-run",
+    ) == "p2_direct_scope_run_id_mismatch"
 
 
 async def _fixtures(db):

@@ -73,3 +73,10 @@ P0 的共享预算、reservation settle、session lease、wrong-session quaranti
 - 加群 Actor 和 reconciliation 会将确认结果投影回 `GroupAccountMembership` 与 `AutoJoinAttempt`，预算 reservation 按其实际零读单元语义结算。实现已通过本地聚焦回归，但尚未完成生产 canary；`P2_JOIN_OUTBOX_ENABLED` 仍保持关闭，待 canary 前继续验证 scope 隔离、未知结果保护和老化任务门禁。
 - 该补接只证明本地 durable producer 和状态边界，未连接生产 PostgreSQL/Redis，也未完成生产 canary；不能据此宣称 P0–P5 已放行。
 - 本次本地验证：P2 producer/snapshot/Outbox/join budget 共 `48 passed`；P0–P4 聚焦 release gate 共 `155 passed`；隔离 PostgreSQL release gate 因本机未提供测试数据库而 `11 skipped`。生产 PostgreSQL/Redis 未连接。
+
+## 2026-10-25 Direct production scope guard
+
+- 新增 fail-closed direct scope 配置，默认关闭：账号仅允许 `33,35`，群仅允许 `231,178`（producer 同时兼容内部 `Group.id` 与 Telegram `group_id`），广告 campaign 仅允许 `1`。
+- 启用 scope 后必须提供非空 `P2_DIRECT_SCOPE_RUN_ID`；run id 会写入广告 snapshot envelope、幂等键和 `GrowthOperation.run_id`，并在 Outbox durable enqueue 与 Actor dispatch 两个边界再次校验。
+- scope 不会自动开启 P2/P3 flags；当前未设置 production run id、未连接生产 PostgreSQL/Redis、未调用 Telegram，因此该修改不构成生产放行。配置范围或 run id 缺失/不匹配时 producer/Outbox fail-closed。
+- 本地验证：P2 Outbox、producer scope、config 回归 `39 passed`，Ruff 通过。

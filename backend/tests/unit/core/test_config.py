@@ -33,6 +33,63 @@ def test_owned_group_execution_defaults_off_and_kill_switch_is_available():
     assert configured.OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS == 2000
 
 
+def test_p2_direct_scope_is_fail_closed_and_defaults_to_requested_canary_shape():
+    configured = Settings(_env_file=None)
+
+    assert configured.P2_DIRECT_SCOPE_ENABLED is False
+    assert configured.p2_direct_scope_accounts == {33, 35}
+    assert configured.p2_direct_scope_groups == {178, 231}
+    assert configured.p2_direct_scope_allows(
+        account_id=33, group_id=231, campaign_id=1, run_id="any"
+    ) == (True, None)
+
+
+def test_p2_direct_scope_requires_run_id_and_rejects_out_of_scope_values():
+    configured = Settings(
+        _env_file=None,
+        P2_DIRECT_SCOPE_ENABLED=True,
+        P2_DIRECT_SCOPE_RUN_ID="p6-canary-20261025",
+    )
+
+    assert configured.p2_direct_scope_allows(
+        account_id=33, group_id=231, campaign_id=1,
+        run_id="p6-canary-20261025",
+    ) == (True, None)
+    assert configured.p2_direct_scope_allows(
+        account_id=33, group_id=231, campaign_id=1,
+        run_id="wrong-run",
+    ) == (False, "p2_direct_scope_run_id_mismatch")
+    assert configured.p2_direct_scope_allows(
+        account_id=2, group_id=231, campaign_id=1,
+        run_id="p6-canary-20261025",
+    ) == (False, "p2_direct_scope_account_blocked")
+    assert configured.p2_direct_scope_allows(
+        account_id=33, group_id=999, campaign_id=1,
+        run_id="p6-canary-20261025",
+    ) == (False, "p2_direct_scope_group_blocked")
+    assert configured.p2_direct_scope_allows(
+        account_id=33, group_id=231, campaign_id=2,
+        run_id="p6-canary-20261025",
+    ) == (False, "p2_direct_scope_campaign_blocked")
+
+
+def test_production_direct_scope_is_limited_to_two_accounts_and_groups():
+    with pytest.raises(ValueError, match="at most two accounts"):
+        _production_settings(
+            P2_DIRECT_SCOPE_ENABLED=True,
+            P2_DIRECT_SCOPE_ACCOUNT_IDS="33,35,2",
+            P2_DIRECT_SCOPE_GROUP_IDS="231,178",
+            P2_DIRECT_SCOPE_RUN_ID="p6-direct-20261025",
+        )
+    with pytest.raises(ValueError, match="at most two groups"):
+        _production_settings(
+            P2_DIRECT_SCOPE_ENABLED=True,
+            P2_DIRECT_SCOPE_ACCOUNT_IDS="33,35",
+            P2_DIRECT_SCOPE_GROUP_IDS="231,178,193",
+            P2_DIRECT_SCOPE_RUN_ID="p6-direct-20261025",
+        )
+
+
 def test_owned_group_operation_accepts_2000_accounts_and_rejects_2001():
     configured = Settings(_env_file=None, OWNED_GROUP_ROLLOUT_MAX_ACCOUNTS=2000)
 
