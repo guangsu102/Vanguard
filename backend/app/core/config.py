@@ -268,8 +268,8 @@ class Settings(BaseSettings):
     # master and lane flags stay mandatory.  ``shadow`` runs the controller
     # (selection, gates, records) without allowing any real release traffic.
     # The runtime kill switch is the persisted stopped state written by the
-    # observer; it blocks new ads/join admission for the stopped cohort even
-    # after the mode returns to ``off``.
+    # observer; mode ``off`` must never leave a stop key that blocks legacy
+    # ads/join admission.
     P5_ROLLOUT_MODE: str = Field(
         default="off",
         description="P5 rollout mode: off|shadow|canary|cohort|full",

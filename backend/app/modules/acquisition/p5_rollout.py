@@ -1229,6 +1229,43 @@ async def _engage_stop_without_record(
     )
 
 
+async def _rollback_without_legacy_stop(
+    db: Any, cache: Any, release: Any, now: datetime
+) -> None:
+    """Record an operator rollback without blocking the legacy dispatcher.
+
+    ``off`` is the default production mode.  It must be a true bypass for the
+    P5 traffic control plane: stale kill-switch state is removed and the
+    release is marked rolled back for audit, while legacy join/ad admission
+    remains available.
+    """
+    import structlog
+
+    await clear_stopped(cache)
+    if release.status != "rolled_back":
+        release.status = "rolled_back"
+    if release.rollback_at is None:
+        release.rollback_at = now
+        release.rollback_reason = "p5_rollout_mode_off"
+        release.rollback_metrics_json = json.dumps({}, sort_keys=True)
+        cohort = _json_list(release.cohort_account_ids_json)
+        release.affected_cohort_json = json.dumps(
+            sorted(int(i) for i in cohort if isinstance(i, int))
+        )
+        try:
+            await record_p5_event("rollback")
+        except Exception:
+            pass
+        structlog.get_logger().info(
+            "p5_rollout_disabled_without_legacy_stop",
+            release_id=release.release_id,
+        )
+    try:
+        await db.commit()
+    except Exception:
+        pass
+
+
 def _stage_key() -> str:
     mode = settings.p5_rollout_mode
     if mode == "canary":
@@ -1262,17 +1299,19 @@ async def observe_cycle(
     release = await _load_release(db, release_id)
 
     if mode == "off":
-        # The operator kill switch: an active release whose deployment
-        # returned to off is rolled back and its cohort stays blocked.
+        # ``off`` is a true bypass.  Roll back the release for audit, but do
+        # not leave a STOPPED_KEY that can remove accounts from legacy ads or
+        # join dispatch.
         active = release if release is not None and release.status == "active" else None
         if active is None:
             active = await _latest_active_release(db)
         if active is not None and active.rollback_at is None:
-            await engage_stop(
-                db, cache, active, ["p5_rollout_mode_off"], now, event="rollback"
-            )
-            summary["result"] = "stop"
+            await _rollback_without_legacy_stop(db, cache, active, now)
+            summary["result"] = "off"
             summary["rolled_back_release"] = active.release_id
+        else:
+            await clear_stopped(cache)
+            summary["result"] = "off"
         await _write_state(cache, {
             "mode": mode,
             "release_id": release_id,

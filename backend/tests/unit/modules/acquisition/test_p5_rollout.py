@@ -753,10 +753,9 @@ async def test_mode_off_rolls_back_the_active_release(test_db):
     await p5_rollout.observe_cycle(test_db, cache, now=NOW, infra_ready=True)
     settings.P5_ROLLOUT_MODE = "off"
     summary = await p5_rollout.observe_cycle(test_db, cache, now=NOW + timedelta(minutes=2))
-    assert summary["result"] == "stop"
-    stopped = await p5_rollout.read_stopped(cache)
-    assert stopped["release_id"] == "p5-test-r1"
-    assert "p5_rollout_mode_off" in stopped["reasons"]
+    assert summary["result"] == "off"
+    # Turning P5 off must not block the legacy dispatcher.
+    assert await p5_rollout.read_stopped(cache) is None
     await test_db.commit()
     record = await test_db.get(P5ReleaseRecord, release.id)
     assert record.status == "rolled_back"
@@ -793,7 +792,7 @@ async def test_new_release_clears_the_stop_and_records_recovery(test_db):
     await p5_rollout.observe_cycle(test_db, cache, now=NOW, infra_ready=True)
     settings.P5_ROLLOUT_MODE = "off"
     await p5_rollout.observe_cycle(test_db, cache, now=NOW)
-    assert await p5_rollout.read_stopped(cache) is not None
+    assert await p5_rollout.read_stopped(cache) is None
 
     release_two = await _freeze(test_db, release_id="p5-test-r2", mode="canary")
     summary = await p5_rollout.observe_cycle(
@@ -803,7 +802,9 @@ async def test_new_release_clears_the_stop_and_records_recovery(test_db):
     assert await p5_rollout.read_stopped(cache) is None
     await test_db.commit()
     first = await test_db.get(P5ReleaseRecord, release.id)
-    assert first.recovered_at == NOW + timedelta(hours=1)
+    # ``mode=off`` clears the kill switch without creating a stopped cohort,
+    # so a later release has no P5 stop to recover.
+    assert first.recovered_at is None
     second = await test_db.get(P5ReleaseRecord, release_two.id)
     assert second.status == "active"
 
