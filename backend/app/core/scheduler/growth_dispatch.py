@@ -664,9 +664,13 @@ async def ensure_growth_account_pool(account_pool: Any, account: TelegramAccount
         pool_reason = reason_reader(account_id)
     status_raw = getattr(pooled_account, "status", None)
     status_value = str(getattr(status_raw, "value", status_raw) or "").lower()
+    session_missing = pooled_account is not None and not bool(
+        getattr(pooled_account, "session_exists", True)
+    )
     refresh_pool_account = (
         pooled_account is None
         or pool_reason in {"account_not_in_pool", "account_session_missing"}
+        or session_missing
         or status_value in {
             AccountStatus.ERROR.value,
             AccountStatus.BANNED.value,
