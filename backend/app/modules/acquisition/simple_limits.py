@@ -44,6 +44,24 @@ RELEASE = """
 if redis.call('GET',KEYS[1]) == ARGV[1] then return redis.call('DEL',KEYS[1]) end
 return 0
 """
+REVERT = """
+local time = redis.call('TIME')
+local now = tonumber(time[1])
+local offset = tonumber(ARGV[1] or '0')
+local day = math.floor((now + offset) / 86400)
+if tonumber(redis.call('HGET', KEYS[1], 'day') or '-1') == day then
+ local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0')
+ if used > 0 then
+  redis.call('HSET', KEYS[1], 'used', used - 1)
+ end
+end
+if KEYS[2] then redis.call('DEL', KEYS[2]) end
+if KEYS[3] then
+ local total = tonumber(redis.call('GET', KEYS[3]) or '0')
+ if total > 0 then redis.call('DECR', KEYS[3]) end
+end
+return 1
+"""
 
 
 class Deferred(RuntimeError):
@@ -80,6 +98,17 @@ async def take_ad(redis, account_id: int, group_key: int, *, cap: int,
     reason = res[2] if len(res) > 2 else "ad_cooldown_or_daily_cap"
     if not ok:
         raise Deferred(reason, int(value))
+
+
+async def revert_ad(redis, account_id: int) -> None:
+    """Rollback ad cooldown and count when sending failed before or during RPC."""
+    from app.core.operating_time import operating_date
+    shared = f"risk:account:{account_id}:daily:outbound_message:{operating_date():%Y%m%d}"
+    try:
+        await redis.eval(REVERT, 3, PREFIX + f"ads:{account_id}:count",
+            PREFIX + f"ads:{account_id}:due", shared, 28800)
+    except Exception:
+        pass
 
 
 async def durable_outbound_used(db, account_id: int, now: datetime) -> int:

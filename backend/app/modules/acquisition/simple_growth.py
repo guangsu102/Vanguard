@@ -626,9 +626,10 @@ class GrowthService:
                 AdCampaign.delivery_policy != "ad_only",
                 or_(AdCampaign.start_at.is_(None), AdCampaign.start_at <= now),
                 or_(AdCampaign.end_at.is_(None), AdCampaign.end_at > now))
-            .order_by(Member.next_ad_allowed_at, Member.id, AccountAdBinding.priority.desc()).limit(100))).all()
+            .order_by(Member.next_ad_allowed_at, Member.id.desc(), AccountAdBinding.priority.desc()).limit(100))).all()
         examined = set()
         delivery_attempts = 0
+        redis = await get_redis()
         for member, group, campaign, _binding in rows:
             pair = (member.id, campaign.id)
             if pair in examined:
@@ -664,8 +665,10 @@ class GrowthService:
                 if sent.get("succeeded", 0) > 0:
                     return sent
                 if sent.get("outcome") == "permission_changed":
+                    from app.modules.acquisition.simple_limits import revert_ad
+                    await revert_ad(redis, account_id)
                     delivery_attempts += 1
-                    if delivery_attempts < 3:
+                    if delivery_attempts < 20:
                         continue
                     return sent
                 if sent.get("reason") not in (
@@ -675,7 +678,7 @@ class GrowthService:
                 ):
                     return sent
             except Deferred as exc:
-                if exc.reason == "group_cooldown":
+                if exc.reason in ("group_cooldown", "account_cooldown"):
                     continue
                 raise
         return result("no_due_eligible_target")
@@ -771,7 +774,7 @@ class GrowthService:
                     from app.core.operating_time import operating_day_start
                     durable_ads = await self.db.scalar(select(func.count(AdDeliveryLog.id)).where(
                         AdDeliveryLog.account_id == account_id, AdDeliveryLog.created_at >= operating_day_start(),
-                        AdDeliveryLog.status.in_(["success", "unknown", "failed", "permission_changed"])))
+                        AdDeliveryLog.status == "success"))
                     await release(self.db)
                     await take_ad(redis, account_id, key, cap=cap, account_interval=account_gap,
                                   group_interval=gap, total_cap=limits["total"],
