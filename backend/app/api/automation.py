@@ -1088,7 +1088,11 @@ async def get_probe_queue(db: AsyncSession = Depends(get_db)) -> dict:
 
 @router.get("/ads/capacity")
 async def get_ad_capacity_config(db: AsyncSession = Depends(get_db)) -> dict:
-    return {"code": 0, "message": "success", "data": await get_ad_capacity_settings(db)}
+    from app.core.config import settings
+    config = await get_ad_capacity_settings(db)
+    return {"code": 0, "message": "success", "data": {
+        **config, "growth_mode": "writable_v2" if settings.GROWTH_SIMPLIFIED_ENABLED else "legacy",
+    }}
 
 
 @router.put("/ads/capacity")
@@ -1831,7 +1835,7 @@ async def update_ad_failure_policy(
 class AccountOperationConfigUpdate(BaseModel):
     dynamic_capacity_enabled: Optional[bool] = None
     adaptive_ads_enabled: Optional[bool] = None
-    max_ads_per_day: Optional[int] = Field(None, ge=0, le=30)
+    max_ads_per_day: Optional[int] = Field(None, ge=0, le=300)
     max_verification_messages_per_day: Optional[int] = Field(None, ge=0, le=30)
     max_diagnostic_messages_per_day: Optional[int] = Field(None, ge=0, le=2)
     operation_mode: Optional[str] = Field(None, pattern="^(growth|ad_only)$")
@@ -2121,8 +2125,10 @@ async def get_dynamic_capacity(
             raise HTTPException(404, "Account not found")
         ids = [account_id]
     else:
+        from app.core.config import settings
         ids = list((await db.scalars(select(AccountOperationConfig.account_id).where(
-            AccountOperationConfig.dynamic_capacity_enabled.is_(True)
+            AccountOperationConfig.enabled.is_(True) if settings.GROWTH_SIMPLIFIED_ENABLED
+            else AccountOperationConfig.dynamic_capacity_enabled.is_(True)
         ).order_by(AccountOperationConfig.account_id))).all())
     snapshots = [await capacity_snapshot(db, value) for value in ids]
     return {"code": 0, "data": snapshots}
@@ -2295,6 +2301,9 @@ class GroupFailoverRunRequest(BaseModel):
 
 @router.post("/auto-join/failover/run", status_code=status.HTTP_202_ACCEPTED)
 async def run_group_failover(request: GroupFailoverRunRequest) -> dict:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"code": 0, "message": "disabled", "data": {"reason": "failover_disabled", "processed": 0}}
     result = _enqueue_automation_task(
         recover_orphaned_groups_task,
         "recover_orphaned_groups_task",
@@ -2328,6 +2337,9 @@ async def run_ad_delivery(request: AdDeliveryRunRequest) -> dict:
 
 @router.post("/ads/auto-policy-probe/run", status_code=status.HTTP_202_ACCEPTED)
 async def run_auto_group_ad_policy_probe(request: AdPolicyAutoProbeRunRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"code": 0, "message": "disabled", "data": {"reason": "permission_review_only", "processed": 0}}
     from app.modules.acquisition.qualification_service import policy
     if (await policy(db)).get("enabled"):
         return {"code": 0, "message": "success", "data": {"reason": "qualification_probe_disabled", "processed": 0}}

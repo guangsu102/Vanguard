@@ -53,13 +53,20 @@ def account_capacity_limits(account: Any, config: Any, now: datetime) -> dict[st
         and getattr(account, "is_active", False)
         and _value(getattr(account, "status", None)) == "restricted"
     )
-    ceiling = 0 if blocked else 10 if cautious else 30
+    ceiling = (
+        0
+        if blocked
+        else 10
+        if cautious
+        else max(30, int(getattr(config, "max_ads_per_day", 30) or 30))
+    )
     configured_total = getattr(config, "max_messages_per_day", None)
-    configured_total = max(0, min(62, int(62 if configured_total is None else configured_total)))
+    max_cap = max(62, ceiling + 32)
+    configured_total = max(0, min(max_cap, int(max_cap if configured_total is None else configured_total)))
     total = configured_total
     adaptive = getattr(config, "adaptive_ads_enabled", False) is True
     pace = max(1800 if cautious else 600, int(getattr(config, "message_interval_seconds", 0) or 0))
-    probe = min(ceiling, max(0, int(getattr(config, "max_ads_per_day", 30))))
+    probe = min(ceiling, max(0, int(getattr(config, "max_ads_per_day", 30) or 30)))
     # Adaptive pacing controls the minimum interval, while the configured
     # account limit remains a hard ceiling.  Without the ``min`` an account
     # configured for 30 ads/day at a 10-minute interval was admitted for
@@ -156,7 +163,7 @@ class ActionCapacityFeedbackService:
             )
         if action == "ad_delivery":
             interval = max(600, config.message_interval_seconds or 0)
-            configured = min(30, max(0, config.max_ads_per_day))
+            configured = max(0, int(getattr(config, "max_ads_per_day", 30) or 30))
             limit = (
                 min(configured, 86400 // interval)
                 if getattr(config, "adaptive_ads_enabled", False) is True
@@ -310,11 +317,15 @@ class AccountOutboundBudgetService:
         )
 
     async def _attempts(self, account_id: int, now: datetime) -> list[AccountOutboundAttempt]:
+        from app.core.config import settings
+        retired_growth = and_(AccountOutboundAttempt.category == "ad",
+            AccountOutboundAttempt.state.in_(["reserved", "attempted", "unknown"]))
         return list(
             (
                 await self.db.scalars(
                     select(AccountOutboundAttempt).where(
                         AccountOutboundAttempt.account_id == account_id,
+                        ~retired_growth if settings.GROWTH_SIMPLIFIED_ENABLED else True,
                         or_(
                             AccountOutboundAttempt.state.in_(["attempted", "unknown"]),
                             and_(
@@ -513,6 +524,14 @@ class AccountOutboundBudgetService:
                 next_at.isoformat() if next_at and next_at > now else None
             )
         remaining = max(0, min(limits["total"] - len(today), limits["total"] - len(window)))
+        from app.core.config import settings
+        if settings.GROWTH_SIMPLIFIED_ENABLED:
+            from app.core.operating_time import operating_date
+            from app.core.redis import get_redis
+            cache = await get_redis()
+            shared = int(await cache.get(
+                f"risk:account:{account_id}:daily:outbound_message:{operating_date(now):%Y%m%d}") or 0)
+            remaining = max(0, remaining - shared)
         blockers = []
         if limits["state"] == "blocked":
             blockers.append("account_capacity_unavailable")
@@ -667,6 +686,19 @@ class AccountOutboundBudgetService:
         context: dict | None = None,
         now: datetime | None = None,
     ) -> AccountOutboundAttempt:
+        from app.core.config import settings
+        if settings.GROWTH_SIMPLIFIED_ENABLED:
+            from app.core.redis import get_redis
+            from app.modules.acquisition.simple_limits import lease
+            async with lease(await get_redis(), f"outbound-admission:{account_id}"):
+                return await self._reserve(account_id, attempt_key=attempt_key, category=category,
+                                           target_key=target_key, context=context, now=now)
+        return await self._reserve(account_id, attempt_key=attempt_key, category=category,
+                                   target_key=target_key, context=context, now=now)
+
+    async def _reserve(self, account_id: int, *, attempt_key: str, category: str,
+                       target_key: str, context: dict | None = None,
+                       now: datetime | None = None) -> AccountOutboundAttempt:
         now = now or datetime.utcnow()
         if (
             category not in CATEGORIES
