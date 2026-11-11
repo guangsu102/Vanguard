@@ -55,7 +55,14 @@ if tonumber(redis.call('HGET', KEYS[1], 'day') or '-1') == day then
   redis.call('HSET', KEYS[1], 'used', used - 1)
  end
 end
-if KEYS[2] then redis.call('DEL', KEYS[2]) end
+local spacing = tonumber(ARGV[2] or '0')
+if KEYS[2] then
+ if spacing > 0 then
+  redis.call('SET', KEYS[2], now + spacing, 'EX', spacing)
+ else
+  redis.call('DEL', KEYS[2])
+ end
+end
 if KEYS[3] then
  local total = tonumber(redis.call('GET', KEYS[3]) or '0')
  if total > 0 then redis.call('DECR', KEYS[3]) end
@@ -100,13 +107,20 @@ async def take_ad(redis, account_id: int, group_key: int, *, cap: int,
         raise Deferred(reason, int(value))
 
 
-async def revert_ad(redis, account_id: int) -> None:
-    """Rollback ad cooldown and count when sending failed before or during RPC."""
+async def revert_ad(redis, account_id: int, *, cooldown_seconds: int = 0) -> None:
+    """Rollback ad cooldown and count when sending failed before or during RPC.
+
+    ``cooldown_seconds > 0`` keeps a minimum account spacing instead of deleting
+    the cooldown: a permission failure must not authorize an immediate burst of
+    attempts against other groups. The daily count is still rolled back so a
+    dead group does not consume real quota.
+    """
     from app.core.operating_time import operating_date
     shared = f"risk:account:{account_id}:daily:outbound_message:{operating_date():%Y%m%d}"
+    spacing = max(0, int(cooldown_seconds))
     try:
         await redis.eval(REVERT, 3, PREFIX + f"ads:{account_id}:count",
-            PREFIX + f"ads:{account_id}:due", shared, 28800)
+            PREFIX + f"ads:{account_id}:due", shared, 28800, spacing)
     except Exception:
         pass
 

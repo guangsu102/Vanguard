@@ -810,7 +810,7 @@ class AccountRiskGuard:
                 "account_restricted, telegram_error.\n"
                 "Rules:\n"
                 "- Group/channel permission, cannot write, topic closed, private channel, "
-                "not participant, or banned from sending in a "
+                "not participant, restricted in this chat, or banned from sending in a "
                 "supergroup/channel => group_write_forbidden.\n"
                 "- Flood wait/retry-after/too many requests => flood_wait.\n"
                 "- PEER_FLOOD or peer flood protection => peer_flood.\n"
@@ -1229,6 +1229,20 @@ class AccountRiskGuard:
         *,
         reservation_id: Optional[str] = None,
     ) -> tuple[bool, str, Optional[int]]:
+        from app.core.config import settings
+        if settings.GROWTH_SIMPLIFIED_ENABLED and action in MESSAGE_ACTIONS:
+            from app.core.redis import get_redis
+            from app.modules.acquisition.simple_limits import lease
+            async with lease(await get_redis(), f"outbound-admission:{account_id}"):
+                return await self._reserve_budget_unlocked(account_id, action, budget, risk_settings,
+                                                           reservation_id=reservation_id)
+        return await self._reserve_budget_unlocked(account_id, action, budget, risk_settings,
+                                                   reservation_id=reservation_id)
+
+    async def _reserve_budget_unlocked(
+        self, account_id: int, action: AccountRiskAction, budget: RiskBudget,
+        risk_settings: dict[str, Any], *, reservation_id: str | None = None,
+    ) -> tuple[bool, str, int | None]:
         if self.cache.client is None:
             return False, "risk_budget_unavailable", None
 
@@ -1247,6 +1261,16 @@ class AccountRiskGuard:
             if action in MESSAGE_ACTIONS
             else 0
         )
+        from app.core.config import settings
+        if settings.GROWTH_SIMPLIFIED_ENABLED and action in MESSAGE_ACTIONS:
+            from app.modules.acquisition.simple_limits import durable_outbound_used
+            if action == AccountRiskAction.OWNED_GROUP_MESSAGE and reservation_id:
+                existing_key = self._owned_group_reservation_key(account_id, reservation_id)
+                if existing_key and await self.cache.get(existing_key):
+                    return True, "reserved", None
+            outbound_limit -= await durable_outbound_used(self.db, account_id, datetime.utcnow())
+            if outbound_limit <= 0:
+                return False, "account_outbound_message_hard_cap", 86400
         business_budget_actions = {
             AccountRiskAction.JOIN,
             AccountRiskAction.AD_DELIVERY,
@@ -2137,6 +2161,18 @@ class AccountRiskGuard:
             return "account_restricted"
         if "slowmode" in text or "slow mode" in text:
             # Telegram group slow mode is a target wait, never account-wide FloodWait.
+            return "group_write_forbidden"
+        # Telegram CHAT_RESTRICTED means "You're restricted from sending
+        # messages in this chat": one chat's write restriction. Classifying it
+        # as account_restricted froze whole accounts for 24h on a group-level
+        # error, so it must resolve to the chat-scoped reason instead.
+        chat_restricted_markers = (
+            "chatrestrictederror",
+            "chat_restricted",
+            "chat restricted",
+            "restricted from sending messages in this chat",
+        )
+        if any(marker in text for marker in chat_restricted_markers):
             return "group_write_forbidden"
         if "peer_flood" in text or "peer flood" in text or "peerflood" in text:
             return "peer_flood"

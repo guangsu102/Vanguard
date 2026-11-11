@@ -260,6 +260,7 @@ class FrequencyService:
                 continue
             if log.status in {
                 "unknown",
+                "send_unknown",
                 "sending",
                 "reconciliation_required",
             } or "send_outcome_unknown" in (log.error or ""):
@@ -559,6 +560,30 @@ async def run_frequency_exits(service: Any, *, limit: int = 1, account_id: int |
         await db.commit()
         results.append({"membership_id": member.id, "status": member.review_status})
     return {"processed": len(results), "results": results}
+
+
+async def relevant_ad_deletion(db: Any, account_id: int, chat_id: Any, deleted_ids: Any) -> bool:
+    """True only when a deletion can affect durable delivery/survival state.
+
+    The only inbox consumer of ``deleted`` events is :func:`queue_deleted_observation`,
+    which acts exclusively on this account's own successful deliveries. Filtering
+    at ingestion keeps unrelated group deletions (over 99% of observed volume)
+    out of the business queue while this indexed pre-check stays cheap. A
+    deletion racing the result commit is later still caught by the daily
+    survival review, so a rare false negative never loses durable state.
+    """
+    target = canonical(chat_id)
+    ids = [value for value in (deleted_ids or []) if type(value) is int]
+    if target is None or not ids:
+        return False
+    return await db.scalar(
+        select(AdDeliveryLog.id).where(
+            AdDeliveryLog.account_id == account_id,
+            AdDeliveryLog.telegram_group_id.in_(identity_aliases(peer_identity(target))),
+            AdDeliveryLog.telegram_message_id.in_(ids),
+            AdDeliveryLog.status == "success",
+        ).limit(1)
+    ) is not None
 
 
 async def queue_deleted_observation(

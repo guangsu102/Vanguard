@@ -598,8 +598,11 @@ async def project_owned_group_member_observations(
                     for fact in extraction.facts
                 ]
             break
-        except OperationalError:
+        except OperationalError as exc:
             if attempt == 0:
+                logger.warning("member_observation_database_retry",
+                               asset_id=group_asset_id, update_id=update_id,
+                               error_type=type(exc).__name__, error=str(exc)[:500])
                 continue
             duration_ms = int((time.perf_counter() - started) * 1000)
             _record_failure(

@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import and_, case, exists, func, or_, select
+from sqlalchemy import and_, case, exists, func, or_, select, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
@@ -174,6 +174,27 @@ async def enqueue(db: Any, account_id: int, kind: str, event: Any) -> bool:
         return False
 
 
+def _bounded_account_parts(query: Any, account_ids: list[int], per_account: int) -> list:
+    """Bound each account's claim input with the live-account partial index.
+
+    A large pending backlog would otherwise turn every claim into a full
+    sort across all eligible rows. Keeping only each account's oldest
+    ``per_account`` candidates preserves head-of-line order (the winners of a
+    claim are always among each account's oldest eligible rows) while the
+    ranking and locking run over a bounded set. Each window is wrapped as a
+    scalar subquery because compound SELECT components cannot carry their own
+    ORDER BY on SQLite.
+    """
+    parts = []
+    for account_id in account_ids:
+        window = select(TelegramEventInbox.id.label("event_id"),
+                        TelegramEventInbox.account_id.label("account_id")).where(
+            query.whereclause, TelegramEventInbox.account_id == account_id,
+        ).order_by(TelegramEventInbox.id).limit(per_account).subquery()
+        parts.append(select(window.c.event_id, window.c.account_id))
+    return parts
+
+
 async def claim(db: Any, account_ids: list[int], *, local_account_ids: list[int] | None = None,
                 after_account_id: int = 0, local_only: bool | None = None,
                 owner: str | None = None, lease_seconds: int | None = None) -> Any:
@@ -185,12 +206,18 @@ async def claim(db: Any, account_ids: list[int], *, local_account_ids: list[int]
     if not account_ids and not local_account_ids:
         return None
     older = aliased(TelegramEventInbox)
-    blocked_peer = exists(select(older.id).where(
+    older_query = select(older.id).where(
         older.account_id == TelegramEventInbox.account_id,
-        older.chat_id.is_not_distinct_from(TelegramEventInbox.chat_id),
         older.id < TelegramEventInbox.id,
         older.state.in_(["pending", "processing", "executing", "reconciliation_required"]),
-    ))
+    )
+    # PostgreSQL cannot use the chat_id part of the peer index for IS NOT
+    # DISTINCT FROM. Separate the null case so both branches use indexed
+    # equality while retaining ordering for events without a chat id.
+    blocked_peer = case(
+        (TelegramEventInbox.chat_id.is_(None), exists(older_query.where(older.chat_id.is_(None)))),
+        else_=exists(older_query.where(older.chat_id == TelegramEventInbox.chat_id)),
+    )
     # Local facts never wait for earlier chat actions. An OR predicate still
     # lets PostgreSQL execute the correlated history scan for every fact before
     # sorting, even when kind is already constrained to listener_fact.
@@ -205,7 +232,7 @@ async def claim(db: Any, account_ids: list[int], *, local_account_ids: list[int]
         if local_only is False
         else case((local_kinds, True), else_=~blocked_peer)
     )
-    row = await db.scalar(select(TelegramEventInbox).where(
+    scope = select(TelegramEventInbox).where(
         ordered,
         or_(TelegramEventInbox.account_id.in_(account_ids),
             and_(TelegramEventInbox.kind.in_(["listener_fact", "deleted"]),
@@ -218,7 +245,15 @@ async def claim(db: Any, account_ids: list[int], *, local_account_ids: list[int]
          ~TelegramEventInbox.kind.in_(list(LOCAL_KINDS))),
     ).order_by(case((TelegramEventInbox.account_id > after_account_id, 0), else_=1),
                TelegramEventInbox.account_id, TelegramEventInbox.id)
-        .with_for_update(skip_locked=True).limit(1))
+    if local_only is True:
+        # Local facts have no peer blocking, so each account's oldest eligible
+        # row is its claim winner. Bounding the scan keeps an idle poll on a
+        # large backlog from sorting the whole pending set every time.
+        per_account = max(settings.P1_INBOX_CLAIM_BATCH_SIZE, 16)
+        parts = _bounded_account_parts(scope, [*account_ids, *local_account_ids], per_account)
+        candidates = union_all(*parts).subquery() if len(parts) > 1 else parts[0].subquery()
+        scope = scope.where(TelegramEventInbox.id.in_(select(candidates.c.event_id)))
+    row = await db.scalar(scope.with_for_update(skip_locked=True).limit(1))
     if row is not None:
         now = datetime.utcnow()
         row.state, row.started_at = "processing", now
@@ -260,12 +295,18 @@ async def claim_batch(
     if not account_ids and not local_account_ids:
         return []
     older = aliased(TelegramEventInbox)
-    blocked_peer = exists(select(older.id).where(
+    older_query = select(older.id).where(
         older.account_id == TelegramEventInbox.account_id,
-        older.chat_id.is_not_distinct_from(TelegramEventInbox.chat_id),
         older.id < TelegramEventInbox.id,
         older.state.in_(["pending", "processing", "executing", "reconciliation_required"]),
-    ))
+    )
+    # PostgreSQL cannot use the chat_id part of the peer index for IS NOT
+    # DISTINCT FROM. Separate the null case so both branches use indexed
+    # equality while retaining ordering for events without a chat id.
+    blocked_peer = case(
+        (TelegramEventInbox.chat_id.is_(None), exists(older_query.where(older.chat_id.is_(None)))),
+        else_=exists(older_query.where(older.chat_id == TelegramEventInbox.chat_id)),
+    )
     local_kinds = TelegramEventInbox.kind.in_(["listener_fact", "deleted"])
     ordered = (
         True
@@ -300,16 +341,22 @@ async def claim_batch(
     if settings.P1_RUNTIME_RELIABILITY_ENABLED:
         # Rank eligible events by account in SQL so fairness costs one round
         # trip, even with a large account pool. Lock only the outer inbox rows.
-        ranked = query.order_by(None).with_only_columns(
-            TelegramEventInbox.id.label("event_id"),
+        # Each account contributes only its oldest bounded window (served by
+        # the live-account partial index), so a large backlog cannot turn every
+        # claim into a full sort. Locking an outer join to a windowed subquery
+        # can revisit the same visible row under concurrent PostgreSQL
+        # snapshots; the per-id CAS lock makes a claim exclusive.
+        per_account = max(limit * 8, 64)
+        scope_ids = list(dict.fromkeys([*account_ids, *local_account_ids]))
+        parts = _bounded_account_parts(query, scope_ids, per_account)
+        bounded = union_all(*parts).subquery() if len(parts) > 1 else parts[0].subquery()
+        ranked = select(
+            bounded.c.event_id,
             func.row_number().over(
-                partition_by=TelegramEventInbox.account_id,
-                order_by=TelegramEventInbox.id,
+                partition_by=bounded.c.account_id,
+                order_by=bounded.c.event_id,
             ).label("turn"),
         ).subquery()
-        # Rank first, then lock each concrete row. Locking an outer join to a
-        # windowed subquery can revisit the same visible row under concurrent
-        # PostgreSQL snapshots; the per-id CAS lock makes a claim exclusive.
         candidate_ids = list((await db.scalars(select(ranked.c.event_id).order_by(
             ranked.c.turn,
             case((ranked.c.event_id > after_account_id, 0), else_=1),

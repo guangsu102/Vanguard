@@ -57,6 +57,9 @@ from app.modules.acquisition.simple_limits import (
 
 logger = structlog.get_logger()
 STAGES = {"ads": 60, "join": 300, "review_and_verify": 60, "daily_survival_and_exit": 600}
+# A chat permission failure keeps at least this much account spacing before the
+# next ad attempt, whatever the allocator rolled back.
+PERMISSION_FAILURE_SPACING_SECONDS = 600
 
 
 async def release(db: Any) -> None:
@@ -190,6 +193,8 @@ class GrowthService:
                 await redis.set(key, "completed", ex=172800)
                 await redis.set(completed_key, "completed", ex=172800)
             return False
+        if fact.writable is True:
+            return True
         # Absence of a prompt is not proof that a previously observed challenge passed.
         return member.verification_status != "pending"
 
@@ -396,7 +401,7 @@ class GrowthService:
         cursor_key = PREFIX + f"join:{account_id}:candidate_offset"
         offset = max(0, int(await redis.get(cursor_key) or 0))
         query = select(Group).options(lazyload("*")).where(
-            Group.status.in_(["pending_join", "cooling_down"]),
+            Group.status.in_(["pending", "pending_join", "cooling_down"]),
             Group.username.is_not(None), ~group_occupied(now),
         ).order_by(Group.level_score.desc(), Group.updated_at, Group.id).limit(30)
         candidates = list((await self.db.scalars(query.offset(offset))).all())
@@ -609,6 +614,15 @@ class GrowthService:
         account, config = await self.account(account_id)
         if not config.auto_ads_enabled or not (await get_ad_delivery_execution_settings(self.db))["enabled"]:
             return result("ad_delivery_paused")
+        redis = await get_redis()
+        # The account cooldown is global: checking it here keeps a cooling
+        # account from paying for candidate queries, client preparation and a
+        # full target sweep that would end at the same cooldown anyway.
+        due = await redis.get(PREFIX + f"ads:{account_id}:due")
+        if due:
+            wait = float(due) - now.replace(tzinfo=UTC).timestamp()
+            if wait > 0:
+                return result("account_cooldown", retry_after_seconds=int(wait) + 1)
         other_member = aliased(Member)
         rows = (await self.db.execute(select(Member, Group, AdCampaign, AccountAdBinding)
             .join(Group, Group.id == Member.group_id)
@@ -628,8 +642,6 @@ class GrowthService:
                 or_(AdCampaign.end_at.is_(None), AdCampaign.end_at > now))
             .order_by(Member.next_ad_allowed_at, Member.id.desc(), AccountAdBinding.priority.desc()).limit(100))).all()
         examined = set()
-        delivery_attempts = 0
-        redis = await get_redis()
         for member, group, campaign, _binding in rows:
             pair = (member.id, campaign.id)
             if pair in examined:
@@ -665,11 +677,16 @@ class GrowthService:
                 if sent.get("succeeded", 0) > 0:
                     return sent
                 if sent.get("outcome") == "permission_changed":
+                    # One chat-level permission failure must not fund an
+                    # immediate burst against other groups. The daily count is
+                    # still rolled back (a dead group consumes no quota), but
+                    # the account is held at the configured minimum spacing and
+                    # this stage stops; the group is requeued for review by the
+                    # persisted result.
                     from app.modules.acquisition.simple_limits import revert_ad
-                    await revert_ad(redis, account_id)
-                    delivery_attempts += 1
-                    if delivery_attempts < 20:
-                        continue
+                    await revert_ad(redis, account_id,
+                                    cooldown_seconds=await self._permission_retry_spacing(
+                                        account, config, now))
                     return sent
                 if sent.get("reason") not in (
                     "group_send_interval", "frequency_paused", "permission_refresh_required",
@@ -678,10 +695,23 @@ class GrowthService:
                 ):
                     return sent
             except Deferred as exc:
-                if exc.reason in ("group_cooldown", "account_cooldown"):
+                if exc.reason == "account_cooldown":
+                    # The wait is account-wide: no other target can run sooner.
+                    return result(exc.reason, retry_after_seconds=exc.retry_after_seconds)
+                if exc.reason == "group_cooldown":
                     continue
                 raise
         return result("no_due_eligible_target")
+
+    async def _permission_retry_spacing(self, account: Any, config: Any, now: datetime) -> int:
+        """Minimum account spacing kept after a chat permission failure."""
+        from app.core.account.outbound_budget import effective_capacity_limits
+        from app.core.automation_settings import get_ad_delivery_throttle_settings
+        limits = await effective_capacity_limits(self.db, account, config, now)
+        throttle = await get_ad_delivery_throttle_settings(self.db)
+        return int(max(limits["ad_interval_seconds"],
+                       throttle["growth_min_interval_seconds"] if throttle["enabled"] else 0,
+                       PERMISSION_FAILURE_SPACING_SECONDS))
 
     async def send(self, account_id: int, member_id: int, campaign_id: int, creative_id: int, key: int) -> dict:
         key = canonical(key)
@@ -794,7 +824,8 @@ class GrowthService:
                     outcome = "unknown" if isinstance(exc, (TimeoutError, OSError)) else "failed"
                     if error == "SlowModeWaitError":
                         gap = max(gap, int(exc.seconds) + 1)
-                    if error in {"ChatWriteForbiddenError", "UserBannedInChannelError", "ChannelPrivateError"}:
+                    if error in {"ChatWriteForbiddenError", "ChatRestrictedError",
+                                 "UserBannedInChannelError", "ChannelPrivateError"}:
                         outcome = "permission_changed"
         except Deferred:
             raise

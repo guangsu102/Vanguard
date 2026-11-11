@@ -12,8 +12,10 @@ import asyncio
 import json
 import logging
 import re
+import signal
 import socket
 import time
+import traceback
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -28,6 +30,7 @@ from sqlalchemy.orm import selectinload
 from telethon import events as telethon_events
 
 from app.core.account.bot_credentials import resolve_guardian_bot_token
+from app.core.account.auto_recovery import AccountAutoRecovery
 from app.core.account.models import (
     AccountOperationConfig,
     AccountStatus,
@@ -54,6 +57,7 @@ from app.core.logging import setup_logging
 from app.core.redis import close_redis, init_redis
 from app.core.telegram_chat_lock import acquire_telegram_chat_transaction_lock
 from app.core.worker_status import (
+    TelegramEventInbox,
     TelegramWorkerRole,
     TelegramWorkerStatus,
     TelegramWorkerStatusValue,
@@ -175,14 +179,23 @@ class TelegramWorker:
         self.worker_id = worker_id or f"{role.value}:{socket.gethostname()}"
         self.heartbeat_interval = heartbeat_interval
         self._running = False
+        self._stop_requested = False
         self._account_pool: Optional[AccountPool] = AccountPool() if role == TelegramWorkerRole.GROWTH_USER else None
+        self._account_auto_recovery = AccountAutoRecovery(self._account_pool) if self._account_pool is not None else None
         self._guardian_update_offsets: dict[int, int] = {}
         self._growth_listener_sessions: dict[int, str] = {}
         self._growth_runtime_account_ids: set[int] = set()
+        # Accounts with pending local-kind inbox rows, refreshed periodically.
+        # A restricted or offline account leaves the runtime scope, but its
+        # deletion and listener facts are pure local projections that never
+        # reconnect Telegram, so its queue must still drain.
+        self._growth_local_fact_account_ids: set[int] = set()
+        self._local_fact_accounts_refreshed_at: float = 0.0
         self._entity_name_cache: dict[int, tuple[float, str]] = {}
         self._growth_handler_init_options: dict[str, bool] = {}
         self._growth_ingress_policy: dict | None = None
         self._growth_filtered_messages = 0
+        self._growth_irrelevant_deletions = 0
         self._last_daily_health_log_date: str | None = None
         self._growth_event_concurrency = min(
             GROWTH_EVENT_CONCURRENCY_CAP,
@@ -198,15 +211,24 @@ class TelegramWorker:
         self._platform_restriction_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
+        from app.modules.acquisition import qualification_sla_lifecycle as sla_lifecycle
+        sla_lifecycle.declare_process("telegram:" + self.role.value)
+        from app.modules.acquisition.review_diagnostics import start_maintenance, stop_maintenance
+        await start_maintenance()
         await init_db(create_tables=not settings.is_production)
         await init_redis()
+        await sla_lifecycle.start("telegram:" + self.role.value)
+        from app.modules.acquisition.review_evidence_ingest import start_ingest_worker
+        await start_ingest_worker()
         await start_account_proxy_policy_listener()
         if self.role == TelegramWorkerRole.GROWTH_USER:
             self._install_platform_restriction_handler()
             from app.core.account.event_inbox import recover_interrupted
             async with get_db_session() as db:
                 await recover_interrupted(db)
-        self._running = True
+        from app.core.account.read_metrics import start_metrics_health
+        start_metrics_health()
+        self._running = not self._stop_requested
         try:
             await self._heartbeat(TelegramWorkerStatusValue.STARTING.value, {"phase": "startup"})
             database_failures = 0
@@ -225,6 +247,8 @@ class TelegramWorker:
                         "telegram_worker_database_retry", worker_id=self.worker_id,
                         error_type=type(exc).__name__, attempts=database_failures,
                         retry_seconds=delay,
+                        error=safe_exception_message(exc, max_length=500),
+                        stack=traceback.format_exc(limit=8)[:2000],
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -254,6 +278,7 @@ class TelegramWorker:
             await self._heartbeat(TelegramWorkerStatusValue.ERROR.value, {"phase": "error"}, last_error=str(exc))
             raise
         finally:
+            await stop_maintenance()
             self._remove_platform_restriction_handler()
             await self._drain_platform_restriction_tasks()
             self._running = False
@@ -271,15 +296,25 @@ class TelegramWorker:
                     await self._private_outbox_task
                 self._private_outbox_task = None
             if self._session_exec_task is not None:
-                self._session_exec_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await self._session_exec_task
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._session_exec_task), timeout=90)
+                except (TimeoutError, asyncio.CancelledError):
+                    self._session_exec_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._session_exec_task
                 self._session_exec_task = None
+            if self._account_auto_recovery is not None:
+                await self._account_auto_recovery.close()
             if self._account_pool is not None:
                 await self._account_pool.close_all()
+            from app.modules.acquisition.review_evidence_ingest import stop_ingest_worker
+            await stop_ingest_worker()
             await stop_account_proxy_policy_listener()
+            await sla_lifecycle.stop(close_process=True)
             await close_redis()
             await close_db()
+            from app.core.account.read_metrics import stop_metrics_health
+            await stop_metrics_health()
 
     def _install_platform_restriction_handler(self) -> None:
         if self._platform_restriction_handler is not None:
@@ -374,8 +409,12 @@ class TelegramWorker:
             source="telethon_update_loop",
         )
 
-    async def stop(self) -> None:
+    def request_stop(self) -> None:
+        self._stop_requested = True
         self._running = False
+
+    async def stop(self) -> None:
+        self.request_stop()
         await self._heartbeat(TelegramWorkerStatusValue.OFFLINE.value, {"phase": "shutdown"})
 
     async def run_once(self) -> dict[str, Any]:
@@ -514,6 +553,7 @@ class TelegramWorker:
                     "enabled_ad_campaigns": enabled_ad_campaigns,
                     "ordinary_group_messages_required": self._growth_ingress_policy["ordinary_required"],
                     "filtered_group_messages": self._growth_filtered_messages,
+                    "irrelevant_deletions_filtered": self._growth_irrelevant_deletions,
                     "config_source": "backend_database",
                     "execution_surface": "acquisition",
                 }
@@ -585,11 +625,13 @@ class TelegramWorker:
         from app.core.account.listener_pause import process_memory
         async with get_db_session() as db:
             inbox = await inbox_snapshot(db)
+        recovery_state = await self._account_auto_recovery.tick(accounts) if self._account_auto_recovery is not None else {}
         blocking_reasons = self._growth_blocking_reasons(account_inventory, listener_state)
         return {
             "runtime": {
                 "process_memory": process_memory(),
                 "event_inbox": inbox,
+                "account_error_recovery": recovery_state,
                 "account_pool_size": self._account_pool.size,
                 "account_pool_synced": synced,
                 "account_pool_sync": sync_report,
@@ -688,9 +730,6 @@ class TelegramWorker:
                 item["resume_at"] = listener["resume_at"]
             reasons.append(item)
         return reasons
-
-    def _is_runtime_capable_account(self, account: TelegramAccount) -> bool:
-        return self._is_runtime_capable_account_static(account)
 
     async def _ensure_growth_listeners(self, accounts: list[TelegramAccount]) -> dict[str, Any]:
         if self._account_pool is None:
@@ -821,6 +860,28 @@ class TelegramWorker:
                 await persist("join", event)
 
         async def handle_ad_deleted(event: Any) -> None:
+            # Unrelated group deletions dominate the inbox (over 99% of observed
+            # volume); only deletions of this account's own delivered ads drive
+            # durable state. The daily survival review still covers a rare race
+            # with the result commit, so filtering here never loses evidence.
+            from app.modules.acquisition.adaptive_frequency import relevant_ad_deletion
+            chat_id = getattr(event, "chat_id", None)
+            ids = [value for value in (getattr(event, "deleted_ids", None) or [])
+                   if type(value) is int]
+            if not ids:
+                return
+            try:
+                async with get_db_session() as db:
+                    if not await relevant_ad_deletion(db, account_id, chat_id, ids):
+                        self._growth_irrelevant_deletions += 1
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The filter is an optimization, never a fact loss: on a
+                # database hiccup keep the durable event instead.
+                logger.warning("growth_deletion_filter_unavailable", account_id=account_id,
+                               error_type=type(exc).__name__)
             await persist("deleted", event)
 
         client.add_event_handler(handle_ad_deleted, telethon_events.MessageDeleted())
@@ -918,6 +979,7 @@ class TelegramWorker:
                     priority_stages=PROTECTED_STAGES,
                     priority_reserved_slots=1,
                     queued_stages=SESSION_EXEC_QUEUED_STAGES,
+                    stopping=lambda: not self._running,
                 )
             except asyncio.CancelledError:
                 raise
@@ -930,6 +992,32 @@ class TelegramWorker:
                 )
                 await asyncio.sleep(5)
 
+
+    async def _local_fact_account_ids(self) -> list[int]:
+        """Runtime accounts plus every account that still owes local facts.
+
+        Deletion and listener facts never touch Telegram, so accounts that left
+        the active runtime (restricted, frozen, or simply offline) keep draining
+        their local queues through the ordinary claim path.
+        """
+        now = time.monotonic()
+        if now - self._local_fact_accounts_refreshed_at >= 30:
+            self._local_fact_accounts_refreshed_at = now
+            try:
+                from app.core.account.event_inbox import LOCAL_KINDS
+                async with get_db_session() as db:
+                    rows = (await db.execute(select(TelegramEventInbox.account_id).where(
+                        TelegramEventInbox.state == "pending",
+                        TelegramEventInbox.kind.in_(LOCAL_KINDS),
+                    ).group_by(TelegramEventInbox.account_id))).all()
+                self._growth_local_fact_account_ids = {row[0] for row in rows}
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("growth_local_fact_accounts_refresh_failed",
+                               error_type=type(exc).__name__)
+        return list(getattr(self, "_growth_runtime_account_ids", set())
+                    | self._growth_local_fact_account_ids)
 
     async def _growth_inbox_lane(self, *, local_only: bool) -> None:
         while self._running:
@@ -985,7 +1073,7 @@ class TelegramWorker:
             rows = await claim_batch(
                 db,
                 list(self._growth_listener_sessions),
-                local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
+                local_account_ids=await self._local_fact_account_ids(),
                 after_account_id=after,
                 local_only=True,
                 limit=limit or settings.growth_inbox_claim_batch_size,
@@ -1074,7 +1162,7 @@ class TelegramWorker:
                                       fallback=cursors.get(local_only, 0))
         async with get_db_session() as db:
             row = await claim(db, list(self._growth_listener_sessions),
-                              local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
+                              local_account_ids=await self._local_fact_account_ids(),
                               after_account_id=after, local_only=local_only,
                               owner=self.worker_id,
                               lease_seconds=settings.growth_inbox_claim_lease_seconds)
@@ -1085,7 +1173,7 @@ class TelegramWorker:
                 # claim listener facts ahead of an available business event.
                 row = await claim(
                     db, list(self._growth_listener_sessions),
-                    local_account_ids=list(getattr(self, "_growth_runtime_account_ids", set())),
+                    local_account_ids=await self._local_fact_account_ids(),
                     after_account_id=after, local_only=True,
                     owner=self.worker_id,
                     lease_seconds=settings.growth_inbox_claim_lease_seconds,
@@ -1209,17 +1297,6 @@ class TelegramWorker:
 
         name = self._display_name_from_entity(sender, fallback)
         self._cache_entity_name(sender_id, name)
-        return name
-
-    async def _resolve_entity_name_from_client(self, client: Any, user_id: int) -> str:
-        cached = self._get_cached_entity_name(user_id)
-        if cached:
-            return cached
-
-        fallback = str(user_id)
-        entity = await client.get_entity(user_id)
-        name = self._display_name_from_entity(entity, fallback)
-        self._cache_entity_name(user_id, name)
         return name
 
     @staticmethod
@@ -2375,7 +2452,11 @@ async def main() -> None:
             await close_db()
         return
 
-    await worker.run()
+    previous = signal.signal(signal.SIGTERM, lambda *_args: worker.request_stop())
+    try:
+        await worker.run()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":
