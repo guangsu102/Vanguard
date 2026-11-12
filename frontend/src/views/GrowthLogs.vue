@@ -69,6 +69,10 @@ function statusLabel(status?: string) {
     pending: '等待中',
     scheduled: '已排队',
     retry: '等待重试',
+    unknown: '结果未确认（已冷却）',
+    permission_changed: '权限变化，待复查',
+    send_unknown: '历史未确认',
+    reconciliation_required: '历史待核实',
   }
   return labels[status || ''] || status || '-'
 }
@@ -221,18 +225,6 @@ onMounted(loadAll)
       </el-tab-pane>
 
       <el-tab-pane label="广告发送记录" name="delivery">
-        <el-table :data="deliveryLogs" border size="small" empty-text="暂无广告发送记录">
-          <el-table-column prop="id" label="ID" width="80" />
-          <el-table-column label="账号" min-width="150" show-overflow-tooltip>
-            <template #default="{ row }">{{ accountLabel(row.account_id) }}</template>
-          </el-table-column>
-          <el-table-column label="计划" min-width="160" show-overflow-tooltip>
-            <template #default="{ row }">{{ row.campaign_name || campaignLabel(row.campaign_id || row.ad_campaign_id) }}</template>
-          </el-table-column>
-          <el-table-column prop="group_title" label="群" min-width="200" show-overflow-tooltip />
-          <el-table-column label="状态" width="120">
-            <template #default="{ row }">
-              <el-tag :type="statusType(row.status)" effect="plain">{{ statusLabel(row.status) }}</el-tag>
         <div class="delivery-filters">
           <el-select v-model="deliveryAccountId" clearable filterable placeholder="全部账号" class="filter-control">
             <el-option
@@ -263,6 +255,18 @@ onMounted(loadAll)
           <el-button type="primary" :loading="loading" @click="searchDeliveryLogs">查询</el-button>
           <el-button @click="resetDeliveryLogs">重置</el-button>
         </div>
+        <el-table :data="deliveryLogs" border size="small" empty-text="暂无广告发送记录">
+          <el-table-column prop="id" label="ID" width="80" />
+          <el-table-column label="账号" min-width="150" show-overflow-tooltip>
+            <template #default="{ row }">{{ accountLabel(row.account_id) }}</template>
+          </el-table-column>
+          <el-table-column label="计划" min-width="160" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.campaign_name || campaignLabel(row.campaign_id || row.ad_campaign_id) }}</template>
+          </el-table-column>
+          <el-table-column prop="group_title" label="群" min-width="200" show-overflow-tooltip />
+          <el-table-column label="状态" width="120">
+            <template #default="{ row }">
+              <el-tag :type="statusType(row.status)" effect="plain">{{ statusLabel(row.status) }}</el-tag>
             </template>
           </el-table-column>
           <el-table-column prop="survival_status" label="存活" width="110" />
@@ -323,11 +327,6 @@ onMounted(loadAll)
   overflow-x: auto;
 }
 
-@media (max-width: 768px) {
-  .page-header {
-    align-items: stretch;
-    flex-direction: column;
-
 .delivery-filters {
   display: flex;
   align-items: center;
@@ -343,6 +342,11 @@ onMounted(loadAll)
 .time-range-control {
   width: 360px;
 }
+
+@media (max-width: 768px) {
+  .page-header {
+    align-items: stretch;
+    flex-direction: column;
   }
 
   .filter-control,

@@ -134,4 +134,30 @@ describe('GrowthLogs view', () => {
       }),
     )
   })
+
+  it('renders the delivery filter form once, outside the table rows', async () => {
+    getDeliveryLogs.mockResolvedValueOnce({
+      data: {
+        data: Array.from({ length: 20 }, (_, index) => ({
+          id: index + 1,
+          account_id: 7,
+          campaign_id: 9,
+          group_title: `群${index + 1}`,
+          status: 'sent',
+          created_at: '2026-08-25T01:00:00Z',
+        })),
+        total: 20,
+      },
+    })
+
+    const wrapper = mount(GrowthLogs, { global: globalConfig })
+    await flushPromises()
+
+    // The filter bar must exist exactly once (V-04: it used to render inside
+    // the status column template for every row).
+    expect(wrapper.findAll('.delivery-filters')).toHaveLength(1)
+
+    const searchButtons = wrapper.findAll('button').filter((button) => button.text() === '查询')
+    expect(searchButtons).toHaveLength(1)
+  })
 })
