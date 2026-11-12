@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import { usersApi, type User, type UserListParams, type UserActivity } from '@/api/users'
+import { usersApi, type User, type UserListParams, type UserActivity, type UserState } from '@/api/users'
 import { DEFAULT_PAGE_SIZE, normalizeListPayload, normalizePageSize } from '@/utils/pagination'
 
 export const useUserStore = defineStore('user', () => {
@@ -41,25 +41,25 @@ export const useUserStore = defineStore('user', () => {
     return currentUser.value
   }
 
-  const update = async (id: number, data: { displayName?: string; status?: string }) => {
+  const update = async (id: number, data: { state?: UserState }) => {
     loading.value = true
     try {
-      const res = await usersApi.update(id, data as any)
-      const index = list.value.findIndex((item) => item.id === id)
-      if (index !== -1) {
-        list.value[index] = res.data.data
+      await usersApi.update(id, data)
+      const user = list.value.find((item) => item.id === id)
+      if (user && data.state) {
+        user.state = data.state
       }
-      return res.data.data
     } finally {
       loading.value = false
     }
   }
 
-  const mute = async (id: number, data?: { duration?: number; reason?: string }) => {
-    await usersApi.mute(id, data)
+  const mute = async (id: number, data?: { durationHours?: number; reason?: string }) => {
+    const res = await usersApi.mute(id, data)
+    const mutedUntil = (res.data as { data?: { muted_until?: string } } | undefined)?.data?.muted_until
     const user = list.value.find((item) => item.id === id)
     if (user) {
-      user.status = 'muted'
+      user.mutedUntil = mutedUntil ?? user.mutedUntil
     }
   }
 
@@ -67,15 +67,17 @@ export const useUserStore = defineStore('user', () => {
     await usersApi.unmute(id)
     const user = list.value.find((item) => item.id === id)
     if (user) {
-      user.status = 'active'
+      user.mutedUntil = null
+      user.warningCount = 0
     }
   }
 
-  const blacklist = async (id: number, data?: { reason?: string }) => {
-    await usersApi.blacklist(id, data)
+  const blacklist = async (id: number) => {
+    await usersApi.blacklist(id)
     const user = list.value.find((item) => item.id === id)
     if (user) {
-      user.status = 'banned'
+      user.state = 'blocked'
+      user.mutedUntil = null
     }
   }
 
@@ -83,7 +85,7 @@ export const useUserStore = defineStore('user', () => {
     await usersApi.removeBlacklist(id)
     const user = list.value.find((item) => item.id === id)
     if (user) {
-      user.status = 'active'
+      user.state = 'new'
     }
   }
 

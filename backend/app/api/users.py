@@ -40,13 +40,15 @@ class UserResponse(BaseModel):
 
 
 class UserListResponse(BaseModel):
-    """User list response with cursor pagination."""
+    """User list response with cursor/offset pagination."""
     code: int = 0
     message: str = "success"
     data: list[UserResponse]
     total: int
     next_cursor: Optional[str] = None
     has_more: bool = False
+    page: Optional[int] = None
+    page_size: Optional[int] = None
 
 
 class UserStateUpdate(BaseModel):
@@ -141,20 +143,46 @@ def _violation_to_response(v: Violation) -> ViolationRecordResponse:
 # User CRUD Endpoints
 # =============================================================================
 
+def _parse_datetime_filter(value: str, param_name: str, end_of_day: bool = False) -> datetime:
+    """Parse a date/datetime filter string into a datetime.
+
+    Accepts full ISO datetimes (``YYYY-MM-DD HH:mm:ss``) or plain dates
+    (``YYYY-MM-DD``); plain dates are expanded to the start (or end) of day.
+    """
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    try:
+        day = datetime.strptime(value.strip(), "%Y-%m-%d")
+        return day.replace(hour=23, minute=59, second=59) if end_of_day else day
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid datetime for {param_name}: {value}")
+
+
 @router.get("", response_model=UserListResponse)
 async def list_users(
     cursor: Optional[str] = None,
     limit: int = 20,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    pageSize: Optional[int] = None,
+    registered_from: Optional[str] = None,
+    registered_to: Optional[str] = None,
     state_filter: Optional[str] = None,
     has_trial: Optional[bool] = None,
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ) -> UserListResponse:
     """
-    Get list of users with cursor pagination.
+    Get list of users with cursor or page-based pagination.
 
-    - cursor: Pagination cursor (user ID from previous response)
+    - cursor: Pagination cursor (user ID from previous response); takes precedence over page
     - limit: Number of items per page (max 100)
+    - page: 1-based page number for offset pagination (used by the web UI)
+    - page_size/pageSize: Page size alias preferred over limit
+    - registered_from/registered_to: Filter by registration time (created_at range)
     - state_filter: Filter by state (new, pending, active, silent, churned, blocked)
     - has_trial: Filter by trial status
     - search: Search by username or telegram_id
@@ -162,8 +190,18 @@ async def list_users(
     query = select(User)
     count_query = select(func.count(User.id))
 
-    # Cursor pagination
-    if cursor:
+    size = page_size or pageSize or limit
+    if size < 1:
+        size = 1
+    elif size > 100:
+        size = 100
+    if page is not None and page < 1:
+        raise HTTPException(status_code=400, detail="page must be >= 1")
+
+    # Cursor pagination (takes precedence over offset pagination)
+    use_cursor = cursor is not None
+    offset = 0 if use_cursor or page is None else (page - 1) * size
+    if use_cursor:
         try:
             cursor_id = int(cursor)
             query = query.where(User.id < cursor_id)
@@ -178,6 +216,16 @@ async def list_users(
             count_query = count_query.where(User.state == state_enum)
         except ValueError:
             raise HTTPException(status_code=400, detail=f"Invalid state: {state_filter}")
+
+    if registered_from:
+        parsed_from = _parse_datetime_filter(registered_from, "registered_from")
+        query = query.where(User.created_at >= parsed_from)
+        count_query = count_query.where(User.created_at >= parsed_from)
+
+    if registered_to:
+        parsed_to = _parse_datetime_filter(registered_to, "registered_to", end_of_day=True)
+        query = query.where(User.created_at <= parsed_to)
+        count_query = count_query.where(User.created_at <= parsed_to)
 
     if has_trial is not None:
         if has_trial:
@@ -203,23 +251,30 @@ async def list_users(
     total = total_result.scalar() or 0
 
     # Get data with pagination
-    query = query.order_by(desc(User.id)).limit(limit + 1)
-    result = await db.execute(query)
-    users = list(result.scalars().all())
+    if use_cursor:
+        query = query.order_by(desc(User.id)).limit(size + 1)
+        result = await db.execute(query)
+        users = list(result.scalars().all())
 
-    # Check if there are more results
-    has_more = len(users) > limit
-    if has_more:
-        users = users[:limit]
+        has_more = len(users) > size
+        if has_more:
+            users = users[:size]
+        next_cursor = str(users[-1].id) if users and has_more else None
+    else:
+        query = query.order_by(desc(User.id)).offset(offset).limit(size)
+        result = await db.execute(query)
+        users = list(result.scalars().all())
 
-    # Get next cursor
-    next_cursor = str(users[-1].id) if users and has_more else None
+        has_more = offset + len(users) < total
+        next_cursor = str(users[-1].id) if users and has_more else None
 
     return UserListResponse(
         data=[_user_to_response(u) for u in users],
         total=total,
         next_cursor=next_cursor,
         has_more=has_more,
+        page=page,
+        page_size=size,
     )
 
 

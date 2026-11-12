@@ -60,12 +60,25 @@ const statusConfig: Record<string, { label: string; type: string }> = {
   processing: { label: '处理中', type: 'warning' },
 }
 
+const userStateConfig: Record<string, { label: string; type: string }> = {
+  new: { label: '新用户', type: 'info' },
+  pending: { label: '待转化', type: 'warning' },
+  active: { label: '活跃', type: 'success' },
+  silent: { label: '沉默', type: 'info' },
+  churned: { label: '已流失', type: 'danger' },
+  blocked: { label: '已封禁', type: 'danger' },
+  muted: { label: '已禁言', type: 'warning' },
+}
+
 const config = computed(() => {
   if (props.type === 'group' && props.status === 'pending') {
     return { label: '等待审核', type: 'warning' }
   }
   if (props.type === 'keyword' && props.status === 'pending') {
     return { label: '待审核', type: 'warning' }
+  }
+  if (props.type === 'user') {
+    return userStateConfig[props.status] || { label: props.status, type: 'info' }
   }
   return statusConfig[props.status] || { label: props.status, type: 'info' }
 })

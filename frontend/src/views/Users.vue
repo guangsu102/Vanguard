@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import { ElButton, ElIcon, ElMessage, ElDrawer, ElEmpty, ElTimeline, ElTimelineItem } from 'element-plus'
 import { View, Mute, Unlock, RemoveFilled, CircleCheckFilled } from '@element-plus/icons-vue'
 import { useUserStore } from '@/stores/user'
+import { isUserMuted, isUserBlocked } from '@/api/users'
 import TableCard from '@/components/TableCard.vue'
 import SearchBar from '@/components/SearchBar.vue'
 import StatusTag from '@/components/StatusTag.vue'
@@ -24,15 +25,18 @@ const searchFilters = [
   },
   {
     type: 'select' as const,
-    key: 'status',
+    key: 'state',
     label: '状态',
     placeholder: '全部状态',
     width: '120px',
     options: [
       { label: '全部', value: '' },
-      { label: '正常', value: 'active' },
-      { label: '已禁言', value: 'muted' },
-      { label: '已封禁', value: 'banned' },
+      { label: '新用户', value: 'new' },
+      { label: '待转化', value: 'pending' },
+      { label: '活跃', value: 'active' },
+      { label: '沉默', value: 'silent' },
+      { label: '已流失', value: 'churned' },
+      { label: '已封禁', value: 'blocked' },
     ],
   },
   {
@@ -44,14 +48,14 @@ const searchFilters = [
 ]
 
 const columns = [
-  { prop: 'id', label: 'ID', width: '80' },
-  { prop: 'tgUserId', label: 'TG用户ID', width: '120' },
-  { prop: 'displayName', label: '昵称', minWidth: '120', slot: 'displayName' },
-  { prop: 'username', label: '用户名', width: '150' },
-  { prop: 'status', label: '状态', width: '100', slot: 'status' },
-  { prop: 'sourceGroupName', label: '来源群组', minWidth: '150' },
-  { prop: 'registeredAt', label: '注册时间', width: '180', slot: 'registeredAt' },
-  { prop: 'lastActiveAt', label: '最后活跃', width: '180', slot: 'lastActive' },
+  { prop: 'id', label: 'ID', width: '70' },
+  { prop: 'telegramId', label: 'TG用户ID', width: '160' },
+  { prop: 'username', label: '用户名', minWidth: '140' },
+  { prop: 'state', label: '状态', width: '90', slot: 'state' },
+  { prop: 'warningCount', label: '警告次数', width: '90' },
+  { prop: 'mutedUntil', label: '禁言截止', width: '160', slot: 'mutedUntil' },
+  { prop: 'createdAt', label: '注册时间', width: '160', slot: 'createdAt' },
+  { prop: 'updatedAt', label: '最后更新', width: '160', slot: 'updatedAt' },
   { prop: 'actions', label: '操作', width: '200', fixed: 'right', slot: 'actions' },
 ]
 
@@ -59,12 +63,13 @@ const fetchData = async (params?: Record<string, any>) => {
   loading.value = true
   try {
     // Handle date range filter
-    if (params?.dateRange) {
-      params.registeredFrom = params.dateRange[0]
-      params.registeredTo = params.dateRange[1]
-      delete params.dateRange
+    const query: Record<string, any> = { ...params }
+    if (query.dateRange) {
+      query.registeredFrom = query.dateRange[0]
+      query.registeredTo = query.dateRange[1]
+      delete query.dateRange
     }
-    await userStore.fetchList(params)
+    await userStore.fetchList(query)
   } catch (error) {
     console.error('Failed to fetch users:', error)
   } finally {
@@ -97,15 +102,20 @@ const handleViewDetail = async (row: any) => {
   detailDrawerVisible.value = true
   try {
     await userStore.getById(row.id)
-    await userStore.fetchActivities(row.id)
   } catch (error) {
     ElMessage.error('获取用户详情失败')
+  }
+  // Load activity history separately so a failure here does not block the detail view
+  try {
+    await userStore.fetchActivities(row.id)
+  } catch (error) {
+    console.error('Failed to fetch user activities:', error)
   }
 }
 
 const handleMute = async (row: any) => {
   try {
-    await userStore.mute(row.id, { reason: '手动禁言' })
+    await userStore.mute(row.id, { durationHours: 24, reason: '手动禁言' })
     ElMessage.success('禁言成功')
   } catch (error) {
     ElMessage.error('禁言失败')
@@ -123,7 +133,7 @@ const handleUnmute = async (row: any) => {
 
 const handleBlacklist = async (row: any) => {
   try {
-    await userStore.blacklist(row.id, { reason: '手动封禁' })
+    await userStore.blacklist(row.id)
     ElMessage.success('加入黑名单成功')
   } catch (error) {
     ElMessage.error('操作失败')
@@ -139,7 +149,7 @@ const handleRemoveBlacklist = async (row: any) => {
   }
 }
 
-const formatDate = (date?: string) => {
+const formatDate = (date?: string | null) => {
   return date ? dayjs(date).format('YYYY-MM-DD HH:mm') : '-'
 }
 
@@ -172,23 +182,23 @@ onMounted(() => {
       @page-change="handlePageChange"
       @page-size-change="handlePageSizeChange"
     >
-      <template #displayName="{ row }">
-        <div class="user-info">
-          <el-avatar v-if="row.avatar" :src="row.avatar" :size="32" />
-          <span>{{ row.displayName || '-' }}</span>
+      <template #state="{ row }">
+        <div class="state-cell">
+          <StatusTag :status="row.state" type="user" />
+          <StatusTag v-if="isUserMuted(row) && !isUserBlocked(row)" status="muted" type="user" />
         </div>
       </template>
 
-      <template #status="{ row }">
-        <StatusTag :status="row.status" type="user" />
+      <template #mutedUntil="{ row }">
+        {{ formatDate(row.mutedUntil) }}
       </template>
 
-      <template #registeredAt="{ row }">
-        {{ formatDate(row.registeredAt) }}
+      <template #createdAt="{ row }">
+        {{ formatDate(row.createdAt) }}
       </template>
 
-      <template #lastActive="{ row }">
-        {{ formatDate(row.lastActiveAt) }}
+      <template #updatedAt="{ row }">
+        {{ formatDate(row.updatedAt) }}
       </template>
 
       <template #actions="{ row }">
@@ -197,7 +207,7 @@ onMounted(() => {
           详情
         </el-button>
         <el-button
-          v-if="row.status === 'active'"
+          v-if="!isUserBlocked(row) && !isUserMuted(row)"
           type="warning"
           link
           size="small"
@@ -207,7 +217,7 @@ onMounted(() => {
           禁言
         </el-button>
         <el-button
-          v-else-if="row.status === 'muted'"
+          v-else-if="isUserMuted(row)"
           type="success"
           link
           size="small"
@@ -217,7 +227,7 @@ onMounted(() => {
           解除禁言
         </el-button>
         <el-button
-          v-if="row.status !== 'banned'"
+          v-if="!isUserBlocked(row)"
           type="danger"
           link
           size="small"
@@ -248,35 +258,52 @@ onMounted(() => {
       <template v-if="userStore.currentUser">
         <div class="user-detail">
           <div class="detail-header">
-            <el-avatar :src="userStore.currentUser.avatar" :size="80" />
             <div class="user-basic">
-              <h3>{{ userStore.currentUser.displayName || '-' }}</h3>
-              <p>@{{ userStore.currentUser.username || '-' }}</p>
-              <StatusTag :status="userStore.currentUser.status" type="user" />
+              <h3>{{ userStore.currentUser.username ? `@${userStore.currentUser.username}` : '-' }}</h3>
+              <div class="state-cell">
+                <StatusTag :status="userStore.currentUser.state" type="user" />
+                <StatusTag v-if="isUserMuted(userStore.currentUser) && !isUserBlocked(userStore.currentUser)" status="muted" type="user" />
+              </div>
             </div>
           </div>
 
           <div class="detail-info">
             <div class="info-item">
               <span class="label">TG用户ID:</span>
-              <span class="value">{{ userStore.currentUser.tgUserId }}</span>
+              <span class="value">{{ userStore.currentUser.telegramId || '-' }}</span>
             </div>
             <div class="info-item">
-              <span class="label">来源群组:</span>
-              <span class="value">{{ userStore.currentUser.sourceGroupName || '-' }}</span>
+              <span class="label">XBoard用户ID:</span>
+              <span class="value">{{ userStore.currentUser.xboardUserId ?? '-' }}</span>
+            </div>
+            <div class="info-item">
+              <span class="label">警告次数:</span>
+              <span class="value">{{ userStore.currentUser.warningCount }}</span>
+            </div>
+            <div class="info-item">
+              <span class="label">禁言截止:</span>
+              <span class="value">{{ formatDate(userStore.currentUser.mutedUntil) }}</span>
+            </div>
+            <div class="info-item">
+              <span class="label">试用开始:</span>
+              <span class="value">{{ formatDate(userStore.currentUser.trialStartedAt) }}</span>
+            </div>
+            <div class="info-item">
+              <span class="label">试用过期:</span>
+              <span class="value">{{ formatDate(userStore.currentUser.trialExpiresAt) }}</span>
             </div>
             <div class="info-item">
               <span class="label">注册时间:</span>
-              <span class="value">{{ formatDate(userStore.currentUser.registeredAt) }}</span>
+              <span class="value">{{ formatDate(userStore.currentUser.createdAt) }}</span>
             </div>
             <div class="info-item">
-              <span class="label">最后活跃:</span>
-              <span class="value">{{ formatDate(userStore.currentUser.lastActiveAt) }}</span>
+              <span class="label">最后更新:</span>
+              <span class="value">{{ formatDate(userStore.currentUser.updatedAt) }}</span>
             </div>
           </div>
 
           <div class="activity-section">
-            <h4>行为记录</h4>
+            <h4>违规记录</h4>
             <el-timeline>
               <el-timeline-item
                 v-for="activity in userStore.activities"
@@ -286,11 +313,11 @@ onMounted(() => {
               >
                 <el-card>
                   <p class="activity-type">{{ activity.type }}</p>
-                  <p class="activity-desc">{{ activity.description }}</p>
+                  <p class="activity-desc">{{ activity.description || '-' }}</p>
                 </el-card>
               </el-timeline-item>
             </el-timeline>
-            <el-empty v-if="userStore.activities.length === 0" description="暂无行为记录" />
+            <el-empty v-if="userStore.activities.length === 0" description="暂无违规记录" />
           </div>
         </div>
       </template>
@@ -317,10 +344,10 @@ onMounted(() => {
   color: #303133;
 }
 
-.user-info {
+.state-cell {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .user-detail {
@@ -337,14 +364,9 @@ onMounted(() => {
 
   .user-basic {
     h3 {
-      margin: 0 0 4px 0;
+      margin: 0 0 8px 0;
       font-size: 20px;
       font-weight: 600;
-    }
-
-    p {
-      margin: 0 0 8px 0;
-      color: #909399;
     }
   }
 }
@@ -358,7 +380,7 @@ onMounted(() => {
     border-bottom: 1px solid #f5f7fa;
 
     .label {
-      width: 100px;
+      width: 120px;
       color: #909399;
     }
 
