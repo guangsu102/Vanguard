@@ -35,6 +35,7 @@ logger = structlog.get_logger()
 PREFIX = "telegram.rpc.account."
 _SESSION_GATE = AccountSessionGate()
 _metric_rpc: ContextVar[tuple[str, str, int] | None] = ContextVar("metric_rpc", default=None)
+_read_metrics_route: ContextVar[tuple[str, str] | None] = ContextVar("read_metrics_route", default=None)
 
 READ_PREFIXES = ("Get", "Search", "Resolve", "CheckChatInvite")
 
@@ -70,6 +71,8 @@ def limits_for(state: dict, now: datetime, account_id: int | None = None) -> dic
         name: max(1, max(floor, int(base * factor)) * percent // 100)
         for name, base, floor in (("minute", 120, 6), ("hour", 240, 30), ("day", 2400, 120))
     }
+    from app.modules.acquisition.qualification_engine import enabled_for
+    limits["growth_efficiency_v1"] = int(account_id is not None and enabled_for(account_id))
     from app.core.account.reserved_reads import allocations, listener_reserve
     sync_target = 20
     p1_sync = account_id is not None and settings.p1_sync_enabled_for(account_id)
@@ -186,17 +189,18 @@ async def read_budget_state(account_id: int, limits: dict, now: datetime) -> dic
         raw[f"sync_borrowed_survival_{window}"] = (sync_borrowed_survival, ttl)
         control_used = raw[f"listener_{window}"][0] if ttl != -2 else 0
         control_room = max(0, limits[f"listener_{window}"]-control_used)
+        listener_floor = control_room if limits.get("growth_efficiency_v1") else 0
         raw[f"listener_{window}"] = (control_used, ttl)
         for kind in ("join", "review"):
             name = f"critical_{kind}_{window}"
             raw[name] = (raw[name][0] if ttl != -2 else 0, ttl)
         duration = 3600 if window == "hour" else 86400
-        safety_room = available(limits[window], used, caps, "survival")
+        safety_room = available(limits[window], used, caps, "survival", survival_floor=listener_floor)
         lane_windows["listener"].append((min(control_room, safety_room), ttl, duration))
         for lane, index in LANE_INDEX.items():
             raw[f"{lane}_{window}"] = (used[index], ttl)
             guaranteed[f"{lane}_{window}"] = caps[index]
-            room = available(limits[window], used, caps, lane)
+            room = available(limits[window], used, caps, lane, survival_floor=listener_floor)
             if lane == "survival":
                 room = max(0, room-control_room)
             lane_windows[lane].append((room, ttl, duration))
@@ -265,6 +269,22 @@ def deferred_error(error: Exception | str) -> tuple[str, int] | None:
 
 
 async def snapshot(db: Any, account_id: int, now: datetime) -> dict:
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        from app.core.redis import get_redis
+        state = await load_state(db, account_id)
+        end = parse_date(state.get("pause_until"))
+        try:
+            redis = await get_redis()
+            delay = max(0, int(await redis.ttl(f"vanguard:rpc:cooldown:{account_id}")),
+                        math.ceil((end-now).total_seconds()) if end else 0)
+        except Exception:
+            return {"state": "unavailable", "reason": "telegram_rpc_guard_unavailable",
+                    "retry_after_seconds": 30, "budget_enabled": False, "limits": None}
+        return {**state, "state": "cooldown" if delay else "ready",
+                "reason": "telegram_rpc_cooldown" if delay else None,
+                "retry_after_seconds": delay, "budget_enabled": False, "limits": None,
+                "resume_at": (now+timedelta(seconds=delay)).isoformat() if delay else None,
+                "minimum_rpc_interval_seconds": settings.TELEGRAM_RPC_MIN_INTERVAL_SECONDS}
     state = await load_state(db, account_id)
     end = parse_date(state.get("pause_until"))
     limits = limits_for(state, now, account_id)
@@ -327,6 +347,10 @@ async def check_read_ready(
     work_group_id: int | None = None, work_scope: str = "",
 ) -> dict:
     result = await snapshot(db, account_id, now or datetime.utcnow())
+    if result.get("budget_enabled") is False:
+        if result["state"] in {"cooldown", "unavailable"}:
+            raise RpcDeferred(result["reason"], result["retry_after_seconds"])
+        return result
     from app.core.account.critical_fairness import purpose_budget
     required_lanes = {read_lane([], purpose)}
     held = result.get("work_reservation") or {}
@@ -375,6 +399,9 @@ class RpcGovernor:
 
     async def before(self, methods: list[str], *, sync: bool = False) -> None:
         _metric_rpc.set(None)
+        _read_metrics_route.set(None)
+        if settings.TELEGRAM_RPC_PACING_ENABLED:
+            return  # Pacing runs under the SDK session gate, never before queuing.
         lane = None
         started = time.monotonic()
         from app.core.database import get_db_session
@@ -401,6 +428,7 @@ class RpcGovernor:
                 purpose = "growth_event"
             control = all(method in LISTENER_CONTROL_METHODS for method in methods)
             lane = ("listener" if control else "sync") if sync else read_lane(methods, purpose)
+            _read_metrics_route.set((purpose, lane))
             if (not sync and getattr(self, "bootstrapping", False)
                     and all(m in LISTENER_CONTROL_METHODS | {"updates.GetDifferenceRequest"} for m in methods)):
                 # SDK _on_login needs one initial difference after GetState.
@@ -413,9 +441,21 @@ class RpcGovernor:
             if not reads and work is None and purpose != "join_candidate_preview":
                 return
             p1_sync = lane == "sync" and settings.p1_sync_enabled_for(self.account_id)
-            if lane == "critical" or work is not None or purpose == 'ad_qualification_refresh' or p1_sync:
-                # Recompute before each actual read. The Lua allocator retains
-                # all totals/TTLs and applies the buffer to current counters.
+            from app.modules.acquisition.qualification_engine import enabled_for
+            admitted_step = (work is not None and work.claimed
+                             and not work.handed_off and not work.budget_bind_failed
+                             and purpose != "join_candidate_preview"
+                             and read_work.lane_for(work) == lane and enabled_for(self.account_id))
+            if admitted_step:
+                # The slice already passed demand forecasting and atomically
+                # reserved its loans. Recheck the initial-join claim, then let
+                # the same Lua validate token, remaining reads, current totals,
+                # listener floor and expiry. No new loan is forecast here.
+                async with get_db_session() as db:
+                    await read_work.ensure(db, self.account_id, limits, redis)
+            elif lane == "critical" or work is not None or purpose == 'ad_qualification_refresh' or p1_sync:
+                # A new slice still needs the complete demand forecast before
+                # the existing atomic allocator reserves its bounded work.
                 async with get_db_session() as db:
                     current = await snapshot(db, self.account_id, now)
                     if current["state"] not in {"cooldown", "unavailable", "budget_wait"} and work is not None:
@@ -426,7 +466,9 @@ class RpcGovernor:
                         # Preview shares the same account-local admission as
                         # joining. One parked technical retry is not a veto.
                         from app.modules.acquisition.growth_admission import admission_plan
-                        from app.modules.acquisition.join_budget import is_hard_join_admission_blocker
+                        from app.modules.acquisition.join_budget import (
+                            is_hard_join_admission_blocker,
+                        )
 
                         admission = await admission_plan(db, self.account_id, now, rpc=current)
                         # Keep execution capacity as a scheduler signal. The
@@ -436,7 +478,15 @@ class RpcGovernor:
                         # preview from silently restoring the old hard stop.
                         if is_hard_join_admission_blocker(admission['reason']):
                             raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
-                        required = read_work.DEFAULT_JOIN_READS + read_work.DEFAULT_REVIEW_READS + reads
+                        from app.modules.acquisition.qualification_engine import enabled_for
+
+                        if enabled_for(self.account_id):
+                            from app.modules.acquisition.review_read_plan import for_join
+
+                            preview_plan = await for_join(db, self.account_id, None, now)
+                            required = preview_plan.required_reads
+                        else:
+                            required = read_work.DEFAULT_JOIN_READS + read_work.DEFAULT_REVIEW_READS + reads
                         if purpose_budget(current, purpose).get("remaining", 0) < required:
                             raise RpcDeferred("telegram_read_budget", read_work.minimum_wait(current, purpose, required))
                 if current["state"] in {"cooldown", "unavailable", "budget_wait"}:
@@ -461,8 +511,14 @@ class RpcGovernor:
                 pace = 0
             from app.core.account.critical_fairness import workload
             from app.core.account.reserved_reads import RESERVED_BUDGET_LUA, reservation_args
+            budget_workload = workload(purpose) if lane == "critical" else None
+            if work is not None and lane == "critical":
+                from app.modules.acquisition.qualification_engine import enabled_for
+
+                if enabled_for(self.account_id):
+                    budget_workload = read_work.budget_kind(work, purpose)
             keys, args = reservation_args(self.account_id, limits, lane, reads, pace,
-                                           workload=workload(purpose) if lane == "critical" else None,
+                                           workload=budget_workload,
                                            ad_refresh=purpose == "ad_qualification_refresh",
                                            sync_catchup=catchup and pace > 0)
             redis = await get_redis()
@@ -556,9 +612,9 @@ class RpcGovernor:
         read_work.failed(self.account_id, methods, exc)
         # Write floods keep the existing action-specific feedback. Read floods
         # block every workflow sharing this identity until Telegram's deadline.
-        if "FloodWait" not in type(exc).__name__ or not any(
+        if "FloodWait" not in type(exc).__name__ or (not settings.TELEGRAM_RPC_PACING_ENABLED and not any(
             method.split(".")[-1].startswith(READ_PREFIXES) for method in methods
-        ):
+        )):
             return
         from app.core.database import get_db_session
         from app.core.redis import get_redis
@@ -589,6 +645,8 @@ class RpcGovernor:
             exc._vanguard_read_flood = cached
 
     async def succeeded(self) -> None:
+        if settings.TELEGRAM_RPC_PACING_ENABLED:
+            return
         from app.core.database import get_db_session
 
         async with get_db_session() as db:
@@ -609,6 +667,8 @@ class RpcGovernor:
 
 
 def install_governor(client: Any, governor: RpcGovernor) -> None:
+    from app.core.account.read_metrics import start_metrics_health
+    start_metrics_health()
     original = client._call
 
     async def guarded(
@@ -623,6 +683,11 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             type(item).__module__.rsplit(".", 1)[-1] + "." + type(item).__name__
             for item in requests
         ]
+        if (settings.TELEGRAM_RPC_PACING_ENABLED and len(requests) > 1
+                and any(method.split(".")[-1].startswith(READ_PREFIXES) for method in methods)):
+            # Pace each SDK request; charging a batch afterwards permits a burst.
+            return [await guarded(sender, item, ordered=ordered, flood_sleep_threshold=0)
+                    for item in requests]
         from app.core.account.reconciliation_handlers import verification_only
         if verification_only.get() and any(not method.split(".")[-1].startswith(READ_PREFIXES) for method in methods):
             raise RuntimeError("reconciliation_write_forbidden")
@@ -678,6 +743,20 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
             client._vanguard_sync_wait = None
         metric_rpc = _metric_rpc.get()
         rpc_outcome = "unknown"
+        from app.core.account.read_metrics import (
+            enter_sdk,
+            finish_sdk_entry,
+            prepare_sdk_entry,
+        )
+        from app.core.account.read_metrics import record_rpc as record_read_rpc
+        read_purpose, read_lane_name = _read_metrics_route.get() or (str(getattr(governor, "purpose", lambda: "other")()), "other")
+        await record_read_rpc(getattr(governor, "account_id", None), methods, "attempted", purpose=read_purpose, lane=read_lane_name)
+        entered_sdk = False
+        join_entered_at = join_responded_at = None
+        from app.core.account.join_execution_metrics import observer_for, persist as persist_join_execution
+        join_observer = observer_for(methods)
+        sdk_entry = None
+        sdk_outcome = "error"
         try:
             if any(not method.split(".")[-1].startswith(READ_PREFIXES) for method in methods):
                 from app.core.account.event_inbox import mark_external_attempt
@@ -692,10 +771,42 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
                 guard = getattr(client, "_vanguard_session_guard", None)
                 if guard is not None:
                     await guard.assert_owned()
+                if settings.TELEGRAM_RPC_PACING_ENABLED:
+                    from app.core.account.rpc_pacing import pace
+                    while True:
+                        try:
+                            await pace(governor.account_id, reads=sum(
+                                method.split(".")[-1].startswith(READ_PREFIXES) for method in methods))
+                            break
+                        except RpcDeferred as exc:
+                            if not internal_sync:
+                                raise
+                            pause = getattr(client, "_vanguard_listener_pause", None)
+                            if pause is not None:
+                                pause.request(exc)
+                                await asyncio.Future()
+                            # No SDK call has happened. Keep the exact difference
+                            # cursor while waiting; disconnect cancellation propagates.
+                            await asyncio.sleep(min(60, exc.retry_after_seconds + 1))
+                sdk_entry = await prepare_sdk_entry(getattr(governor, "account_id", None), methods,
+                                                    purpose=read_purpose, lane=read_lane_name)
+                entered_sdk = True
+                # No cancellation point between the synchronous entry mark and
+                # execution of the original SDK coroutine. The durable marker
+                # above means pending, never that Telegram has been called.
+                enter_sdk(sdk_entry)
+                if join_observer is not None:
+                    join_entered_at = datetime.utcnow()
                 result = await original(sender, request, ordered=ordered, flood_sleep_threshold=0)
+                if join_observer is not None:
+                    join_responded_at = datetime.utcnow()
+                sdk_outcome = "success"
                 rpc_outcome = "success"
             await record_request(getattr(governor, "account_id", None), requests, result)
         except Exception as exc:
+            from telethon.errors import RPCError
+            if join_entered_at is not None and join_responded_at is None and isinstance(exc, RPCError):
+                join_responded_at = datetime.utcnow()
             rpc_outcome = "flood" if "FloodWait" in type(exc).__name__ else "error"
             await governor.failed(methods, exc)
             if is_wrong_session_error(exc):
@@ -714,6 +825,9 @@ def install_governor(client: Any, governor: RpcGovernor) -> None:
                 )
             raise
         finally:
+            await persist_join_execution(join_observer, join_entered_at, join_responded_at)
+            if entered_sdk:
+                await finish_sdk_entry(sdk_entry, sdk_outcome, flood=rpc_outcome == "flood")
             if metric_rpc is not None:
                 from app.core.metrics import record_rpc
                 await record_rpc(metric_rpc[0], metric_rpc[1], rpc_outcome, metric_rpc[2])

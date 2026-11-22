@@ -56,6 +56,8 @@ def evidence_is_fresh(snapshot: Mapping[str, Any], now: datetime) -> bool:
         now - timedelta(seconds=SNAPSHOT_CACHE_TTL_SECONDS) <= collected <= now
         and snapshot.get("quality_status") == "qualified"
         and snapshot.get("collection_complete") is True
+        and snapshot.get("rules_evaluation_status") != "NOT_EVALUATED"
+        and snapshot.get("history_evaluation_status") != "NOT_EVALUATED"
         and snapshot.get("evidence")
         and not snapshot.get("collection_needs_refresh")
         and not snapshot.get("invalidated_at")
@@ -78,6 +80,8 @@ def review_input_hash(snapshot: Mapping[str, Any], account: Any) -> str:
         "group_type": snapshot.get("group_type"),
         "system_identity_fingerprint": snapshot.get("system_identity_fingerprint"),
         "permissions": snapshot.get("permissions"),
+        "rules_evaluation_status": snapshot.get("rules_evaluation_status"),
+        "history_evaluation_status": snapshot.get("history_evaluation_status"),
     })
 
 

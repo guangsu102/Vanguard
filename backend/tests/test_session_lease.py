@@ -18,8 +18,40 @@ class FakeRedis:
         self.expiry[key] = ex or 0
         return True
 
+    async def get(self, key: str):
+        return self.values.get(key)
+
     async def eval(self, script: str, numkeys: int, *rest) -> int:
         keys, argv = list(rest[:numkeys]), list(rest[numkeys:])
+        if "quarantine_publish_sentinel_v1" in script:
+            current, previous = self.values.get(keys[0]), self.values.get(keys[2])
+            if (current == argv[1] or (current is None and not argv[2] and previous in (None, argv[0]))
+                    or (argv[2] and current == argv[2] and self.values.get(keys[1]) == argv[3])):
+                self.values[keys[2]] = argv[0]
+                self.values[keys[0]] = argv[1]
+                self.expiry[keys[0]] = 0
+                self.values.pop(keys[1], None)
+                return 1
+            return 0
+        if "quarantine_probe_claim_v1" in script:
+            if self.values.get(keys[0]) != argv[0] or self.values.get(keys[2]) != argv[1]:
+                return 0
+            self.values[keys[0]], self.values[keys[1]] = argv[2], argv[4]
+            self.expiry[keys[0]] = int(argv[3])
+            return 1
+        if "quarantine_probe_release_v1" in script:
+            if self.values.get(keys[0]) != argv[0]:
+                return 0
+            self.values[keys[0]], self.values[keys[2]] = argv[1], argv[2]
+            self.expiry[keys[0]] = 0
+            self.values.pop(keys[1], None)
+            return 1
+        if "quarantine_compare_delete_v1" in script:
+            if self.values.get(keys[0]) not in (None, argv[0]) or self.values.get(keys[1]) not in (None, argv[1]):
+                return 0
+            for key in keys:
+                self.values.pop(key, None)
+            return 1
         lease_key = keys[0]
         owner_key = keys[1] if len(keys) > 1 else None
         token = argv[0]
@@ -35,6 +67,11 @@ class FakeRedis:
         if owner_key is not None:
             self.values.pop(owner_key, None)
         return 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_quarantine_store(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.core.account.session_quarantine._root", lambda: tmp_path)
 
 
 @pytest.mark.asyncio

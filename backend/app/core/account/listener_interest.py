@@ -15,6 +15,8 @@ from sqlalchemy import select
 from telethon import utils
 from telethon.tl import types
 
+from app.core.config import settings
+
 
 def fresh(policy: dict | None) -> bool:
     return bool(policy and policy.get("selective") and time.monotonic() - policy["loaded_at"] <= 90)
@@ -31,7 +33,8 @@ async def load_interests(db: Any) -> dict:
         return accounts.setdefault(account_id, {"ads": {}, "groups": {}, "verification": {}})
 
     now = datetime.utcnow()
-    audits = (await db.scalars(select(GroupQualificationAudit).where(
+    from app.core.config import settings
+    audits = [] if settings.GROWTH_SIMPLIFIED_ENABLED else (await db.scalars(select(GroupQualificationAudit).where(
         GroupQualificationAudit.decision.in_(["allowed", "trial"]),
         GroupQualificationAudit.state != "cancelled",
     ).order_by(GroupQualificationAudit.id.desc()))).all()
@@ -53,7 +56,7 @@ async def load_interests(db: Any) -> dict:
         value = {
             "membership_id": member.id,
             "joined_at": member.joined_at.isoformat() if member.joined_at else None,
-            "evidence_needed": member.review_status != "approved",
+            "evidence_needed": not settings.GROWTH_SIMPLIFIED_ENABLED and member.review_status != "approved",
         }
         audit = approved.get(member.id)
         snapshot = payload(audit.evidence_json) if audit and audit.membership_joined_at == member.joined_at else {}
@@ -67,7 +70,7 @@ async def load_interests(db: Any) -> dict:
                 member.joined_at
                 and member.joined_at >= now - timedelta(hours=48)
                 and member.review_status
-                in {"initial_pending", "review_2h", "review_24h", "verification_pending"}
+                in {"pending", "initial_pending", "review_2h", "review_24h", "verification_pending"}
             ):
                 entry(member.account_id)["verification"][peer] = value
     logs = (
@@ -159,6 +162,9 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
     groups = policy.get("groups", {})
 
     def fact(kind, peer, suffix="", **data):
+        from app.core.config import settings
+        if settings.GROWTH_SIMPLIFIED_ENABLED and kind not in {"membership", "verification"}:
+            return
         if kind == "rules" and data.get("message_ids"):
             suffix = str(max(data["message_ids"]) % 32)
         facts.append(
@@ -193,13 +199,23 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
                     if member.get("evidence_needed") and not message.out:
                         from app.modules.acquisition.group_qualification import looks_like_ad, naive
                         created = naive(message.date)
+                        candidate = looks_like_ad(message.message or "")
                         if (created and datetime.utcnow() - timedelta(hours=72) <= created <= datetime.utcnow()
-                                and looks_like_ad(message.message or "")):
+                                and candidate):
                             # At most 32 pending hints per group in the durable
                             # ingress store; only IDs/dates, never chat bodies.
                             fact("evidence_candidate", peer, str(message.id % 32),
                                  joined_at=member.get("joined_at"), message_id=message.id,
-                                 message_date=created.isoformat())
+                                 message_date=max(created, naive(message.edit_date) or created).isoformat())
+                        elif (not candidate and isinstance(update, (
+                            types.UpdateEditChannelMessage, types.UpdateEditMessage,
+                        ))):
+                            # An edit can remove the promotional content from a
+                            # pending hint. Do not leave its old maturity timer.
+                            changed_at = message.edit_date or message.date
+                            fact("evidence_candidate_removed", peer, str(message.id % 32),
+                                 joined_at=member.get("joined_at"), message_ids=[message.id],
+                                 at=changed_at.timestamp() if isinstance(changed_at, datetime) else occurred)
                     if verification_prompt(message, policy):
                         fact(
                             "verification",
@@ -236,7 +252,7 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
                         # approved membership when history is projected.
                         kind = (
                             "membership"
-                            if isinstance(action, types.MessageActionChatDeleteUser)
+                            if settings.GROWTH_SIMPLIFIED_ENABLED or isinstance(action, types.MessageActionChatDeleteUser)
                             else "verification"
                         )
                         event_at = (
@@ -245,7 +261,8 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
                             else occurred
                         )
                         fact(
-                            kind, peer, at=event_at, joined_at=groups.get(peer, {}).get("joined_at")
+                            kind, peer, at=event_at, joined_at=groups.get(peer, {}).get("joined_at"),
+                            member=not isinstance(action, types.MessageActionChatDeleteUser)
                         )
                     handled = True
         elif isinstance(update, types.UpdateDeleteChannelMessages):
@@ -268,6 +285,7 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
                             peer,
                             ids=unknown[-512:],
                             overflow=len(unknown) > 512,
+                            joined_at=groups[peer].get("joined_at"),
                         )
                 handled = True
         elif isinstance(update, types.UpdateDeleteMessages):
@@ -297,10 +315,12 @@ def project(envelope: Any, policy: dict | None) -> tuple[Any, list[int], list[di
                         )
                     )
                     fact(
-                        "membership" if peer in groups else "verification",
+                        "membership" if settings.GROWTH_SIMPLIFIED_ENABLED or peer in groups else "verification",
                         peer,
                         joined_at=groups.get(peer, {}).get("joined_at"),
                         blocked=blocked,
+                        member=(participant is not None and not isinstance(participant, types.ChannelParticipantLeft)
+                                and not getattr(participant, "left", False) and not getattr(rights, "view_messages", False)),
                     )
                 elif peer in groups and any(isinstance(p, (types.ChannelParticipantAdmin, types.ChannelParticipantCreator))
                                              for p in (update.prev_participant, update.new_participant)):

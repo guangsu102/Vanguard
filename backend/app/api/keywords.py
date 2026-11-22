@@ -543,11 +543,11 @@ async def get_keyword_stats(
 
     # 各状态统计
     status_counts = {}
-    for status in KeywordStatus:
+    for keyword_status in KeywordStatus:
         count_result = await db.execute(
-            select(func.count(Keyword.id)).where(Keyword.status == status)
+            select(func.count(Keyword.id)).where(Keyword.status == keyword_status)
         )
-        status_counts[status.value] = count_result.scalar() or 0
+        status_counts[keyword_status.value] = count_result.scalar() or 0
 
     # 各分类统计
     type_counts = {}

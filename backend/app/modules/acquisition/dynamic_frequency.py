@@ -782,6 +782,11 @@ class AccountDynamicFrequencyService:
             if account_age_eligibility_reason(account, now):
                 return 0
             limits = await effective_capacity_limits(self.db, account, config, now)
+            from app.modules.acquisition.qualification_engine import enabled_for
+            if enabled_for(config.account_id):
+                # Ads and review have separate bounded lanes. Their historical
+                # inventory cannot erase the platform/account join allowance.
+                return max(0, limits["join"])
             plan = await ad_output_plan(self.db, account, config, now, limits=limits)
             if plan["join_blocker"]:
                 return 0

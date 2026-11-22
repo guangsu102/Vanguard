@@ -99,7 +99,7 @@ export const createDefaultAssetPolicy = (): AccountAssetPolicySettings => ({
     year_3_plus: { join_multiplier: 1.3, ad_multiplier: 1.35, run_multiplier: 1.25, probe_multiplier: 1.15, age_floor_days: 1095 },
   },
 })
-export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 10, job_lease_seconds: 300, growth_group_global_cooldown_seconds: 86400 })
+export const createDefaultAdDeliveryExecution = (): AdDeliveryExecutionSettings => ({ enabled: true, dispatcher_interval_seconds: 60, dispatcher_batch_size: 100, max_parallel_accounts: 10, job_lease_seconds: 300, send_failure_exit_threshold: 3, send_failure_retry_seconds: 1800, growth_group_global_cooldown_seconds: 86400 })
 export const createDefaultAdDeliveryThrottle = (): AdDeliveryThrottleSettings => ({ enabled: true, growth_min_interval_seconds: 600, growth_max_interval_seconds: 1800 })
 
 export const createDefaultAdCapacity = (): AdCapacitySettings => ({

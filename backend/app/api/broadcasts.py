@@ -44,19 +44,6 @@ class BroadcastCreate(BaseModel):
     broadcast_type: str = Field(default="node_update", description="Broadcast type")
 
 
-class BroadcastResponse(BaseModel):
-    """Broadcast response."""
-    id: int
-    content: str
-    broadcast_type: str
-    target_group_count: int
-    success_count: int
-    failed_count: int
-    status: str
-    created_at: str
-    completed_at: Optional[str] = None
-
-
 # =============================================================================
 # Broadcast Endpoints
 # =============================================================================

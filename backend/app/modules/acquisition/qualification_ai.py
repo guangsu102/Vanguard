@@ -25,6 +25,46 @@ EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}")
 SECRET = re.compile(r"(?:sk-[a-zA-Z0-9_-]{12,}|\b\d{6,}:[a-zA-Z0-9_-]{20,})")
 MATERIAL_COLUMNS = {"source", "text", "sender_id", "sender_role", "message_id", "topic_id",
                     "reply_to_message_id", "system_account", "forwarded", "scope"}
+PRECALL_FAILURES = frozenset({
+    "group_rules_ai_disabled",
+    "group_rules_ai_destination_unapproved",
+    "group_rules_ai_capacity_unavailable",
+    "group_rules_ai_configuration_unavailable",
+    "group_rules_ai_owner_required",
+})
+
+
+def precall_failure(result: dict) -> bool:
+    """Only failures proven to precede the provider call may be retried."""
+    return result.get("reason") in PRECALL_FAILURES and not result.get("ai_reviews")
+
+
+def approved_destination(base_url: str) -> bool:
+    try:
+        endpoint = urlsplit(base_url)
+        return bool(
+            endpoint.scheme == "https"
+            and endpoint.port in {None, 443}
+            and not (endpoint.username or endpoint.password or endpoint.query or endpoint.fragment)
+            and (
+                endpoint.hostname in {"api.openai.com", "api.pipenai.xyz", "pipenai.xyz"}
+                and endpoint.path.rstrip("/") in {"", "/v1"}
+                or endpoint.hostname == "ark.cn-beijing.volces.com"
+                and endpoint.path.rstrip("/") == "/api/coding/v3"
+            )
+        )
+    except ValueError:
+        return False
+
+
+def defer_preflight(snapshot: dict, evidence: list, reason: str) -> Any:
+    from app.modules.acquisition.automation import GroupAdRulesAuditResult
+
+    snapshot.update(
+        ai_final=False, ai_pending=True, ai_decision=None, ai_request_started=False,
+        ai_retry_after_seconds=60 if reason == "group_rules_ai_capacity_unavailable" else 300,
+    )
+    return GroupAdRulesAuditResult(ad_allowed=False, reason=reason, evidence=evidence)
 
 
 def _json(value: Any) -> str:
@@ -211,62 +251,110 @@ async def review_semantics(
     snapshot["ai_redaction_version"] = SEMANTIC_VERSION
     snapshot["profile_fingerprint"] = profile_fingerprint(account)
     material = semantic_key(snapshot, safe, account, limits)
-    snapshot.update(ai_material_key=material, ai_final=True, ai_pending=False, ai_decision="fail")
+    from app.modules.acquisition.qualification_engine import enabled_for
+    efficiency = enabled_for(account.id)
+    snapshot.update(ai_material_key=material, ai_final=True, ai_pending=False,
+                    ai_decision="fail", ai_request_started=True)
     cache_key = "qualification.ai.once." + material
-    # Commit the terminal fail-closed attempt BEFORE any external call. A crash,
-    # timeout or concurrent reader cannot reclaim it or invoke the provider again.
     failed = GroupAdRulesAuditResult(ad_allowed=False, reason="group_rules_ai_attempt_interrupted")
     old = (previous or {}).get("advertising_audit") or {}
     attempted = old.get("ai_reviews") or str(old.get("reason") or "").startswith("group_rules_ai_")
-    reuse_old = bool(attempted and previous.get("profile_fingerprint") == profile_fingerprint(account)
+    reuse_old = bool(attempted and not precall_failure(old)
+                     and previous.get("profile_fingerprint") == profile_fingerprint(account)
                      and semantic_key(previous, [], account, limits) == material)
     if reuse_old:
         accepted = {field.name for field in fields(failed)} - {"evidence", "cache_hit"}
         failed = binary_result(GroupAdRulesAuditResult(**{k: v for k, v in old.items() if k in accepted}), limits)
-    value = _json({"at": datetime.utcnow().isoformat(), "result": saved_result(failed),
-                   "legacy_import": reuse_old})
     cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
-    if cache is None:
+    retry_value = None
+    if cache is not None:
         try:
-            async with service.db.begin_nested():
-                service.db.add(SystemSetting(key=cache_key, value=value))
-                await service.db.flush()
-            await service.db.commit()
-        except IntegrityError:
-            # Another worker won the unique insert.  Its fail-closed marker
-            # already owns this material, so reload and reuse it; never call
-            # the provider from the losing worker.
-            cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
-    if cache is not None or reuse_old:
-        try:
-            data = json.loads(cache.value if cache is not None else value)
-            result = binary_result(GroupAdRulesAuditResult(**data["result"]), limits)
-        except (ValueError, TypeError, KeyError):
+            data = json.loads(cache.value)
+            if efficiency:
+                from app.modules.acquisition.qualification_provider import pending_result
+                waiting = pending_result(snapshot, original, data)
+                if waiting is not None:
+                    return waiting
+            # Old releases cached these before making any provider request.
+            # Never reclaim a marker written after the request boundary.
+            if data.get("phase") not in {"attempted", "completed"} and precall_failure(data["result"]):
+                retry_value = cache.value
+            else:
+                result = binary_result(GroupAdRulesAuditResult(**data["result"]), limits)
+        except (ValueError, TypeError, KeyError, AttributeError):
             result = failed
-        result.evidence, result.cache_hit = original, True
-        snapshot["ai_decision"] = "pass" if result.ad_allowed else "fail"
-        return result
-    if not limits.get("ad_policy_ai_enabled", True):
-        failed.reason = "group_rules_ai_disabled"
-        return await finish_once(service.db, cache_key, failed, snapshot, original)
-    llm = service._ad_policy_llm()
-    # Scope actual configured clients to the one user-authorized destination.
-    endpoint = urlsplit(str(getattr(llm, "base_url", "") or ""))
-    approved_endpoint = endpoint.scheme == "https" and (
-        endpoint.hostname in {"api.pipenai.xyz", "pipenai.xyz"}
-        or (
-            endpoint.hostname == "ark.cn-beijing.volces.com"
-            and endpoint.path.rstrip("/") == "/api/coding/v3"
-        )
-    )
-    if isinstance(llm, LLMClient) and not approved_endpoint:
-        failed.reason = "group_rules_ai_destination_unapproved"
-        return await finish_once(service.db, cache_key, failed, snapshot, original)
-    claim = await claim_slot(service.db)
-    if claim is None:
-        failed.reason = "group_rules_ai_capacity_unavailable"
-        return await finish_once(service.db, cache_key, failed, snapshot, original)
+        if retry_value is None:
+            result.evidence, result.cache_hit = original, True
+            snapshot["ai_decision"] = "pass" if result.ad_allowed else "fail"
+            return result
+    if cache is not None:
+        reuse_old = False
+
+    # Configuration and slot waits must not spend the material's sole attempt.
+    # The durable claim below still precedes every possible external call.
+    claim = None
+    if not reuse_old:
+        if efficiency:
+            from app.core.account.session_exec import current_actor_account
+            if current_actor_account() != account.id:
+                return defer_preflight(snapshot, original, "group_rules_ai_owner_required")
+        if not limits.get("ad_policy_ai_enabled", True):
+            return defer_preflight(snapshot, original, "group_rules_ai_disabled")
+        try:
+            llm = service._ad_policy_llm()
+        except Exception:
+            return defer_preflight(snapshot, original, "group_rules_ai_configuration_unavailable")
+        if llm is None:
+            return defer_preflight(snapshot, original, "group_rules_ai_configuration_unavailable")
+        if isinstance(llm, LLMClient) and not approved_destination(str(llm.base_url or "")):
+            return defer_preflight(snapshot, original, "group_rules_ai_destination_unapproved")
+        claim = await claim_slot(service.db)
+        if claim is None:
+            return defer_preflight(snapshot, original, "group_rules_ai_capacity_unavailable")
     try:
+        attempt = {"at": datetime.utcnow().isoformat(), "result": saved_result(failed),
+                   "legacy_import": reuse_old, "phase": "attempted"}
+        if efficiency and not reuse_old:
+            attempt.update(background=True, deadline_at=(datetime.utcnow()+timedelta(seconds=300)).isoformat())
+        value = _json(attempt)
+        won = False
+        if retry_value is not None:
+            changed = await service.db.execute(
+                update(SystemSetting)
+                .where(SystemSetting.key == cache_key, SystemSetting.value == retry_value)
+                .values(value=value).execution_options(synchronize_session=False)
+            )
+            await service.db.commit()
+            won = changed.rowcount == 1
+        else:
+            try:
+                async with service.db.begin_nested():
+                    service.db.add(SystemSetting(key=cache_key, value=value))
+                    await service.db.flush()
+                await service.db.commit()
+                won = True
+            except IntegrityError:
+                pass
+        if not won or reuse_old:
+            cache = await service.db.get(SystemSetting, cache_key, populate_existing=True)
+            try:
+                data = json.loads(cache.value)
+                if efficiency:
+                    from app.modules.acquisition.qualification_provider import pending_result
+                    waiting = pending_result(snapshot, original, data)
+                    if waiting is not None:
+                        return waiting
+                result = binary_result(GroupAdRulesAuditResult(**data["result"]), limits)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                result = failed
+            result.evidence, result.cache_hit = original, True
+            snapshot["ai_decision"] = "pass" if result.ad_allowed else "fail"
+            return result
+        if efficiency:
+            from app.modules.acquisition.qualification_provider import launch, pending_result
+            launch(service, cache_key, claim, material, account.id, safe, local, limits)
+            claim = None  # The detached task now owns releasing this exact slot.
+            return pending_result(snapshot, original, attempt)
         async with asyncio.timeout(240):
             result = await service._evaluate_group_ad_rules_with_ai(safe, local, limits)
         return await finish_once(service.db, cache_key, binary_result(result, limits), snapshot, original)
@@ -274,17 +362,82 @@ async def review_semantics(
         failed.reason = "group_rules_ai_unavailable"
         return await finish_once(service.db, cache_key, failed, snapshot, original)
     finally:
-        await release_slot(service.db, claim)
+        if claim is not None:
+            await release_slot(service.db, claim)
 
 
 async def finish_once(db: Any, key: str, result: Any, snapshot: dict, evidence: list) -> Any:
     await db.execute(update(SystemSetting).where(SystemSetting.key == key).values(
-        value=_json({"at": datetime.utcnow().isoformat(), "result": saved_result(result)})
+        value=_json({"at": datetime.utcnow().isoformat(), "result": saved_result(result),
+                     "phase": "completed"})
     ).execution_options(synchronize_session=False))
     await db.commit()
     result.evidence = evidence
     snapshot["ai_decision"] = "pass" if result.ad_allowed is True else "fail"
     return result
+
+
+async def recover_preflight_reviews(db: Any, config: dict, *, limit: int = 32) -> list[int]:
+    """Wake only current joined memberships whose provider call never started."""
+    from sqlalchemy import select
+
+    from app.core.account.models import TelegramAccount
+    from app.core.group.models import Group, GroupAccountMembership as Member
+    from app.modules.acquisition.adaptive_frequency import payload
+    from app.modules.acquisition.models import GroupQualificationAudit as Audit
+    from app.modules.acquisition.qualification_due import current_clause
+    from app.modules.acquisition.qualification_service import _ids, manually_protected
+
+    if not config.get("enabled") or not config.get("execute_reviews", True):
+        return []
+    filters = [current_clause(), Audit.reason.in_(PRECALL_FAILURES),
+               Audit.state.in_(["completed", "queued"]),
+               (Audit.evidence_json.contains('"ai_final": true')
+                | Audit.evidence_json.contains('"ai_final":true')),
+               Audit.decision.notin_(["allowed", "trial", "protected"]),
+               Member.status == "joined", Member.left_at.is_(None),
+               Member.review_status.notin_(["exit_pending", "owned_group_excluded"])]
+    if config.get("account_ids") and not config.get("exit_all_accounts"):
+        filters.append(Audit.account_id.in_(_ids(config["account_ids"])))
+    rows = (await db.execute(select(Audit, Member, Group)
+        .join(Member, Member.id == Audit.membership_id).join(Group, Group.id == Audit.group_id)
+        .where(*filters).order_by(Audit.id).with_for_update(of=Audit, skip_locked=True)
+        .limit(max(1, min(limit, 100))))).all()
+    recovered = []
+    for row, member, group in rows:
+        if manually_protected(config, group, member):
+            continue
+        snapshot = payload(row.evidence_json)
+        material = snapshot.get("pending_collection") or snapshot
+        old = material.get("advertising_audit") or snapshot.get("advertising_audit") or {}
+        if not precall_failure({**old, "reason": row.reason}) or snapshot.get("ai_final") is not True:
+            continue
+        account = await db.get(TelegramAccount, row.account_id)
+        if account is None or not material.get("evidence"):
+            continue
+        cache = await db.get(SystemSetting, "qualification.ai.once." + semantic_key(material, [], account, {}))
+        if cache is not None:
+            try:
+                data = json.loads(cache.value)
+                if data.get("phase") in {"attempted", "completed"} or not precall_failure(data["result"]):
+                    continue
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+        snapshot = {**snapshot, **material}
+        snapshot.pop("pending_collection", None)
+        snapshot.update(ai_final=False, ai_pending=True, ai_decision=None,
+                        ai_request_started=False, ai_review_incomplete=False,
+                        decision="observe", review_trigger="ai_preflight_recovery",
+                        ai_preflight_recovery={"at": datetime.utcnow().isoformat(),
+                                               "reason": row.reason, "version": 1})
+        row.evidence_json = _json(snapshot)
+        row.decision, row.state = "observe", "queued"
+        row.next_retry_at = datetime.utcnow() + timedelta(seconds=row.id % 30)
+        member.ad_status, member.review_next_at = "blocked", row.next_retry_at
+        recovered.append(row.id)
+    if recovered:
+        await db.commit()
+    return recovered
 
 
 async def retire_failed_retries(db: Any) -> dict:
@@ -308,7 +461,8 @@ async def retire_failed_retries(db: Any) -> dict:
         material = snapshot.get("pending_collection") or snapshot
         old = material.get("advertising_audit") or snapshot.get("advertising_audit") or {}
         reason = str(old.get("reason") or material.get("reason") or row.reason or "")
-        if not reason.startswith("group_rules_ai_") or old.get("ad_allowed") is True:
+        if (not reason.startswith("group_rules_ai_") or old.get("ad_allowed") is True
+                or precall_failure({**old, "reason": reason})):
             continue
         account = await db.get(TelegramAccount, row.account_id)
         if account is None or not material.get("evidence"):

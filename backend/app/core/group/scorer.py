@@ -249,7 +249,7 @@ class GroupScorer:
         if kicked_count >= config["kick_threshold"]:
             return True, f"kicked_{kicked_count}_times_threshold"
         elif kicked_count >= 1:
-            return True, f"kicked_1_time"
+            return True, "kicked_1_time"
 
         if success_rate < config["success_rate_threshold"]:
             return True, f"low_success_rate_{success_rate:.0%}"

@@ -1,5 +1,5 @@
 <!-- oracle-shared-postgres-20260930 -->
-> **Oracle 部署（2026-09-30）：共用 PostgreSQL 18 实例，业务分库分账号。** 先阅读 [共享数据库与部署边界](docs/ORACLE_SHARED_POSTGRES.md)，不要在 Oracle 常规发布时启动旧独立 PG。Redis 保持现状。
+> **当前生产环境** `oracle4c24g-us`。Vanguard 使用 `vanguard.dh113.xyz` 和 Cloudflare 源站证书。旧主机 `xd` 已到期。 [生产部署指南](SERVER_DEPLOY.md)
 
 # =============================================================================
 # Vanguard Project
@@ -18,15 +18,6 @@ vanguard/
 │   │   └── api/            # REST API endpoints
 │   ├── migrations/          # Database migrations (Alembic)
 │   ├── tests/              # Unit and integration tests
-│   ├── Dockerfile
-│   └── requirements.txt
-│
-├── bot-matrix/              # Legacy/reference Telegram Bot implementation
-│   ├── src/
-│   │   ├── bots/          # Bot implementations
-│   │   ├── core/          # Core utilities
-│   │   └── integrations/  # External integrations
-│   ├── tests/              # Tests
 │   ├── Dockerfile
 │   └── requirements.txt
 │
@@ -51,7 +42,6 @@ vanguard/
 │
 ├── docker-compose.yml       # Docker Compose orchestration
 ├── Dockerfile.backend       # Backend Docker image
-├── Dockerfile.bot          # Bot Docker image
 ├── .env.example            # Environment variables template
 └── README.md
 ```
@@ -59,8 +49,8 @@ vanguard/
 ## Quick Start
 
 Documentation map: [docs/README.md](docs/README.md). The active Telegram
-execution path is backend/app/workers/telegram_worker.py; bot-matrix is
-kept as legacy/reference code behind an explicit Compose profile.
+execution path is backend/app/workers/telegram_worker.py. The retired standalone
+bot-matrix implementation and its build/deployment entries were removed.
 
 ### Prerequisites
 

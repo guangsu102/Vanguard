@@ -81,7 +81,7 @@ def analyze_regex_complexity(pattern: str) -> tuple[bool, str, int]:
     for cata in CATASTROPHIC_PATTERNS:
         if cata.search(pattern):
             risk_score += 5
-            return False, f"Pattern contains catastrophic ReDoS construct", risk_score
+            return False, "Pattern contains catastrophic ReDoS construct", risk_score
 
     # Check nested quantifier depth
     depth = _count_quantifier_depth(pattern)

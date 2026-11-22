@@ -91,21 +91,23 @@ export const useAccountStore = defineStore('account', () => {
   }
 
   const enable = async (id: number) => {
-    await accountsApi.connect(id)
+    const result = await accountsApi.connect(id)
     const account = list.value.find((item) => item.id === id)
     if (account) {
-      account.status = 'online'
-      account.is_active = true
+      account.status = result.status
+      account.is_active = result.is_active
     }
+    return result
   }
 
   const disable = async (id: number) => {
-    await accountsApi.disconnect(id)
+    const result = await accountsApi.disconnect(id)
     const account = list.value.find((item) => item.id === id)
     if (account) {
-      account.status = 'offline'
-      account.is_active = false
+      account.status = result.status
+      account.is_active = result.is_active
     }
+    return result
   }
 
   const syncProfileBio = async (id: number, profileBio?: string) => {

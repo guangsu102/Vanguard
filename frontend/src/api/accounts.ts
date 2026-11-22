@@ -211,6 +211,13 @@ export interface AccountListPayload {
   hasMore: boolean;
 }
 
+export interface AccountConnectionResult {
+  account_id: number;
+  status: AccountStatus;
+  is_active: boolean;
+  identity_verified?: boolean;
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
@@ -361,14 +368,14 @@ export const accountsApi = {
 
   connect: async (
     id: number,
-  ): Promise<{ account_id: number; status: AccountStatus }> => {
-    const response = await apiClient.post(`/accounts/${id}/connect`);
+  ): Promise<AccountConnectionResult> => {
+    const response = await apiClient.post(`/accounts/${id}/connect`, undefined, { timeout: 120000 });
     return response.data.data;
   },
 
   disconnect: async (
     id: number,
-  ): Promise<{ account_id: number; status: AccountStatus }> => {
+  ): Promise<AccountConnectionResult> => {
     const response = await apiClient.post(`/accounts/${id}/disconnect`);
     return response.data.data;
   },

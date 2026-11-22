@@ -17,13 +17,26 @@ from app.core.worker_status import TelegramEventInbox
 
 async def enqueue_fact(db: Any, account_id: int, fact: dict) -> None:
     kind = fact["kind"]
+    if settings.GROWTH_SIMPLIFIED_ENABLED and kind not in {"membership", "verification"}:
+        return
     # Definitive deletion facts have one lifetime identity. Cues are coalesced
     # in SQLite, then bucketed to keep repeated updates from producing work.
     identity = [account_id, fact["key"]]
+    if settings.GROWTH_SIMPLIFIED_ENABLED and kind in {"membership", "verification"}:
+        identity.extend([fact.get("member"), fact.get("blocked"), fact.get("at")])
     if kind == "evidence_candidate":
         identity.append(fact["message_id"])
+        identity.append(fact.get("message_date"))  # A same-bucket edit restarts maturity.
+    if kind == "evidence_candidate_removed":
+        identity.append(sorted(fact.get("message_ids", [])))
     if kind == "rules":
         identity.append(sorted(fact.get("message_ids", [])))
+        from app.modules.acquisition.review_read_runtime import enabled_for
+
+        if enabled_for(account_id):
+            # An edit/reference change in the same five-minute bucket is a
+            # new input version. Only exact journal replays may deduplicate it.
+            identity.append(hashlib.sha256(json.dumps(fact, sort_keys=True).encode()).hexdigest())
     if kind == "deletion_candidates":
         identity.append(hashlib.sha256(json.dumps(sorted(fact["ids"])).encode()).hexdigest())
         identity.append(bool(fact.get("overflow")))
@@ -79,6 +92,9 @@ async def enqueue_fact(db: Any, account_id: int, fact: dict) -> None:
 
 
 async def apply_fact(db: Any, account_id: int, fact: dict) -> None:
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import apply_fact as apply_simple
+        return await apply_simple(db, account_id, fact)
     from app.core.group.models import GroupAccountMembership
     from app.modules.acquisition.adaptive_frequency import (
         canonical,
@@ -125,7 +141,13 @@ async def apply_fact(db: Any, account_id: int, fact: dict) -> None:
             db, account_id, SimpleNamespace(chat_id=peer, deleted_ids=ids),
             confirmed=(kind == "deleted" or (kind == "deletion_candidates" and not fact.get("overflow"))),
         )
-        return
+        if kind == "ad_gap" or fact.get("overflow"):
+            return  # Uncertain callbacks cannot delete an ordinary-ad proof.
+        # Definite deletions also invalidate ordinary candidate hints, even
+        # when no ad delivery of ours matches the deleted message ID.
+        fact = {**fact, "kind": "evidence_candidate_removed", "message_ids": ids,
+                "at": fact.get("at", datetime.utcnow().timestamp())}
+        kind = fact["kind"]
     members = (
         await db.scalars(
             select(GroupAccountMembership)
@@ -154,6 +176,14 @@ async def apply_fact(db: Any, account_id: int, fact: dict) -> None:
             continue
         if member.status == "pending" and kind != "membership":
             continue  # A rules/gap cue is not proof of an accepted join.
+        from app.modules.acquisition.qualification_engine import enabled_for, project_fact
+        if enabled_for(account_id):
+            await project_fact(db, member, fact, now=now)
+            continue
+        if kind == "evidence_candidate_removed":
+            from app.modules.acquisition.callback_evidence import remove_hints
+            await remove_hints(db, member, fact["message_ids"], now)
+            continue
         if kind == "evidence_candidate":
             from app.modules.acquisition.callback_evidence import save_hint
             changed = await save_hint(db, member, fact, now)
@@ -201,9 +231,23 @@ async def apply_fact(db: Any, account_id: int, fact: dict) -> None:
             if row.decision in {"allowed", "trial"}:
                 if member.ad_status == "paused" or member.review_status in {"manual_required", "exit_pending"}:
                     continue
-                await request(db, member, kind, message_ids=fact.get("message_ids", []), source_token=source_token)
+                await request(
+                    db, member, kind, message_ids=fact.get("message_ids", []),
+                    source_token=source_token, evidence_refs=fact.get("evidence_refs"),
+                )
                 continue
-            await request(db, member, kind, message_ids=fact.get("message_ids", []), source_token=source_token)
+            await request(
+                db, member, kind, message_ids=fact.get("message_ids", []),
+                source_token=source_token, evidence_refs=fact.get("evidence_refs"),
+            )
+        if (row is not None and row.membership_joined_at == member.joined_at
+                and row.decision == "technical_wait"
+                and payload(row.evidence_json).get("technical_recovery_exhausted") is True):
+            # Keep the durable cue membership-only. The audit-first recovery
+            # lane owns event-version checks and the bounded 3-failure/24h reset.
+            if kind == "membership":
+                member.ad_status, member.review_status = "blocked", "initial_pending"
+            continue
         if row is None:
             await enqueue_membership_review(
                 db, member, batch_id=f"listener:{member.id}:{member.joined_at.isoformat()}"

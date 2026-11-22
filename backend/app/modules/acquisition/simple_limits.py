@@ -1,4 +1,4 @@
-"""Redis coordination for growth operations; no pre-RPC database writes."""
+"""Redis coordination for growth admission, cooldowns and execution leases."""
 from __future__ import annotations
 
 import asyncio
@@ -26,14 +26,20 @@ if KEYS[3] then
  if shared > now then return {0, shared-now, 'group_cooldown'} end
 end
 if KEYS[4] then
- local total=tonumber(redis.call('GET',KEYS[4]) or '0')+tonumber(ARGV[5])
- if total>=tonumber(ARGV[4]) then return {0,86400, 'account_total_cap'} end
+ local total=math.max(tonumber(redis.call('GET',KEYS[4]) or '0'),used)+tonumber(ARGV[5])
+ if total>=tonumber(ARGV[4]) then
+  return {0,math.max(1,math.min(3600,(day+1)*86400-offset-now)), 'account_total_cap'}
+ end
 end
 redis.call('HSET', KEYS[1], 'day', day, 'used', used+1)
 redis.call('EXPIREAT', KEYS[1], (day+2)*86400-offset)
 redis.call('SET', KEYS[2], now+tonumber(ARGV[2]), 'EX', ARGV[2])
 if KEYS[3] then redis.call('SET', KEYS[3], now+tonumber(ARGV[3]), 'EX', ARGV[3]) end
 if KEYS[4] then redis.call('INCR',KEYS[4]);redis.call('EXPIRE',KEYS[4],172800) end
+if KEYS[5] then
+ redis.call('HSET',KEYS[5],'state','admitted','day',day)
+ redis.call('EXPIRE',KEYS[5],172800)
+end
 return {1, now+tonumber(ARGV[2])}
 """
 RENEW = """
@@ -49,6 +55,11 @@ local time = redis.call('TIME')
 local now = tonumber(time[1])
 local offset = tonumber(ARGV[1] or '0')
 local day = math.floor((now + offset) / 86400)
+if KEYS[4] then
+ if redis.call('HGET',KEYS[4],'state') ~= 'admitted' then return 0 end
+ day = tonumber(redis.call('HGET',KEYS[4],'day'))
+ redis.call('HSET',KEYS[4],'state','released')
+end
 if tonumber(redis.call('HGET', KEYS[1], 'day') or '-1') == day then
  local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0')
  if used > 0 then
@@ -58,7 +69,8 @@ end
 local spacing = tonumber(ARGV[2] or '0')
 if KEYS[2] then
  if spacing > 0 then
-  redis.call('SET', KEYS[2], now + spacing, 'EX', spacing)
+  local due = math.max(now + spacing, tonumber(redis.call('GET',KEYS[2]) or '0'))
+  redis.call('SET', KEYS[2], due, 'EX', math.max(1, math.ceil(due-now)))
  else
   redis.call('DEL', KEYS[2])
  end
@@ -77,27 +89,36 @@ class Deferred(RuntimeError):
         super().__init__(reason)
 
 
-async def take_join(redis, account_id: int, *, recovering: bool = False, durable_used: int = 0) -> datetime:
+async def take_join(redis, account_id: int, *, recovering: bool = False, durable_used: int = 0,
+                    cap: int = 30, interval: int = 0) -> datetime:
+    """Daily join cap follows the per-account configured limit; 30 stays the ceiling."""
     try:
-        ok, value = await redis.eval(TAKE, 2, PREFIX + f"join:{account_id}:count",
-                                    PREFIX + f"join:{account_id}:due", 30, 7200 if recovering else 2880,
+        response = await redis.eval(TAKE, 2, PREFIX + f"join:{account_id}:count",
+                                    PREFIX + f"join:{account_id}:due", min(30, max(0, cap)),
+                                    max(7200 if recovering else 2880, int(interval)),
                                     0, 0, 0, 0, durable_used)
     except Exception as exc:
         raise Deferred("redis_unavailable", 30) from exc
+    ok, value = response[0], response[1]
     if not ok:
-        raise Deferred("join_cooldown_or_daily_cap", int(value))
+        reason = response[2] if len(response) > 2 else "join_cooldown_or_daily_cap"
+        raise Deferred(reason, int(value))
     return datetime.fromtimestamp(int(value), UTC).replace(tzinfo=None)
 
 
 async def take_ad(redis, account_id: int, group_key: int, *, cap: int,
                   account_interval: int, group_interval: int, total_cap: int | None = None,
-                  durable_used: int = 0, durable_ads: int = 0) -> None:
+                  durable_used: int = 0, durable_ads: int = 0,
+                  attempt_id: str | None = None) -> None:
     from app.core.operating_time import operating_date
     shared = f"risk:account:{account_id}:daily:outbound_message:{operating_date():%Y%m%d}"
     try:
-        res = await redis.eval(TAKE, 4, PREFIX + f"ads:{account_id}:count",
-            PREFIX + f"ads:{account_id}:due", PREFIX + f"group:{group_key}:due",
-            shared, max(0, cap), max(1, account_interval), max(1, group_interval),
+        keys = [PREFIX + f"ads:{account_id}:count", PREFIX + f"ads:{account_id}:due",
+                PREFIX + f"group:{group_key}:due", shared]
+        if attempt_id:
+            keys.append(PREFIX + f"admission:{account_id}:{attempt_id}")
+        res = await redis.eval(TAKE, len(keys), *keys,
+            max(0, cap), max(1, account_interval), max(1, group_interval),
             max(0, total_cap if total_cap is not None else cap), durable_used, 28800, durable_ads)
     except Exception as exc:
         raise Deferred("redis_unavailable", 30) from exc
@@ -107,7 +128,8 @@ async def take_ad(redis, account_id: int, group_key: int, *, cap: int,
         raise Deferred(reason, int(value))
 
 
-async def revert_ad(redis, account_id: int, *, cooldown_seconds: int = 0) -> None:
+async def revert_ad(redis, account_id: int, *, cooldown_seconds: int = 0,
+                    attempt_id: str | None = None, admitted_at: datetime | None = None) -> None:
     """Rollback ad cooldown and count when sending failed before or during RPC.
 
     ``cooldown_seconds > 0`` keeps a minimum account spacing instead of deleting
@@ -116,13 +138,16 @@ async def revert_ad(redis, account_id: int, *, cooldown_seconds: int = 0) -> Non
     dead group does not consume real quota.
     """
     from app.core.operating_time import operating_date
-    shared = f"risk:account:{account_id}:daily:outbound_message:{operating_date():%Y%m%d}"
+    shared = f"risk:account:{account_id}:daily:outbound_message:{operating_date(admitted_at):%Y%m%d}"
     spacing = max(0, int(cooldown_seconds))
     try:
-        await redis.eval(REVERT, 3, PREFIX + f"ads:{account_id}:count",
-            PREFIX + f"ads:{account_id}:due", shared, 28800, spacing)
-    except Exception:
-        pass
+        keys = [PREFIX + f"ads:{account_id}:count", PREFIX + f"ads:{account_id}:due", shared]
+        if attempt_id:
+            keys.append(PREFIX + f"admission:{account_id}:{attempt_id}")
+        await redis.eval(REVERT, len(keys), *keys, 28800, spacing)
+    except Exception as exc:
+        if attempt_id:
+            raise Deferred("result_admission_settle_pending", 30) from exc
 
 
 async def durable_outbound_used(db, account_id: int, now: datetime) -> int:

@@ -171,6 +171,7 @@ async def add_idle_survival_headroom(
         allocations,
         available,
         lending_caps,
+        listener_floor,
         transferred_caps,
     )
 
@@ -192,8 +193,9 @@ async def add_idle_survival_headroom(
             budget["usage"].get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
             budget["usage"].get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
-        adjusted = lending_caps(caps, used, "critical", holds[window])
-        room = available(limits[window], used, adjusted, "critical")
+        control = listener_floor(limits, budget["usage"], window)
+        adjusted = lending_caps(caps, used, "critical", holds[window], survival_floor=control)
+        room = available(limits[window], used, adjusted, "critical", survival_floor=control)
         rooms.append(room)
         if room <= 0:
             ttl = budget["usage"][window]["ttl_seconds"]

@@ -1,5 +1,7 @@
 # oracle4c24g 共享 PostgreSQL（2026-09-30）
 
+> **历史环境。** 本文记录 `oracle4c24g`。`oracle4c24g-us` 上的现行配置见 [Vanguard 生产部署指南](../SERVER_DEPLOY.md)。
+
 Oracle 上的业务共用一个 PostgreSQL 18 主实例 `sub2api-dr-postgres`，每个业务保留独立数据库和账号。这里的“整合”是共享实例，不是把业务表混放到一个数据库。
 
 | 业务 | 数据库 | 应用账号 | 连接数上限 |

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import secrets
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -20,6 +22,36 @@ from .session_lease import SessionLease
 T = TypeVar("T")
 
 _PROCESS_SESSION_GATE = AccountSessionGate()
+DISCONNECT_TIMEOUT_SECONDS = 10.0
+
+
+async def _disconnect_client(client: Any) -> None:
+    """Bound shutdown without cancelling Telethon's underlying Future.
+
+    Timed-out/cancelled callers leave the SDK shutdown running, and its final
+    exception is consumed even when the caller no longer awaits it.
+    """
+    disconnect = getattr(client, "disconnect", None)
+    if disconnect is None:
+        return
+    result = disconnect()
+    if not inspect.isawaitable(result):
+        return
+    future = asyncio.ensure_future(result)
+
+    def consume(completed: asyncio.Future[Any]) -> None:
+        with contextlib.suppress(BaseException):
+            completed.exception()
+
+    future.add_done_callback(consume)
+    try:
+        async with asyncio.timeout(DISCONNECT_TIMEOUT_SECONDS):
+            await asyncio.shield(future)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if future.cancelled() and (task is None or not task.cancelling()):
+            raise RuntimeError("session_cleanup_failed") from None
+        raise
 
 _WRONG_SESSION_MARKERS = (
     "wrong session id",
@@ -109,9 +141,8 @@ def install_session_failure_hook(client: Any) -> None:
                         return
                     disconnect = getattr(client, "disconnect", None)
                     if disconnect is not None:
-                        result = disconnect()
-                        if asyncio.iscoroutine(result):
-                            await result
+                        with contextlib.suppress(Exception):
+                            await _disconnect_client(client)
 
                 try:
                     loop = asyncio.get_running_loop()
@@ -142,14 +173,18 @@ class AccountSessionGuard:
         gate: AccountSessionGate | None = None,
         on_quarantine: Callable[[int | str, BaseException], Awaitable[None] | None]
         | None = None,
+        quarantine_token: str | None = None,
     ) -> None:
         self.account_id = account_id
         self.client = client
         self.lease = SessionLease(redis, account_id)
+        self.lease.quarantine_token = quarantine_token
         self.gate = gate or _PROCESS_SESSION_GATE
         self._on_quarantine = on_quarantine
         self._quarantined = False
         self._failure_lock = asyncio.Lock()
+        self._quarantine_token: str | None = None
+        self._fence_confirmed = False
 
     @property
     def quarantined(self) -> bool:
@@ -201,6 +236,11 @@ class AccountSessionGuard:
         """
         if self._quarantined or self.lease.lost.is_set():
             raise SessionQuarantined(f"lease lost for account {self.account_id}")
+        from .session_quarantine import current
+
+        fence = await current(self.account_id, self.lease.redis)
+        if fence is not None and fence != self.lease.quarantine_token:
+            raise SessionQuarantined(f"account {self.account_id} is quarantined")
         token = str(self.lease.token or "")
         if not token or (expected_token is not None and token != str(expected_token)):
             raise SessionQuarantined(f"session generation mismatch for account {self.account_id}")
@@ -229,29 +269,66 @@ class AccountSessionGuard:
             if self._quarantined:
                 return
             self._quarantined = True
-            self.lease.stop_renewal()
+            from .session_quarantine import StaleQuarantineOwner, publish
+
+            try:
+                from .session_lease import PROCESS_ID
+
+                self._quarantine_token = secrets.token_hex(16)
+                published = await publish(
+                    self.account_id, self.lease.redis,
+                    token=self._quarantine_token,
+                    lease_token=self.lease.token, owner=PROCESS_ID,
+                )
+                self._quarantine_token = published.token
+                self._fence_confirmed = published.sentinel_confirmed
+            except StaleQuarantineOwner:
+                # Only retire this stale client. It has no authority to alter
+                # the current owner's file/Redis fence or account DB status.
+                self.lease.stop_renewal()
+                if self.client is not None:
+                    with contextlib.suppress(Exception):
+                        await _disconnect_client(self.client)
+                with contextlib.suppress(Exception):
+                    await self.lease.release()
+                return
+            except BaseException:
+                # Mark the pool/PG fence too, but never release an unprotected
+                # owner when durable quarantine could not be confirmed.
+                if self._on_quarantine is not None:
+                    result = self._on_quarantine(self.account_id, error)
+                    if inspect.isawaitable(result):
+                        await result
+                raise
+            if self._fence_confirmed:
+                self.lease.stop_renewal()
             if self.client is not None:
                 disconnect = getattr(self.client, "disconnect", None)
                 if disconnect is not None:
                     with contextlib.suppress(Exception):
-                        result = disconnect()
-                        if asyncio.iscoroutine(result):
-                            await result
-            with contextlib.suppress(Exception):
-                await self.lease.release()
+                        await _disconnect_client(self.client)
             if self._on_quarantine is not None:
                 result = self._on_quarantine(self.account_id, error)
-                if asyncio.iscoroutine(result):
+                if inspect.isawaitable(result):
                     await result
+            if self._fence_confirmed:
+                with contextlib.suppress(Exception):
+                    await self.lease.release()
+            else:
+                from .session_quarantine import QuarantineUnavailable
+
+                raise QuarantineUnavailable("quarantine sentinel unconfirmed; owner retained")
 
     async def close(self) -> None:
         if self.client is not None:
-            disconnect = getattr(self.client, "disconnect", None)
-            if disconnect is not None:
-                with contextlib.suppress(Exception):
-                    result = disconnect()
-                    if asyncio.iscoroutine(result):
-                        await result
-        with contextlib.suppress(Exception):
-            await self.lease.close()
+            try:
+                await _disconnect_client(self.client)
+            except Exception as error:
+                if not (self._quarantined and self._fence_confirmed):
+                    # An unfenced producer may still be connected. Retain its
+                    # renewable owner; cleanup failure is never lease release.
+                    raise RuntimeError("session_cleanup_failed") from error
+        if not self._quarantined or self._fence_confirmed:
+            with contextlib.suppress(Exception):
+                await self.lease.close()
 

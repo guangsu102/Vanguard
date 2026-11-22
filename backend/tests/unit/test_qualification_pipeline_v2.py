@@ -141,7 +141,7 @@ async def test_completed_semantics_never_expires_and_new_profile_is_new_material
     )
     service = Obj(
         db=test_db,
-        _ad_policy_llm=lambda: None,
+        _ad_policy_llm=lambda: Obj(),
         _evaluate_group_ad_rules_with_ai=AsyncMock(return_value=result),
     )
     limits = {"ad_policy_ai_enabled": True, "ad_policy_ai_model": "one"}
@@ -437,7 +437,7 @@ async def test_unapproved_real_llm_destination_never_receives_evidence(test_db):
         {"ad_policy_ai_enabled": True},
     )
     assert result.reason == "group_rules_ai_destination_unapproved"
-    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
+    assert snapshot["ai_pending"] is True and snapshot["ai_request_started"] is False
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
 
 
@@ -571,7 +571,7 @@ async def test_approved_ark_coding_destination_reaches_ai_queue(test_db, monkeyp
         {"ad_policy_ai_enabled": True, "ad_policy_ai_model": "glm-5.3-flash"},
     )
     assert result.reason == "group_rules_ai_capacity_unavailable"
-    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
+    assert snapshot["ai_pending"] is True and snapshot["ai_request_started"] is False
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
 
 
@@ -594,7 +594,7 @@ async def test_approved_shared_pipenai_destination_reaches_ai_queue(test_db, mon
         {"ad_policy_ai_enabled": True, "ad_policy_ai_model": "gpt-6.1-sol"},
     )
     assert result.reason == "group_rules_ai_capacity_unavailable"
-    assert snapshot["ai_pending"] is False and snapshot["ai_decision"] == "fail"
+    assert snapshot["ai_pending"] is True and snapshot["ai_request_started"] is False
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()
 
 

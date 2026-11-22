@@ -36,6 +36,11 @@ from app.modules.acquisition.qualification_service import (
     qualification_peer_history,
 )
 
+BUSINESS_VALUE_REASONS = {
+    "members_below_50", "messages_below_5_in_72h", "group_ad_ban_and_online_below_2",
+    "no_ordinary_member_ad_48h", "advertising_evidence_insufficient_after_observation",
+}
+
 
 def rejection_facts(row: GroupQualificationAudit) -> list[dict[str, Any]]:
     """Only this qualification policy creates rejoin blocks, not manual leaves."""
@@ -180,7 +185,7 @@ def _rejoin_cleared(
     return False
 
 
-async def qualification_join_gate(db: Any, entity: Any) -> str | None:
+async def qualification_join_gate(db: Any, entity: Any, *, account_id: int | None = None) -> str | None:
     """Return a blocking reason; never join, send, mutate membership or clear history."""
     setting = await db.get(SystemSetting, SETTING_KEY, populate_existing=True)
     if setting is None or not setting.value:
@@ -192,9 +197,12 @@ async def qualification_join_gate(db: Any, entity: Any) -> str | None:
     if identity is None:
         return "qualification_join_identity_unknown"
     from app.modules.acquisition.adaptive_frequency import FrequencyService
+    from app.modules.acquisition.qualification_engine import enabled_for
+    efficiency = enabled_for(account_id)
     marked = -identity[0] - (1_000_000_000_000 if identity[1] == "channel" else 0)
     frequency = await FrequencyService(db).state(marked)
-    if frequency and frequency.status in {"exit_pending", "blocked"}:
+    if (frequency and frequency.status in {"exit_pending", "blocked"}
+            and not (efficiency and frequency.reason in BUSINESS_VALUE_REASONS)):
         return "frequency_rejoin_blocked"
     history = await qualification_peer_history(db, identity)
     latest = {}
@@ -220,6 +228,10 @@ async def qualification_join_gate(db: Any, entity: Any) -> str | None:
             ):
                 return "qualification_group_rule_prohibits_rejoin"
         for fact in facts:
+            if efficiency and fact.get("reason") in BUSINESS_VALUE_REASONS:
+                # Business-value maintenance does not create an authorization
+                # fence. Confirmed bans above retain their existing clearance.
+                continue
             evidence = fact.get("snapshot") or {}
             relation = identity_relation(identity, peer_identity(group.group_id, evidence))
             if relation == "different":

@@ -97,7 +97,7 @@ async def settle(
 
 async def reserve_read_work(db: Any, cache: Any, work: Any, reserved: int) -> None:
     """Called only after the Redis claim and before the first Telegram RPC."""
-    if not settings.BUDGET_LEDGER_ENABLED:
+    if settings.TELEGRAM_RPC_PACING_ENABLED or not settings.BUDGET_LEDGER_ENABLED:
         return
     from app.core.account.read_work import key, lane_for
 
@@ -130,7 +130,7 @@ async def reserve_read_work(db: Any, cache: Any, work: Any, reserved: int) -> No
 
 
 async def finish_read_work(work: Any) -> None:
-    if not work.ledger_id:
+    if not getattr(work, "ledger_id", None):
         return
     import structlog
 
@@ -145,7 +145,8 @@ async def finish_read_work(work: Any) -> None:
                 db,
                 work.ledger_id,
                 int(actual) if actual is not None else work.reads,
-                reason="handoff" if work.handed_off else "work_complete",
+                reason=("consumption_evidence_missing" if actual is None else
+                        "handoff" if work.handed_off else "work_complete"),
             )
     except Exception as exc:
         # The expiry scanner uses the Redis journal after a crash or DB outage.
@@ -185,6 +186,8 @@ async def expire_reservations(db: Any, cache: Any, now: datetime) -> int:
 
 
 async def write_snapshots(db: Any, cache: Any, now: datetime) -> list[dict]:
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return []
     from app.core.account.models import TelegramAccount
     from app.core.account.rpc_governor import (
         limits_for,

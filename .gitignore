@@ -138,3 +138,6 @@ NUL
 /docs/reports/*
 !/docs/reports/*.md
 *.tgz
+
+# Disposable PostgreSQL regression script is test source, not a database backup.
+!backend/tests/integration/sql/account_delete_migration.sql

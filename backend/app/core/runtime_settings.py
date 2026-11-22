@@ -387,7 +387,7 @@ DEFAULT_AD_DELIVERY_EXECUTION_SETTINGS: dict[str, Any] = {
     "dispatcher_batch_size": 100,
     "max_parallel_accounts": 10,
     "job_lease_seconds": 300,
-    "growth_group_global_cooldown_seconds": 86400,
+    "growth_group_global_cooldown_seconds": 10800,
 }
 DEFAULT_AD_ONLY_RECOMMENDATION_SETTINGS: dict[str, Any] = {
     "recommendation_enabled": False,

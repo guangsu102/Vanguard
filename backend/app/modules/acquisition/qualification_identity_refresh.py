@@ -149,6 +149,13 @@ async def queue_identity_refreshes(
             continue
         if (evidence.get("identity_refresh") or {}).get("fingerprint") == fingerprint:
             continue
+        from app.modules.acquisition.qualification_engine import enabled_for
+        if enabled_for(row.account_id):
+            from app.modules.acquisition.qualification_events import request
+            relation = await db.get(GroupAccountMembership, row.membership_id)
+            await request(db, relation, "identity", source_token=fingerprint)
+            queued += 1
+            continue
         reusable = await reusable_identity_context(db, config, row.account_id, evidence)
         evidence["identity_refresh"] = {
             "fingerprint": fingerprint,

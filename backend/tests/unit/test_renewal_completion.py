@@ -43,7 +43,7 @@ def test_admin_role_change_invalidates_observations_but_member_join_does_not():
     assert project(envelope, policy())[2][0]['kind'] == 'rules'
 
 
-def test_progress_is_scoped_and_expires_while_queue_flag_alone_is_not_new_evidence():
+def test_progress_is_scoped_and_queue_flag_or_elapsed_time_does_not_discard_stable_work():
     now = datetime.utcnow()
     member = Obj(id=60, joined_at=now - timedelta(days=3))
     event = {'kinds': ['gap'], 'token': 'one', 'queued': False}
@@ -53,7 +53,7 @@ def test_progress_is_scoped_and_expires_while_queue_flag_alone_is_not_new_eviden
     previous['renewal_progress'] = progress
     assert resume(previous, {**event, 'queued': True}, member, now)['checked']
     assert not resume(previous, {**event, 'token': 'two'}, member, now)['checked']
-    assert not resume(previous, event, member, now + timedelta(minutes=6))['checked']
+    assert resume(previous, event, member, now + timedelta(minutes=6))['checked']
     assert not resume(previous, event, member, now - timedelta(seconds=1))['checked']
     assert not resume({**previous, 'profile_fingerprint': 'other'}, event, member, now)['checked']
     member.joined_at += timedelta(seconds=1)

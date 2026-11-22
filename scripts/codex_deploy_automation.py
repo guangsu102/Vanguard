@@ -39,7 +39,6 @@ ARCHIVE_PATH = ROOT / ".codex-vanguard-full-deploy.tar.gz"
 
 INCLUDE_DIRS = [
     "backend",
-    "bot-matrix",
     "deploy",
     "docs",
     "frontend",
@@ -87,7 +86,6 @@ APP_CONTAINERS = [
     "vanguard-resource-search-worker",
     "vanguard-telegram-growth-worker",
     "vanguard-telegram-guardian-worker",
-    "vanguard-bot",
 ]
 
 MAINLINE_SERVICES = [

@@ -10,6 +10,7 @@ import FormDrawer from '@/components/FormDrawer.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import AccountLoginDialog from '@/components/AccountLoginDialog.vue'
 import AccountOperationalStatusPanel from '@/components/AccountOperationalStatusPanel.vue'
+import AccountGrowthReadiness from '@/components/AccountGrowthReadiness.vue'
 import AccountDeliveryBlockDrawer from '@/components/AccountDeliveryBlockDrawer.vue'
 import AccountPersonaDrawer from '@/components/accounts/AccountPersonaDrawer.vue'
 import AccountProfileUpdateDialog from '@/components/accounts/AccountProfileUpdateDialog.vue'
@@ -1038,8 +1039,10 @@ const handleDelete = async (row: Account) => {
 
 const handleEnable = async (row: Account) => {
   try {
-    await accountStore.enable(row.id)
-    ElMessage.success('账号已连接')
+    const result = await accountStore.enable(row.id)
+    ElMessage.success(result?.identity_verified
+      ? '身份核验通过，账号将由运行进程重新连接'
+      : '已提交连接请求，请查看实际连接状态')
   } catch (error) {
     console.error('Failed to connect account:', error)
   }
@@ -1048,7 +1051,7 @@ const handleEnable = async (row: Account) => {
 const handleDisable = async (row: Account) => {
   try {
     await accountStore.disable(row.id)
-    ElMessage.success('账号已断开')
+    ElMessage.success('账号已停用，运行进程将在下一轮同步停止连接')
   } catch (error) {
     console.error('Failed to disconnect account:', error)
   }
@@ -1121,6 +1124,8 @@ onBeforeUnmount(() => {
       <el-tab-pane label="账号列表" name="list" />
       <el-tab-pane label="账号运营态" name="operations" />
     </el-tabs>
+
+    <AccountGrowthReadiness v-if="isAdmin" :accounts="promoterAccounts" />
 
     <div v-show="activeAccountTab === 'list'">
     <el-alert
@@ -1287,6 +1292,18 @@ onBeforeUnmount(() => {
             编辑
           </el-button>
           <el-button
+            v-if="row.status === 'error'"
+            type="success"
+            link
+            size="small"
+            :disabled="!row.is_active"
+            :title="row.is_active ? '核验现有会话身份后恢复' : '请先在编辑中启用账号，再核验恢复'"
+            @click="handleEnable(row)"
+          >
+            <el-icon><CircleCheck /></el-icon>
+            核验恢复
+          </el-button>
+          <el-button
             v-if="row.is_active"
             type="warning"
             link
@@ -1294,10 +1311,10 @@ onBeforeUnmount(() => {
             @click="handleDisable(row)"
           >
             <el-icon><CircleClose /></el-icon>
-            断开
+            停用
           </el-button>
           <el-button
-            v-else
+            v-else-if="!['error', 'banned', 'restricted'].includes(row.status)"
             type="success"
             link
             size="small"

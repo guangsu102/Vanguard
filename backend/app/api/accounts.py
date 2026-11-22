@@ -10,12 +10,13 @@ import shutil
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import structlog
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Header, Query, UploadFile, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, lazyload, undefer_group
 from sqlalchemy.orm.attributes import set_committed_value
@@ -1119,22 +1120,87 @@ async def connect_account(
     account_id: int,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Connect account to Telegram (placeholder - actual connection handled by AccountPool)."""
+    """Request a connection; quarantined sessions require verified recovery."""
     manager = AccountManager(db)
     account = await manager.get_account(account_id)
 
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    await _ensure_account_proxy_available(account, db)
+    if account.status in {AccountStatus.BANNED, AccountStatus.RESTRICTED}:
+        raise HTTPException(status_code=400, detail={"reason": "account_status_blocked", "status": account.status.value})
 
-    # Update status to online
-    await manager.update_account_status(account_id, AccountStatus.ONLINE)
+    async def recover() -> dict:
+        from app.core.account.recovery import AccountRecoveryService
+
+        result = await AccountRecoveryService(db, get_account_pool()).recover(account_id)
+        if not result.ok:
+            raise HTTPException(status_code=400, detail={"reason": result.reason, "status": "error"})
+        return {
+            "code": 0, "message": "Account identity verified; normal owner may reconnect",
+            "data": {"account_id": account_id, "status": "online", "is_active": True,
+                     "identity_verified": True},
+        }
+
+    if account.status == AccountStatus.ERROR:
+        return await recover()
+
+    observed_status, observed_updated_at = account.status, account.updated_at
+    proxy_account = SimpleNamespace(**{
+        key: getattr(account, key) for key in (
+            "id", "account_type", "proxy_mode", "country_code", "phone", "session_name", "static_proxy_id",
+        )
+    })
+    # Redis and provider waits must not retain the inventory read transaction.
+    await db.rollback()
+
+    async def fenced() -> bool:
+        from app.core.account.session_quarantine import QuarantineUnavailable, current
+        from app.core.redis import redis_client
+
+        try:
+            return await current(account_id, redis_client) is not None
+        except QuarantineUnavailable as error:
+            raise HTTPException(status_code=503, detail={"reason": "lease_unavailable", "status": "error"}) from error
+
+    async def recover_fenced() -> dict:
+        # Historical OFFLINE/ONLINE values must not bypass a durable fence.
+        changed = await db.execute(update(TelegramAccount).where(
+            TelegramAccount.id == account_id,
+            TelegramAccount.status.in_({AccountStatus.OFFLINE, AccountStatus.ONLINE, AccountStatus.IDLE,
+                                       AccountStatus.WORKING}),
+        ).values(status=AccountStatus.ERROR))
+        await db.commit()
+        if not changed.rowcount:
+            latest = await manager.get_account(account_id)
+            if latest is None or latest.status != AccountStatus.ERROR:
+                raise HTTPException(status_code=409, detail={"reason": "account_changed_during_verification", "status": "error"})
+        return await recover()
+
+    if await fenced():
+        return await recover_fenced()
+
+    await _ensure_account_proxy_available(proxy_account, db)
+    await db.rollback()
+    if await fenced():
+        return await recover_fenced()
+
+    # A concurrent quarantine/ban/operator edit must win over this request.
+    changed = await db.execute(update(TelegramAccount).where(
+        TelegramAccount.id == account_id,
+        TelegramAccount.status == observed_status,
+        TelegramAccount.updated_at == observed_updated_at,
+    ).values(status=AccountStatus.ONLINE, is_active=True, last_active_at=datetime.utcnow()))
+    if not changed.rowcount:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail={"reason": "account_changed_during_verification", "status": "error"})
+    await db.commit()
 
     return {
         "code": 0,
         "message": "Connection initiated",
-        "data": {"account_id": account_id, "status": "online"}
+        "data": {"account_id": account_id, "status": "online", "is_active": True,
+                 "identity_verified": False}
     }
 
 
@@ -1215,19 +1281,25 @@ async def disconnect_account(
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """Disconnect account from Telegram."""
-    manager = AccountManager(db)
-    account = await manager.get_account(account_id)
+    account = await db.scalar(select(TelegramAccount).options(lazyload("*")).where(
+        TelegramAccount.id == account_id,
+    ).with_for_update(of=TelegramAccount).execution_options(populate_existing=True))
 
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # Update status to offline
-    await manager.update_account_status(account_id, AccountStatus.OFFLINE)
+    # Stop worker/automatic recovery eligibility without erasing a protective
+    # status. In-flight recovery rechecks this flag before publishing ONLINE.
+    account.is_active = False
+    if account.status not in {AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED}:
+        account.status = AccountStatus.OFFLINE
+    saved_status = account.status.value
+    await db.commit()
 
     return {
         "code": 0,
-        "message": "Disconnected",
-        "data": {"account_id": account_id, "status": "offline"}
+        "message": "Account disabled; runtime will stop on its next synchronization",
+        "data": {"account_id": account_id, "status": saved_status, "is_active": False}
     }
 
 
@@ -1933,16 +2005,6 @@ class Verify2FAResponse(BaseModel):
     code: int = 0
     message: str = "success"
     data: dict
-
-
-class ImportSessionRequest(BaseModel):
-    """Import session request."""
-    phone: str = Field(..., description="Phone number with country code")
-    api_config_name: str = Field(default="default", description="API config name")
-    country_code: str = Field(default="US", max_length=2, description="Country code")
-    country_name: Optional[str] = Field(None, description="Country name")
-    proxy_mode: str = Field(default="dynamic", description="Proxy mode: dynamic/static/none")
-    static_proxy_id: Optional[int] = Field(None, description="Static proxy ID")
 
 
 class ImportSessionResponse(BaseModel):

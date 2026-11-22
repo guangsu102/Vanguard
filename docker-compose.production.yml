@@ -317,25 +317,6 @@ services:
     networks:
       - vanguard-internal
 
-  # ==================== Legacy Bot Matrix (optional) ====================
-  bot:
-    profiles: ["legacy-bot-matrix"]
-    build:
-      context: .
-      dockerfile: Dockerfile.bot
-    logging: *runtime-logging
-    container_name: vanguard-bot
-    restart: unless-stopped
-    env_file:
-      - .env.production
-    environment:
-      API_BASE_URL: http://backend:8000
-    depends_on:
-      backend:
-        condition: service_healthy
-    networks:
-      - vanguard-internal
-
   # Run with: docker compose --profile bootstrap run --rm db-init/admin-init
   db-init:
     profiles: ["bootstrap"]

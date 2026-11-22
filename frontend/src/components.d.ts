@@ -9,6 +9,7 @@ declare module 'vue' {
   export interface GlobalComponents {
     AccountAgeAttestation: typeof import('./components/AccountAgeAttestation.vue')['default']
     AccountDeliveryBlockDrawer: typeof import('./components/AccountDeliveryBlockDrawer.vue')['default']
+    AccountGrowthReadiness: typeof import('./components/AccountGrowthReadiness.vue')['default']
     AccountLoginDialog: typeof import('./components/AccountLoginDialog.vue')['default']
     AccountOperationalStatusPanel: typeof import('./components/AccountOperationalStatusPanel.vue')['default']
     AccountPersonaDrawer: typeof import('./components/accounts/AccountPersonaDrawer.vue')['default']
@@ -77,6 +78,7 @@ declare module 'vue' {
     OwnedGroupCapabilityCards: typeof import('./components/ownedGroup/OwnedGroupCapabilityCards.vue')['default']
     OwnedGroupMemberTable: typeof import('./components/ownedGroup/OwnedGroupMemberTable.vue')['default']
     OwnedGroupOperationTable: typeof import('./components/ownedGroup/OwnedGroupOperationTable.vue')['default']
+    PermissionReviewPanel: typeof import('./components/PermissionReviewPanel.vue')['default']
     PersonaForm: typeof import('./components/accounts/PersonaForm.vue')['default']
     PersonaPreviewPanel: typeof import('./components/accounts/PersonaPreviewPanel.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']

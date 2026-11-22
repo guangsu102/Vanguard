@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -79,6 +80,9 @@ async def _insert_task(
 
 async def scan_database(db: Any, *, limit: int = 300) -> int:
     """Create outbox rows only; source business rows are never rewritten."""
+    from sqlalchemy import literal
+
+    from app.core.account.models import AccountOutboundAttempt
     from app.core.worker_status import TelegramEventInbox
     from app.modules.acquisition.models import AdDeliveryLog, AutoJoinAttempt
     from app.modules.acquisition.p2_models import GrowthOperation
@@ -99,13 +103,23 @@ async def scan_database(db: Any, *, limit: int = 300) -> int:
         AutoJoinAttempt.reconciliation_status.not_in(["confirmed", "resolved"]),
         missing("join", AutoJoinAttempt.id),
     ]
+    unknown_ledger = exists(select(AccountOutboundAttempt.id).where(
+        AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
+        AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+        AccountOutboundAttempt.category == "ad",
+        AccountOutboundAttempt.state.in_(["attempted", "unknown"]),
+        AccountOutboundAttempt.created_at < datetime.utcnow() - timedelta(minutes=10),
+    ))
     ad_filter = [
         rollout_filter(AdDeliveryLog.account_id),
-        AdDeliveryLog.status.in_(["pending", "unknown", "sending", "reconciliation_required"]),
         or_(
-            AdDeliveryLog.status.in_(["unknown", "reconciliation_required"]),
-            AdDeliveryLog.error.ilike("%unknown%"),
-            AdDeliveryLog.created_at < datetime.utcnow() - timedelta(minutes=10),
+            unknown_ledger,
+            AdDeliveryLog.status.in_(["pending", "unknown", "sending", "reconciliation_required"])
+            & or_(
+                AdDeliveryLog.status.in_(["unknown", "reconciliation_required"]),
+                AdDeliveryLog.error.ilike("%unknown%"),
+                AdDeliveryLog.created_at < datetime.utcnow() - timedelta(minutes=10),
+            ),
         ),
         missing("ad", AdDeliveryLog.id),
     ]
@@ -137,15 +151,16 @@ async def scan_database(db: Any, *, limit: int = 300) -> int:
         await _insert_task(db, kind="join", source_id=source_id, account_id=account_id,
                            priority=20, available_at=scheduled)
         rows.append(1)
-    for source_id, account_id in (
+    for source_id, account_id, created_at in (
         await db.execute(
-            select(AdDeliveryLog.id, AdDeliveryLog.account_id)
+            select(AdDeliveryLog.id, AdDeliveryLog.account_id, AdDeliveryLog.created_at)
             .where(*ad_filter)
             .order_by(AdDeliveryLog.id)
             .limit(limit)
         )
     ).all():
-        await _insert_task(db, kind="ad", source_id=source_id, account_id=account_id, priority=10)
+        await _insert_task(db, kind="ad", source_id=source_id, account_id=account_id,
+                           priority=10, available_at=created_at)
         rows.append(1)
     for source_id, account_id in (
         await db.execute(
@@ -249,6 +264,7 @@ async def finish_task(
     error_code: str | None = None,
     retry_after: int = 60,
     next_verification_at: datetime | None = None,
+    result: dict[str, Any] | None = None,
 ) -> bool:
     if state not in {"succeeded", "manual_required", "cancelled", "pending"}:
         raise ValueError("invalid_reconciliation_state")
@@ -259,6 +275,14 @@ async def finish_task(
         "lease_owner": None,
         "lease_expires_at": None,
     }
+    if result is not None and "evidence" in result:
+        # Evidence belongs to the same lease as the terminal outcome. A stale
+        # worker must never overwrite its successor's proof before losing CAS.
+        values.update(
+            evidence_json=json.dumps(result["evidence"], ensure_ascii=False),
+            result_json=json.dumps({key: value for key, value in result.items() if key != "evidence"}),
+            reason=result.get("error"),
+        )
     if state in {"succeeded", "manual_required", "cancelled"}:
         values["finished_at"] = now
     else:
@@ -269,7 +293,7 @@ async def finish_task(
             # the SLO start, so an unavailable budget cannot hide a stuck task.
             values.update(available_at=next_verification_at,
                           verification_due_at=next_verification_at)
-    result = await db.execute(
+    changed = await db.execute(
         update(ReconciliationTask)
         .where(
             ReconciliationTask.task_key == key,
@@ -281,7 +305,7 @@ async def finish_task(
         .returning(ReconciliationTask.id)
     )
     await db.commit()
-    return result.scalar_one_or_none() is not None
+    return changed.scalar_one_or_none() is not None
 
 
 async def recover_expired(db: Any, *, limit: int = 200) -> int:

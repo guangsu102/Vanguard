@@ -38,6 +38,8 @@ async def retire_obsolete_reviews(db: Any, *, limit: int = 500) -> int:
         (GroupQualificationAudit.reason == "join_approval_pending") & (GroupAccountMembership.status == "pending"),
     )).order_by(GroupQualificationAudit.id).limit(max(1, min(limit, 500)))
         .with_for_update(of=GroupQualificationAudit, skip_locked=True))).all()
+    from app.modules.acquisition.qualification_engine import enabled_for
+    rows = [row for row in rows if not enabled_for(row.account_id)]
     for row in rows:
         member = await db.get(GroupAccountMembership, row.membership_id)
         latest = await db.scalar(select(GroupQualificationAudit.id).where(

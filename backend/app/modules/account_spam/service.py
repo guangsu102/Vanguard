@@ -14,6 +14,8 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import (
+    AccountOperationConfig,
+    AccountRiskLevel,
     AccountSpamCheckItem,
     AccountSpamCheckOperation,
     AccountStatus,
@@ -111,15 +113,15 @@ def account_is_eligible(account: TelegramAccount | None) -> bool:
 
 
 def restorable_account_status(value: str | None) -> AccountStatus:
-    """Return a safe runtime status after clearing a SpamBot-only restriction."""
+    """Return a safe runtime status after clearing a restriction."""
 
     try:
         status = AccountStatus(str(value or ""))
     except ValueError:
-        return AccountStatus.IDLE
+        return AccountStatus.ONLINE
     if status in {AccountStatus.OFFLINE, AccountStatus.ONLINE, AccountStatus.IDLE}:
         return status
-    return AccountStatus.IDLE
+    return AccountStatus.ONLINE
 
 
 def safe_worker_error(exc: BaseException) -> str:
@@ -258,12 +260,56 @@ class AccountSpamCheckService:
             AccountRiskGuard(db)
         )
 
+    async def enqueue_expired_restricted_checks(self) -> int:
+        """Find RESTRICTED promoter accounts whose freeze cooldown has expired, and enqueue a SpamBot check."""
+        now = datetime.utcnow()
+        rows = await self.db.execute(
+            select(TelegramAccount).where(
+                TelegramAccount.status == AccountStatus.RESTRICTED,
+                TelegramAccount.account_type == AccountType.PROMOTER,
+                TelegramAccount.is_active.is_(True),
+                or_(
+                    TelegramAccount.risk_pause_until.is_(None),
+                    TelegramAccount.risk_pause_until <= now,
+                ),
+                or_(
+                    TelegramAccount.spam_checked_at.is_(None),
+                    and_(
+                        TelegramAccount.risk_pause_until.is_not(None),
+                        TelegramAccount.spam_checked_at < TelegramAccount.risk_pause_until,
+                    ),
+                    and_(
+                        TelegramAccount.restriction_detected_at.is_not(None),
+                        TelegramAccount.spam_checked_at < TelegramAccount.restriction_detected_at,
+                    ),
+                    and_(
+                        TelegramAccount.last_risk_event_at.is_not(None),
+                        TelegramAccount.spam_checked_at < TelegramAccount.last_risk_event_at,
+                    ),
+                    TelegramAccount.spam_checked_at < now - timedelta(hours=12),
+                ),
+            )
+        )
+        accounts = list(rows.scalars().all())
+        enqueued = 0
+        for account in accounts:
+            if not session_is_available(account):
+                continue
+            operation = await enqueue_automatic_spam_check(
+                self.db,
+                account_id=account.id,
+            )
+            if operation is not None:
+                enqueued += 1
+        return enqueued
+
     async def run_tick(
         self,
         *,
         limit: int = 10,
         stale_after_seconds: int = 300,
     ) -> dict[str, int]:
+        await self.enqueue_expired_restricted_checks()
         recovered = await self.recover_stale_items(
             stale_after_seconds=stale_after_seconds
         )
@@ -597,20 +643,61 @@ class AccountSpamCheckService:
                 account.restriction_detected_at = now
             account.status = AccountStatus.RESTRICTED
             account.spam_restriction_confirmed_at = now
+            if account.risk_pause_until is None or account.risk_pause_until <= now:
+                account.risk_pause_until = now + timedelta(hours=24)
             await AccountRiskGuard(self.db)._disable_account_automation(account.id, now=now)
         elif result == "clear":
             account.spam_restriction_confirmed_at = None
-            if (
-                account.status == AccountStatus.RESTRICTED
-                and account.restriction_source == "spambot"
-            ):
-                account.status = restorable_account_status(
-                    account.restriction_previous_status
-                )
-                account.restriction_source = None
-                account.restriction_reason = None
-                account.restriction_detected_at = None
-                account.restriction_previous_status = None
+            if account.status == AccountStatus.RESTRICTED:
+                can_restore = False
+                if account.restriction_source == "spambot":
+                    can_restore = (
+                        account.risk_pause_until is None
+                        or account.risk_pause_until <= now
+                    )
+                elif account.restriction_source == "telegram_rpc":
+                    if account.risk_pause_until is not None:
+                        can_restore = account.risk_pause_until <= now
+                    elif account.restriction_detected_at is not None:
+                        can_restore = (
+                            account.restriction_detected_at <= now - timedelta(hours=24)
+                        )
+                    else:
+                        can_restore = False
+                else:
+                    if account.risk_pause_until is not None:
+                        can_restore = account.risk_pause_until <= now
+                    elif account.restriction_detected_at is not None:
+                        can_restore = (
+                            account.restriction_detected_at <= now - timedelta(hours=24)
+                        )
+                    else:
+                        can_restore = True
+                if can_restore:
+                    account.status = restorable_account_status(
+                        account.restriction_previous_status
+                    )
+                    account.restriction_source = None
+                    account.restriction_reason = None
+                    account.restriction_detected_at = None
+                    account.restriction_previous_status = None
+                    account.risk_pause_until = None
+                    if account.risk_level in {AccountRiskLevel.FROZEN.value, AccountRiskLevel.LIMITED.value}:
+                        account.risk_level = AccountRiskLevel.WATCH.value
+                    configs = await self.db.execute(
+                        select(AccountOperationConfig).where(
+                            AccountOperationConfig.account_id == account.id
+                        )
+                    )
+                    for config in configs.scalars().all():
+                        from app.core.config import settings as runtime_settings
+                        if runtime_settings.GROWTH_SIMPLIFIED_ENABLED and str(getattr(account.account_type, "value", account.account_type)) == "promoter":
+                            continue  # Clear account risk without overriding manual switches or staged rollout.
+                        config.enabled = True
+                        config.auto_join_enabled = True
+                        config.auto_ads_enabled = True
+                        config.updated_at = now
+                        self.db.add(config)
         # "flagged" is a phone-number advisory: record it, but leave account
         # status and restriction bookkeeping untouched in both directions.
         await self._recompute_operation(item.operation_id, now=now)

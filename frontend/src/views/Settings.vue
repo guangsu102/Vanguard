@@ -376,8 +376,8 @@ const handleBackup = async () => {
 }
 
 const handleChangePassword = async () => {
-  if (passwordForm.newPassword.length < 16) {
-    ElMessage.error('新密码至少需要 16 个字符')
+  if (Array.from(passwordForm.newPassword).length < 8) {
+    ElMessage.error('新密码至少需要 8 个字符')
     return
   }
   if (passwordForm.newPassword !== passwordForm.confirmPassword) {
@@ -791,7 +791,7 @@ onMounted(() => {
       <el-tab-pane label="修改密码" name="password">
         <el-card shadow="never" class="password-card">
           <el-alert
-            title="为保护生产环境，请立即将初始密码修改为个人强密码。新密码至少 16 个字符。"
+            title="为保护生产环境，请立即将初始密码修改为个人强密码。新密码至少 8 个字符。"
             type="warning"
             :closable="false"
             show-icon

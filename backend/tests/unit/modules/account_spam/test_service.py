@@ -523,3 +523,112 @@ async def test_tick_reconciles_preexisting_stuck_terminal_operation(test_db):
     assert operation.status == SpamCheckOperationStatus.PARTIAL_FAILED.value
     assert operation.finished_at is not None
     assert await service.reconcile_completed_operations() == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_restricted_account_automatically_enqueued_and_restored_on_clear(test_db, tmp_path, monkeypatch):
+    from sqlalchemy import select
+    import app.core.config
+    session_file = tmp_path / "expired-restricted-acc.session"
+    session_file.write_text("session")
+    monkeypatch.setattr(app.core.config.settings, "TELEGRAM_SESSION_DIR", str(tmp_path))
+
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        identifier="expired-restricted-acc",
+        session_name="expired-restricted-acc",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.RESTRICTED,
+        is_active=True,
+        restriction_previous_status=AccountStatus.ONLINE.value,
+        restriction_source=None,
+        restriction_reason="account_restricted",
+        restriction_detected_at=now - timedelta(hours=25),
+        risk_pause_until=now - timedelta(hours=1),
+        risk_level=AccountRiskLevel.FROZEN.value,
+        spam_check_status=SpamCheckAccountStatus.UNKNOWN.value,
+    )
+    test_db.add(account)
+    await test_db.commit()
+
+    # Add an operation config with disabled automation
+    op_config = AccountOperationConfig(
+        account_id=account.id,
+        enabled=False,
+        auto_join_enabled=False,
+        auto_ads_enabled=False,
+    )
+    test_db.add(op_config)
+    await test_db.commit()
+
+    service = AccountSpamCheckService(
+        test_db,
+        account_pool=SimpleNamespace(),
+        telegram_execution=SimpleNamespace(),
+    )
+    enqueued = await service.enqueue_expired_restricted_checks()
+    assert enqueued == 1
+
+    # An operation was created
+    op = (await test_db.execute(select(AccountSpamCheckOperation))).scalars().first()
+    assert op is not None
+    assert op.trigger == "automatic"
+
+    item = (await test_db.execute(select(AccountSpamCheckItem).where(AccountSpamCheckItem.account_id == account.id))).scalars().first()
+    assert item is not None
+
+    # Simulate claim and clear result
+    item.status = SpamCheckItemStatus.IN_PROGRESS.value
+    item.lease_id = "lease-expired-restore"
+    await test_db.commit()
+
+    await service._finish_result(
+        item.id,
+        "lease-expired-restore",
+        "clear",
+        "Good news, no limits are currently applied to your account. You're free as a bird!",
+    )
+
+    await test_db.refresh(account)
+    assert account.spam_check_status == SpamCheckAccountStatus.CLEAR.value
+    assert account.status == AccountStatus.ONLINE
+    assert account.restriction_source is None
+    assert account.restriction_reason is None
+    assert account.risk_pause_until is None
+    assert account.risk_level == AccountRiskLevel.WATCH.value
+
+    await test_db.refresh(op_config)
+    assert op_config.enabled is True
+    assert op_config.auto_join_enabled is True
+    assert op_config.auto_ads_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_active_freeze_restricted_account_is_not_enqueued(test_db, tmp_path, monkeypatch):
+    import app.core.config
+    session_file = tmp_path / "active-freeze-acc.session"
+    session_file.write_text("session")
+    monkeypatch.setattr(app.core.config.settings, "TELEGRAM_SESSION_DIR", str(tmp_path))
+
+    now = datetime.utcnow()
+    account = TelegramAccount(
+        identifier="active-freeze-acc",
+        session_name="active-freeze-acc",
+        account_type=AccountType.PROMOTER,
+        status=AccountStatus.RESTRICTED,
+        is_active=True,
+        restriction_previous_status=AccountStatus.ONLINE.value,
+        risk_pause_until=now + timedelta(hours=12),
+        risk_level=AccountRiskLevel.FROZEN.value,
+        spam_check_status=SpamCheckAccountStatus.UNKNOWN.value,
+    )
+    test_db.add(account)
+    await test_db.commit()
+
+    service = AccountSpamCheckService(
+        test_db,
+        account_pool=SimpleNamespace(),
+        telegram_execution=SimpleNamespace(),
+    )
+    enqueued = await service.enqueue_expired_restricted_checks()
+    assert enqueued == 0

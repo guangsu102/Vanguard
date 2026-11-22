@@ -1,7 +1,9 @@
 <!-- oracle-shared-postgres-20260930 -->
 ## Oracle shared PostgreSQL deployment rule
 
-Since 2026-09-30, oracle4c24g uses the shared PG18 primary `sub2api-dr-postgres` (8 GiB limit) through `oracle-shared-postgres:5432`. Each business keeps a separate database/account. Read [docs/ORACLE_SHARED_POSTGRES.md](docs/ORACLE_SHARED_POSTGRES.md). Use the canonical per-project runtime Compose under `/opt/shared-postgres/stacks/`; do not stop/recreate shared PostgreSQL or start the old standalone database during project deployment. Preserve Redis, application authorization settings and unrelated working-tree changes.
+Production runs on `oracle4c24g-us`. Use the canonical per-project runtime Compose under `/opt/shared-postgres/stacks/` and read the [production deployment guide](SERVER_DEPLOY.md). Each application keeps a separate PostgreSQL database and account. Preserve Redis, application authorization settings and unrelated working-tree changes. Do not stop or recreate shared PostgreSQL or start the old standalone database during an application deployment.
+
+The 2026-09-30 configuration for the earlier `oracle4c24g` host is recorded in [shared PostgreSQL history](docs/ORACLE_SHARED_POSTGRES.md).
 
 # AGENTS.md
 
@@ -12,7 +14,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 Vanguard is a Telegram automation marketing matrix system for XBoard. It manages multiple Telegram accounts for lead generation, customer service, and community moderation. The system consists of three main components:
 
 - **Backend API** (FastAPI/Python 3.12+): REST API, business logic, database operations
-- **Bot Matrix** (Telethon/Pyrogram): Multi-account Telegram bot automation
+- **Telegram Workers** (backend/app/workers): Multi-account Telegram bot automation
 - **Frontend** (Vue 3 + Element Plus): Web management interface
 
 ## Development Commands
@@ -70,25 +72,9 @@ npm run test
 npm run test:watch
 ```
 
-### Bot Matrix
+### Telegram Workers
 
-```bash
-cd bot-matrix
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run bot
-python -m src.main
-
-# Tests
-pytest tests/ -v
-
-# Code formatting
-black src/
-isort src/
-flake8 src/
-```
+Telegram automation runs through `backend/app/workers/telegram_worker.py`; use the backend dependencies and tests.
 
 ### Docker Compose
 
@@ -98,12 +84,10 @@ docker-compose up -d
 
 # Start specific service
 docker-compose up -d backend
-docker-compose up -d bot
 docker-compose up -d postgres redis
 
 # View logs
 docker-compose logs -f backend
-docker-compose logs -f bot
 
 # Rebuild and restart
 docker-compose up -d --build
@@ -192,21 +176,9 @@ frontend/src/
 └── router/                 # Vue Router configuration
 ```
 
-### Bot Matrix Structure
+### Telegram Worker Entry
 
-```
-bot-matrix/src/
-├── bots/                   # Bot implementations
-│   ├── lead_gen.py         # Module A: Lead generation & airdrops
-│   ├── service.py          # Module B: Customer service
-│   └── group_ops.py        # Module C: Community moderation
-├── core/                   # Core utilities
-│   ├── account_manager.py  # Multi-account manager
-│   ├── database.py         # PostgreSQL connection
-│   ├── cache.py            # Redis cache
-│   └── middleware.py       # Risk control
-└── integrations/           # External integrations
-```
+`backend/app/workers/telegram_worker.py` runs acquisition and guardian workloads using the shared account pool.
 
 ## Key Architectural Patterns
 
@@ -241,7 +213,7 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `VANGUARD_CALLBACK_SIGNING_SECRET` - Shared HMAC secret for XBoard callbacks
 
 **Frontend (.env.development, .env.production)**:
-- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path on `https://vanguard.pipenai.xyz`.
+- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path on `https://vanguard.dh113.xyz`.
 
 ### Configuration Files
 - `backend/alembic.ini` - Database migration configuration
@@ -292,7 +264,7 @@ If you see "connection pool exhausted" errors, check for:
 - Check shared-instance limits before changing pools. Oracle uses `DATABASE_POOL_SIZE=2` and `DATABASE_MAX_OVERFLOW=1` per process, with a 25-connection cap for vanguard_app.
 
 ### Bot: Session Files
-Telegram session files (`.session`) are stored in `backend/sessions/` or `bot-matrix/sessions/`. These contain authentication credentials and should never be committed to git. If a session becomes invalid, delete the file and re-authenticate.
+Telegram session files (`.session`) are stored in `backend/sessions/`. These contain authentication credentials and should never be committed to git. If a session becomes invalid, delete the file and re-authenticate.
 
 ### Proxy Connection Issues
 If Telegram accounts fail to connect:
@@ -304,43 +276,31 @@ If Telegram accounts fail to connect:
 ## Deployment
 
 ### Production Server
-- **Server**: `168.110.23.229` (SSH alias: `oracle4c24g`; SSH port `22`)
-- **SSH**: `ssh oracle4c24g` via the local SOCKS5 `connect.exe` proxy on `127.0.0.1:7897`, using `E:/sshkey/sshkey/id_rsa`.
-- **Important**: Vanguard production deploys must target `ssh oracle4c24g`. The co-located Sub2API stack under `/opt/sub2api-dr` is a separate service and must not be stopped or reconfigured by Vanguard deployment.
-- **Public domain**: https://vanguard.pipenai.xyz
-- **Backend**: host Nginx proxies `/api`, `/api/ws`, and `/health` to the loopback backend port `127.0.0.1:18080`.
-- **Frontend**: host Nginx proxies the public site to the loopback frontend port `127.0.0.1:13000`.
-- **Database**: shared PG18 `sub2api-dr-postgres`; database `vanguard`, account `vanguard_app`, endpoint `oracle-shared-postgres:5432`. See `docs/ORACLE_SHARED_POSTGRES.md`.
-- **Cache**: isolated `vanguard-redis` service and `./data/redis` volume from `docker-compose.production.yml`.
-- **TLS/Nginx**: host configuration is `/etc/nginx/conf.d/vanguard.conf`; use the existing Cloudflare Origin wildcard certificate for `*.pipenai.xyz` only after verifying its dates and key permissions on the target host.
+
+- Use `ssh oracle4c24g-us` (`147.224.11.146`) and the [Vanguard site](https://vanguard.dh113.xyz). The former host `xd` has expired. [XD deployment history](docs/XD_DEPLOYMENT.md)
+- The production runtime is `/opt/shared-postgres/stacks/vanguard/compose.json` and the application root is `/opt/vanguard`.
+- K3s Traefik routes the Vanguard hostname in the `vanguard` namespace. It forwards `/api` and `/health` to `172.17.0.1:23080` and the website to `172.17.0.1:23000`.
+- The shared PostgreSQL 18 instance serves database `vanguard` through `oracle-shared-postgres:5432` with account `vanguard_app`. Vanguard has its own Redis 8 service for DB 3 (application), 4 (Celery broker), and 5 (results).
+- Cloudflare proxies `vanguard.dh113.xyz` in Full (strict) mode. Traefik uses the `dh113-origin` certificate secret, which covers Vanguard and Airport Growth (`x.dh113.xyz`). [Certificate details](SERVER_DEPLOY.md#网站入口与证书)
 
 ### Deployment Process
 
-**Backend**:
+Build and verify the image, then update the appropriate image reference in the canonical runtime file. Deploy only the intended services with `--no-deps`.
+
 ```bash
-# On server
-cd /opt/vanguard
+ssh oracle4c24g-us
+docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json config --quiet
+docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json config --services
 docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-deps backend
 ```
 
-**Frontend**:
-```bash
-# Local build
-cd frontend
-npm run build
-tar -czf dist.tar.gz -C dist .
-
-# Deploy to server (the frontend image is built as part of the production stack)
-scp dist.tar.gz oracle4c24g:/tmp/
-ssh oracle4c24g
-cd /opt/vanguard
-docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json up -d --no-deps frontend
-```
+Use `frontend` for a web release and confirm Telegram worker service names with `config --services` before updating them.
 
 ### Health Checks
-- Backend: `curl https://vanguard.pipenai.xyz/health`
-- API Docs: `https://vanguard.pipenai.xyz/docs` (only in DEBUG mode)
-- Logs: `docker logs -f vanguard-backend`
+
+- Check the API with `curl -fsS https://vanguard.dh113.xyz/health`.
+- Check the login page at [vanguard.dh113.xyz/login](https://vanguard.dh113.xyz/login).
+- Read logs with `docker compose -f /opt/shared-postgres/stacks/vanguard/compose.json logs --tail=100 backend`.
 
 ## Code Style
 

@@ -1,16 +1,7 @@
-"""Forward session-bound stage quanta to the process that owns the session.
+"""Bounded, fair execution using the process that owns each Telegram session.
 
-The exclusive Telegram session lease (``session_lease``) guarantees one client
-per auth key.  A long-lived listener process therefore owns the sessions of its
-accounts, and work lanes running in other processes can never create clients
-for them.  Instead of negotiating a lease handoff, the celery quantum task
-forwards the whole stage execution to the owner: the owner runs the identical
-service code with its already-connected client and returns the result.  All
-one-shot contracts (receipt verification, budgets, leases) live in the service
-layer and apply unchanged on either side.
-
-The channel is deliberately small: one Redis request list, one per-request
-reply key, and an owner registry maintained alongside the session lease.
+The service layer retains its budgets, receipts and operation leases. This
+channel only admits work, serializes an account, and propagates cancellation.
 """
 
 from __future__ import annotations
@@ -39,14 +30,14 @@ logger = structlog.get_logger()
 
 REQUEST_KEY = "vanguard:session-exec:requests"
 REPLY_PREFIX = "vanguard:session-exec:reply:"
+ACTIVE_PREFIX = "vanguard:session-exec:active:"
 REPLY_TTL_SECONDS = 300
-# The celery quantum task has a 330s soft limit; leave room for reporting.
 FORWARD_TIMEOUT_SECONDS = 270.0
-# Finish execution before the forwarding caller and its Celery task expire.
-STAGE_TIMEOUT_SECONDS = 240.0
+# One slow stage must yield before the Celery task or its caller expires.
+# Services retain attempted writes for reconciliation when cancellation occurs.
+STAGE_TIMEOUT_SECONDS = 60.0
+QUEUE_TIMEOUT_SECONDS = 90.0
 REPLY_MARGIN_SECONDS = 15.0
-# Non-blocking poll cadence on the owner side; blocking BRPOP would hold a
-# pooled connection and collide with the shared client's socket timeout.
 POLL_INTERVAL_SECONDS = 0.5
 # Capacity contention is transient: retry sooner than the old 30 second
 # cadence so a freed owner slot is not left idle for a full scheduler tick.
@@ -86,9 +77,89 @@ async def _execute_in_actor(
         context.active = False
         _actor_context.reset(token)
 
+CLEANUP_TIMEOUT_SECONDS = 2.0
+PRIORITY_BURST_LIMIT = 1
+
+# Fixed identifiers only: never serialize exception text, paths or locals.
+_TIMEOUT_TRACE_MODULES = {
+    "app.core.account.session_exec": 1,
+    "app.core.scheduler.growth_dispatch": 2,
+    "app.modules.acquisition.qualification_service": 3,
+    "app.modules.acquisition.qualification_engine": 4,
+    "app.modules.acquisition.qualification_renewal": 5,
+    "app.modules.acquisition.review_read_plan": 6,
+    "app.modules.acquisition.review_read_runtime": 7,
+    "app.modules.acquisition.review_batch": 8,
+    "app.modules.acquisition.review_fact_owner": 9,
+    "app.modules.acquisition.group_qualification": 10,
+    "app.core.account.pool": 11,
+    "app.core.account.rpc_governor": 12,
+    "app.core.account.read_work": 13,
+    "app.core.account.budget_ledger": 14,
+    "app.core.account.session_guard": 15,
+    "app.core.account.session_lease": 16,
+    "app.core.account.operation_lease": 17,
+    "app.modules.acquisition.review_evidence_handoff": 18,
+    "app.modules.acquisition.qualification_events": 19,
+    "app.modules.acquisition.qualification_system_identity": 20,
+    "app.modules.acquisition.qualification_identity_refresh": 21,
+    "app.modules.acquisition.qualification_ai": 22,
+    "app.modules.acquisition.qualification_provider": 23,
+}
+
+
+def _timeout_trace(error: BaseException) -> dict[str, Any]:
+    """Bounded in-memory traceback projection for one canary timeout log."""
+    try:
+        pending = deque([error])
+        seen: set[int] = set()
+        frames: deque[dict[str, int]] = deque(maxlen=8)
+        matched = 0
+        scanned = 0
+        limited = False
+        while pending and len(seen) < 4:
+            current = pending.popleft()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            chain = len(seen) - 1
+            trace = current.__traceback__
+            for _ in range(64 - scanned):
+                if trace is None:
+                    break
+                scanned += 1
+                module = _TIMEOUT_TRACE_MODULES.get(trace.tb_frame.f_globals.get("__name__"), 0)
+                if module:
+                    frames.append({"chain_code": chain, "module_code": module, "line": int(trace.tb_lineno)})
+                    matched += 1
+                trace = trace.tb_next
+            limited = limited or trace is not None
+            for linked in (current.__cause__, current.__context__):
+                if linked is not None and id(linked) not in seen:
+                    pending.append(linked)
+        limited = limited or matched > 8 or any(id(item) not in seen for item in pending)
+        return {"timeout_app_frames": list(frames), "timeout_trace_limited": int(limited)}
+    except Exception:
+        # Optional diagnostics cannot replace the original timeout or reply.
+        return {"timeout_app_frames": [], "timeout_trace_limited": 1}
+
+
+
+_REPLY_IF_ACTIVE = """
+-- session_exec_reply_if_active_v1
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('LPUSH', KEYS[2], ARGV[1])
+redis.call('EXPIRE', KEYS[2], ARGV[2])
+return 1
+"""
+_CLEANUP = """
+-- session_exec_cleanup_v1
+redis.call('DEL', KEYS[1], KEYS[2])
+return redis.call('LREM', KEYS[3], 0, ARGV[1])
+"""
+
 
 async def owner_id(client: Any, account_id: int) -> str | None:
-    """Return the owning process id for an account session, if any."""
     try:
         value = await client.get(f"{OWNER_PREFIX}{int(account_id)}")
     except Exception:
@@ -97,7 +168,6 @@ async def owner_id(client: Any, account_id: int) -> str | None:
 
 
 def _dedicated_client() -> Any:
-    """A private connection for blocking waits; never shares the app pool."""
     import redis.asyncio as redis_asyncio
 
     from app.core.config import settings
@@ -107,8 +177,6 @@ def _dedicated_client() -> Any:
         password=settings.effective_redis_password,
         encoding="utf-8",
         decode_responses=True,
-        # The only blocking call is BRPOP on the reply key bounded by the
-        # forward timeout itself; a socket timeout must not preempt it.
         socket_timeout=None,
         socket_connect_timeout=10,
     )
@@ -121,28 +189,52 @@ async def forward(
     client: Any = None,
     timeout: float = FORWARD_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
-    """Ask the session owner to execute one stage quantum.
+    """Forward once; remove the request and cancel its owner work on exit.
 
-    Returns the owner's reply dict, or ``None`` when no owner answers before
-    the deadline (owner down or hung).  ``{"error": "not_owner"}`` means the
-    registry entry was stale; the caller should execute locally.
+    A not_owner reply still requires the dispatcher's ownership gate; it never
+    authorizes creating another client for an existing session owner.
     """
+    timeout = float(timeout)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("session execution timeout must be finite and positive")
     own_client = client is None
     if own_client:
         client = _dedicated_client()
     request_id = uuid.uuid4().hex
     reply_key = REPLY_PREFIX + request_id
+    active_key = ACTIVE_PREFIX + request_id
+    request_json = json.dumps(
+        {
+            "id": request_id,
+            "account_id": int(account_id),
+            "stage": stage,
+            "expires_at": time.time() + timeout,
+            "lifecycle": 1,
+        }
+    )
+    item = None
     try:
-        await client.lpush(
-            REQUEST_KEY,
-            json.dumps({"id": request_id, "account_id": int(account_id), "stage": stage,
-                        "expires_at": time.time() + timeout}),
-        )
-        item = await client.brpop(reply_key, timeout=int(timeout))
+        # The outer timeout bounds both connection setup and BRPOP, including
+        # fractional deadlines. Redis timeout=0 would instead wait forever.
+        async with asyncio.timeout(timeout):
+            await client.set(active_key, "1", ex=max(1, math.ceil(timeout) + 30))
+            await client.lpush(REQUEST_KEY, request_json)
+            item = await client.brpop(reply_key, timeout=max(1, math.ceil(timeout)))
+    except TimeoutError:
+        return None
     finally:
+        try:
+            async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+                # Atomic with _REPLY_IF_ACTIVE: either cleanup removes the reply,
+                # or a later reply observes no active caller and cannot write it.
+                await client.eval(_CLEANUP, 3, active_key, reply_key, REQUEST_KEY, request_json)
+        except Exception:
+            # Markers/replies have bounded TTLs if Redis itself is unavailable.
+            logger.warning("session_exec_caller_cleanup_failed", request_id=request_id)
         if own_client:
-            with _suppress_close_errors():
-                await client.aclose()
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+                    await client.aclose()
     if item is None:
         return None
     try:
@@ -150,6 +242,28 @@ async def forward(
     except (TypeError, ValueError):
         return None
     return reply if isinstance(reply, dict) else None
+
+
+@dataclass
+class _Request:
+    payload: dict[str, Any]
+    account_id: int
+    stage: str
+    reply_key: str
+    expires_at: float
+    queued_at: float
+    wait_phase: str = "executor_capacity"
+
+    @property
+    def active_key(self) -> str | None:
+        if self.payload.get("lifecycle") == 1:
+            return ACTIVE_PREFIX + str(self.payload["id"])
+        # Old in-flight publishers remain compatible during a rolling update.
+        return None
+
+
+def _wait(reason: str, phase: str, interval: int = CAPACITY_WAIT_RETRY_SECONDS) -> dict[str, Any]:
+    return {"result": {"processed": 0, "reason": reason, "retryable": True, "wait_phase": phase}, "interval": interval}
 
 
 async def serve_requests(
@@ -164,188 +278,217 @@ async def serve_requests(
     queued_stages: frozenset[str] | None = None,
     priority_stages: frozenset[str] | None = None,
     priority_reserved_slots: int = 1,
+    queue_timeout: float = QUEUE_TIMEOUT_SECONDS,
+    stopping: Callable[[], bool] | None = None,
 ) -> None:
-    """Owner-side consumer loop; runs until cancelled.
+    """Run bounded stages; admit only after both account and slot are free.
 
-    ``owns`` decides whether this process holds a connected session for the
-    account; ``execute_stage`` runs the stage and returns ``(result,
-    interval)`` exactly like ``growth_dispatch.execute``.  Polling keeps every
-    Redis call short; a blocking BRPOP would monopolize a pooled connection.
+    Background work can use at most cap-reserved slots. A running protected
+    task does not block a different account from using another available slot.
+    When both classes are queued, one protected admission is followed by one
+    eligible background admission; the reserved protected slot remains intact.
+    Within each class accounts rotate in FIFO order. Waiting work occupies no
+    task, DB connection, semaphore, or account lock.
 
-    Different accounts execute concurrently (their sessions, database sessions
-    and one-shot contracts are independent) while one account stays serial
-    through a per-account lock.  Concurrency is capped by
-    ``SESSION_EXEC_CONCURRENCY`` so the shared database pool cannot exhaust.
-    With ``parallel_stages``, only those stages may share the executor; other
-    stages reserve it exclusively. ``priority_stages`` additionally reserves a
-    bounded executor slot for the listed stages. Background work can therefore
-    make progress without consuming the last slot needed by a join or an
-    advertisement. This requires busy deferral. Requests for
-    ``queued_stages`` are retained in a small local wait queue while the owner
-    is busy, so a protected stage cannot be repeatedly dropped behind a stream
-    of review requests. Other blocked requests keep the original immediate
-    ``session_owner_capacity_wait`` response and are rescheduled by their
-    caller.
+    Cancellation is cooperative: a slot/account stays occupied until service
+    cleanup unwinds. A coroutine swallowing cancellation is quarantined in its
+    existing slot; releasing it early would permit concurrent session use.
     """
     from app.core.config import settings
 
     if max_concurrency is None:
-        max_concurrency = max(1, int(getattr(settings, "SESSION_EXEC_CONCURRENCY", 2)))
+        max_concurrency = int(getattr(settings, "SESSION_EXEC_CONCURRENCY", 2))
+    max_concurrency = max(1, int(max_concurrency))
+    if not math.isfinite(queue_timeout) or queue_timeout <= 0:
+        raise ValueError("queue timeout must be finite and positive")
     priority_stages = frozenset(priority_stages or ())
     if (parallel_stages is not None or priority_stages) and not defer_if_busy:
         raise ValueError("restricted stage concurrency requires busy deferral")
-    reserved_slots = min(
-        max(0, int(priority_reserved_slots)),
-        max(0, max_concurrency - 1),
-    )
-    semaphore = asyncio.Semaphore(max_concurrency)
+    reserved = min(max(0, int(priority_reserved_slots)), max_concurrency - 1)
+    queued: deque[_Request] = deque()
+    inflight: dict[asyncio.Task[None], _Request] = {}
+    busy_accounts: set[int] = set()
+    cancellation_requested: set[asyncio.Task[None]] = set()
     account_locks: dict[int, asyncio.Lock] = {}
-    inflight: set[asyncio.Task[None]] = set()
-    inflight_stages: dict[asyncio.Task[None], str] = {}
-    queued = deque[tuple[dict[str, Any], str]]()
-    # A worker must never become an unbounded request buffer if the owner is
-    # unhealthy.  The forwarding caller still has its own deadline and will
-    # retry after this bounded queue fills.
-    queue_limit = max(1, max_concurrency * 4)
+    semaphore = asyncio.Semaphore(max_concurrency)
+    queue_limit = max_concurrency * 4
+    priority_streak = 0
+    last_account: dict[bool, int] = {}
 
     def completed(task: asyncio.Task[None]) -> None:
-        inflight.discard(task)
-        inflight_stages.pop(task, None)
+        request = inflight.pop(task, None)
+        cancellation_requested.discard(task)
+        if request is not None:
+            busy_accounts.discard(request.account_id)
+            account_locks.pop(request.account_id, None)
+        if not task.cancelled():
+            # Retrieve failures even when shutdown races the callback.
+            task.exception()
 
-    async def execute_and_reply(request: dict[str, Any], reply_key: str) -> None:
-        account_id = int(request.get("account_id") or 0)
-        stage = str(request.get("stage") or "")
-        lock = account_locks.setdefault(account_id, asyncio.Lock())
+    def blocked_phase(request: _Request) -> str | None:
+        if request.account_id in busy_accounts:
+            return "account_session"
+        if len(inflight) >= max_concurrency:
+            return "executor_capacity"
+        if request.stage not in priority_stages and priority_stages:
+            background = sum(item.stage not in priority_stages for item in inflight.values())
+            if background >= max_concurrency - reserved:
+                return "protected_slot_reservation"
+        if (
+            inflight
+            and parallel_stages is not None
+            and (
+                request.stage not in parallel_stages
+                or any(item.stage not in parallel_stages for item in inflight.values())
+            )
+        ):
+            return "exclusive_stage"
+        return None
+
+    async def live_requests() -> None:
+        all_requests = list(queued) + list(inflight.values())
+        keys = [item.active_key for item in all_requests if item.active_key]
+        if not keys:
+            return
+        values = await client.mget(keys)
+        active = {key for key, value in zip(keys, values, strict=True) if value}
+        for request in list(queued):
+            if request.active_key and request.active_key not in active:
+                queued.remove(request)
+        for task, request in list(inflight.items()):
+            if request.active_key and request.active_key not in active and task not in cancellation_requested:
+                cancellation_requested.add(task)
+                logger.info(
+                    "session_exec_cancellation_requested",
+                    stage=request.stage,
+                    request_id=request.payload["id"],
+                    wait_phase="cancellation_cleanup",
+                )
+                task.cancel()
+
+    async def execute_and_reply(request: _Request) -> None:
         async with semaphore:
-            # One account, one stage at a time: its client, read budget lane
-            # and one-shot contracts are not safe to interleave.
-            async with lock:
+            async with account_locks.setdefault(request.account_id, asyncio.Lock()):
                 try:
+                    if request.active_key and not await client.get(request.active_key):
+                        return
+                    # Ownership can change while a request waits in the queue.
+                    if not owns(request.account_id):
+                        await _reply(client, request, {"error": "not_owner"})
+                        return
                     started_at = time.time()
-                    expires_at = float(request.get("expires_at", started_at + FORWARD_TIMEOUT_SECONDS))
-                    if not math.isfinite(expires_at):
-                        raise ValueError("invalid session execution deadline")
-                    remaining = expires_at - started_at
+                    remaining = request.expires_at - started_at
                     if remaining <= 0:
-                        await _reply(client, reply_key, {"result": {"processed": 0,
-                            "reason": "session_owner_request_expired"}, "interval": 15})
+                        await _reply(client, request, _wait("session_owner_request_expired", "queue", 15))
                         return
                     budget = min(STAGE_TIMEOUT_SECONDS, remaining - min(REPLY_MARGIN_SECONDS, remaining / 10))
-                    logger.info("session_exec_stage_started", account_id=account_id, stage=stage,
-                                request_id=request.get("id"), started_at=started_at,
-                                deadline_at=started_at + budget)
+                    logger.info(
+                        "session_exec_stage_started",
+                        account_id=request.account_id,
+                        stage=request.stage,
+                        request_id=request.payload["id"],
+                        started_at=started_at,
+                        deadline_at=started_at + budget,
+                        queued_seconds=round(time.monotonic() - request.queued_at, 3),
+                    )
                     timer = asyncio.timeout(budget)
                     try:
                         async with timer:
-                            result, interval = await _execute_in_actor(execute_stage, account_id, stage)
-                    except TimeoutError:
+                            result, interval = await _execute_in_actor(execute_stage, request.account_id, request.stage)
+                    except TimeoutError as exc:
                         if not timer.expired():
                             raise
-                        # Cancellation unwinds the stage's DB/pool/lease contexts.
-                        # Durable attempted writes stay reserved for reconciliation.
-                        logger.warning("session_exec_stage_timed_out", account_id=account_id,
-                                       stage=stage, request_id=request.get("id"),
-                                       elapsed_seconds=round(time.time() - started_at, 3))
-                        await _reply(client, reply_key, {"result": {"processed": 0,
-                            "reason": "session_owner_stage_timeout", "retryable": True}, "interval": 60})
+                        trace = (_timeout_trace(exc)
+                                 if request.account_id == 33 and request.stage == "review" else {})
+                        logger.warning(
+                            "session_exec_stage_timed_out",
+                            stage=request.stage,
+                            request_id=request.payload["id"],
+                            wait_phase="execution",
+                            elapsed_seconds=round(time.time() - started_at, 3),
+                            **trace,
+                        )
+                        await _reply(client, request, _wait("session_owner_stage_timeout", "execution", 60))
                         return
-                    logger.info("session_exec_stage_completed", account_id=account_id, stage=stage,
-                                request_id=request.get("id"),
-                                elapsed_seconds=round(time.time() - started_at, 3))
-                    await _reply(client, reply_key, {"result": result, "interval": int(interval)})
+                    if timer.expired():
+                        # A stage may suppress CancelledError while unwinding.
+                        # Its late return still is not a successful quantum.
+                        await _reply(client, request, _wait("session_owner_stage_timeout", "execution", 60))
+                        return
+                    logger.info(
+                        "session_exec_stage_completed",
+                        stage=request.stage,
+                        request_id=request.payload["id"],
+                        elapsed_seconds=round(time.time() - started_at, 3),
+                    )
+                    await _reply(client, request, {"result": result, "interval": int(interval)})
                 except asyncio.CancelledError:
+                    # The active marker is gone for caller cancellations. During
+                    # owner shutdown a live caller receives a bounded retry.
+                    await _reply(client, request, _wait("session_owner_shutdown", "owner_shutdown", 15))
                     raise
                 except Exception as exc:
                     logger.warning(
                         "session_exec_stage_failed",
-                        account_id=account_id,
-                        stage=stage,
+                        stage=request.stage,
+                        request_id=request.payload["id"],
                         error_type=type(exc).__name__,
-                        error=str(exc)[:300],
+                        error=str(exc),
+                        exc_info=True,
                     )
-                    await _reply(
-                        client,
-                        reply_key,
-                        {
-                            "error": "execution_failed",
-                            "error_type": type(exc).__name__,
-                            "error_message": str(exc)[:500],
-                        },
-                    )
-
-    def stage_conflicts(stage: str) -> bool:
-        # A protected stage may use any free executor slot. Its account-level
-        # lock still serializes operations that share one Telegram session.
-        if priority_stages and stage in priority_stages:
-            return False
-        if priority_stages:
-            active_priority = any(active in priority_stages for active in inflight_stages.values())
-            if active_priority or len(inflight) >= max_concurrency - reserved_slots:
-                return True
-        return bool(inflight) and parallel_stages is not None and (
-            stage not in parallel_stages
-            or any(active not in parallel_stages for active in inflight_stages.values())
-        )
-
-    def can_start(stage: str) -> bool:
-        return len(inflight) < max_concurrency and not stage_conflicts(stage)
-
-    async def expire_queued() -> None:
-        """Reply to queued requests whose forwarding deadline has elapsed."""
-        if not queued:
-            return
-        now = time.time()
-        retained = deque[tuple[dict[str, Any], str]]()
-        while queued:
-            request, reply_key = queued.popleft()
-            try:
-                expires_at = float(request.get("expires_at", now + FORWARD_TIMEOUT_SECONDS))
-            except (TypeError, ValueError):
-                expires_at = now
-            if not math.isfinite(expires_at) or expires_at <= now:
-                await _reply(client, reply_key, {"result": {"processed": 0,
-                    "reason": "session_owner_request_expired", "retryable": True}, "interval": 15})
-            else:
-                retained.append((request, reply_key))
-        queued.extend(retained)
+                    await _reply(client, request, {"error": "execution_failed", "error_type": type(exc).__name__})
 
     try:
         while True:
-            await expire_queued()
-
-            # Start retained priority requests as soon as a slot opens. They
-            # are intentionally considered before Redis so a protected stage
-            # cannot repeatedly lose the first free slot to review work.
-            started_queued = False
-            if queued:
-                queued_items = list(queued)
-                if priority_stages:
-                    queued_items.sort(
-                        key=lambda item: str(item[0].get("stage") or "") not in priority_stages
-                    )
-                for request, reply_key in queued_items:
-                    stage = str(request.get("stage") or "")
-                    if not can_start(stage):
-                        continue
-                    queued.remove((request, reply_key))
-                    task = asyncio.create_task(execute_and_reply(request, reply_key))
-                    inflight.add(task)
-                    inflight_stages[task] = stage
-                    task.add_done_callback(completed)
-                    started_queued = True
-                    # Keep polling the queue only after this task has been
-                    # admitted; the next pass can fill another free slot.
-                    break
-            if started_queued:
+            if stopping is not None and stopping():
+                # Do not claim queued work during a release; let observed RPCs
+                # finish and commit their results under their existing leases.
+                for request in queued:
+                    await _reply(client, request, _wait("session_owner_shutdown", "owner_shutdown", 15))
+                queued.clear()
+                if inflight:
+                    await asyncio.gather(*list(inflight), return_exceptions=True)
+                return
+            try:
+                await live_requests()
+            except Exception:
+                # Redis cannot confirm caller liveness: cancel once and retain
+                # each slot until cleanup. Never start more session work here.
+                for task in list(inflight):
+                    if task not in cancellation_requested:
+                        cancellation_requested.add(task)
+                        task.cancel()
+                await asyncio.sleep(poll_interval)
                 continue
 
-            # Reap only when the in-flight set is saturated; done callbacks keep
-            # it accurate otherwise and polling never busy-spins.
-            if not defer_if_busy and len(inflight) >= max_concurrency * 2:
-                await asyncio.wait(
-                    set(inflight), timeout=poll_interval, return_when=asyncio.FIRST_COMPLETED
+            for request in list(queued):
+                if request.expires_at <= time.time():
+                    queued.remove(request)
+                    await _reply(client, request, _wait("session_owner_request_expired", request.wait_phase, 15))
+                elif time.monotonic() - request.queued_at >= queue_timeout:
+                    queued.remove(request)
+                    await _reply(client, request, _wait("session_owner_queue_timeout", request.wait_phase, 15))
+
+            eligible = [item for item in queued if blocked_phase(item) is None]
+            if eligible:
+                protected = [item for item in eligible if item.stage in priority_stages]
+                background = [item for item in eligible if item.stage not in priority_stages]
+                choose_priority = bool(protected) and (not background or priority_streak < PRIORITY_BURST_LIMIT)
+                candidates = protected if choose_priority else background
+                # Rotate accounts as well as classes; a burst of one account's
+                # different stages cannot crowd another account indefinitely.
+                selected = next(
+                    (item for item in candidates if item.account_id != last_account.get(choose_priority)), candidates[0]
                 )
+                queued.remove(selected)
+                priority_streak = priority_streak + 1 if choose_priority else 0
+                last_account[choose_priority] = selected.account_id
+                busy_accounts.add(selected.account_id)
+                task = asyncio.create_task(execute_and_reply(selected))
+                inflight[task] = selected
+                task.add_done_callback(completed)
                 continue
+
             try:
                 item = await client.rpop(REQUEST_KEY)
             except Exception:
@@ -355,50 +498,70 @@ async def serve_requests(
                 await asyncio.sleep(poll_interval)
                 continue
             try:
-                request = json.loads(item)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(request, dict):
-                continue
-            try:
-                account_id = int(request.get("account_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            stage = str(request.get("stage") or "")
-            reply_key = REPLY_PREFIX + str(request.get("id"))
-            if not account_id or not stage or not owns(account_id):
-                await _reply(client, reply_key, {"error": "not_owner"})
-                continue
-            if defer_if_busy and not can_start(stage):
-                if queued_stages and stage in queued_stages and len(queued) < queue_limit:
-                    queued.append((request, reply_key))
+                payload = json.loads(item)
+                if not isinstance(payload, dict):
                     continue
-                await _reply(client, reply_key, {"result": {"processed": 0,
-                    "reason": "session_owner_capacity_wait", "retryable": True},
-                    "interval": CAPACITY_WAIT_RETRY_SECONDS})
+                account_id = int(payload.get("account_id") or 0)
+                stage = str(payload.get("stage") or "")
+                request_id = str(payload.get("id") or "")
+                deadline = float(payload.get("expires_at", time.time() + FORWARD_TIMEOUT_SECONDS))
+                if not request_id or len(request_id) > 256 or len(stage) > 256 or not math.isfinite(deadline):
+                    continue
+            except (TypeError, ValueError):
                 continue
-            task = asyncio.create_task(execute_and_reply(request, reply_key))
-            inflight.add(task)
-            inflight_stages[task] = stage
-            task.add_done_callback(completed)
+            request = _Request(payload, account_id, stage, REPLY_PREFIX + request_id, deadline, time.monotonic())
+            if request.active_key and not await client.get(request.active_key):
+                continue
+            if not account_id or not stage or not owns(account_id):
+                await _reply(client, request, {"error": "not_owner"})
+                continue
+            if request.expires_at <= time.time():
+                await _reply(client, request, _wait("session_owner_request_expired", "queue", 15))
+                continue
+            duplicates = any(
+                entry.account_id == account_id and entry.stage == stage
+                for entry in list(queued) + list(inflight.values())
+            )
+            if duplicates:
+                await _reply(client, request, _wait("session_owner_duplicate_wait", "account_stage", 15))
+                continue
+            phase = blocked_phase(request)
+            if len(queued) >= queue_limit or (phase and defer_if_busy and stage not in (queued_stages or ())):
+                await _reply(client, request, _wait("session_owner_capacity_wait", phase or "queue_full"))
+                continue
+            request.wait_phase = phase or "queue"
+            queued.append(request)
+            if phase:
+                logger.info(
+                    "session_exec_request_queued",
+                    stage=stage,
+                    request_id=request_id,
+                    wait_phase=phase,
+                    queue_depth=len(queued),
+                )
     finally:
-        for task in inflight:
-            task.cancel()
-        if inflight:
-            await asyncio.gather(*list(inflight), return_exceptions=True)
+        for request in queued:
+            await _reply(client, request, _wait("session_owner_shutdown", "owner_shutdown", 15))
+        queued.clear()
+        tasks = list(inflight)
+        for task in tasks:
+            if task not in cancellation_requested:
+                cancellation_requested.add(task)
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _reply(client: Any, reply_key: str, payload: dict[str, Any]) -> None:
+async def _reply(client: Any, request: _Request, payload: dict[str, Any]) -> None:
     try:
-        await client.lpush(reply_key, json.dumps(payload, default=str))
-        await client.expire(reply_key, REPLY_TTL_SECONDS)
+        async with asyncio.timeout(CLEANUP_TIMEOUT_SECONDS):
+            encoded = json.dumps(payload, default=str)
+            if request.active_key:
+                await client.eval(
+                    _REPLY_IF_ACTIVE, 2, request.active_key, request.reply_key, encoded, REPLY_TTL_SECONDS
+                )
+            else:
+                await client.lpush(request.reply_key, encoded)
+                await client.expire(request.reply_key, REPLY_TTL_SECONDS)
     except Exception:
-        logger.warning("session_exec_reply_failed", reply_key=reply_key)
-
-
-@contextlib.contextmanager
-def _suppress_close_errors():
-    try:
-        yield
-    except Exception:
-        pass
+        logger.warning("session_exec_reply_failed", request_id=request.payload["id"])

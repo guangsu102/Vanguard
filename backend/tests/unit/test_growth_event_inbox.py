@@ -26,6 +26,21 @@ async def account(db):
     await db.commit()
 
 
+async def test_null_peer_ordering_still_blocks_only_its_own_peer(test_db):
+    await account(test_db)
+    for identifier, peer in ((1, None), (2, None), (3, -100987)):
+        test_db.add(TelegramEventInbox(account_id=2, event_key=str(identifier), kind="message",
+            chat_id=peer, payload_json="{}", state="pending", next_attempt_at=datetime.utcnow()))
+    await test_db.commit()
+    first = await inbox.claim(test_db, [2], local_only=False)
+    assert first.chat_id is None
+    first.external_attempted = True
+    await inbox.finish(test_db, first.id, RuntimeError("unconfirmed_write"))
+    await test_db.commit()
+    next_peer = await inbox.claim(test_db, [2], local_only=False)
+    assert next_peer.chat_id == -100987
+
+
 async def test_duplicate_delivery_is_deduplicated_and_payload_restores_without_rpc(test_db):
     await account(test_db)
     incoming = event()

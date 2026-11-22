@@ -38,6 +38,16 @@ def exclude_owned_group_review(membership: GroupAccountMembership) -> None:
 def reset_join_review(membership: GroupAccountMembership, now: datetime) -> None:
     """Start a new fixed review window after a new or renewed membership."""
 
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        membership.review_status, membership.ad_status = "pending", "blocked"
+        membership.verification_status = "pending"
+        membership.can_send_text = None
+        membership.permission_checked_at = None
+        membership.review_next_at = now
+        membership.leave_requested_at = membership.leave_retry_at = None
+        membership.leave_error = None
+        return
     membership.review_status = JOIN_REVIEW_INITIAL
     membership.review_started_at = now
     membership.review_next_at = now + timedelta(seconds=JOIN_REVIEW_TWO_HOUR_SECONDS)

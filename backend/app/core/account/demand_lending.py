@@ -28,6 +28,7 @@ def add_refresh_demand_headroom(limits: dict, budget: dict, demand: dict) -> Non
         ad_send_hold,
         allocations,
         available,
+        listener_floor,
         transferred_caps,
     )
 
@@ -51,7 +52,8 @@ def add_refresh_demand_headroom(limits: dict, budget: dict, demand: dict) -> Non
         forecast_hold = delivery_work + max(2 * demand['delivery_cost'], math.ceil(delivery_work / 5))
         old_hold = limits.get('ad_refresh_hold_' + window, ad_send_hold(base[0], base[4]))
         holds[window] = min(old_hold, forecast_hold)
-        remaining = available(limits[window], used, caps, 'ad')
+        remaining = available(limits[window], used, caps, 'ad',
+                              survival_floor=listener_floor(limits, usage, window))
         if demand[window]['renewals'] or budget.get('ad_dependency_recovery', {}).get('blocked_grants'):
             # An unfunded future delivery plan must not consume the reads
             # needed to make its own targets deliverable. Admit one complete
@@ -203,6 +205,7 @@ async def add_ad_demand_headroom(db: Any, account_id: int, now: datetime, limits
         allocations,
         available,
         lending_caps,
+        listener_floor,
         transferred_caps,
     )
 
@@ -220,9 +223,11 @@ async def add_ad_demand_headroom(db: Any, account_id: int, now: datetime, limits
                                 usage.get('sync_borrowed_ad_' + window, {}).get('used', 0),
                                 usage.get('sync_borrowed_survival_' + window, {}).get('used', 0))
         used = [usage[lane + '_' + window]['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
+        control = listener_floor(limits, usage, window)
         adjusted = lending_caps(caps, used, 'critical', limits.get('survival_hold_' + window, -1),
-                                limits.get('sync_hold_' + window, -1), demand[window]['hold'])
-        room = available(limits[window], used, adjusted, 'critical')
+                                limits.get('sync_hold_' + window, -1), demand[window]['hold'],
+                                survival_floor=control)
+        room = available(limits[window], used, adjusted, 'critical', survival_floor=control)
         rooms.append(room)
         loans[window] = caps[0] - adjusted[0]
         if not room:

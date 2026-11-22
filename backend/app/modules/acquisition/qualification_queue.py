@@ -59,3 +59,46 @@ async def claimed(db: Any, account_id: int, audit_id: int, family: int) -> None:
         db.add(SystemSetting(key=key(account_id), value=json.dumps(data)))
     else:
         row.value = json.dumps(data)
+
+
+def scan_key(account_id: int) -> str:
+    return f"qualification.review_scan.{account_id}"
+
+
+async def scan_cursor(db: Any, account_id: int) -> dict:
+    """Resume bounded scans independently of successful claim fairness.
+
+    Budget deferrals must not consume a claim turn, but retrying the same
+    leading rows every quantum can hide a runnable family behind the scan cap.
+    One fixed-size position per account carries scan progress across quanta.
+    """
+    position = await cursor(db, account_id)
+    row = await db.get(SystemSetting, scan_key(account_id), populate_existing=True)
+    if row is not None:
+        try:
+            data = json.loads(row.value)
+            return {
+                "last_family": position["last_family"],
+                "renewal_id": max(0, int(data.get("renewal_id", 0))),
+                "initial_id": max(0, int(data.get("initial_id", 0))),
+                "fresh_id": max(0, int(data.get("fresh_id", 0))),
+            }
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return position
+
+
+async def scanned(db: Any, account_id: int, audit_id: int, family: int) -> None:
+    """Caller holds the account row lock and commits with its defer/claim.
+
+    Successful claims also advance their family scan. Family turns always
+    come from the successful-claim cursor, written only by ``claimed``.
+    """
+    data = await scan_cursor(db, account_id)
+    data[{0: "renewal_id", 1: "initial_id", 2: "fresh_id"}[family]] = audit_id
+    data.pop("last_family", None)
+    row = await db.get(SystemSetting, scan_key(account_id))
+    if row is None:
+        db.add(SystemSetting(key=scan_key(account_id), value=json.dumps(data)))
+    else:
+        row.value = json.dumps(data)

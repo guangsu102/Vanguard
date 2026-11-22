@@ -4,9 +4,11 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import exists, func, or_, select
+from sqlalchemy.orm import raiseload
 
 
-async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict[str, Any]:
+async def _join_demand_snapshot(db: Any, account_id: int, now: datetime, *,
+                                stop_when_executable: bool = False) -> dict[str, Any]:
     """Return the cached join work that can justify an idle join hold.
 
     A preview-pending row is demand for a future read, but it is not an
@@ -22,11 +24,13 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
     from app.modules.acquisition.models import AutoJoinAttempt
     from app.modules.acquisition.qualification_identity import peer_identity
     from app.modules.acquisition.qualification_join_gate import qualification_join_gate
+    from app.modules.acquisition.qualification_engine import enabled_for
+    efficiency = enabled_for(account_id)
 
     rows = list(
         (
             await db.scalars(
-                select(Group)
+                select(Group).options(raiseload(Group.account_memberships))
                 .where(
                     Group.status.in_(["pending_join", "join_failed", "cooling_down"]),
                     Group.username.is_not(None),
@@ -49,14 +53,20 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
         "identity_pending": 0,
         "excluded": 0,
         "ready": 0,
+        "preview_retry_wait": 0,
     }
     executable = False
+    examined = 0
     for group in candidate_rows:
+        examined += 1
         if group.id in joined_ids:
             continue
         counts["total"] += 1
         fact = facts.get(group.id, {})
         if not candidate_inventory.fresh(fact, group, account_id, now):
+            if efficiency and not candidate_inventory.due(fact, group, account_id, now):
+                counts["preview_retry_wait"] += 1
+                continue
             counts["preview_pending"] += 1
             if (peer_identity(group.group_id) or (None, None))[1] is None:
                 counts["identity_pending"] += 1
@@ -74,16 +84,17 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
             counts["identity_pending"] += 1
             counts["preview_pending"] += 1
             continue
-        # Use the same local gate as capacity_snapshot().  Keep scanning the
-        # bounded sample after finding a runnable candidate so the operational
-        # counts describe the full sample instead of whichever row happened to
-        # be first.
+        # Final qualification remains unchanged. A lending forecast only
+        # needs one executable candidate to retain the same join floor; callers
+        # asking for complete operational counts keep the full bounded scan.
         entity = PeerChannel(identity[0]) if identity[1] == "channel" else PeerChat(identity[0])
-        if await qualification_join_gate(db, entity):
+        if await qualification_join_gate(db, entity, account_id=account_id):
             counts["excluded"] += 1
             continue
         counts["ready"] += 1
         executable = True
+        if stop_when_executable:
+            break
 
     # The snapshot is produced immediately before this helper by the governor.
     # It may represent an in-flight join even when the candidate inventory is
@@ -102,7 +113,7 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
 
     return {
         **counts,
-        "sample_complete": len(rows) <= 300,
+        "sample_complete": len(rows) <= 300 and examined == len(candidate_rows),
         "account_retry_at": retry_at.isoformat() if retry_at else None,
         "retry_wait": retry_wait,
         # account_retry_at only gates the next preview attempt.  A fresh,
@@ -115,7 +126,7 @@ async def _join_demand_snapshot(db: Any, account_id: int, now: datetime) -> dict
 
 async def add_work_demand(db: Any, account_id: int, now: datetime, limits: dict, budget: dict) -> None:
     from app.core.account.models import AccountOperationConfig
-    from app.core.account.reserved_reads import allocations, available, transferred_caps
+    from app.core.account.reserved_reads import allocations, available, listener_floor, transferred_caps
     from app.core.group.models import GroupAccountMembership as Member
     from app.core.settings_models import SystemSetting
     from app.modules.acquisition.models import AdDeliveryScheduleState as Schedule
@@ -173,7 +184,8 @@ async def add_work_demand(db: Any, account_id: int, now: datetime, limits: dict,
                                     budget['usage'].get('ad_lent_' + window, {}).get('used', 0),
                                     budget['usage'].get('sync_borrowed_ad_' + window, {}).get('used', 0),
                                     budget['usage'].get('sync_borrowed_survival_' + window, {}).get('used', 0))
-        room = max(0, available(limits[window], used, adjusted, 'ad') - hold)
+        room = max(0, available(limits[window], used, adjusted, 'ad',
+                                survival_floor=listener_floor(limits, budget['usage'], window)) - hold)
         rooms.append(room)
         if not room:
             ttl = budget['usage'][window]['ttl_seconds']

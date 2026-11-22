@@ -7,17 +7,23 @@ and broker lists are both bounded; stale deliveries cannot execute a new ticket.
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import structlog
+
 from sqlalchemy import or_, select
 
 from app.core.account.models import AccountOperationConfig, AccountStatus, TelegramAccount
+from app.core.config import settings as runtime_settings
 
-PREFIX = "vanguard:growth_dispatch:v1:"
+logger = structlog.get_logger()
+
+PREFIX = "vanguard:growth_dispatch:v2:" if runtime_settings.GROWTH_SIMPLIFIED_ENABLED else "vanguard:growth_dispatch:v1:"
 TASK = "app.core.scheduler.growth_dispatch.account_quantum_task"
 TICK_TASK = "app.core.scheduler.growth_dispatch.dispatch_growth_task"
 QUEUED_SECONDS = 120
@@ -34,7 +40,11 @@ PROTECTED_RETRY_SECONDS = 15
 BROKER_CAP = 8
 PROTECTED_STAGES = frozenset({"ads", "join"})
 SESSION_EXEC_PARALLEL_STAGES = frozenset({"review", "ads", "join"})
-SESSION_EXEC_QUEUED_STAGES = PROTECTED_STAGES
+# Retain background quanta too: immediate rejection lets a continuing stream
+# of protected requests win every retry, even after the owner becomes free.
+SESSION_EXEC_QUEUED_STAGES = frozenset({
+    "ads", "join", "review", "survival", "reconcile", "verify", "exit",
+})
 
 
 @dataclass(frozen=True)
@@ -48,12 +58,28 @@ class Stage:
 STAGES = {
     "ads": Stage("growth_ads", 60, 4, 1),
     "join": Stage("growth_join", 300, 4, 1),
-    "review": Stage("qualification", 30, 4, 2),
+    "review": Stage("qualification", 30, 4, 15),
     "survival": Stage("growth_maintenance", 60, 2, 2),
     "reconcile": Stage("growth_maintenance", 60, 2, 2),
     "verify": Stage("growth_maintenance", 60, 2, 1),
     "exit": Stage("growth_maintenance", 120, 2, 1),
 }
+
+
+if runtime_settings.TELEGRAM_RPC_PACING_ENABLED:
+    for _stage in ("review", "survival", "reconcile", "exit"):
+        _old = STAGES[_stage]
+        STAGES[_stage] = Stage(_old.queue, 60 if _stage == "review" else 600, _old.outstanding, _old.quantum)
+
+if runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+    STAGES = {
+        "ads": Stage("growth_ads", 60, 4, 1),
+        "join": Stage("growth_join", 300, 4, 1),
+        "review_and_verify": Stage("qualification", 60, 4, 15),
+        "exit": Stage("growth_maintenance", 60, 2, 2),
+    }
+    SESSION_EXEC_PARALLEL_STAGES = frozenset()
+    SESSION_EXEC_QUEUED_STAGES = frozenset(STAGES)
 
 
 def eligible_accounts(now: datetime):
@@ -98,6 +124,7 @@ if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[5]) then return -1 end
 redis.call('SET', KEYS[1], 'r:' .. ARGV[1], 'EX', ARGV[4])
 redis.call('ZADD', KEYS[2], now + tonumber(ARGV[4]), ARGV[3])
 redis.call('ZADD', KEYS[3], now + tonumber(ARGV[4]), ARGV[1])
+if KEYS[4] then redis.call('ZREM', KEYS[4], ARGV[3]) end
 return 1
 """
 
@@ -107,7 +134,13 @@ if value ~= 'q:' .. ARGV[1] and value ~= 'r:' .. ARGV[1] then return 0 end
 redis.call('DEL', KEYS[1])
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('ZREM', KEYS[3], ARGV[1])
-redis.call('ZADD', KEYS[4], ARGV[3], ARGV[2])
+local due=tonumber(ARGV[3])
+if KEYS[5] then
+ local wake=redis.call('ZSCORE',KEYS[5],ARGV[2])
+ if wake then due=math.min(due,tonumber(wake)) end
+ redis.call('ZREM',KEYS[5],ARGV[2])
+end
+redis.call('ZADD', KEYS[4], due, ARGV[2])
 return 1
 """
 
@@ -115,6 +148,65 @@ UNLOCK = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
 """
+
+
+_WAKE = """
+local account,due,token=ARGV[1],tonumber(ARGV[2]),ARGV[3]
+for i=3,#KEYS,2 do
+ for _,key in ipairs({KEYS[i],KEYS[i+1]}) do
+  local previous=redis.call('ZSCORE',key,account)
+  if not previous or tonumber(previous)>due then redis.call('ZADD',key,due,account) end
+ end
+end
+if tonumber(ARGV[4])==0 then return 0 end
+local first=redis.call('SET',KEYS[1],token,'NX','EX',5)
+if not first then return 0 end
+if redis.call('SET',KEYS[2],token,'NX','EX',2) then return 1 end
+return 0
+"""
+
+
+async def wake_account(account_id: int, *, stages: tuple[str, ...] = ("review",),
+                       reason: str = "target_ready", ready_at: datetime | None = None,
+                       client: Any = None) -> bool:
+    """Merge advisory events into existing tickets; durable state stays authoritative.
+
+    A future dependency merely moves its due marker. The periodic dispatcher
+    remains the fallback for lost notifications, broker failure, and commits
+    that become visible after an event-triggered dispatch has already run.
+    """
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+        aliases = {"review": "review_and_verify", "verify": "review_and_verify", "exit": "exit"}
+        stages = tuple(dict.fromkeys(aliases.get(stage, stage) for stage in stages))
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if not runtime_settings.GROWTH_SIMPLIFIED_ENABLED and not enabled_for(account_id):
+        return False
+    stages = tuple(dict.fromkeys(stage for stage in stages if stage in STAGES))
+    if not stages:
+        return False
+    token = uuid4().hex
+    try:
+        async with asyncio.timeout(2):
+            if client is None:
+                from app.core.redis import get_redis
+                client = await get_redis()
+            now = time.time()
+            due = max(now, (ready_at - datetime(1970, 1, 1)).total_seconds()) if ready_at else now
+            keys = [PREFIX + f"wake:{account_id}", PREFIX + "wake_publish"]
+            for stage in stages:
+                keys.extend((PREFIX + stage + ":due", PREFIX + stage + ":wake_due"))
+            publish = int(await client.eval(_WAKE, len(keys), *keys, account_id, due, token, int(due <= now)))
+            if not publish:
+                return False
+            try:
+                await asyncio.to_thread(dispatch_growth_task.apply_async,
+                    queue="growth_dispatch", expires=30, countdown=1)
+            except Exception:
+                await client.eval(UNLOCK, 1, PREFIX + "wake_publish", token)
+                return False
+            return True
+    except Exception:
+        return False
 
 
 def active_key(stage: str) -> str:
@@ -264,15 +356,16 @@ async def reserve(client: Any, stage: str, account_id: int, token: str, now: flo
 
 async def start(client: Any, stage: str, account_id: int, token: str, now: float) -> int:
     return int(await client.eval(
-        START, 3, ticket_key(stage, account_id), active_key(stage), running_key(stage),
-        token, now, account_id, RUN_SECONDS, 2 if stage == "review" else 1,
+        START, 4, ticket_key(stage, account_id), active_key(stage), running_key(stage),
+        PREFIX + stage + ":wake_due",
+        token, now, account_id, RUN_SECONDS, 15 if stage == "review" else 1,
     ))
 
 
 async def finish(client: Any, stage: str, account_id: int, token: str, due: float) -> None:
     await client.eval(
-        FINISH, 4, ticket_key(stage, account_id), active_key(stage), running_key(stage),
-        PREFIX + stage + ":due", token, account_id, due,
+        FINISH, 5, ticket_key(stage, account_id), active_key(stage), running_key(stage),
+        PREFIX + stage + ":due", PREFIX + stage + ":wake_due", token, account_id, due,
     )
 
 
@@ -281,7 +374,65 @@ async def broker_depth(client: Any, queue: str) -> int:
     return sum([await client.llen(queue + (f"\x06\x16{p}" if p else "")) for p in (0, 3, 6, 9)])
 
 
+async def _efficiency_work_accounts(db: Any, now: datetime, eligible: Any,
+                                    config: dict, account_ids: set[int]) -> tuple[set[int], set[int]]:
+    """Resolve current scopes in local batches; old work cannot hide new work."""
+    import hashlib
+    from app.core.group.models import GroupAccountMembership
+    from app.modules.acquisition.models import QualificationWork
+    from app.modules.acquisition.qualification_ai import profile_fingerprint
+    from app.modules.acquisition.qualification_engine import (
+        ENGINE_VERSION, FAMILY, HELD_REVIEW_STATES, RUNNABLE_STATES, _scope_key,
+    )
+
+    rows = (await db.execute(select(GroupAccountMembership, TelegramAccount).join(
+        TelegramAccount, TelegramAccount.id == GroupAccountMembership.account_id,
+    ).where(
+        GroupAccountMembership.account_id.in_(eligible),
+        GroupAccountMembership.account_id.in_(account_ids),
+        GroupAccountMembership.status == "joined", GroupAccountMembership.left_at.is_(None),
+        GroupAccountMembership.ad_status != "paused",
+        GroupAccountMembership.review_status.not_in(HELD_REVIEW_STATES),
+    ))).all()
+    members = {member.id: member for member, _ in rows}
+    scopes = {member.id: _scope_key(member, config, profile_fingerprint(account))
+              for member, account in rows}
+    if not scopes:
+        return set(), set()
+    maintenance_scopes = {member_id: hashlib.sha256(("business_maintenance:" + scope).encode()).hexdigest()
+                          for member_id, scope in scopes.items()}
+    works = (await db.scalars(select(QualificationWork).where(
+        QualificationWork.membership_id.in_(list(scopes)),
+        QualificationWork.scope_key.in_([*scopes.values(), *maintenance_scopes.values()]),
+        QualificationWork.engine_version == ENGINE_VERSION,
+        QualificationWork.family.in_((FAMILY, "business_maintenance")),
+    ))).all()
+    adopted, reviews, maintenance = set(), set(), set()
+    for work in works:
+        member = members[work.membership_id]
+        if work.membership_joined_at != member.joined_at:
+            continue
+        scope = scopes[member.id]
+        due = work.ready_at is None or work.ready_at <= now
+        if work.family == FAMILY and work.scope_key == scope:
+            adopted.add(member.id)
+            if due and (work.state in RUNNABLE_STATES or (
+                    work.state == "RUNNING" and work.claim_until is not None and work.claim_until <= now)):
+                reviews.add(member.account_id)
+        elif (work.family == "business_maintenance"
+                and work.scope_key == maintenance_scopes[member.id]
+                and work.state in {"READY", "WAIT_EVENT"} and due):
+            maintenance.add(member.account_id)
+    # A policy/profile change creates a new scope even within one membership
+    # generation. Bootstrap remains local and reuses only verified old facts.
+    reviews.update(member.account_id for member_id, member in members.items() if member_id not in adopted)
+    return reviews, maintenance
+
+
 async def account_sets(db: Any, now: datetime) -> dict[str, list[int]]:
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import account_sets as simple_sets
+        return await simple_sets(db, now)
     from app.core.account.reconciliation_stream import legacy_account_filter
     from app.core.automation_settings import get_auto_join_scheduler_settings
     from app.core.group.models import GroupAccountMembership
@@ -304,6 +455,20 @@ async def account_sets(db: Any, now: datetime) -> dict[str, list[int]]:
 
     eligible = eligible_accounts(now)
     config = await policy(db, fresh=True)
+    from app.modules.acquisition.qualification_engine import enabled_account_ids
+    efficiency_ids = enabled_account_ids()
+    if runtime_settings.TELEGRAM_RPC_PACING_ENABLED:
+        from app.core.account.models import AccountType
+        efficiency_ids = set(await ids(eligible.join(AccountOperationConfig,
+            AccountOperationConfig.account_id == TelegramAccount.id).where(
+                TelegramAccount.account_type == AccountType.PROMOTER,
+                AccountOperationConfig.enabled.is_(True))))
+    efficiency_reviews, efficiency_maintenance = set(), set()
+    if (efficiency_ids and config.get("enabled")
+            and (config.get("execute_reviews", True) or config.get("execute_exits"))):
+        efficiency_reviews, efficiency_maintenance = await _efficiency_work_accounts(
+            db, now, eligible, config, efficiency_ids,
+        )
     reviews = []
     if config.get("enabled") and config.get("execute_reviews", True):
         from app.modules.acquisition.qualification_due import current_clause, due_clause
@@ -312,6 +477,11 @@ async def account_sets(db: Any, now: datetime) -> dict[str, list[int]]:
             GroupQualificationAudit.account_id.in_(eligible),
             current_clause(), due_clause(now),
         ))
+        if efficiency_ids:
+            # An enabled account owns work rows, never a periodic replay of
+            # completed Audit history. Compare the full current policy/profile
+            # scope so old DONE/WAIT_EVENT rows cannot strand an account.
+            reviews = sorted((set(reviews) - efficiency_ids) | efficiency_reviews)
         if config.get("automatic_identity_registration"):
             from app.modules.acquisition.qualification_system_identity import parse_identity_map
             mapping = parse_identity_map(config.get("system_account_user_ids")) or {}
@@ -322,6 +492,7 @@ async def account_sets(db: Any, now: datetime) -> dict[str, list[int]]:
         reviews = [i for i in reviews if i in config["account_ids"]]
     exits: set[int] = set()
     if config.get("enabled") and config.get("execute_exits"):
+        exits.update(efficiency_maintenance)
         # Include both ordinary exits and recovery of stale non-memberships.
         exits.update(await ids(select(GroupAccountMembership.account_id).where(
             GroupAccountMembership.account_id.in_(eligible),
@@ -418,11 +589,20 @@ async def dispatch(db: Any, client: Any, broker: Any, publish: Any, *, now: floa
         return {"enqueued": 0, "reason": "dispatch_inflight"}
     enqueued = 0
     try:
-        from app.core.account.backlog_discard import maybe_sweep_ineligible_backlog
+        repairs = {}
+        if runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+            from app.modules.acquisition.simple_runtime import recover_result_journals
+            repairs = await recover_result_journals(db, client)
+        if not runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+            from app.modules.acquisition.ad_opportunities import capture_due
+            from app.modules.acquisition import qualification_sla_runtime
+            qualification_sla_runtime.request_census()
+            await capture_due(db, datetime.utcfromtimestamp(now))
+            from app.core.account.backlog_discard import maybe_sweep_ineligible_backlog
 
-        await maybe_sweep_ineligible_backlog(db, client, now=datetime.utcfromtimestamp(now))
-        from app.modules.acquisition.qualification_recovery import repair
-        repairs = await repair(db, client, datetime.utcfromtimestamp(now))
+            await maybe_sweep_ineligible_backlog(db, client, now=datetime.utcfromtimestamp(now))
+            from app.modules.acquisition.qualification_recovery import repair
+            repairs = await repair(db, client, datetime.utcfromtimestamp(now))
         available = await account_sets(db, datetime.utcfromtimestamp(now))
         # The P5 kill switch removes the stopped cohort from new ads/join
         # admission; maintenance lanes keep resolving unconfirmed results.
@@ -447,7 +627,7 @@ async def dispatch(db: Any, client: Any, broker: Any, publish: Any, *, now: floa
         last_runs: dict[str, Any] = {}
         from app.core.config import settings
 
-        if settings.P4_AD_PACING and available.get("ads"):
+        if not runtime_settings.GROWTH_SIMPLIFIED_ENABLED and settings.P4_AD_PACING and available.get("ads"):
             # One bounded read per dispatch tick feeds the pacing decision's
             # last-scheduled tiebreak; nothing else changes while flags are off.
             try:
@@ -483,7 +663,7 @@ async def dispatch(db: Any, client: Any, broker: Any, publish: Any, *, now: floa
             # the same accounts lose their queued lease without ever executing.
             ordered = sorted(zip(rotated, scores, strict=True), key=lambda pair: pair[1] if pair[1] is not None else now)
             order_accounts = [account_id for account_id, _ in ordered]
-            if stage == "ads" and settings.P4_AD_PACING and order_accounts:
+            if stage == "ads" and not runtime_settings.GROWTH_SIMPLIFIED_ENABLED and settings.P4_AD_PACING and order_accounts:
                 from app.modules.acquisition.ad_fairness_pacing import apply_to_dispatch
 
                 try:
@@ -539,6 +719,8 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
     with its already-connected client, so every one-shot contract applies
     unchanged regardless of which side executes.
     """
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED and stage not in STAGES and not (stage.startswith("join_link:") and len(stage) == 42):
+        return {"processed": 0, "reason": "retired_stage"}, 600
     from app.core.account.session_exec import PROCESS_ID, forward, owner_id
     from app.core.redis import get_redis
 
@@ -547,16 +729,29 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
     reason = account_block_reason(account, datetime.utcnow())
     if reason:
         return {"processed": 0, "reason": reason}, 60
+    if stage == "reconcile" or runtime_settings.TELEGRAM_RPC_PACING_ENABLED:
+        # Only the account SELECT above belongs to this adapter. Reject caller
+        # writes and return the connection before owner lookup/Telegram waits.
+        from app.core.database_transaction_boundary import release_read_transaction
+
+        await release_read_transaction(db, allow_untracked_read_only=True)
     from app.core.config import settings
     p2_kind = "send_ad" if stage == "ads" else "join_group" if stage == "join" else None
-    p2_enabled = p2_kind is not None and settings.p2_outbox_enabled_for(
+    p2_enabled = not settings.GROWTH_SIMPLIFIED_ENABLED and p2_kind is not None and settings.p2_outbox_enabled_for(
         p2_kind, account_id
     )
+    redis_client = None
     try:
         redis_client = await get_redis()
         owner = await owner_id(redis_client, account_id)
     except Exception:
         owner = None
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED and owner is None:
+        return {"processed": 0, "reason": "session_owner_required"}, 30
+    if stage == "review":
+        from app.modules.acquisition.qualification_engine import enabled_for
+        if enabled_for(account_id) and owner is None:
+            return {"processed": 0, "reason": "session_owner_required", "retryable": True}, 30
     if p2_enabled and owner is None:
         # An enabled P2 lane is fail-closed.  A worker without an owner Actor
         # must never fall through to the legacy direct Telegram path.
@@ -567,14 +762,31 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
         if reply is None:
             return {"processed": 0, "reason": "session_owner_unreachable"}, 30
         if reply.get("error") == "not_owner":
-            # The registry entry was stale (owner died); fall through to a
-            # local execution attempt against the now-free lease.
+            # A paused owner can retain its auth-key lease while disconnected.
+            # Its reply does not prove another process may create a client.
             pass
         elif reply.get("error"):
             return {"processed": 0, "reason": "session_owner_execution_failed",
                     "error_type": reply.get("error_type"), "retryable": True}, 30
         else:
             return reply.get("result") or {"processed": 0}, int(reply.get("interval") or 30)
+    if not (owner == PROCESS_ID and account_pool is not None):
+        from app.core.account.session_lease import OWNER_PREFIX, SessionLease
+
+        try:
+            # MGET observes the registry and auth-key lease together, including
+            # a lease whose owner marker has not been published yet. Only the
+            # original owner's explicit pool may bypass this fallback gate.
+            ownership = await redis_client.mget([
+                f"{OWNER_PREFIX}{int(account_id)}",
+                SessionLease(redis_client, account_id).key,
+            ])
+            if not isinstance(ownership, (list, tuple)) or len(ownership) != 2:
+                raise ValueError("invalid session ownership snapshot")
+        except Exception:
+            return {"processed": 0, "reason": "session_owner_unavailable", "retryable": True}, 30
+        if any(value is not None for value in ownership):
+            return {"processed": 0, "reason": "session_owner_not_connected", "retryable": True}, 30
     # Celery growth workers do not own the long-lived listener session and may
     # start with an empty local AccountPool.  The legacy path still needs a
     # hydrated wrapper when no session owner is registered; otherwise every
@@ -620,7 +832,13 @@ async def execute(db: Any, stage: str, account_id: int, *, account_pool: Any = N
     from app.modules.acquisition.automation import AcquisitionAutomationService
     from app.modules.acquisition.qualification_service import run_reviews
     service = AcquisitionAutomationService(db, account_pool=account_pool)
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED and stage.startswith("join_link:"):
+        from app.modules.acquisition.simple_growth import GrowthService
+        return await GrowthService(service).join_link(account_id, stage.split(":", 1)[1]), 300
     spec = STAGES[stage]
+    if runtime_settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_growth import GrowthService
+        return await GrowthService(service).execute(stage, account_id), spec.interval
     if stage == "ads":
         from app.core.automation_settings import get_ad_delivery_execution_settings
         settings = await get_ad_delivery_execution_settings(db)
@@ -682,6 +900,8 @@ async def ensure_growth_account_pool(account_pool: Any, account: TelegramAccount
 
 
 async def run_ticket(stage: str, account_id: int, token: str) -> dict:
+    if stage not in STAGES:
+        return {"reason": "stale_ticket"}
     from app.core.redis import get_redis
     from app.core.scheduler.tasks import _run_with_db
     client = await get_redis()
@@ -756,10 +976,27 @@ async def run_ticket(stage: str, account_id: int, token: str) -> dict:
             "succeeded": result.get("succeeded", 0), "skipped": result.get("skipped", 0),
             "failed": result.get("failed", 0),
             "sent": result.get("succeeded", 0) if stage == "ads" else 0,
-            "joined": sum(item.get("action") in {"joined", "joined_pending_review"} for item in details)
+            "joined": sum(item.get("action") in {"joined", "joined_pending_review", "joined_pending_qualification"} for item in details)
                       if stage == "join" else 0,
             "reason": result.get("reason") or next((item["reason"] for item in details if item.get("reason")), None),
+            "wait_phase": result.get("wait_phase"),
         }))
+        if not runtime_settings.GROWTH_SIMPLIFIED_ENABLED and stage == "ads" and (
+            result.get("reason") or any(item.get("reason") for item in details)
+        ):
+            async def note_ad_opportunity_result(db):
+                from app.modules.acquisition.ad_opportunities import note_result
+                await note_result(db, account_id, result, datetime.utcnow())
+                await db.commit()
+            try:
+                await asyncio.wait_for(_run_with_db(note_ad_opportunity_result), timeout=0.5)
+            except asyncio.CancelledError:
+                logger.warning("growth_ad_result_measurement_failed", error_type="CancelledError")
+                raise
+            except Exception as exc:
+                # The scanner's durable obligation remains pending; result
+                # annotation can never prevent releasing the execution lease.
+                logger.warning("growth_ad_result_measurement_failed", error_type=type(exc).__name__)
 
 
 def next_due(result: dict, interval: int, *, now: float | None = None) -> float:
@@ -865,7 +1102,7 @@ from app.celery import celery_app  # noqa: E402
 def account_quantum_task(stage: str, account_id: int, token: str) -> dict:
     from app.core.scheduler.tasks import _run_async
     if stage not in STAGES:
-        raise ValueError("unknown_growth_stage")
+        return {"reason": "stale_ticket"}
     return _run_async(run_ticket(stage, account_id, token))
 
 

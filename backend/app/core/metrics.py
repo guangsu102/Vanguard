@@ -110,6 +110,12 @@ EXTRA_COUNTER_LABELS = {
     "vanguard_p5_events_total": ("event",),
 }
 GAUGE_LABELS = {
+    "vanguard_send_result_today": ("outcome",),
+    "vanguard_send_result_memberships": ("state",),
+    "vanguard_send_result_inbox_live": ("state",),
+    "vanguard_send_result_inbox_oldest_age_seconds": (),
+    "vanguard_send_result_sending_oldest_age_seconds": (),
+    "vanguard_send_result_survival_enabled": (),
     "vanguard_budget_remaining": ("lane", "window"),
     "vanguard_reconciliation_tasks": ("kind", "state"),
     "vanguard_reconciliation_oldest_age_seconds": ("kind",),
@@ -245,6 +251,12 @@ def _safe_gauge_labels(name: str, labels: list[str]) -> bool:
         return False
     if not labels:
         return True
+    if name == "vanguard_send_result_today":
+        return labels[0] in {"success", "unknown", "sending", "failed", "permission_changed", "content_invalid", "not_member", "rate_limited"}
+    if name == "vanguard_send_result_memberships":
+        return labels[0] in {"cooldown", "exit_pending", "exit_failed"}
+    if name == "vanguard_send_result_inbox_live":
+        return labels[0] in {"pending", "processing", "executing", "reconciliation_required"}
     if name == "vanguard_budget_remaining":
         return labels[0] in LANES and labels[1] in {"hour", "day"}
     if name == "vanguard_reconciliation_tasks":
@@ -487,6 +499,9 @@ def histogram_quantile(counters: dict, name: str, quantile: float = 0.95) -> flo
 
 
 async def aggregate(db: Any, cache: Any) -> dict:
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.send_result_metrics import aggregate as simple_aggregate
+        return await simple_aggregate(db, cache)
     """Bounded group queries once per 30s, never once per scrape or per RPC."""
     from app.core.account.budget_ledger import SNAPSHOT_AT
     from app.core.account.control_models import AccountBudgetSnapshot, ReconciliationTask
@@ -1045,21 +1060,28 @@ async def render(cache: Any) -> bytes:
 
 async def aggregation_loop() -> None:
     import structlog
+    from sqlalchemy import text
 
     from app.core.database import get_db_session
     from app.core.redis import get_redis
 
     while True:
+        interval = 60 if settings.GROWTH_SIMPLIFIED_ENABLED else 300 if settings.TELEGRAM_RPC_PACING_ENABLED else 30
         try:
             cache = await get_redis()
             if settings.GROWTH_METRICS_ENABLED and await cache.set(
-                PREFIX + "aggregate_lock", "1", nx=True, ex=29
+                PREFIX + "aggregate_lock", "1", nx=True, ex=interval + 30
             ):
-                async with asyncio.timeout(25):
+                async with asyncio.timeout(15):
                     async with get_db_session() as db:
+                        # Cancel slow telemetry on the server as well. A client
+                        # timeout alone can leave a scan occupying a connection
+                        # while another process acquires the next metrics lease.
+                        if db.bind.dialect.name == "postgresql":
+                            await db.execute(text("SET LOCAL statement_timeout = '5s'"))
                         await aggregate(db, cache)
         except Exception as exc:
             structlog.get_logger().warning(
                 "metrics_aggregation_failed", error_type=type(exc).__name__
             )
-        await asyncio.sleep(30)
+        await asyncio.sleep(interval)

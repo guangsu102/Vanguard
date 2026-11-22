@@ -32,6 +32,8 @@ async def init_redis() -> None:
 async def close_redis() -> None:
     """Close Redis connection."""
     global redis_client
+    from app.modules.acquisition.qualification_sla_lifecycle import stop
+    await stop(close_process=False)
     if redis_client:
         await redis_client.close()
         redis_client = None

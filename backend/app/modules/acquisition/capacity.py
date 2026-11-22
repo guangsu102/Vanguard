@@ -499,7 +499,7 @@ async def executable_inventory(
             reasons["join_candidate_identity_pending"] += 1
             continue
         entity = PeerChannel(identity[0]) if identity[1] == "channel" else PeerChat(identity[0])
-        reason = await qualification_join_gate(db, entity)
+        reason = await qualification_join_gate(db, entity, account_id=account_id)
         if reason:
             excluded += 1
             reasons[reason] += 1
@@ -543,6 +543,16 @@ async def executable_inventory(
 async def capacity_snapshot(
     db: Any, account_id: int, now: datetime | None = None
 ) -> dict[str, Any]:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import runtime
+        payload = (await runtime(db, account_id))["data"]
+        config = await db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
+        return {**payload, "account_id": account_id, "enabled": bool(config and config.enabled),
+                "next_allowed_at": config.next_join_after if config else None,
+                "configured": {}, "effective": {}, "used_today": {}, "used_rolling_24h": {},
+                "remaining": None, "read_rpc": payload["readiness"], "inventory": payload["permissions"]["counts"],
+                "blockers": [payload["cooldown_reason"]] if payload["cooldown_reason"] else []}
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.modules.acquisition.capacity_reads import CapacityReads
@@ -570,6 +580,8 @@ async def capacity_snapshot(
     from app.core.account.rpc_governor import parse_date
     from app.core.account.rpc_governor import snapshot as rpc_snapshot
     from app.modules.acquisition.join_budget import JoinRequestBudgetService
+    from app.modules.acquisition.qualification_engine import enabled_for, initial_slots
+    efficiency = enabled_for(account_id)
     rpc = await rpc_snapshot(db, account_id, now)
     pause_until = max(filter(None, [parse_date(rpc.get("resume_at")), account.risk_pause_until]), default=None)
     cooling = bool(pause_until and pause_until > now)
@@ -614,12 +626,14 @@ async def capacity_snapshot(
         blockers.append(age_reason)
         join_remaining = 0
     # Keep unresolved evidence visible while pacing joins by executable work.
-    probe_backlog = inventory.get("probe_review_pressure", inventory.get("probe_active_backlog", inventory["active_backlog"]))
-    paused = probe_backlog >= 12 or (
+    probe_backlog = (await initial_slots(db, account_id) if efficiency else
+                     inventory.get("probe_review_pressure", inventory.get("probe_active_backlog", inventory["active_backlog"])))
+    from app.core.config import settings
+    paused = not settings.TELEGRAM_RPC_PACING_ENABLED and (probe_backlog >= 2 if efficiency else probe_backlog >= 12 or (
         config.join_review_backlog_paused and probe_backlog > 6
-    )
+    ))
     if paused:
-        blockers.append("join_review_backlog")
+        blockers.append("join_initial_collection_capacity" if efficiency else "join_review_backlog")
         join_remaining = 0
     interval = max(limits["join_interval_seconds"], int(config.join_interval_min_seconds or 0))
     due = max(
@@ -661,9 +675,12 @@ async def capacity_snapshot(
     verification_remaining = min(
         outbound["remaining"], outbound["categories"]["verification"]["remaining"]
     )
-    executable_join = min(join_remaining, workload["join_candidates"], verification_remaining)
+    executable_join = min(join_remaining, workload["join_candidates"],
+                          max(0, 2 - probe_backlog) if efficiency else verification_remaining)
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        executable_join = min(join_remaining, workload["join_candidates"])
     executable_ad = min(ad_remaining, workload["ad_targets"])
-    if verification_remaining <= 0:
+    if verification_remaining <= 0 and not efficiency and not settings.TELEGRAM_RPC_PACING_ENABLED:
         blockers.append("verification_budget_unavailable")
     if due and due > now:
         executable_join = 0

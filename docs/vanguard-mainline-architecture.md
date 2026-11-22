@@ -5,7 +5,7 @@ Vanguard is converged around one source of truth:
 - Backend/Admin is the configuration and data center.
 - Telegram Workers are the only long-running execution surface.
 - XBoard integration uses the HMAC signed `/api/v1/...` protocol from `Xboard-master`.
-- `bot-matrix` is legacy/reference code, not a separate runtime authority.
+- The retired standalone `bot-matrix` implementation has been removed; Telegram execution lives in the backend workers.
 
 ## Runtime Roles
 

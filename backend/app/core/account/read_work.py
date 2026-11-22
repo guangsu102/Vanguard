@@ -44,13 +44,18 @@ class ReadWork:
     review_reads: int = DEFAULT_REVIEW_READS
     phase: str = "full"
     requested_reads: int = DEFAULT_REVIEW_READS
+    planned_reads: int | None = None
     reads: int = 0
+    entered_reads: int = 0
     outcome: str = "interrupted"
     defer_reason: str | None = None
     methods: Counter = field(default_factory=Counter)
     failures: Counter = field(default_factory=Counter)
     ledger_id: str | None = None
     started: float = field(default_factory=time.monotonic)
+    budget_workload: str | None = None
+    budget_claim: Any = None
+    budget_bind_failed: bool = False
 
     def summary(self) -> dict[str, Any]:
         from app.modules.acquisition.read_costs import COST_VERSION
@@ -58,10 +63,13 @@ class ReadWork:
             "path": COST_VERSION,
             "version": 1,
             "reads": self.reads,
+            "entered_sdk_reads": self.entered_reads,
+            "measurement_stage": getattr(self, "measurement_stage", "unknown"),
             "reserved_reads": self.limit,
             "methods": dict(self.methods),
             "failures": dict(self.failures),
             "kind": self.kind,
+            "budget_workload": self.budget_workload,
             "phase": self.phase,
             "outcome": self.outcome,
             "defer_reason": self.defer_reason,
@@ -85,6 +93,17 @@ def current(account_id: int | None = None) -> ReadWork | None:
 
 def lane_for(work: ReadWork) -> str:
     return {"renewal": "ad", "ad_reconciliation": "ad", "survival": "survival"}.get(work.kind, "critical")
+
+
+def budget_kind(work: ReadWork, purpose: str = "") -> str:
+    """Classify spending without changing the work's evidence/cost identity."""
+    if work.budget_workload in {"join", "review"}:
+        return work.budget_workload
+    if work.kind in {"join", "join_reconciliation"}:
+        return "join"
+    from app.core.account.critical_fairness import workload
+
+    return workload(purpose)
 
 
 def charged(account_id: int, methods: list[str]) -> None:
@@ -126,21 +145,28 @@ def estimate(samples: list[str], fallback: int, now: float, *, minimum: int | No
 
 
 async def review_required(account_id: int, group_id: int, scope: str, *, phase: str = 'full',
-                          fallback: int = DEFAULT_REVIEW_READS, cache: Any = None) -> int:
+                          fallback: int = DEFAULT_REVIEW_READS, cache: Any = None,
+                          planned_reads: int | None = None) -> int:
+    fallback = min(48, max(1, planned_reads)) if planned_reads is not None else fallback
     try:
         if cache is None:
             from app.core.redis import get_redis
             cache = await get_redis()
         samples = await cache.lrange(sample_key(account_id, 'review'), 0, 199)
-        return review_estimate(samples, account_id, group_id, scope, phase=phase, fallback=fallback)
+        return review_estimate(samples, account_id, group_id, scope, phase=phase, fallback=fallback,
+                               planned_reads=planned_reads)
     except Exception:
         return fallback
 
 
 def review_estimate(samples: list[str], account_id: int, group_id: int, scope: str, *,
-                    phase: str = 'full', fallback: int = DEFAULT_REVIEW_READS) -> int:
+                    phase: str = 'full', fallback: int = DEFAULT_REVIEW_READS,
+                    planned_reads: int | None = None) -> int:
     """Use the same membership cost for forecasts, preflight and atomic claims."""
-    required = estimate(samples, fallback, time.time(), minimum=12 if phase == 'exit' else 16, phase=phase)
+    minimum = min(48, max(1, planned_reads)) if planned_reads is not None else (12 if phase == 'exit' else 16)
+    if planned_reads is not None:
+        fallback = minimum
+    required = estimate(samples, fallback, time.time(), minimum=minimum, phase=phase)
     return resumed_estimate(samples, ReadWork(account_id, group_id, 'review', scope), required)
 
 
@@ -161,6 +187,9 @@ def resumed_estimate(samples: list[str], work: ReadWork, default: int) -> int:
 
 
 def minimum_wait(budget: dict, purpose: str, required: int) -> int:
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return 0
     from app.core.account.critical_fairness import other_hold, workload
     from app.core.account.reserved_reads import (
         ad_send_hold,
@@ -189,6 +218,8 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
             usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
         lane = 'ad' if purpose == 'ad_qualification_refresh' else 'critical'
+        listener_floor = (usage.get(f"listener_{window}", {}).get("remaining", 0)
+                          if limits.get("growth_efficiency_v1") else 0)
         caps = lending_caps(
             caps,
             used,
@@ -196,6 +227,7 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
             limits.get(f"survival_hold_{window}", -1),
             limits.get(f"sync_hold_{window}", -1),
             limits.get(f"ad_demand_hold_{window}", -1),
+            survival_floor=listener_floor,
         )
         hold = other_hold(
             base[2],
@@ -204,10 +236,11 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
             usage[f"critical_review_{window}"]["used"],
             workload(purpose),
             limits.get(f'join_idle_hold_{window}', -1),
+            efficiency=bool(limits.get("growth_efficiency_v1")),
         )
         if lane == 'ad':
             hold = limits.get(f'ad_refresh_hold_{window}', ad_send_hold(base[0], base[4]))
-        if available(limits[window], used, caps, lane) - hold < required:
+        if available(limits[window], used, caps, lane, survival_floor=listener_floor) - hold < required:
             ttl = usage[window]["ttl_seconds"]
             waits.append(max(1, ttl) if ttl > 0 else duration)
     return max(waits, default=60)
@@ -215,6 +248,11 @@ def minimum_wait(budget: dict, purpose: str, required: int) -> int:
 
 async def initial_pending(db: Any, account_id: int, group_id: int) -> tuple[int, datetime] | None:
     """Report initial work only when account-local execution capacity is full."""
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if enabled_for(account_id):
+        # New work owns explicit first-collection slots. Historical verdicts
+        # and future evidence waits cannot veto unrelated joins.
+        return None
     from app.modules.acquisition.execution_admission import execution_plan
 
     if (await execution_plan(db, datetime.utcnow(), account_id=account_id))["remaining"] > 0:
@@ -273,14 +311,64 @@ async def initial_pending(db: Any, account_id: int, group_id: int) -> tuple[int,
 
 
 async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return
     """Called by the real RPC governor; fake/offline collectors spend no budget."""
     work = current(account_id)
-    if work is None or work.claimed:
+    if work is None:
         return
     from app.core.account.reserved_reads import RESERVED_BUDGET_LUA, reservation_args
     from app.core.account.rpc_governor import RpcDeferred
+    from app.modules.acquisition.qualification_engine import enabled_for
 
-    if work.kind == "join":
+    efficiency = enabled_for(account_id)
+    initial_join_review = efficiency and work.kind == "review" and work.budget_workload == "join"
+    if initial_join_review:
+        from app.modules.acquisition.qualification_engine import (
+            initial_join_budget_current,
+            initial_join_claim_current,
+        )
+
+        try:
+            valid = await initial_join_budget_current(
+                db, work.budget_claim, account_id, work.group_id, work_token=work.token,
+            )
+        except Exception as exc:
+            raise RpcDeferred("telegram_rpc_guard_unavailable", 60) from exc
+        if not valid:
+            if work.claimed:
+                raise RpcDeferred("qualification_work_claim_changed", 60)
+            try:
+                claim_current = await initial_join_claim_current(
+                    db, work.budget_claim, account_id, work.group_id,
+                )
+            except Exception as exc:
+                raise RpcDeferred("telegram_rpc_guard_unavailable", 60) from exc
+            if not claim_current:
+                raise RpcDeferred("qualification_work_claim_changed", 60)
+            # A prior nonzero/unknown slice consumed the protected first step.
+            # The still-current work may continue under the ordinary review
+            # budget, without inheriting the old token's join entitlement.
+            work.budget_workload, work.budget_claim = None, None
+            initial_join_review = False
+    if work.claimed:
+        return
+
+    efficiency_join = work.kind == "join" and efficiency
+    join_confirmation = work.kind == "join_reconciliation" and efficiency
+    next_join_plan = None
+    if efficiency_join:
+        from app.modules.acquisition.review_read_plan import for_join
+        from app.modules.acquisition.growth_admission import admission_plan
+
+        next_join_plan = await for_join(db, account_id, work.group_id, datetime.utcnow())
+        admission = await admission_plan(db, account_id, datetime.utcnow(), group_id=work.group_id,
+                                         read_plan=next_join_plan)
+        if admission["remaining"] <= 0:
+            raise RpcDeferred(admission["reason"], admission.get("retry_after_seconds") or 60)
+
+    if work.kind == "join" and not efficiency_join:
         from sqlalchemy import select
 
         from app.core.account.models import AccountOperationConfig
@@ -299,21 +387,41 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
             if is_hard_join_admission_blocker(admission['reason']):
                 raise RpcDeferred(admission['reason'], admission.get('retry_after_seconds', 60))
     try:
-        samples = await cache.lrange(sample_key(account_id, work.kind), 0, 199)
-        work.limit = estimate(
-            samples,
-            {"join": DEFAULT_JOIN_READS, "join_reconciliation": 8, "survival": 8, "ad_reconciliation": 8}.get(work.kind, DEFAULT_REVIEW_READS),
-            time.time(),
-        )
-        if work.kind == "join":
-            work.limit = min(24, work.limit)
-        work.limit = resumed_estimate(samples, work, work.limit)
-        if work.kind == 'review':
+        bounded_join_work = initial_join_review or join_confirmation
+        samples = [] if efficiency_join or bounded_join_work else await cache.lrange(sample_key(account_id, work.kind), 0, 199)
+        if efficiency_join:
+            # Reserve just this target's next bounded dependency. Initial
+            # qualification later owns its own plan and checkpoint, rather
+            # than a 24-read handoff coupled to this join reservation.
+            work.limit = next_join_plan.required_reads
+            work.planned_reads = work.limit
+            work.phase = next_join_plan.operation
+            work.review_reads = 0
+        elif bounded_join_work:
+            # The current new membership / original join request owns this
+            # bounded step. Historical review samples cannot inflate it.
+            if type(work.planned_reads) is not int or not 1 <= work.planned_reads <= 8:
+                raise RpcDeferred("telegram_rpc_guard_unavailable", 60)
+            work.limit = work.planned_reads
+            work.review_reads = 0
+        else:
+            work.limit = estimate(
+                samples,
+                {"join": DEFAULT_JOIN_READS, "join_reconciliation": 8, "survival": 8, "ad_reconciliation": 8}.get(work.kind, DEFAULT_REVIEW_READS),
+                time.time(),
+            )
+            if work.kind == "join":
+                work.limit = min(24, work.limit)
+            work.limit = resumed_estimate(samples, work, work.limit)
+        if work.kind == 'review' and not initial_join_review:
             work.limit = await review_required(account_id, work.group_id, work.scope, phase=work.phase,
-                                               fallback=work.requested_reads, cache=cache)
+                                               fallback=work.requested_reads, cache=cache,
+                                               planned_reads=work.planned_reads)
         if work.kind == 'renewal':
-            work.limit = DEFAULT_RENEWAL_READS
-        if work.kind == "join":
+            work.limit = (estimate(samples, min(48, max(1, work.planned_reads)), time.time(),
+                                   minimum=min(48, max(1, work.planned_reads)), phase=work.phase)
+                          if work.planned_reads is not None else DEFAULT_RENEWAL_READS)
+        if work.kind == "join" and not efficiency_join:
             review_samples = await cache.lrange(sample_key(account_id, "review"), 0, 199)
             work.review_reads = estimate(review_samples, DEFAULT_REVIEW_READS, time.time())
         reserve = work.limit + (work.review_reads if work.kind == "join" else 0)
@@ -323,7 +431,7 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
             lane_for(work),
             reserve,
             0,
-            workload="join" if work.kind in {"join", "join_reconciliation"} else "review",
+            workload=budget_kind(work) if efficiency else ("join" if work.kind in {"join", "join_reconciliation"} else "review"),
             work_token=work.token,
             work_mode="reserve",
             work_group=work.group_id,
@@ -340,7 +448,15 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
         from app.core.account.budget_ledger import reserve_read_work
         try:
             await reserve_read_work(db, cache, work, remaining)
+            if initial_join_review:
+                from app.modules.acquisition.qualification_engine import bind_initial_join_read_work
+
+                if not await bind_initial_join_read_work(
+                    db, work.budget_claim, account_id, work.group_id, work.token, work.limit,
+                ):
+                    raise RpcDeferred("telegram_rpc_guard_unavailable", 60)
         except BaseException:
+            work.budget_bind_failed = True
             # Includes cancellation after Redis succeeded and PG failed. Only
             # this generation's reservation is released; spent quotas stay.
             await cache.eval(
@@ -349,6 +465,8 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
             )
             raise
         work.claimed = True
+        from app.modules.acquisition import qualification_sla_runtime
+        qualification_sla_runtime.budget_step_entered(account_id, work)
     except RpcDeferred:
         raise
     except Exception as exc:
@@ -357,7 +475,7 @@ async def ensure(db: Any, account_id: int, limits: dict, cache: Any) -> None:
 
 async def handoff(work: ReadWork, scope: str) -> None:
     """Retain only the first-review share after a confirmed, committed join."""
-    if not work.claimed:
+    if not work.claimed or work.review_reads <= 0:
         return
     from app.core.redis import get_redis
 
@@ -394,13 +512,17 @@ async def release(work: ReadWork) -> None:
     try:
         async with asyncio.timeout(2):
             cache = await get_redis()
-            await cache.eval(
+            released = await cache.eval(
                 "if redis.call('HGET',KEYS[1],'token')==ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
                 1,
                 key(work.account_id),
                 work.token,
             )
             work.claimed = False
+            if released:
+                from app.core.scheduler.growth_dispatch import wake_account
+                await wake_account(work.account_id, stages=("ads", "join", "review"),
+                                   reason="budget_settled", client=cache)
     except Exception:
         pass  # Original lease expiry remains the fallback.
 
@@ -427,22 +549,36 @@ async def reservation_snapshot(cache: Any, account_id: int) -> dict:
 @asynccontextmanager
 async def operation(account_id: int, group_id: int, kind: str, *, scope: str = "") -> AsyncIterator[ReadWork]:
     work = ReadWork(account_id, group_id, kind, scope)
+    from app.modules.acquisition import qualification_sla_runtime
+    qualification_sla_runtime.slice_started(work)
     token = _current.set(work)
+    failed_work = False
     try:
         yield work
+    except BaseException:
+        failed_work = True
+        raise
     finally:
         work.closed = True
         _current.reset(token)
         from app.core.account.budget_ledger import finish_read_work
         await finish_read_work(work)
+        if work.kind == "review" and work.budget_workload == "join" and work.budget_claim is not None:
+            from app.modules.acquisition.qualification_engine import finish_initial_join_read_work
+
+            await finish_initial_join_read_work(work, failed=failed_work)
+        qualification_sla_runtime.slice_finished(work, failed=failed_work)
+        from app.core.account.read_metrics import record_work
+        await record_work(work, failed=failed_work)
         if work.claimed or work.reads:
             try:
                 from app.core.redis import get_redis
 
                 async with asyncio.timeout(2):
                     cache = await get_redis()
+                    released = False
                     if work.claimed and not work.handed_off:
-                        await cache.eval(
+                        released = await cache.eval(
                             "if redis.call('HGET',KEYS[1],'token')==ARGV[1] then return redis.call('DEL',KEYS[1]) end return 0",
                             1,
                             key(account_id),
@@ -460,6 +596,10 @@ async def operation(account_id: int, group_id: int, kind: str, *, scope: str = "
                             pipe.ltrim(sample_key(account_id, work.kind), 0, 199)
                             pipe.expire(sample_key(account_id, work.kind), RETENTION_SECONDS)
                             await pipe.execute()
+                    if released:
+                        from app.core.scheduler.growth_dispatch import wake_account
+                        await wake_account(account_id, stages=("ads", "join", "review"),
+                                           reason="budget_settled", client=cache)
             except Exception:
                 # A crashed/failed cleanup expires; never reset spent counters.
                 pass

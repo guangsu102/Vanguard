@@ -802,6 +802,40 @@ def test_high_risk_telegram_errors_are_account_scoped():
     )
 
 
+def test_chat_scoped_restriction_never_freezes_the_account():
+    """CHAT_RESTRICTED scopes the restriction to one chat, not the account.
+
+    Classifying the group-level error as account_restricted froze whole
+    accounts for 24 hours (production account 2, 2026-11-11 diagnosis).
+    """
+    chat_error = "ChatRestrictedError: You're restricted from sending messages in this chat"
+    assert (
+        AccountRiskGuard.classify_error(
+            chat_error,
+            action=AccountRiskAction.AD_DELIVERY,
+            target_type="group",
+        )
+        == "group_write_forbidden"
+    )
+    assert (
+        AccountRiskGuard.classify_error(
+            "You're restricted from sending messages in this chat",
+            action=AccountRiskAction.AD_DELIVERY,
+            target_type="group",
+        )
+        == "group_write_forbidden"
+    )
+    # SpamBot's account-scoped signal keeps freezing.
+    assert (
+        AccountRiskGuard.classify_error(
+            "UserRestrictedError: You're restricted until the date specified",
+            action=AccountRiskAction.AD_DELIVERY,
+            target_type="group",
+        )
+        == "account_restricted"
+    )
+
+
     frozen_error = "Your account is frozen and can't access the chat"
     assert (
         AccountRiskGuard.classify_error(

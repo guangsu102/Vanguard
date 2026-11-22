@@ -111,7 +111,11 @@ def start_worker(
     cmd = " ".join(cmd_parts)
     logger.info("starting_celery_worker", queues=queues_arg, command=cmd)
 
-    os.system(cmd)
+    stop_metrics_manager = _start_metrics_manager_health()
+    try:
+        os.system(cmd)
+    finally:
+        stop_metrics_manager()
 
 
 def start_multi_workers() -> None:
@@ -166,9 +170,11 @@ def start_multi_workers() -> None:
         processes.append((name, proc))
 
     logger.info("all_workers_started", count=len(processes))
+    stop_metrics_manager = _start_metrics_manager_health()
 
     def signal_handler(signum, frame):
         logger.info("shutdown_signal_received")
+        stop_metrics_manager()
         for name, proc in processes:
             logger.info(f"stopping_{name}")
             proc.terminate()
@@ -177,8 +183,52 @@ def start_multi_workers() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    for name, proc in processes:
-        proc.wait()
+    try:
+        for name, proc in processes:
+            proc.wait()
+    finally:
+        stop_metrics_manager()
+
+
+def _start_metrics_manager_health():
+    """The idle multi-worker manager owns one real loop, after all Popen calls."""
+    from app.core.config import settings
+
+    if (not (settings.REVIEW_READ_METRICS_ENABLED or settings.REVIEW_DIAGNOSTICS_PATH)
+            or settings.REVIEW_READ_METRICS_ROLE not in {"celery", "resource"}):
+        return lambda: None
+    import asyncio
+    import threading
+
+    stopping = threading.Event()
+
+    async def monitor():
+        from app.core.account.read_metrics import start_metrics_health, stop_metrics_health
+        from app.modules.acquisition.review_diagnostics import start_maintenance, stop_maintenance
+
+        await start_maintenance()
+        start_metrics_health()
+        try:
+            while not stopping.is_set():
+                await asyncio.sleep(0.25)
+        finally:
+            await stop_maintenance()
+            await stop_metrics_health()
+
+    def run():
+        try:
+            asyncio.run(monitor())
+        except Exception:
+            logger.exception("review_metrics_manager_health_failed")
+
+    thread = threading.Thread(target=run, name="review-metrics-health", daemon=True)
+    thread.start()
+
+    def stop():
+        stopping.set()
+        thread.join(timeout=5)
+
+    return stop
 
 
 def start_beat(loglevel: str = "info") -> None:
@@ -188,9 +238,9 @@ def start_beat(loglevel: str = "info") -> None:
     Args:
         loglevel: Logging level
     """
-    cmd = f"celery -A app.celery beat --loglevel={loglevel}"
     logger.info("starting_celery_beat")
-    os.system(cmd)
+    # Replace PID 1 so Docker's TERM reaches Beat and stops new task claims.
+    os.execvp("celery", ["celery", "-A", "app.celery", "beat", f"--loglevel={loglevel}"])
 
 
 def start_flower(broker_url: Optional[str] = None, port: int = 5555) -> None:

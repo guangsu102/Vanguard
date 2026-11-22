@@ -61,9 +61,11 @@ async def reserve(cache: Any, account_id: int, snapshot: dict, reads: int) -> in
     """No loan from ads/reviews; every granted read stays in the same totals."""
     from app.core.account.reserved_reads import RESERVED_BUDGET_LUA, reservation_args
 
-    limits = snapshot["limits"]
     if snapshot["state"] in {"cooldown", "unavailable"}:
         return max(1, snapshot.get("retry_after_seconds", 60)) * 1000
+    if snapshot.get("budget_enabled") is False:
+        return 0  # Actual SDK pacing applies to every continuation request.
+    limits = snapshot["limits"]
     if any(limits.get("survival_hold_" + w, -1) < 0 for w in ("hour", "day")):
         return 60000  # Active/uncertain survival readers keep their reservation.
     keys, args = reservation_args(account_id, limits, "survival", reads, 0, sync_completion=True)

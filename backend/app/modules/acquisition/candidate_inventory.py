@@ -1,7 +1,7 @@
 """Account-scoped, expiring hints for the join queue (never ad qualification)."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -45,8 +45,7 @@ def ready(fact: dict) -> bool:
     return bool(
         not fact.get("preview_exclusion")
         and fact.get("namespace") in {"chat", "channel"}
-        and type(count) is int
-        and count >= 50
+        and (fact.get("efficiency_mode") is True or (type(count) is int and count >= 50))
         and (
             fact.get("status") == "metadata_checked"
             or int(fact.get("ordinary_advertisers") or 0) > 0
@@ -56,6 +55,9 @@ def ready(fact: dict) -> bool:
 
 
 def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime, previous: dict | None = None) -> dict:
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if enabled_for(account_id):
+        hint = replace(hint, efficiency_mode=True)
     collected = min(now, date(hint.evidence_collected_at) or now)
     fact = {
         **asdict(hint),
@@ -81,6 +83,21 @@ def record(group: Any, account_id: int, hint: CandidatePreview, now: datetime, p
         ttl = timedelta(minutes=min(120, 15 * 2 ** (fact["failure_count"] - 1)))
     fact["expires_at"] = (collected + ttl).isoformat()
     fact["next_preview_at"] = fact["expires_at"]
+    return fact
+
+
+def for_account(fact: dict, account_id: int) -> dict:
+    """Reuse old structural facts while retiring value filters for the new engine."""
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if not enabled_for(account_id):
+        return fact
+    fact = {**fact, "efficiency_mode": True}
+    if fact.get("preview_exclusion") in {
+        "prejoin_members_below_50", "prejoin_rules_ban_and_online_below_2",
+    }:
+        fact["preview_exclusion"] = None
+        if fact.get("status") == "sampled":
+            fact["status"] = "metadata_checked"
     return fact
 
 
@@ -118,7 +135,7 @@ async def load(db: Any, account_id: int, group_ids: list[int]) -> dict[int, dict
         try:
             fact = json.loads(row.value)
             if isinstance(fact, dict):
-                result[keys[row.key]] = fact
+                result[keys[row.key]] = for_account(fact, account_id)
         except (ValueError, TypeError):
             continue
     return result

@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Vanguard is a Telegram automation marketing matrix system for XBoard. It manages multiple Telegram accounts for lead generation, customer service, and community moderation. The system consists of three main components:
 
 - **Backend API** (FastAPI/Python 3.12+): REST API, business logic, database operations
-- **Bot Matrix** (Telethon/Pyrogram): Multi-account Telegram bot automation
+- **Telegram Workers** (backend/app/workers): Multi-account Telegram bot automation
 - **Frontend** (Vue 3 + Element Plus): Web management interface
 
 ## Development Commands
@@ -65,25 +65,9 @@ npm run test
 npm run test:watch
 ```
 
-### Bot Matrix
+### Telegram Workers
 
-```bash
-cd bot-matrix
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run bot
-python -m src.main
-
-# Tests
-pytest tests/ -v
-
-# Code formatting
-black src/
-isort src/
-flake8 src/
-```
+Telegram automation runs through `backend/app/workers/telegram_worker.py`; use the backend dependencies and tests.
 
 ### Docker Compose
 
@@ -93,12 +77,10 @@ docker-compose up -d
 
 # Start specific service
 docker-compose up -d backend
-docker-compose up -d bot
 docker-compose up -d postgres redis
 
 # View logs
 docker-compose logs -f backend
-docker-compose logs -f bot
 
 # Rebuild and restart
 docker-compose up -d --build
@@ -187,21 +169,9 @@ frontend/src/
 └── router/                 # Vue Router configuration
 ```
 
-### Bot Matrix Structure
+### Telegram Worker Entry
 
-```
-bot-matrix/src/
-├── bots/                   # Bot implementations
-│   ├── lead_gen.py         # Module A: Lead generation & airdrops
-│   ├── service.py          # Module B: Customer service
-│   └── group_ops.py        # Module C: Community moderation
-├── core/                   # Core utilities
-│   ├── account_manager.py  # Multi-account manager
-│   ├── database.py         # PostgreSQL connection
-│   ├── cache.py            # Redis cache
-│   └── middleware.py       # Risk control
-└── integrations/           # External integrations
-```
+`backend/app/workers/telegram_worker.py` runs acquisition and guardian workloads using the shared account pool.
 
 ## Key Architectural Patterns
 
@@ -236,7 +206,7 @@ The system integrates with XBoard (VPN panel) via webhooks and API calls. XBoard
 - `VANGUARD_CALLBACK_SIGNING_SECRET` - Shared HMAC secret for XBoard callbacks
 
 **Frontend (.env.development, .env.production)**:
-- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path at `https://vanguard.pipenai.xyz`.
+- `VITE_API_BASE_URL` - Backend API base URL. Production uses the same-origin `/api` path at `https://vanguard.dh113.xyz`.
 
 ### Configuration Files
 - `backend/alembic.ini` - Database migration configuration
@@ -287,7 +257,7 @@ If you see "connection pool exhausted" errors, check for:
 - Insufficient pool size in `DATABASE_URL` (add `?pool_size=20&max_overflow=10`)
 
 ### Bot: Session Files
-Telegram session files (`.session`) are stored in `backend/sessions/` or `bot-matrix/sessions/`. These contain authentication credentials and should never be committed to git. If a session becomes invalid, delete the file and re-authenticate.
+Telegram session files (`.session`) are stored in `backend/sessions/`. These contain authentication credentials and should never be committed to git. If a session becomes invalid, delete the file and re-authenticate.
 
 ### Proxy Connection Issues
 If Telegram accounts fail to connect:
@@ -298,38 +268,11 @@ If Telegram accounts fail to connect:
 
 ## Deployment
 
-### Production Server
-- **Server**: `168.110.23.229` (SSH alias: `oracle4c24g`, port `22`)
-- **SSH**: local SOCKS5 `connect.exe -S 127.0.0.1:7897`, key `E:/sshkey/sshkey/id_rsa`
-- **Public domain**: https://vanguard.pipenai.xyz
-- **Backend/frontend**: isolated Docker Compose stack in `/opt/vanguard`; host nginx forwards `/api`, `/api/ws`, `/health` to `127.0.0.1:18080` and `/` to `127.0.0.1:13000`.
-- **Database/cache**: Vanguard-owned PostgreSQL and Redis volumes under `/opt/vanguard/data`; do not stop the co-located `/opt/sub2api-dr` stack.
-- **Host Nginx**: `/etc/nginx/conf.d/vanguard.conf`, using the verified Cloudflare Origin wildcard certificate for `*.pipenai.xyz`.
+Production runs on `oracle4c24g-us` (`147.224.11.146`) at [vanguard.dh113.xyz](https://vanguard.dh113.xyz). The former `xd` host has expired.
 
-### Deployment Process
+Use the canonical runtime at `/opt/shared-postgres/stacks/vanguard/compose.json`. Deploy only the intended application services with `--no-deps` and preserve shared PostgreSQL, Redis, and other site routes.
 
-**Backend**:
-```bash
-# On server
-cd /opt/vanguard
-docker compose -f docker-compose.production.yml up -d --build
-```
-
-**Frontend**:
-```bash
-# Local build
-cd frontend
-npm run build
-tar -czf dist.tar.gz -C dist .
-
-# The frontend image is built as part of the isolated production stack.
-ssh oracle4c24g 'cd /opt/vanguard && docker compose -f docker-compose.production.yml up -d --build frontend'
-```
-
-### Health Checks
-- Backend: `curl https://vanguard.pipenai.xyz/health`
-- API Docs: `https://vanguard.pipenai.xyz/docs` (only in DEBUG mode)
-- Logs: `ssh oracle4c24g 'docker logs -f vanguard-backend'`
+Cloudflare uses Full (strict) mode and the `dh113-origin` certificate on K3s Traefik. Follow the [production deployment guide](SERVER_DEPLOY.md) for release commands, verification, and certificate details.
 
 ## Code Style
 

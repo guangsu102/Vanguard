@@ -263,6 +263,8 @@ class AdDeliveryThrottleUpdate(BaseModel):
 
 
 class AdDeliveryExecutionUpdate(BaseModel):
+    send_failure_exit_threshold: int = Field(default=3, ge=1, le=10)
+    send_failure_retry_seconds: int = Field(default=1800, ge=60, le=86400)
     enabled: bool = True
     dispatcher_interval_seconds: int = Field(default=60, ge=10, le=3600)
     dispatcher_batch_size: int = Field(default=100, ge=1, le=1000)
@@ -2358,6 +2360,9 @@ class AdSurvivalCheckRunRequest(BaseModel):
 
 @router.post("/ads/survival-check/run", status_code=status.HTTP_202_ACCEPTED)
 async def run_ad_survival_check(request: AdSurvivalCheckRunRequest) -> dict:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        raise HTTPException(status_code=410, detail="survival_review_disabled")
     result = _enqueue_automation_task(
         check_ad_survival_task,
         "check_ad_survival_task",

@@ -195,6 +195,11 @@ class GroupAccountMembership(Base):
         nullable=False,
         comment="加群后审核状态",
     )
+    next_ad_allowed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    permission_checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    can_send_text: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    permission_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    verification_status: Mapped[str] = mapped_column(String(24), default="pending", server_default="pending", nullable=False)
     review_started_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="审核固定起点"
     )
@@ -268,7 +273,7 @@ class GroupAccountMembership(Base):
         UniqueConstraint("group_id", "account_id", name="uq_group_account_membership_group_account"),
         CheckConstraint(
             "status NOT IN ('left', 'banned', 'rejected', 'leave_failed') "
-            "OR ad_status = 'blocked'",
+            "OR ad_status IN ('blocked', 'paused')",
             name="ck_group_membership_inactive_ad_blocked",
         ),
         Index("idx_group_membership_group", "group_id"),
@@ -278,5 +283,6 @@ class GroupAccountMembership(Base):
         Index("idx_group_membership_warmup", "account_id", "warmup_status", "probe_status"),
         Index("idx_group_membership_ad_eligible", "account_id", "ad_eligible_after"),
         Index("idx_group_membership_ad_status", "account_id", "ad_status"),
+        Index("idx_group_membership_ad_due", "account_id", "status", "review_status", "next_ad_allowed_at"),
         Index("idx_group_membership_review_due", "account_id", "review_status", "review_next_at"),
     )

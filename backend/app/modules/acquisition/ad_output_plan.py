@@ -27,6 +27,9 @@ def resource_capacity(ad_limit: int, read_limits: dict[str, int], *, delivery_co
 
 def mixed_resource_capacity(ad_limit: int, limits: dict, inventory: dict, costs: dict) -> int:
     """Estimate output from protected shares plus the single elastic pool."""
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return max(0, ad_limit)
     mature_groups = inventory.get("mature_usable", 0)
     mature_slots = inventory.get("mature_slots_24h", 0)
     probe_slots = inventory.get("probe_slots_24h", inventory.get("slots_24h", 0) - mature_slots)
@@ -242,6 +245,23 @@ async def ad_output_plan(
         probe_limit=limits.get("ad_probe", min(30, limits.get("ad", 0))),
         group_limit=min(300, int(getattr(config, "max_groups_total", 300) or 300)),
     )
+    from app.core.config import settings
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if settings.TELEGRAM_RPC_PACING_ENABLED or enabled_for(account_id):
+        # Output forecasts remain useful telemetry. A due ad, an observation,
+        # or old review debt cannot consume the independent next-join lane.
+        advisory = plan["join_blocker"]
+        hard = {"account_risk_quarantined", "telegram_read_budget", "telegram_rpc_cooldown",
+                "telegram_rpc_guard_unavailable", "total_group_quota"}
+        plan.update(
+            engine_version="efficiency_v1",
+            join_advisories=[advisory] if advisory and advisory not in hard else [],
+            recommended_probe_target=plan["target_groups"],
+            target_groups=plan["group_limit"],
+            group_deficit=plan["group_headroom"],
+            join_blocker=("total_group_quota" if not plan["group_headroom"] else
+                          advisory if advisory in hard else None),
+        )
     return {
         **plan, **costs,
         "probe_ad_due": plan["ad_due"],

@@ -826,11 +826,21 @@ class LLMClient:
             client = AsyncOpenAI(**client_kwargs)
             try:
                 async with asyncio.timeout(self.OPENAI_TOTAL_TIMEOUT_SECONDS):
+                    generation_options: dict[str, Any] = {
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    if model == "gpt-6.1-sol" and (
+                        not self.base_url
+                        or self._canonical_custom_endpoint(self.base_url) == "https://api.openai.com/v1"
+                    ):
+                        # The official Sol endpoint rejects max_tokens and custom
+                        # temperatures. Preserve the requested completion budget.
+                        generation_options = {"max_completion_tokens": max_tokens}
                     response = await client.chat.completions.create(
                         model=model,
                         messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
+                        **generation_options,
                         **({"extra_body": self.openai_extra_body} if self.openai_extra_body else {}),
                     )
             except Exception as exc:

@@ -26,7 +26,6 @@ WARMUP_STAGE_ORDER = (
 ACTION_MULTIPLIER_KEYS = {
     "join": "join_multiplier",
     "ad_delivery": "ad_multiplier",
-    "ad_probe": "probe_multiplier",
     "ad_run": "run_multiplier",
     "private_message": "private_message_multiplier",
     "group_message": "group_message_multiplier",

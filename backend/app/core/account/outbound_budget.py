@@ -53,12 +53,15 @@ def account_capacity_limits(account: Any, config: Any, now: datetime) -> dict[st
         and getattr(account, "is_active", False)
         and _value(getattr(account, "status", None)) == "restricted"
     )
+    configured_ads = max(
+        0, int(30 if getattr(config, "max_ads_per_day", None) is None else config.max_ads_per_day)
+    )
     ceiling = (
         0
         if blocked
         else 10
         if cautious
-        else max(30, int(getattr(config, "max_ads_per_day", 30) or 30))
+        else max(30, configured_ads)
     )
     configured_total = getattr(config, "max_messages_per_day", None)
     max_cap = max(62, ceiling + 32)
@@ -66,7 +69,7 @@ def account_capacity_limits(account: Any, config: Any, now: datetime) -> dict[st
     total = configured_total
     adaptive = getattr(config, "adaptive_ads_enabled", False) is True
     pace = max(1800 if cautious else 600, int(getattr(config, "message_interval_seconds", 0) or 0))
-    probe = min(ceiling, max(0, int(getattr(config, "max_ads_per_day", 30) or 30)))
+    probe = min(ceiling, configured_ads)
     # Adaptive pacing controls the minimum interval, while the configured
     # account limit remains a hard ceiling.  Without the ``min`` an account
     # configured for 30 ads/day at a 10-minute interval was admitted for
@@ -98,8 +101,11 @@ def account_capacity_limits(account: Any, config: Any, now: datetime) -> dict[st
         if blocked and not diagnostic_only
         else min(2, max(0, int(getattr(config, "max_diagnostic_messages_per_day", 2)))),
         "other": 0,
-        "join": min(ceiling, max(0, int(getattr(config, "max_groups_per_day", 30)))),
-        "join_interval_seconds": 7200 if cautious else 2880,
+        "join": min(30, ceiling, max(0, int(getattr(config, "max_groups_per_day", 30)))),
+        "join_interval_seconds": max(
+            7200 if cautious else 2880,
+            int(getattr(config, "join_interval_min_seconds", 0) or 0),
+        ),
         "ad_interval_seconds": max(
             1800 if cautious else 600, int(getattr(config, "message_interval_seconds", 0) or 0)
         ),
@@ -163,7 +169,9 @@ class ActionCapacityFeedbackService:
             )
         if action == "ad_delivery":
             interval = max(600, config.message_interval_seconds or 0)
-            configured = max(0, int(getattr(config, "max_ads_per_day", 30) or 30))
+            configured = max(
+                0, int(30 if getattr(config, "max_ads_per_day", None) is None else config.max_ads_per_day)
+            )
             limit = (
                 min(configured, 86400 // interval)
                 if getattr(config, "adaptive_ads_enabled", False) is True
@@ -271,6 +279,20 @@ async def effective_capacity_limits(
         pause = _feedback_time(state.get("pause_until"))
         if pause and pause > now:
             limits["action_pauses"][category] = pause.isoformat()
+    observation = await db.get(SystemSetting, f"growth.canary.account.{account.id}",
+                               populate_existing=True) if account is not None else None
+    if observation:
+        try:
+            policy = json.loads(observation.value)
+            if policy.get("enabled") is True:
+                for category in ("ad", "join"):
+                    limits[category] = min(limits[category], max(0, int(policy[category + "_daily"])))
+                    interval = category + "_interval_seconds"
+                    limits[interval] = max(limits[interval], int(policy[interval]))
+                limits["ad_probe"] = min(limits["ad_probe"], limits["ad"])
+                limits["observation"] = policy
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise OutboundBudgetBlocked("observation_policy_invalid") from exc
     if limits.get("adaptive_ads"):
         configured_total = int(limits["total"])
         # Keep the configured per-account cap in force after dynamic feedback

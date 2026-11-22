@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Vanguard V5 strict benefit evidence v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "baseline_weights",
+    "weights_frozen_at",
+    "windows",
+    "pairs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "baseline_weights": {
+      "type": "object",
+      "required": [
+        "simple",
+        "standard",
+        "complex",
+        "unknown"
+      ],
+      "properties": {
+        "simple": {
+          "type": "number",
+          "minimum": 0
+        },
+        "standard": {
+          "type": "number",
+          "minimum": 0
+        },
+        "complex": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "weights_frozen_at": {
+      "type": "number",
+      "minimum": 0
+    },
+    "windows": {
+      "type": "array",
+      "maxItems": 96,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "account_id",
+          "stage",
+          "window_start",
+          "window_end",
+          "release",
+          "metrics",
+          "business",
+          "execution_coverage_verified",
+          "unmetered_channels"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "account_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "stage": {
+            "enum": [
+              "baseline",
+              "phase1",
+              "phase2"
+            ]
+          },
+          "window_start": {
+            "type": "number",
+            "minimum": 0
+          },
+          "window_end": {
+            "type": "number",
+            "minimum": 0
+          },
+          "release": {
+            "type": "object",
+            "required": [
+              "image",
+              "manifest_sha256",
+              "measurement_version",
+              "attribution_version",
+              "completion_version",
+              "config_fingerprint",
+              "flags_fingerprint",
+              "flags"
+            ],
+            "properties": {
+              "image": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "manifest_sha256": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "measurement_version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "attribution_version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "completion_version": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "config_fingerprint": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "flags_fingerprint": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "flags": {
+                "type": "object",
+                "required": [
+                  "demand_identity",
+                  "dependency_resume",
+                  "fact_handoff",
+                  "fast_path",
+                  "minimal_plan",
+                  "public_share",
+                  "push",
+                  "resume",
+                  "reuse"
+                ],
+                "properties": {
+                  "demand_identity": {
+                    "type": "boolean"
+                  },
+                  "dependency_resume": {
+                    "type": "boolean"
+                  },
+                  "fact_handoff": {
+                    "type": "boolean"
+                  },
+                  "fast_path": {
+                    "type": "boolean"
+                  },
+                  "minimal_plan": {
+                    "type": "boolean"
+                  },
+                  "public_share": {
+                    "type": "boolean"
+                  },
+                  "push": {
+                    "type": "boolean"
+                  },
+                  "resume": {
+                    "type": "boolean"
+                  },
+                  "reuse": {
+                    "type": "boolean"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "metrics": {
+            "type": "object",
+            "description": "Unmodified FixedReadMetrics.snapshot(account, now=end, hours=24). Never replace missing/unknown metrics with zero."
+          },
+          "business": {
+            "type": "object",
+            "required": [
+              "healthy_seconds",
+              "backlog_start",
+              "backlog_end",
+              "oldest_age_start",
+              "oldest_age_end",
+              "latency_p95_seconds",
+              "ads_attempted",
+              "ads_succeeded",
+              "ads_unknown",
+              "joins_completed",
+              "failed_jobs",
+              "duplicate_sends",
+              "premature_protection_releases",
+              "storage_bytes",
+              "arrivals_known",
+              "arrivals_by_complexity"
+            ],
+            "properties": {
+              "healthy_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "backlog_start": {
+                "type": "number",
+                "minimum": 0
+              },
+              "backlog_end": {
+                "type": "number",
+                "minimum": 0
+              },
+              "oldest_age_start": {
+                "type": "number",
+                "minimum": 0
+              },
+              "oldest_age_end": {
+                "type": "number",
+                "minimum": 0
+              },
+              "latency_p95_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "ads_attempted": {
+                "type": "number",
+                "minimum": 0
+              },
+              "ads_succeeded": {
+                "type": "number",
+                "minimum": 0
+              },
+              "ads_unknown": {
+                "type": "number",
+                "minimum": 0
+              },
+              "joins_completed": {
+                "type": "number",
+                "minimum": 0
+              },
+              "failed_jobs": {
+                "type": "number",
+                "minimum": 0
+              },
+              "duplicate_sends": {
+                "type": "number",
+                "minimum": 0
+              },
+              "premature_protection_releases": {
+                "type": "number",
+                "minimum": 0
+              },
+              "storage_bytes": {
+                "type": "number",
+                "minimum": 0
+              },
+              "arrivals_known": {
+                "const": true
+              },
+              "arrivals_by_complexity": {
+                "type": "object",
+                "required": [
+                  "simple",
+                  "standard",
+                  "complex",
+                  "unknown"
+                ],
+                "properties": {
+                  "simple": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "standard": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "complex": {
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "unknown": {
+                    "type": "number",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "execution_coverage_verified": {
+            "const": true
+          },
+          "unmetered_channels": {
+            "const": 0
+          }
+        }
+      }
+    },
+    "pairs": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "required": [
+          "baseline",
+          "phase1",
+          "phase2"
+        ],
+        "properties": {
+          "baseline": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "phase1": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "phase2": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "description": "Collector may retain null for unavailable fields; calculator returns insufficient_evidence. Completion version is business_transition_v2: only committed new review revisions, real identity changes, or locked compare-and-clear event consumption count; identical local grant reuse is only a slice. No persistent completion markers are added to PG. Effective flags use stage_enabled(account_id, key); flags_fingerprint is sha256 of sorted compact JSON. All windows require 24 complete UTC hours, verified release/configuration, numeric business start/end aggregates and raw fixed-file completeness. No Telegram reads or production writes are needed."
+}

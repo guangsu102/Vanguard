@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from app.core import database_transaction_boundary as _transaction_boundary  # noqa: F401
 from app.core.config import settings
 
 # Naming convention for database constraints
@@ -91,10 +92,15 @@ async def init_db(create_tables: bool = True) -> None:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
+    from app.modules.acquisition.qualification_sla_lifecycle import start_current_process
+    await start_current_process()
+
 
 async def close_db() -> None:
     """Close database connection."""
     global engine, async_session_factory
+    from app.modules.acquisition.qualification_sla_lifecycle import stop
+    await stop(close_process=False)
     if engine:
         await engine.dispose()
         engine = None

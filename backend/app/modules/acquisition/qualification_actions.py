@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.account.models import TelegramAccount
 from app.core.account.rpc_governor import RpcDeferred
@@ -38,7 +42,9 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             or member.status != "joined" or member.review_status != "approved"
             or member.ad_status in {"blocked", "paused"}):
         raise TelegramExecutionError("qualification_review_required")
-    if await pending(db, member):
+    from app.modules.acquisition.qualification_engine import enabled_for, event_blocks_authorization
+    change = await pending(db, member)
+    if change and (not enabled_for(account_id) or event_blocks_authorization(json.loads(row.evidence_json or "{}"), change)):
         raise TelegramExecutionError("qualification_event_pending", retry_after_seconds=60)
     snapshot = json.loads(row.evidence_json or "{}")
     if snapshot.get("invalidated_at") or snapshot.get("protected"):
@@ -54,14 +60,200 @@ async def validate_live_send(db: Any, client: Any, account_id: int, target: int 
             raise TelegramExecutionError("qualification_wait_condition")
 
 
+_REFRESH_AUDIT_FIELDS = (
+    "id", "membership_id", "account_id", "group_id", "membership_joined_at",
+    "policy_version", "content_scope", "attempts", "state", "decision", "reason",
+    "evidence_json", "evidence_hash", "checked_at", "expires_at", "next_retry_at",
+    "checkpoint_revision",
+)
+_REFRESH_MEMBER_FIELDS = (
+    "id", "account_id", "group_id", "telegram_group_id", "joined_at", "left_at",
+    "status", "review_status", "ad_status", "ad_pause_until", "review_next_at",
+)
+_REFRESH_GROUP_FIELDS = ("id", "group_id", "username")
+_REFRESH_ACCOUNT_FIELDS = (
+    "id", "profile_bio", "status", "is_active", "risk_level", "risk_pause_until",
+)
+_expected_refresh_scope: ContextVar[dict[str, Any] | None] = ContextVar(
+    "qualification_expected_refresh_scope", default=None,
+)
+
+
+def _refresh_values(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    return {field: getattr(value, field, None) for field in fields}
+
+
+async def _refresh_scope(db: Any, row: Any, group: Any, member: Any) -> dict[str, Any]:
+    """Capture the generation before releasing the read transaction."""
+    from app.modules.acquisition.qualification_events import pending
+
+    account = await db.get(TelegramAccount, member.account_id, populate_existing=True)
+    return {
+        "audit": _refresh_values(row, _REFRESH_AUDIT_FIELDS),
+        "member": _refresh_values(member, _REFRESH_MEMBER_FIELDS),
+        "group": _refresh_values(group, _REFRESH_GROUP_FIELDS),
+        "account": _refresh_values(account, _REFRESH_ACCOUNT_FIELDS),
+        "event": deepcopy(await pending(db, member)),
+        "policy": deepcopy(await policy(db, fresh=True)),
+    }
+
+
+async def _release_refresh_transaction(db: Any, row: Any, member: Any) -> None:
+    """Commit only this scoped snapshot; never commit another caller's writes.
+
+    SQLAlchemy retains flushed mutations in the transaction rollback snapshot.
+    Public dirty/new collections alone miss an already flushed write, so both
+    are checked. An unsupported transaction implementation fails closed.
+    """
+    if not isinstance(db, AsyncSession):
+        return  # Lightweight offline collectors do not own pooled connections.
+    from app.core.database_transaction_boundary import (
+        TransactionBoundaryBlocked,
+        release_read_transaction,
+    )
+    from app.modules.acquisition.qualification_events import key
+
+    try:
+        await release_read_transaction(
+            db, allowed_objects=(row, member), allowed_setting_keys=(key(member.id),),
+            allowed_object_fields={row: frozenset({"evidence_json"}),
+                                   member: frozenset({"review_next_at", "updated_at"})},
+        )
+    except TransactionBoundaryBlocked as exc:
+        raise TelegramExecutionError("qualification_transaction_pending", retry_after_seconds=60) from exc
+
+
+async def _lock_refresh_scope(db: Any, scope: dict[str, Any]) -> tuple[Any, Any, Any]:
+    """Recheck audit -> member locks before applying any detached read result."""
+    from app.modules.acquisition.models import GroupQualificationAudit
+    from app.modules.acquisition.qualification_events import pending, same_evidence_event
+
+    with db.no_autoflush:
+        row = await db.scalar(select(GroupQualificationAudit).where(
+            GroupQualificationAudit.id == scope["audit"]["id"],
+        ).with_for_update(of=GroupQualificationAudit).execution_options(populate_existing=True))
+        member = await db.scalar(select(GroupAccountMembership).where(
+            GroupAccountMembership.id == scope["member"]["id"],
+        ).with_for_update(of=GroupAccountMembership).execution_options(populate_existing=True))
+        group = await db.get(Group, scope["group"]["id"], populate_existing=True)
+        account = await db.get(TelegramAccount, scope["account"]["id"], populate_existing=True)
+        valid = (
+            row is not None and member is not None and group is not None and account is not None
+            and _refresh_values(row, _REFRESH_AUDIT_FIELDS) == scope["audit"]
+            and _refresh_values(member, _REFRESH_MEMBER_FIELDS) == scope["member"]
+            and _refresh_values(group, _REFRESH_GROUP_FIELDS) == scope["group"]
+            and _refresh_values(account, _REFRESH_ACCOUNT_FIELDS) == scope["account"]
+            and same_evidence_event(await pending(db, member), scope["event"])
+            and await policy(db, fresh=True) == scope["policy"]
+        )
+        if valid:
+            current, _, _ = await current_authorization(db, member.account_id, group.group_id)
+            valid = current is not None and current.id == row.id
+    if not valid:
+        # This transaction has performed only fresh reads. Commit releases its
+        # locks without expiring callers' ORM instances or changing any verdict.
+        await db.commit()
+        raise TelegramExecutionError("qualification_refresh_scope_changed", retry_after_seconds=60)
+    return row, group, member
+
+
+def _detached_refresh_row(value: Any) -> SimpleNamespace:
+    return SimpleNamespace(**{
+        column.key: getattr(value, column.key) for column in inspect(value).mapper.column_attrs
+    })
+
+
 async def refresh_live_authorization(
     db: Any, client: Any, account_id: int, target: int | str,
     *, permissions_only: bool = False, message_ids: list[int] | None = None,
     recheck_rules: bool = False, progress: dict | None = None,
+    event_evidence: list[Any] | None = None,
+    shared_read_context: Any = None,
+    handoff_scope: dict | None = None,
+) -> None:
+    """Read without a business connection, then apply to the same generation."""
+    options = {"permissions_only": permissions_only, "message_ids": message_ids,
+               "recheck_rules": recheck_rules, "progress": progress, "event_evidence": event_evidence,
+               "shared_read_context": shared_read_context, "handoff_scope": handoff_scope}
+    from app.modules.acquisition.qualification_engine import enabled_for, enqueue
+    if enabled_for(account_id):
+        # Event repair is executed by the fenced work runner. Direct callers
+        # cannot rewrite the audit behind the active authorization pointer.
+        _, _, member = await current_authorization(db, account_id, target)
+        if member is not None:
+            await enqueue(db, member, reason="event")
+        raise TelegramExecutionError("qualification_event_pending", retry_after_seconds=60)
+    if not isinstance(db, AsyncSession):
+        await _read_live_authorization(db, client, account_id, target, **options)
+        return
+    row, group, member = await current_authorization(db, account_id, target)
+    if row is None or group is None or member is None:
+        raise TelegramExecutionError("qualification_review_required")
+    expected_scope = _expected_refresh_scope.get()
+    if expected_scope is not None:
+        # Account acquisition/cache work may yield to a newer claim. Release
+        # only the caller-owned snapshot before refreshing identity-map rows,
+        # then reject that newer generation before making any Telegram read.
+        await _release_refresh_transaction(db, row, member)
+        row, group, member = await _lock_refresh_scope(db, expected_scope)
+    from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
+
+    previous = json.loads(row.evidence_json or "{}")
+    if previous.get("authorization_basis") == OWN_SOURCE and not await own_proof_valid(
+        db, previous, member, group,
+    ):
+        raise TelegramExecutionError("qualification_own_delivery_unconfirmed")
+    scope = await _refresh_scope(db, row, group, member)
+    if expected_scope is not None and scope != expected_scope:
+        await _release_refresh_transaction(db, row, member)
+        raise TelegramExecutionError("qualification_refresh_scope_changed", retry_after_seconds=60)
+    detached = tuple(_detached_refresh_row(item) for item in (row, group, member))
+    await _release_refresh_transaction(db, row, member)
+    effects: dict[str, Any] = {}
+    failure = None
+    try:
+        await _read_live_authorization(
+            db, client, account_id, target, **options,
+            authorization=detached, effects=effects,
+        )
+    except Exception as exc:
+        failure = exc
+    # Cancellation never applies a partial read. The original event and claim
+    # remain recoverable through the existing bounded cancellation handler.
+    row, group, member = await _lock_refresh_scope(db, scope)
+    for field in ("evidence_json", "expires_at", "reason", "state", "decision", "next_retry_at"):
+        value = getattr(detached[0], field)
+        if value != scope["audit"][field]:
+            setattr(row, field, value)
+    for field in ("review_status", "ad_status"):
+        value = getattr(detached[2], field)
+        if value != scope["member"][field]:
+            setattr(member, field, value)
+    if effects.get("live_mute") is not None:
+        from app.modules.acquisition.adaptive_frequency import record_live_mute
+
+        await record_live_mute(db, account_id, group.group_id, effects["live_mute"])
+    await db.commit()
+    if expected_scope is not None:
+        # Only this validated invocation can advance the caller's expected
+        # evidence version. A new claim/callback must never be adopted here.
+        expected_scope["audit"] = _refresh_values(row, _REFRESH_AUDIT_FIELDS)
+        expected_scope["member"] = _refresh_values(member, _REFRESH_MEMBER_FIELDS)
+    if failure is not None:
+        raise failure
+
+
+async def _read_live_authorization(
+    db: Any, client: Any, account_id: int, target: int | str,
+    *, permissions_only: bool = False, message_ids: list[int] | None = None,
+    recheck_rules: bool = False, progress: dict | None = None,
+    event_evidence: list[Any] | None = None,
+    shared_read_context: Any = None,
+    handoff_scope: dict | None = None,
+    authorization: tuple[Any, Any, Any] | None = None,
+    effects: dict[str, Any] | None = None,
 ) -> None:
     """Bounded repair after a concrete change/gap, never a per-send precheck."""
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    from telethon.tl.functions.messages import GetFullChatRequest, GetOnlinesRequest
     from telethon.tl.types import InputMessagesFilterPinned
 
     from app.modules.acquisition.group_qualification import (
@@ -78,23 +270,26 @@ async def refresh_live_authorization(
         identity_relation,
         peer_identity,
     )
+    from app.modules.acquisition.qualification_read_context import QualificationReadContext
+    from app.modules.acquisition.review_read_flags import stage_enabled
 
-    row, group, member = await current_authorization(db, account_id, target)
+    row, group, member = authorization or await current_authorization(db, account_id, target)
     if row is None or group is None or member is None:
         raise TelegramExecutionError("qualification_review_required")
     snapshot = json.loads(row.evidence_json or "{}")
     from app.modules.acquisition.qualification_continuity import OWN_SOURCE, own_proof_valid
     established = snapshot.get("authorization_basis") == OWN_SOURCE
-    if established and not await own_proof_valid(db, snapshot, member, group):
+    if authorization is None and established and not await own_proof_valid(db, snapshot, member, group):
         raise TelegramExecutionError("qualification_own_delivery_unconfirmed")
     from app.modules.acquisition.adaptive_frequency import canonical
     marked_target = canonical(group.group_id, snapshot)
     if marked_target is None:
         raise TelegramExecutionError("qualification_group_identity_unknown", retry_after_seconds=300)
+    context = shared_read_context or QualificationReadContext(enabled=stage_enabled(account_id, "reuse"))
     # A bare positive legacy group ID is a PeerUser to Telethon. Resolve only
     # the namespace proved by the saved group evidence, then recheck identity.
     try:
-        entity = await client.get_entity(getattr(group, "username", None) or marked_target)
+        entity = await context.get_entity(client, getattr(group, "username", None) or marked_target)
     except ValueError as exc:
         raise TelegramExecutionError("qualification_entity_unavailable", retry_after_seconds=300) from exc
     if (
@@ -102,14 +297,12 @@ async def refresh_live_authorization(
         != "same"
     ):
         raise TelegramExecutionError("qualification_identity_changed")
-    response = await client(
-        GetFullChannelRequest(entity)
-        if hasattr(entity, "megagroup")
-        else GetFullChatRequest(entity.id)
-    )
+    if handoff_scope is not None:
+        from app.modules.acquisition.review_fact_owner import bind_context
+        await bind_context(context, entity, handoff_scope, snapshot)
+    response = await context.full_info(client, entity)
     full = response.full_chat
-    from app.modules.acquisition.qualification_reads import current_permissions
-    current = await current_permissions(client, entity, "me", full_chat=full)
+    current = await context.permissions(client, entity, "me", full_chat=full)
     if current is None or not hasattr(current, "is_admin"):
         raise TelegramExecutionError("qualification_current_permission_unknown")
     if getattr(current, "is_admin", False) or getattr(current, "is_creator", False):
@@ -122,8 +315,8 @@ async def refresh_live_authorization(
             and any(getattr(own, field, False) for field in ("view_messages", "send_messages", "send_plain"))
             and not getattr(current, "is_admin", False) and not getattr(current, "is_creator", False)):
         from app.modules.acquisition.adaptive_frequency import record_live_mute
-        from app.modules.acquisition.send_restriction import restriction_facts, track_restriction
         from app.modules.acquisition.qualification_service import annotate_newcomer_restriction
+        from app.modules.acquisition.send_restriction import restriction_facts, track_restriction
         observed_at = datetime.utcnow()
         live = {**snapshot, "technical_errors": [], "collected_at": observed_at.isoformat(),
                 "permissions": {**restriction_facts([own], observed_at),
@@ -133,7 +326,10 @@ async def refresh_live_authorization(
                     "can_send_text": False}}
         annotate_newcomer_restriction(live, member.joined_at, observed_at)
         track_restriction(live, snapshot, observed_at)
-        await record_live_mute(db, account_id, group.group_id, live)
+        if effects is None:
+            await record_live_mute(db, account_id, group.group_id, live)
+        else:
+            effects["live_mute"] = live
     if (
         not is_member
         or any(
@@ -156,7 +352,8 @@ async def refresh_live_authorization(
                                "paid_messages": False,
                                "slowmode_until": None, "temporary_until": None}
     row.evidence_json = json.dumps(snapshot, ensure_ascii=False)
-    if permissions_only:
+    deferred_rules = snapshot.get("rules_evaluation_status") == "NOT_EVALUATED"
+    if permissions_only and not deferred_rules:
         return
     async def invalidate(reason: str, *, unknown: bool = False, retry_after: int = 0) -> None:
         if unknown and ("read_failed" in reason or "identity_failed" in reason):
@@ -173,7 +370,8 @@ async def refresh_live_authorization(
             snapshot["unknowns"] = sorted(set(snapshot.get("unknowns", []) + [reason]))
         row.evidence_json = json.dumps(snapshot, ensure_ascii=False)
         # This invalidation must survive the outer send failure.
-        await db.commit()
+        if effects is None:
+            await db.commit()
         raise TelegramExecutionError(
             "qualification_rules_unknown" if unknown else "qualification_rules_changed",
             retry_after_seconds=retry_after or None,
@@ -181,21 +379,29 @@ async def refresh_live_authorization(
 
     # Online count is an exit fact only; it is not an additional ad permission gate.
     online_count = getattr(full, "online_count", None)
-    if snapshot.get("exit_group_rule_ban") is True:
+    from app.modules.acquisition.qualification_engine import enabled_for
+    efficiency = enabled_for(account_id)
+    if not efficiency and (snapshot.get("exit_group_rule_ban") is True or deferred_rules):
         if not isinstance(online_count, int) or online_count < 0:
             try:
-                online_count = getattr(await client(GetOnlinesRequest(entity)), "onlines", None)
+                online_count = getattr(await context.onlines(client, entity), "onlines", None)
             except RpcDeferred:
                 raise
             except Exception as exc:
                 if "Flood" in type(exc).__name__:
                     raise
                 online_count = None
-        if type(online_count) is int and 0 <= online_count < 2:
+        if deferred_rules and (recheck_rules or type(online_count) is not int or online_count < 2):
+            # An unread rule set cannot be treated as an empty/no-ban result.
+            # Return to the original evidence path when it becomes relevant.
+            await invalidate("deferred_rules_require_evidence", unknown=True)
+        if snapshot.get("exit_group_rule_ban") is True and type(online_count) is int and 0 <= online_count < 2:
             await invalidate("exit_group_ad_ban_and_online_below_2_before_send")
     members = getattr(full, "participants_count", None)
-    if type(members) is int and 0 <= members < 50:
+    if not efficiency and type(members) is int and 0 <= members < 50:
         await invalidate("exit_members_below_50_before_send")
+    if permissions_only:
+        return
 
     own_ids = snapshot.get("system_user_ids")
     if (
@@ -208,6 +414,18 @@ async def refresh_live_authorization(
         # Already verified own 24h survival is local evidence. No repeated history,
         # third-party post or AI reads; live identity/rights/slowmode checks above remain.
         return
+    # One context belongs to this invocation/event only. It cannot lend a
+    # previous continuation's permissions or visibility to a fresh read.
+    read_context = context if context.enabled else None
+    rules_required = recheck_rules or getattr(row, "decision", None) != "trial"
+    old_admin = {
+        item.get("message_id"): item
+        for item in snapshot.get("evidence", [])
+        if item.get("source") == "admin_rule"
+    }
+    rule_ids = list(dict.fromkeys([*(message_ids or []), *old_admin])) if rules_required else []
+    targeted_messages = None
+    proof = []
     # Trial authorization is based on an observed ordinary-member precedent.
     # Explicit group-rule permission is a separate route and needs no such post.
     if getattr(row, "decision", None) != "allowed" and not established:
@@ -216,8 +434,30 @@ async def refresh_live_authorization(
         )
         if len(proof) != 1:
             await invalidate("advertising_precedent_unconfirmed_before_send", unknown=True)
+    if read_context is not None and event_evidence:
+        live_ids = set(old_admin) | {item["message_id"] for item in proof}
+        event_ids = set(message_ids or []) - live_ids
+        # Only exact, scoped event bodies may be reused. The selected proof
+        # and prior admin-rule messages always require a live targeted read.
+        read_context.remember_messages(client, entity, [
+            item for item in event_evidence if getattr(item, "id", None) in event_ids
+        ])
+    # Selected precedent and established rule anchors retain the original live
+    # check even when an interrupted task handed off raw event messages.
+    if hasattr(context, "mandatory_live_ids"):
+        context.mandatory_live_ids.update(set(old_admin) | {item["message_id"] for item in proof})
+    if proof:
         try:
-            present = await client.get_messages(entity, ids=[item["message_id"] for item in proof])
+            # Proof, concrete events and known rules can overlap. Fetch their
+            # union now so later consumers do not repeat the same RPC or ID.
+            present = (
+                await read_context.get_messages(
+                    client, entity,
+                    [item["message_id"] for item in proof] + rule_ids,
+                ) if read_context is not None
+                else await client.get_messages(entity, ids=[item["message_id"] for item in proof])
+            )
+            targeted_messages = present if read_context is not None else None
         except RpcDeferred:
             raise
         except Exception as exc:
@@ -232,7 +472,10 @@ async def refresh_live_authorization(
             for message in (present if isinstance(present, list) else [present])
             if message is not None
         }
-        proof_collector = EvidenceCollector(client, own_user_ids=set(own_ids))
+        proof_collector = EvidenceCollector(
+            client, own_user_ids=set(own_ids), read_context=read_context,
+            account_id=account_id,
+        )
         proof_collector.full_chat = full
         for prior in proof:
             message = current_ads.get(prior["message_id"])
@@ -283,11 +526,6 @@ async def refresh_live_authorization(
         for item in old_rules
         if item["source"] == "pinned_message"
     }
-    old_admin = {
-        item.get("message_id"): item
-        for item in snapshot.get("evidence", [])
-        if item.get("source") == "admin_rule"
-    }
     try:
         pins = [
             message
@@ -295,11 +533,23 @@ async def refresh_live_authorization(
                 entity, filter=InputMessagesFilterPinned(), limit=201
             )
         ]
-        latest = (
-            [item for item in await client.get_messages(entity, ids=message_ids) if item is not None]
-            if message_ids else []
-        )
-        current_admin = await client.get_messages(entity, ids=list(old_admin)) if old_admin else []
+        if read_context is None:
+            latest = (
+                [item for item in await client.get_messages(entity, ids=message_ids) if item is not None]
+                if message_ids else []
+            )
+            current_admin = await client.get_messages(entity, ids=list(old_admin)) if old_admin else []
+        else:
+            current_messages = (
+                targeted_messages if targeted_messages is not None
+                else await read_context.get_messages(client, entity, rule_ids)
+            )
+            by_id = {
+                getattr(message, "id", None): message
+                for message in current_messages if message is not None
+            }
+            latest = [by_id[mid] for mid in dict.fromkeys(message_ids or []) if mid in by_id]
+            current_admin = [by_id[mid] for mid in old_admin if mid in by_id]
     except RpcDeferred:
         raise
     except Exception as exc:
@@ -346,9 +596,17 @@ async def refresh_live_authorization(
     dates = [naive(getattr(message, "date", None)) for message in latest]
     if any(date is None for date in dates):
         await invalidate("recent_rules_coverage_unknown_before_send", unknown=True)
-    collector = EvidenceCollector(client, own_user_ids=set(own_ids))
+    collector = EvidenceCollector(
+        client, own_user_ids=set(own_ids), read_context=read_context,
+        account_id=account_id,
+    )
     collector.full_chat = full
-    from app.modules.acquisition.renewal_progress import administrator_ids, signature
+    from app.modules.acquisition.renewal_progress import (
+        administrator_ids,
+        checked_fresh,
+        record_checked,
+        signature,
+    )
     checked = progress.setdefault('checked', {}) if progress is not None else {}
     candidates = [message for message, date in zip(latest, dates, strict=True)
                   if max(date, naive(getattr(message, 'edit_date', None)) or date) > since
@@ -364,7 +622,7 @@ async def refresh_live_authorization(
         if not possible_rule(text):
             continue
         digest = signature(message)
-        if admins is None and checked.get(str(message.id)) == digest:
+        if admins is None and checked_fresh(progress, str(message.id), digest, now):
             continue
         try:
             sender = getattr(message, 'sender', None)
@@ -390,6 +648,7 @@ async def refresh_live_authorization(
             # the same words previously appeared in ordinary members' messages.
             await invalidate("admin_rules_or_feedback_changed_before_send")
         checked[str(message.id)] = digest
+        record_checked(progress, str(message.id), digest, now)
 
 
 async def reconcile_exit(service: Any, member: GroupAccountMembership, group: Group, *, read_only_recovery: bool = False) -> str:
@@ -440,6 +699,21 @@ async def record_confirmed_exit(db: Any, member: GroupAccountMembership, group: 
     # current_authorization refreshes ORM membership state from the database.
     # Persist the confirmed left state before that refresh can replace it.
     await db.flush()
+    from app.modules.acquisition.qualification_engine import enabled_for, business_decision
+    if enabled_for(member.account_id):
+        row = await business_decision(db, member, require_fresh=False)
+        if row is not None:
+            from app.modules.acquisition.models import GroupQualificationAudit
+            snapshot = {**json.loads(row.evidence_json or "{}"), "exit_confirmed_at": member.leave_confirmed_at.isoformat(), "exit_source_audit_id": row.id}
+            db.add(GroupQualificationAudit(
+                batch_id=f"exit-confirmed:{row.id}:{member.leave_confirmed_at.isoformat()}",
+                membership_id=member.id, account_id=member.account_id, group_id=member.group_id,
+                membership_joined_at=member.joined_at, policy_version=row.policy_version, content_scope=row.content_scope,
+                state="completed", decision="reject", reason=row.reason, checked_at=row.checked_at,
+                expires_at=row.expires_at, evidence_json=json.dumps(snapshot, ensure_ascii=False, default=str),
+                evidence_hash=row.evidence_hash,
+            ))
+        return
     row, _, _ = await current_authorization(db, member.account_id, group.group_id)
     if row is None:
         return
@@ -536,8 +810,11 @@ async def exit_serialization_lock(db: Any):
 async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit: int = 1, account_id: int | None = None) -> dict[str, int]:
     """Read old non-joined relations in a separate lane; never consume a leave slot."""
     from app.core.account.models import TelegramAccount
-    from app.modules.acquisition.qualification_service import enqueue_membership_review, manually_protected
     from app.core.group.identity import is_owned_group_target
+    from app.modules.acquisition.qualification_service import (
+        enqueue_membership_review,
+        manually_protected,
+    )
     query = select(GroupAccountMembership).where(
         GroupAccountMembership.status.not_in(["joined", "leave_failed"]),
         GroupAccountMembership.review_status.in_(["exit_pending", "leave_failed", "membership_reconciliation"]),
@@ -595,6 +872,12 @@ async def reconcile_stale_exit_memberships(service: Any, config: dict, *, limit:
 
 
 async def run_exits(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import run
+        return await run(service, "exit", account_id, limit=limit)
+    from app.modules.acquisition.qualification_engine import run_business_maintenance
+    await run_business_maintenance(service, account_id=account_id, limit=limit)
     config = await policy(service.db, fresh=True)
     if not config.get("enabled") or not config.get("execute_exits"):
         return {"processed": 0, "reason": "exits_paused"}
@@ -683,6 +966,13 @@ async def _run_exits_serialized(service: Any, *, limit: int = 1, account_id: int
         resolution = await current_authorization(service.db, member.account_id, group.group_id)
         row, current_group, current_member = resolution
         resolution_error = getattr(resolution, "reason", None)
+        from app.modules.acquisition.qualification_engine import business_decision, enabled_for, enqueue_business_maintenance
+        efficiency = enabled_for(member.account_id)
+        if efficiency and current_member is not None:
+            row = await business_decision(service.db, current_member)
+            resolution_error = None if row is not None else "qualification_exit_review_required"
+            if row is None:
+                await enqueue_business_maintenance(service.db, current_member, refresh=True)
         if row is None or current_group is None or current_member is None:
             resolution_error = resolution_error or "qualification_review_required"
         elif current_group.id != group.id or current_member.id != member.id:
@@ -693,7 +983,11 @@ async def _run_exits_serialized(service: Any, *, limit: int = 1, account_id: int
             member.leave_error = "exit_" + resolution_error
             await service.db.commit()
             continue
-        audit = await assess(service, member.account_id, group, row=row, force_refresh=True)
+        if efficiency:
+            from app.modules.acquisition.automation import JoinedGroupAuditResult
+            audit = JoinedGroupAuditResult(passed=False, verification_details={"qualification_decision": row.decision})
+        else:
+            audit = await assess(service, member.account_id, group, row=row, force_refresh=True)
         decision = audit.verification_details.get("qualification_decision")
         if decision == "observe" and row.state == "waiting_ai":
             # Model outages leave a prior rejection unresolved, not cleared.

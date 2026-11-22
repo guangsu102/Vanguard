@@ -10,7 +10,6 @@ Provides utilities for Telegram account login flow:
 
 import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -66,12 +65,6 @@ class TelegramAuthHelper:
         self.settings = get_settings()
         self.logger = logger.bind(module="telegram_auth")
         self._login_sessions: Dict[str, LoginSession] = {}
-        self._session_dir = Path(self.settings.TELEGRAM_SESSION_DIR)
-        self._session_dir.mkdir(parents=True, exist_ok=True)
-
-    def _get_session_path(self, session_name: str) -> Path:
-        """Get session file path."""
-        return self._session_dir / f"{session_name}.session"
 
     @staticmethod
     def _export_session_string(client: TelegramClient) -> str:
@@ -88,6 +81,15 @@ class TelegramAuthHelper:
             from app.core.account.decodo import get_decodo_client
 
             proxy = (await get_decodo_client().get_proxy_for_account(country_code))[0]
+        elif provider == "trustsource":
+            from app.core.account.trustsource import get_trustsource_client
+
+            proxy = (
+                await get_trustsource_client().get_proxy_for_account(
+                    country_code,
+                    account_key=account_key,
+                )
+            )[0]
         else:
             from app.core.account.evomi import get_evomi_client
 

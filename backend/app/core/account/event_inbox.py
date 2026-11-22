@@ -131,6 +131,14 @@ def restore_event(data: dict, client: Any, *, retry: bool = False) -> Any:
 
 
 async def enqueue(db: Any, account_id: int, kind: str, event: Any) -> bool:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED and kind in {"message", "join"}:
+        from app.core.account.models import AccountOperationConfig, TelegramAccount, AccountType
+        enabled = await db.scalar(select(AccountOperationConfig.enabled).join(
+            TelegramAccount, TelegramAccount.id == AccountOperationConfig.account_id).where(
+            TelegramAccount.id == account_id, TelegramAccount.account_type == AccountType.PROMOTER))
+        if enabled is False:
+            return False
     key, data = event_payload(kind, event)
     try:
         async with db.begin_nested():
@@ -663,6 +671,6 @@ async def resolve_reconciliation(db: Any, event_id: int, *, evidence: str, actor
 
 
 async def inbox_snapshot(db: Any) -> dict:
-    rows = (await db.execute(select(TelegramEventInbox.state, func.count()).group_by(TelegramEventInbox.state))).all()
+    rows = (await db.execute(select(TelegramEventInbox.state, func.count()).where(TelegramEventInbox.state.in_(["pending", "processing", "executing", "reconciliation_required"])).group_by(TelegramEventInbox.state))).all()
     oldest = await db.scalar(select(func.min(TelegramEventInbox.received_at)).where(TelegramEventInbox.state == "pending"))
     return {"states": dict(rows), "oldest_pending_seconds": max(0, int((datetime.utcnow()-oldest).total_seconds())) if oldest else 0}

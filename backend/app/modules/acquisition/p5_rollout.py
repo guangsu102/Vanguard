@@ -121,13 +121,6 @@ def _consecutive_rises(values: Sequence[Any], rises: int) -> bool:
     return all(tail[i + 1] > tail[i] for i in range(rises))
 
 
-def _window_deltas(samples: Sequence[dict[str, Any]], key: str) -> list[float]:
-    totals = [
-        float(sample[key]) for sample in samples if sample.get(key) is not None
-    ]
-    return [totals[i] - totals[i - 1] for i in range(1, len(totals))]
-
-
 def evaluate_gate(
     *,
     baseline: dict[str, Any],

@@ -11,15 +11,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlsplit
 
+from app.modules.acquisition.growth_policy import URL as URL
+from app.modules.acquisition.qualification_read_context import QualificationReadContext
+
 POLICY_VERSION = "pp-ai-qualification-v3"
 WINDOW_HOURS = 72
 MAX_MESSAGES, MAX_IDENTITIES, MAX_PINS, MAX_AD_EVIDENCE = 1000, 60, 200, 100
 MAX_WARNING_THREAD_ADS, MAX_WARNING_THREAD_REPLIES = 6, 50
 MAX_PRIORITY_IDENTITIES = 40
-URL = re.compile(
-    r"(?:https?://|t\.me/|telegram\.me/|www\.|(?<![\w@])(?:[a-z0-9-]+\.)+[a-z]{2,}\b)[^\s<>]*",
-    re.I,
-)
 CONTACT = re.compile(
     r"(?<![\w/])@([a-z0-9_]{4,})|(?:微信|wechat|wx|qq)\s*[:：号]?\s*([a-z0-9_-]{5,})", re.I
 )
@@ -340,8 +339,36 @@ class EvidenceCollector:
     def __init__(
         self, client: Any, *, own_user_ids: set[int] | None = None,
         identity_limit: int | None = None, priority_identities: int | None = None,
+        read_context: QualificationReadContext | None = None,
+        enable_fast_path: bool = False,
+        account_id: int | None = None,
+        enable_history_resume: bool | None = None,
+        enable_on_demand_identity: bool | None = None,
+        candidate_only: bool = False,
+        history_scope: dict[str, Any] | None = None,
+        history_store: Any = None,
     ) -> None:
         self.client = client
+        self.account_id = account_id
+        from app.modules.acquisition.qualification_engine import enabled_for
+        self.efficiency = enabled_for(account_id)
+        self.history_scope = history_scope
+        self.history_store = history_store
+        if account_id is not None:
+            from app.modules.acquisition.review_read_flags import stage_enabled
+
+            reuse_enabled = self.efficiency or stage_enabled(account_id, "reuse")
+            resume_enabled = self.efficiency or stage_enabled(account_id, "resume")
+            demand_enabled = self.efficiency or stage_enabled(account_id, "demand_identity")
+        else:
+            reuse_enabled, resume_enabled, demand_enabled = True, False, False
+        self.read_context = read_context if read_context is not None else QualificationReadContext(enabled=reuse_enabled)
+        self.enable_history_resume = resume_enabled if enable_history_resume is None else enable_history_resume and (account_id is None or resume_enabled)
+        self.enable_on_demand_identity = demand_enabled if enable_on_demand_identity is None else enable_on_demand_identity and (account_id is None or demand_enabled)
+        # The caller also verifies account/profile/membership identity and the
+        # local delivery/event gates. This opt-in never replaces those checks.
+        self.enable_fast_path = self.efficiency or enable_fast_path
+        self.candidate_only = candidate_only
         self.own_user_ids = own_user_ids or set()
         self.roles: dict[int, str] = {}
         self.role_errors: dict[int, str] = {}
@@ -357,11 +384,160 @@ class EvidenceCollector:
         self.permission_capability_retry_at: datetime | None = None
         self.history_progress: list[dict[str, Any]] = []
         self.history_pending_ids: list[int] = []
+        self.skipped_chat_ids: set[int] = set()
+        self.history_resume_refresh_required = False
+        self.history_resume_fallback = False
+        self.reported_optimizations: set[tuple[str, str]] = set()
         self.full_chat: Any = None
+        self.full_entity: Any = None
+        self.self_history_visible = False
         self.roster_roles: dict[int, str] | None = None
         self.role_sources: dict[int, str] = {}
+        self.candidate_outcomes: dict[str, dict] = {}
         self.identity_limit = min(MAX_IDENTITIES, max(1, identity_limit)) if identity_limit is not None else MAX_IDENTITIES
         self.priority_identities = min(MAX_PRIORITY_IDENTITIES, max(0, priority_identities)) if priority_identities is not None else MAX_PRIORITY_IDENTITIES
+
+    def _optimization(self, reason: str, outcome: str = "used") -> None:
+        key = reason, outcome
+        if key in self.reported_optimizations:
+            return
+        try:
+            from app.core.account.read_metrics import mark_optimization
+        except ImportError:
+            return
+        self.reported_optimizations.add(key)
+        mark_optimization(reason, outcome)
+
+    def _connection_token(self) -> str:
+        import uuid
+        sender = getattr(self.client, "_sender", None)
+        connection = getattr(sender, "_connection", None)
+        saved = getattr(self.client, "_efficiency_connection_token", None)
+        if saved is None or saved[1] is not sender or saved[2] is not connection:
+            saved = (uuid.uuid4().hex, sender, connection)
+            self.client._efficiency_connection_token = saved
+        return saved[0]
+
+    def _step_permissions(self, result: dict, now: datetime) -> dict | None:
+        from app.modules.acquisition.evidence_progress import date
+        saved = (result.get("read_checkpoint") or {}).get("own_permissions")
+        if not self.efficiency or not isinstance(saved, dict):
+            return None
+        checked = date(saved.get("checked_at"))
+        if (checked and 0 <= (now-checked).total_seconds() < 300
+                and saved.get("generation") == self._connection_token()):
+            return saved
+        return None
+
+    async def _step_full_info(self, entity: Any, result: dict) -> Any:
+        from types import SimpleNamespace
+        saved = (result.get("read_checkpoint") or {}).get("metadata")
+        if self.efficiency and isinstance(saved, dict):
+            return SimpleNamespace(full_chat=SimpleNamespace(**saved), chats=[])
+        response = await self.read_context.full_info(self.client, entity)
+        if self.efficiency:
+            full = response.full_chat
+            fields = ("about", "participants_count", "online_count", "ttl_period",
+                      "migrated_from_chat_id", "slowmode_seconds", "send_paid_messages_stars",
+                      "hidden_prehistory", "available_min_id")
+            result["read_checkpoint"]["metadata"] = {
+                name: getattr(full, name, None) for name in fields}
+            slow = getattr(full, "slowmode_next_send_date", None)
+            if isinstance(slow, datetime):
+                slow = int(slow.replace(tzinfo=UTC).timestamp())
+            result["read_checkpoint"]["metadata"]["slowmode_next_send_date"] = slow
+        return response
+
+    async def _step_pins(self, entity: Any, result: dict) -> list[Any]:
+        from telethon.tl.types import InputMessagesFilterPinned
+
+        from app.modules.acquisition.review_history_progress import _message, _record
+        saved = (result.get("read_checkpoint") or {}).get("pinned_messages")
+        if self.efficiency and isinstance(saved, list):
+            return [_message(record) for record in saved]
+        messages = await self.messages(entity, filter=InputMessagesFilterPinned(), limit=MAX_PINS + 1)
+        if self.efficiency:
+            # Raw rule sources survive waits; their author roles are separately
+            # checked and no previous clear-warning proof is copied.
+            result["read_checkpoint"]["pinned_messages"] = [_record(m) for m in messages]
+        return messages
+
+    async def _sufficient_trial_snapshot(
+        self, entity: Any, result: dict[str, Any], now: datetime,
+    ) -> dict[str, Any] | None:
+        """Stop only after current facts rule out every independent exit arm."""
+        if not self.enable_fast_path or quality_decision(result)[0] != "qualified":
+            return None
+        members, online = result.get("member_count"), result.get("online_count")
+        if not self.efficiency and (
+            result.get("member_count_verified") is not True
+            or type(members) is not int or members < 50
+            or type(online) is not int or online < 2
+            or result.get("online_count_source")
+            not in {"full_chat.online_count", "messages.getOnlines"}
+            or result.get("technical_errors") or result.get("unknowns")
+        ):
+            return None
+        anchors = [
+            item.get("message_id") for item in self.previous.get("evidence", [])
+            if item.get("source") == "recent_promotional_message"
+            and item.get("sender_role") == "ordinary"
+            and not item.get("system_account") and item.get("topic_id") is None
+            and item.get("accessible") is True and not item.get("warning_reply_ids")
+        ]
+        ids = list(dict.fromkeys(
+            identifier for identifier in [*anchors, *self.callback_message_ids]
+            if type(identifier) is int and identifier > 0
+            and not (self.efficiency and self.candidate_outcomes.get(str(identifier), {}).get("excluded"))
+        ))[:1 if self.efficiency else MAX_WARNING_THREAD_ADS]
+        if not ids:
+            return None
+        try:
+            async with asyncio.timeout(15):
+                messages = await self.read_context.get_messages(self.client, entity, ids, require_live=True)
+            self.progress_attempted_ids.update(ids)
+        except Exception as exc:
+            if self._error(result, "trial_candidate_read", exc):
+                return self._finish(result)
+            return None
+        candidates = []
+        for message in messages:
+            if message is None or getattr(message, "action", None):
+                continue
+            published = naive(getattr(message, "date", None))
+            if (
+                published is None or not now - timedelta(hours=WINDOW_HOURS if self.efficiency else 48) <= published <= now
+                or (evidence_age(message, now) or 0) < 24
+                or _message_metadata(message, now)["topic_id"] is not None
+                or not looks_like_ad(text_of(message))
+            ):
+                continue
+            candidates.append(message)
+        for message in candidates:
+            probe = await self._classify_history(
+                entity, copy.deepcopy(result), [message], now, verify_threads=True,
+            )
+            if probe.get("collection_halted"):
+                return probe
+            if (
+                not probe.get("root_ad_history_sufficient")
+                or probe.get("technical_errors") or probe.get("unknowns")
+                or probe.get("quality_status") != "qualified"
+            ):
+                continue
+            probe.update(
+                sampling_stopped_reason="sufficient_ordinary_root_trial_proof",
+                rules_evaluation_status="NOT_EVALUATED",
+                history_evaluation_status="NOT_EVALUATED",
+                decision_dependencies_complete=True,
+                valid_messages_complete=False,
+                rules_incomplete=True,
+                history_complete=False,
+                exit_group_rule_ban=None,
+            )
+            probe["unknowns"].append("history_coverage_incomplete")
+            return self._finish(probe)
+        return None
 
     async def _resume_messages(self, entity: Any, result: dict[str, Any], now: datetime) -> list[Any]:
         """Resume by message ID, always fetching the current message and role."""
@@ -377,7 +553,9 @@ class EvidenceCollector:
             and type(item.get("message_id")) is int
             and item["message_id"] > 0
         ][:6]
-        pending = (self.previous.get("collection_progress") or {}).get("pending_message_ids", [])
+        progress = self.previous.get("collection_progress") or {}
+        pending = [*progress.get("pending_message_ids", []),
+                   *progress.get("not_evaluated_message_ids", [])]
         hints = [value for value in self.callback_message_ids if type(value) is int and value > 0][:6]
         rule_ids = list(dict.fromkeys(
             item["message_id"] for item in self.previous.get("evidence", [])
@@ -392,7 +570,14 @@ class EvidenceCollector:
             return []
         try:
             async with asyncio.timeout(15):
-                messages = await self.client.get_messages(entity, ids=ids)
+                from app.modules.acquisition.review_fact_owner import ReviewFactOwner
+                if isinstance(self.read_context, ReviewFactOwner):
+                    # Only pending/hint raw bodies may cross tasks; established
+                    # rule anchors and selected precedents keep their live read.
+                    self.read_context.mandatory_live_ids.update([*anchors, *rule_ids])
+                    messages = await self.read_context.get_messages(self.client, entity, ids)
+                else:
+                    messages = await self.read_context.get_messages(self.client, entity, ids, require_live=True)
             returned = {getattr(item, "id", None) for item in (messages or []) if item is not None}
             if any(value in ids and value not in returned for value in rule_ids):
                 result["rules_incomplete"] = True
@@ -428,7 +613,13 @@ class EvidenceCollector:
         if sender is not None and getattr(sender, "bot", False):
             self.roles[sender_id] = "bot"
             self.role_errors.pop(sender_id, None)
+            self.read_context.remember_role(self.client, entity, sender_id, "bot")
             return "bot"
+        shared_role = self.read_context.role(self.client, entity, sender_id)
+        if shared_role is not None:
+            self.roles[sender_id] = shared_role
+            self.role_errors.pop(sender_id, None)
+            return shared_role
         cached = self.roles.get(sender_id)
         if cached is not None and (
             cached != "unknown"
@@ -443,6 +634,7 @@ class EvidenceCollector:
             found = await self.roster_role(entity, sender_id)
             if found != "unknown":
                 self.roles[sender_id] = found
+                self.read_context.remember_role(self.client, entity, sender_id, found)
                 return found
             self.role_errors[sender_id] = "ChatAdminRequiredError"
             return "unknown"
@@ -468,13 +660,14 @@ class EvidenceCollector:
                         self.role_errors[sender_id] = "sender_resolution_budget_exhausted"
                         return "unknown"
                     self.sender_resolution_queries += 1
-                    sender = await self.client.get_entity(sender_id)
+                    sender = await self.read_context.get_entity(self.client, sender_id)
             if sender is None:
                 self.role_errors[sender_id] = "sender_unavailable"
                 return "unknown"
             if getattr(sender, "bot", False):
                 self.roles[sender_id] = "bot"
                 self.role_errors.pop(sender_id, None)
+                self.read_context.remember_role(self.client, entity, sender_id, "bot")
                 return "bot"
             if getattr(sender, "deleted", False):
                 self.role_errors[sender_id] = "sender_deleted"
@@ -483,8 +676,7 @@ class EvidenceCollector:
                 self.role_errors[sender_id] = "identity_budget_exhausted"
                 return "unknown"
             self.permission_queries += 1
-            from app.modules.acquisition.qualification_reads import current_permissions
-            permission = await current_permissions(self.client, entity, sender, full_chat=self.full_chat)
+            permission = await self.read_context.permissions(self.client, entity, sender, full_chat=self.full_chat)
             if permission is None or not hasattr(permission, "is_admin"):
                 raise ValueError("participant_permission_unavailable")
             participant = getattr(permission, "participant", None)
@@ -504,6 +696,7 @@ class EvidenceCollector:
             if role != "unknown":
                 self.role_errors.pop(sender_id, None)
                 self.permission_failures.pop(str(sender_id), None)
+                self.read_context.remember_role(self.client, entity, sender_id, role)
         except Exception as exc:
             self.role_errors[sender_id] = type(exc).__name__
             if type(exc).__name__ == "ChatAdminRequiredError":
@@ -513,6 +706,7 @@ class EvidenceCollector:
                 if found != "unknown":
                     self.roles[sender_id] = found
                     self.role_errors.pop(sender_id, None)
+                    self.read_context.remember_role(self.client, entity, sender_id, found)
                 failures = min(4, int(prior_failure.get("attempts") or 0) + 1)
                 self.permission_failures[str(sender_id)] = {
                     "attempts": failures,
@@ -551,7 +745,7 @@ class EvidenceCollector:
         return role
 
     async def messages(self, entity: Any, **kwargs: Any) -> list[Any]:
-        return [item async for item in self.client.iter_messages(entity, **kwargs)]
+        return await self.read_context.messages(self.client, entity, **kwargs)
 
     def _error(self, result: dict[str, Any], source: str, exc: Exception) -> bool:
         from app.core.account.rpc_governor import RpcDeferred
@@ -568,7 +762,9 @@ class EvidenceCollector:
         return False
 
     def _finish(self, result: dict[str, Any]) -> dict[str, Any]:
-        old_pending = (self.previous.get("collection_progress") or {}).get("pending_message_ids", [])
+        old_progress = self.previous.get("collection_progress") or {}
+        old_pending = [*old_progress.get("pending_message_ids", []),
+                       *old_progress.get("not_evaluated_message_ids", [])]
         pending = [
             value for value in old_pending
             if type(value) is int and value > 0 and value not in self.progress_attempted_ids
@@ -579,14 +775,23 @@ class EvidenceCollector:
             if self.role_errors.get(sender_id) in budget_errors and sender_id not in pending_senders:
                 pending.append(message_id)
                 pending_senders.add(sender_id)
-        pending.extend(self.history_pending_ids)
+        pending.extend(value for value in self.history_pending_ids
+                       if not self.efficiency or value not in self.skipped_chat_ids)
+        sufficient = result.get("sampling_stopped_reason") == "sufficient_ordinary_root_trial_proof"
         result["collection_progress"] = {
-            "version": 1,
-            "pending_message_ids": list(dict.fromkeys(pending))[:100],
+            "version": 2 if self.enable_history_resume else 1,
+            "pending_message_ids": [] if sufficient else list(dict.fromkeys(pending))[:100],
             "permission_failures": dict(list(self.permission_failures.items())[-100:]),
             "permission_capability_retry_at": self.permission_capability_retry_at.isoformat() if self.permission_capability_retry_at else None,
             "history_cursors": self.history_progress or (self.previous.get("collection_progress") or {}).get("history_cursors", []),
+            "history_resume_refresh_required": self.history_resume_refresh_required,
+            "history_resume_fallback": self.history_resume_fallback,
         }
+        if sufficient:
+            # These facts were not read because the current decision no longer
+            # needs them. Keep their IDs for a later full-path revalidation.
+            result["collection_progress"]["not_evaluated_message_ids"] = list(dict.fromkeys(pending))[:100]
+            result["collection_complete"] = True
         result["roles"] = {str(key): value for key, value in self.roles.items()}
         result["role_sources"] = {str(key): value for key, value in self.role_sources.items()}
         result["identity_errors"] = {str(key): value for key, value in self.role_errors.items()}
@@ -599,12 +804,53 @@ class EvidenceCollector:
             [item for item in result["evidence"] if item.get("topic_id") is None]
         )
         result["quality_status"], result["quality_reason"] = quality_decision(result)
+        if self.efficiency:
+            result["efficiency_v1"] = True
+            result["business_maintenance_deferred"] = True
+            result.setdefault("read_checkpoint", {})["role_proofs"] = {
+                "generation": self._connection_token(),
+                "values": {str(key): value for key, value in self.roles.items() if value != "unknown"},
+            }
+            for item in result.get("evidence", []):
+                if item.get("source") != "recent_promotional_message":
+                    continue
+                excluded = (item.get("sender_role") in {"admin", "bot", "system"}
+                            or bool(item.get("warning_reply_ids")) or item.get("accessible") is False)
+                if (item.get("validation_attempted") and not trial_proof([item])
+                        and float(item.get("age_hours") or 0) >= 24
+                        and not result.get("collection_halted") and not result.get("technical_errors")):
+                    # Unknown/oversized warning coverage cannot authorize a
+                    # send, and must give another candidate a turn. Only a new
+                    # relevant fact will reopen this unchanged candidate.
+                    excluded = True
+                if excluded:
+                    self.candidate_outcomes[str(item.get("message_id"))] = {
+                        "content": content_key(item.get("text") or ""),
+                        "edited_at": item.get("edited_at"), "excluded": True,
+                        "sender_id": item.get("sender_id"),
+                    }
+            result["read_checkpoint"]["candidate_outcomes"] = {
+                "generation": self._connection_token(),
+                "values": dict(list(self.candidate_outcomes.items())[-MAX_MESSAGES:]),
+            }
+            result.pop("read_plan_requires_full", None)
+            cursors = result["collection_progress"].get("history_cursors") or []
+            result["discovery_exhausted"] = not result.get("candidate_validation_pending") and bool(
+                result.get("sample_limit_reached") or
+                (len(cursors) == 3 and all(cursor.get("complete") for cursor in cursors)))
+            if (result["root_ad_history_sufficient"] and result["quality_status"] == "qualified"
+                    and not result.get("technical_errors") and not result.get("collection_halted")):
+                result["collection_complete"] = True
+                result["decision_dependencies_complete"] = True
         return result
 
     async def _history(
         self, entity: Any, result: dict[str, Any], now: datetime, hidden: bool
     ) -> list[Any]:
-        """First sample all three days; then fill each unfinished segment within one cap."""
+        """Restore bounded exact facts first; legacy skipped pages stay hints."""
+        from app.modules.acquisition import review_history_progress as pagefacts
+        from app.modules.acquisition.evidence_progress import date
+
         segments = [
             {
                 "start": now - timedelta(hours=24 * (index + 1)),
@@ -615,15 +861,101 @@ class EvidenceCollector:
                 "attempted": False,
                 "observed_oldest": None,
                 "observed_newest": None,
+                "messages": {},
+                "calls": 0,
+                "source_observed_at": now.replace(tzinfo=UTC).timestamp(),
             }
             for index in range(3)
         ]
         messages: dict[int, Any] = {}
         total = 0
+        restored_ids: set[int] = set()
+        prior = self.previous.get("collection_progress") or {}
+        if self.efficiency and prior.get("history_cursors"):
+            # Keep the original discovery window while traversing it. New
+            # messages wake a separate targeted dependency, not a moving head.
+            old = prior["history_cursors"]
+            if len(old) == 3:
+                for segment, cursor in zip(segments, old, strict=True):
+                    end = date(cursor.get("window_end"))
+                    start = date(cursor.get("window_start")) or (end-timedelta(hours=24) if end else None)
+                    if start and end and (end-start).total_seconds() == 86400:
+                        segment.update(start=start, end=end)
+        store = self.history_store
+        group_id = pagefacts.group_key(entity)
+        identity = None
+        if self.enable_history_resume and self.account_id is not None and group_id is not None and self.history_scope:
+            if store is None:
+                from app.modules.acquisition.review_read_runtime import maintenance_store
+
+                store = maintenance_store(self.account_id)
+            if store is not None:
+                identity = pagefacts.page_identity(self.client, self.account_id, group_id, self.history_scope)
+        # A resumed hint deliberately leaves a visibility/coverage gap. The
+        # next pass fills it using the original fresh reader, and stays on that
+        # reader until the caller starts another evidence generation. This
+        # finite fallback prevents repeatedly jumping the same missing pages.
+        self.history_resume_fallback = bool(prior.get("history_resume_fallback")
+                                            or prior.get("history_resume_refresh_required"))
+        if any(isinstance(cursor, dict) and cursor.get("page_key") not in {None, "unavailable"}
+               for cursor in prior.get("history_cursors", [])):
+            # Once a fresh fallback produced real bounded packages, those
+            # packages can be validated normally on the next slice.
+            self.history_resume_fallback = False
+        if self.enable_history_resume and self.history_resume_fallback:
+            self._optimization("resume", "fallback")
+        if self.enable_history_resume and not self.history_resume_fallback:
+            old = prior.get("history_cursors") or []
+            for segment, cursor in zip(segments, old, strict=False):
+                if not isinstance(cursor, dict):
+                    continue
+                anchor, offset = date(cursor.get("window_end")), cursor.get("offset_id")
+                if (anchor is None or not 0 <= (segment["end"] - anchor).total_seconds() < 86400
+                        or type(offset) is not int or offset < 0
+                        or (not cursor.get("complete") and offset == 0)):
+                    continue
+                facts = None
+                if identity is not None:
+                    facts = await pagefacts.load(store, client=self.client, account_id=self.account_id,
+                                                 group_id=group_id, scope=self.history_scope, cursor=cursor)
+                if cursor.get("page_key") and facts is None:
+                    # A stale/incomplete ordinary package cannot become a hint
+                    # that skips current negative proof. Use the original reader.
+                    self._optimization("resume", "fallback")
+                    continue
+                if facts is not None:
+                    restored = {message.id: message for message in facts["messages"]
+                                if segment["start"] <= message.date <= segment["end"]}
+                    messages.update(restored)
+                    restored_ids.update(restored)
+                    segment.update(messages=restored, sample_count=facts["sample_count"],
+                                   calls=facts["calls"], source_observed_at=facts["observed_at"])
+                    if facts.get("coverage_current") is False:
+                        segment["raw_only"] = True
+                    dates = [message.date for message in restored.values()]
+                    segment.update(observed_oldest=min(dates) if dates else None,
+                                   observed_newest=max(dates) if dates else None)
+                    source = datetime.fromtimestamp(facts["observed_at"], UTC).replace(tzinfo=None).isoformat()
+                    result["history_source_oldest_at"] = min(source, result.get("history_source_oldest_at", source))
+                    self._optimization("resume")
+                segment.update(offset_id=offset, complete=bool(cursor.get("complete")),
+                               attempted=True, resumed_hint=facts is None)
+                if facts is None:
+                    self.history_resume_refresh_required = True
+                if segment["end"] > anchor:
+                    # Only the newly shifted interval needs a head read. Keep
+                    # the old tail cursor already loaded, before issuing it.
+                    segment.update(tail_offset=offset, tail_complete=bool(cursor.get("complete")),
+                                   coverage_start=segment["start"], start=anchor,
+                                   offset_id=0, complete=False, attempted=False, old_cursor=cursor)
+            if self.history_resume_refresh_required:
+                result["unknowns"].append("resumed_history_hint")
+                self._optimization("resume")
 
         async def read_segment(segment: dict[str, Any], limit: int) -> None:
             nonlocal total
             segment["attempted"] = True
+            segment["calls"] += 1
             batch = []
             # Count each observed item before the iterator can fail mid-page.
             try:
@@ -644,6 +976,7 @@ class EvidenceCollector:
                     observed = naive(getattr(item, "date", None))
                     if type(getattr(item, "id", None)) is int and observed is not None and segment["start"] <= observed <= segment["end"]:
                         messages[item.id] = item
+                        segment["messages"][item.id] = item
                 if batch:
                     segment["offset_id"] = int(batch[-1].id)
                 raise
@@ -654,6 +987,7 @@ class EvidenceCollector:
             for message in batch:
                 date = naive(getattr(message, "date", None))
                 if date is None:
+                    segment["cache_invalid"] = True
                     result["unknowns"].append("message_date_unknown")
                     continue
                 if date < segment["start"]:
@@ -662,9 +996,11 @@ class EvidenceCollector:
                 if date <= segment["end"]:
                     message_id = getattr(message, "id", None)
                     if message_id is None:
+                        segment["cache_invalid"] = True
                         result["unknowns"].append("message_id_unknown")
                     else:
                         messages[message_id] = message
+                        segment["messages"][message_id] = message
                     segment["observed_oldest"] = min(segment["observed_oldest"] or date, date)
                     segment["observed_newest"] = max(segment["observed_newest"] or date, date)
             if len(batch) < limit:
@@ -677,9 +1013,9 @@ class EvidenceCollector:
                 result["unknowns"].append("history_pagination_stalled")
 
         halted = False
-        resumed_cursors = False
+        legacy_resumed_cursors = False
         # Each round grants at most 100 per day. The first round is capped at 300.
-        while total < MAX_MESSAGES:
+        while total + len(restored_ids) < MAX_MESSAGES:
             pending = [
                 segment
                 for segment in segments
@@ -688,10 +1024,16 @@ class EvidenceCollector:
             if not pending:
                 break
             for segment in pending:
-                if total >= MAX_MESSAGES:
+                if total + len(restored_ids) >= MAX_MESSAGES:
                     break
                 try:
-                    await read_segment(segment, min(100, MAX_MESSAGES - total))
+                    await read_segment(segment, min(100, MAX_MESSAGES - total - len(restored_ids)))
+                    if "tail_offset" in segment and segment["complete"]:
+                        segment["start"] = segment.pop("coverage_start")
+                        segment["offset_id"] = segment.pop("tail_offset")
+                        segment["complete"] = segment.pop("tail_complete")
+                    if self.efficiency:
+                        break
                 except Exception as exc:
                     segment["error"] = type(exc).__name__
                     segment["stalled"] = True
@@ -699,6 +1041,10 @@ class EvidenceCollector:
                         halted = True
                         break
             if halted:
+                break
+            if self.efficiency:
+                # One history page per payable step. Classification and any
+                # original/author/thread check use the remaining reservation.
                 break
             if total < MAX_MESSAGES and all(segment["attempted"] for segment in segments):
                 probe = await self._classify_history(
@@ -742,11 +1088,10 @@ class EvidenceCollector:
                 if not missing:
                     result["sampling_stopped_reason"] = "ordinary_member_advertising_found"
                     break
-                if not resumed_cursors:
-                    resumed_cursors = True
-                    from app.modules.acquisition.evidence_progress import date
-                    old = (self.previous.get("collection_progress") or {}).get("history_cursors", [])
-                    for segment, cursor in zip(segments, old):
+                if not self.enable_history_resume and not legacy_resumed_cursors:
+                    # The disabled stage retains the pre-optimization reader.
+                    legacy_resumed_cursors = True
+                    for segment, cursor in zip(segments, prior.get("history_cursors", []), strict=False):
                         anchor = date(cursor.get("window_end")) if isinstance(cursor, dict) else None
                         offset = cursor.get("offset_id") if isinstance(cursor, dict) else None
                         if (anchor and 0 <= (segment["end"] - anchor).total_seconds() <= 86400
@@ -756,10 +1101,11 @@ class EvidenceCollector:
                             segment["resumed_hint"] = True
         coverage = []
         for segment in segments:
-            complete = segment["complete"] and not hidden and not segment.get("error") and not segment.get("resumed_hint")
+            complete = (segment["complete"] and not hidden and not segment.get("error")
+                        and not segment.get("resumed_hint") and not segment.get("raw_only"))
             coverage.append(
                 {
-                    "window_start": segment["start"].isoformat(),
+                    "window_start": segment.get("coverage_start", segment["start"]).isoformat(),
                     "window_end": segment["end"].isoformat(),
                     "complete": complete,
                     "sample_count": segment["sample_count"],
@@ -797,22 +1143,42 @@ class EvidenceCollector:
                 }
             )
         result["coverage"] = coverage
-        self.history_progress = [
-            {"window_end": segment["end"].isoformat(), "offset_id": segment["offset_id"],
-             "complete": segment["complete"] and not segment.get("resumed_hint")}
-            for segment in segments
-        ]
+        self.history_progress = []
+        for segment in segments:
+            cursor = {"window_end": segment["end"].isoformat(), "offset_id": segment["offset_id"],
+                      "complete": segment["complete"] and not segment.get("resumed_hint")}
+            if self.efficiency:
+                cursor["window_start"] = segment["start"].isoformat()
+            if "tail_offset" in segment and segment.get("old_cursor", {}).get("page_key"):
+                # An unfinished incremental head cannot replace the proven old
+                # prefix: keep the old exact pointer until that head completes.
+                cursor = dict(segment["old_cursor"])
+            elif identity is not None and segment["attempted"]:
+                page_key = await pagefacts.save(store, client=self.client, account_id=self.account_id,
+                                               group_id=group_id, scope=self.history_scope,
+                                               identity=identity, segment=segment)
+                if page_key is not None:
+                    cursor["page_key"] = page_key
+                elif segment.get("resumed_hint") is not True:
+                    # Explicit pointer miss prevents next slice silently using
+                    # this cursor as a legacy body-free coverage hint.
+                    cursor["page_key"] = "unavailable"
+            self.history_progress.append(cursor)
+            from app.modules.acquisition import review_public_history as public_history
+            public_history.publish(public_history.certificate(self, entity, result), cursor=cursor,
+                                   observed_at=segment["source_observed_at"])
         self.history_pending_ids = [
             message_id for message_id, message in messages.items()
-            if getattr(message, "sender_id", None) not in self.roles
+            if message_id not in self.skipped_chat_ids and (getattr(message, "sender_id", None) not in self.roles
             or self.role_errors.get(getattr(message, "sender_id", None)) in {
                 "identity_budget_exhausted", "sender_resolution_budget_exhausted", "RpcDeferred"
-            }
+            })
         ]
         result["history_complete"] = all(item["complete"] for item in coverage)
         result["sample_count"] = total
+        result["history_cached_count"] = len(restored_ids)
         result["unique_sample_count"] = len(messages)
-        result["sample_limit_reached"] = total >= MAX_MESSAGES
+        result["sample_limit_reached"] = total + len(restored_ids) >= MAX_MESSAGES
         if hidden:
             result["unknowns"].append("history_hidden")
         if not result["history_complete"]:
@@ -836,16 +1202,15 @@ class EvidenceCollector:
             return self._finish(self.active_result)
 
     async def _collect(self, entity: Any, *, now: datetime | None = None) -> dict[str, Any]:
-        from telethon.tl.functions.channels import GetFullChannelRequest
-        from telethon.tl.functions.messages import GetFullChatRequest, GetOnlinesRequest
-        from telethon.tl.types import InputMessagesFilterPinned
 
         now = naive(now) or datetime.utcnow()
         self.collection_now = now
         self.full_chat = None
+        self.full_entity = None
+        self.self_history_visible = False
         from app.modules.acquisition.evidence_progress import date
         prior_date = date(self.previous.get("collected_at")) or date(self.previous.get("checked_at"))
-        if prior_date is None or not now - timedelta(hours=24) <= prior_date <= now:
+        if not self.efficiency and (prior_date is None or not now - timedelta(hours=24) <= prior_date <= now):
             self.previous = {}
         self.permission_failures = {
             str(key): dict(value)
@@ -892,17 +1257,23 @@ class EvidenceCollector:
             ),
             "migrated_to": getattr(getattr(entity, "migrated_to", None), "channel_id", None),
         }
+        if self.efficiency:
+            result["read_checkpoint"] = dict(self.previous.get("read_checkpoint") or {})
+            saved_roles = result["read_checkpoint"].get("role_proofs") or {}
+            if saved_roles.get("generation") == self._connection_token():
+                self.roles.update({int(key): value for key, value in (saved_roles.get("values") or {}).items()
+                                   if str(key).isdigit() and value in {"admin", "ordinary", "bot", "system"}})
+            outcomes = result["read_checkpoint"].get("candidate_outcomes") or {}
+            if outcomes.get("generation") == self._connection_token():
+                self.candidate_outcomes = dict(outcomes.get("values") or {})
         self.active_result = result
         full = None
         try:
-            request = (
-                GetFullChannelRequest(entity)
-                if hasattr(entity, "megagroup")
-                else GetFullChatRequest(entity.id)
-            )
-            response = await self.client(request)
+            response = await self._step_full_info(entity, result)
             full = response.full_chat
             self.full_chat = full
+            self.full_entity = next((chat for chat in getattr(response, "chats", [])
+                                     if getattr(chat, "id", None) == getattr(entity, "id", None)), None)
             count = getattr(full, "participants_count", None)
             if count is not None:
                 result["member_count_source"] = "full_chat.participants_count"
@@ -936,9 +1307,9 @@ class EvidenceCollector:
             if self._error(result, "full_info", exc):
                 return self._finish(result)
 
-        if result["online_count"] is None:
+        if not self.efficiency and result["online_count"] is None:
             try:
-                online_result = await self.client(GetOnlinesRequest(entity))
+                online_result = await self.read_context.onlines(self.client, entity)
                 online_count = getattr(online_result, "onlines", None)
                 if isinstance(online_count, int) and online_count >= 0:
                     result["online_count"] = online_count
@@ -952,71 +1323,83 @@ class EvidenceCollector:
 
         rights = getattr(entity, "default_banned_rights", None)
         permissions: dict[str, Any] = {"member": None, "can_send_text": None}
-        try:
-            from app.modules.acquisition.qualification_reads import current_permissions
-            me = await current_permissions(self.client, entity, "me", full_chat=full)
-            if me is None or not hasattr(me, "is_admin"):
-                raise ValueError("self_permission_unavailable")
-            participant = getattr(me, "participant", None)
-            is_admin = bool(getattr(me, "is_admin", False) or getattr(me, "is_creator", False))
-            result["protected"] = is_admin
-            permissions["is_admin"] = is_admin
-            permissions["is_creator"] = bool(getattr(me, "is_creator", False))
-            own = getattr(participant, "banned_rights", None)
-            from app.modules.acquisition.send_restriction import telegram_member
-            permissions["member"] = telegram_member(entity, me)
-            permissions["membership_state"] = "member" if permissions["member"] else "not_member"
-            permissions["membership_evidence"] = "telegram_permissions" if not permissions["member"] else None
-            for name, fields in {
-                "can_send_text": ("send_messages", "send_plain"),
-                "can_send_photo": ("send_messages", "send_media", "send_photos"),
-                "can_send_video": ("send_messages", "send_media", "send_videos"),
-                "can_send_file": ("send_messages", "send_media", "send_docs"),
-                "can_send_audio": ("send_messages", "send_media", "send_audios"),
-                "can_send_voice": ("send_messages", "send_media", "send_voices"),
-                "can_send_poll": ("send_messages", "send_polls"),
-                "can_preview_links": ("send_messages", "embed_links"),
-            }.items():
-                permissions[name] = bool(
-                    permissions["member"]
-                    and (
-                        is_admin
-                        or not any(
-                            getattr(value, field, False)
-                            for value in (rights, own)
-                            for field in fields
+        cached_permissions = self._step_permissions(result, now)
+        if cached_permissions is not None:
+            permissions = dict(cached_permissions["permissions"])
+            result["protected"] = cached_permissions["protected"]
+            self.self_history_visible = cached_permissions["history_visible"]
+        else:
+            try:
+                me = await self.read_context.permissions(self.client, entity, "me", full_chat=full)
+                if me is None or not hasattr(me, "is_admin"):
+                    raise ValueError("self_permission_unavailable")
+                participant = getattr(me, "participant", None)
+                is_admin = bool(getattr(me, "is_admin", False) or getattr(me, "is_creator", False))
+                result["protected"] = is_admin
+                permissions["is_admin"] = is_admin
+                permissions["is_creator"] = bool(getattr(me, "is_creator", False))
+                own = getattr(participant, "banned_rights", None)
+                self.self_history_visible = not bool(getattr(own, "view_messages", False))
+                from app.modules.acquisition.send_restriction import telegram_member
+                permissions["member"] = telegram_member(entity, me)
+                permissions["membership_state"] = "member" if permissions["member"] else "not_member"
+                permissions["membership_evidence"] = "telegram_permissions" if not permissions["member"] else None
+                for name, fields in {
+                    "can_send_text": ("send_messages", "send_plain"),
+                    "can_send_photo": ("send_messages", "send_media", "send_photos"),
+                    "can_send_video": ("send_messages", "send_media", "send_videos"),
+                    "can_send_file": ("send_messages", "send_media", "send_docs"),
+                    "can_send_audio": ("send_messages", "send_media", "send_audios"),
+                    "can_send_voice": ("send_messages", "send_media", "send_voices"),
+                    "can_send_poll": ("send_messages", "send_polls"),
+                    "can_preview_links": ("send_messages", "embed_links"),
+                }.items():
+                    permissions[name] = bool(
+                        permissions["member"]
+                        and (
+                            is_admin
+                            or not any(
+                                getattr(value, field, False)
+                                for value in (rights, own)
+                                for field in fields
+                            )
                         )
                     )
+                # Telegram's embed_links controls previews, not literal URL text.
+                permissions["can_send_url_text"] = permissions["can_send_text"]
+                permissions["url_content_rules_checked"] = False
+                blocked_rights = [value for value in (rights, own) if value is not None
+                                  and any(getattr(value, key, False) for key in ("send_messages", "send_plain"))]
+                from app.modules.acquisition.send_restriction import restriction_facts
+                permissions.update(restriction_facts(blocked_rights, now))
+                permissions["permanent_send_restriction_verified"] = bool(
+                    permissions["member"] and not permissions["can_send_text"]
+                    and permissions["permanent_send_restriction_verified"])
+                permissions["restriction_kind"] = (
+                    "temporary"
+                    if permissions.get("temporary_until")
+                    else "indefinite"
+                    if permissions["member"] and not permissions["can_send_text"]
+                    else "none"
                 )
-            # Telegram's embed_links controls previews, not literal URL text.
-            permissions["can_send_url_text"] = permissions["can_send_text"]
-            permissions["url_content_rules_checked"] = False
-            blocked_rights = [value for value in (rights, own) if value is not None
-                              and any(getattr(value, key, False) for key in ("send_messages", "send_plain"))]
-            from app.modules.acquisition.send_restriction import restriction_facts
-            permissions.update(restriction_facts(blocked_rights, now))
-            permissions["permanent_send_restriction_verified"] = bool(
-                permissions["member"] and not permissions["can_send_text"]
-                and permissions["permanent_send_restriction_verified"])
-            permissions["restriction_kind"] = (
-                "temporary"
-                if permissions.get("temporary_until")
-                else "indefinite"
-                if permissions["member"] and not permissions["can_send_text"]
-                else "none"
-            )
-        except Exception as exc:
-            if type(exc).__name__ == "UserNotParticipantError":
-                permissions.update(
-                    member=False,
-                    membership_state="not_member",
-                    membership_evidence="telegram_permissions_not_participant",
-                )
+            except Exception as exc:
+                if type(exc).__name__ == "UserNotParticipantError":
+                    permissions.update(
+                        member=False,
+                        membership_state="not_member",
+                        membership_evidence="telegram_permissions_not_participant",
+                    )
+                    result["permissions"] = permissions
+                    return self._finish(result)
                 result["permissions"] = permissions
-                return self._finish(result)
-            result["permissions"] = permissions
-            if self._error(result, "self_permissions", exc):
-                return self._finish(result)
+                if self._error(result, "self_permissions", exc):
+                    return self._finish(result)
+            if self.efficiency and not result.get("technical_errors"):
+                result["read_checkpoint"]["own_permissions"] = {
+                    "permissions": permissions, "protected": result["protected"],
+                    "history_visible": self.self_history_visible,
+                    "checked_at": now.isoformat(), "generation": self._connection_token(),
+                }
         slow = getattr(full, "slowmode_next_send_date", None)
         if isinstance(slow, int):
             slow = datetime.fromtimestamp(slow, UTC)
@@ -1058,6 +1441,26 @@ class EvidenceCollector:
             )
 
         add_rule("full_about", str(getattr(full, "about", "") or ""))
+        from app.modules.acquisition import review_public_history as public_history
+        from app.modules.acquisition.review_read_flags import stage_enabled
+        if stage_enabled(self.account_id, "public_share"):
+            public_store = self.history_store
+            if public_store is None:
+                from app.modules.acquisition.review_read_runtime import maintenance_store
+                public_store = maintenance_store(self.account_id)
+            shared_ids = await public_history.candidate_ids(
+                public_store, collector=self, entity=entity, result=result, now=now)
+            # IDs are discovery hints only: both existing paths fetch the root
+            # in B and recheck authors/warnings. No source coverage is imported.
+            self.callback_message_ids = list(dict.fromkeys([*self.callback_message_ids, *shared_ids]))[:6]
+        sufficient = await self._sufficient_trial_snapshot(entity, result, now)
+        if sufficient is not None:
+            return sufficient
+        if self.candidate_only and not self.efficiency:
+            result.update(read_plan_requires_full=not self.efficiency,
+                          local_rpc_defer_reason="qualification_candidate_full_required",
+                          sampling_stopped_reason="candidate_requires_full_evidence")
+            return self._finish(result)
         resumed = await self._resume_messages(entity, result, now)
         if result.get("collection_halted"):
             return self._finish(result)
@@ -1070,9 +1473,7 @@ class EvidenceCollector:
                 if self._error(result, "progress_identity", exc):
                     return self._finish(result)
         try:
-            pinned = await self.messages(
-                entity, filter=InputMessagesFilterPinned(), limit=MAX_PINS + 1
-            )
+            pinned = await self._step_pins(entity, result)
             result["pinned_sample_count"] = min(len(pinned), MAX_PINS)
             if len(pinned) > MAX_PINS:
                 result["rules_incomplete"] = True
@@ -1114,12 +1515,14 @@ class EvidenceCollector:
         Returns True only when a Telegram rate limit requires stopping collection.
         An unavailable or oversized thread stays unknown and never becomes proof.
         """
+        if self.efficiency:
+            advert["validation_attempted"] = True
         message_id = advert.get("message_id")
         if type(message_id) is not int or message_id <= 0:
             return False
         try:
             async with asyncio.timeout(15):
-                root = await self.client.get_messages(entity, ids=message_id)
+                root = await self.read_context.get_message(self.client, entity, message_id, require_live=True)
                 if root is None:
                     advert["accessible"] = False
                     result["unknowns"].append("advertisement_no_longer_accessible")
@@ -1129,6 +1532,8 @@ class EvidenceCollector:
                     return False
                 age = evidence_age(root, now)
                 advert["age_hours"] = age
+                if self.efficiency:
+                    advert.update(_message_metadata(root, now))
                 if age is None or age < 24:
                     return False
                 reply_info = getattr(root, "replies", None)
@@ -1136,18 +1541,30 @@ class EvidenceCollector:
                 if type(declared) is not int or not 0 <= declared <= MAX_WARNING_THREAD_REPLIES:
                     result["unknowns"].append("warning_reply_count_unconfirmed")
                     return False
-                replies = await self.messages(
-                    entity, reply_to=message_id, limit=MAX_WARNING_THREAD_REPLIES + 1
+                replies = (
+                    await self.messages(entity, reply_to=message_id, limit=MAX_WARNING_THREAD_REPLIES + 1)
+                    if declared else []
                 )
             if len(replies) != declared:
                 result["unknowns"].append("warning_reply_coverage_incomplete")
                 return False
+            dependencies = result.setdefault("evidence_dependencies", [])
+            known_dependencies = {item.get("message_id") for item in dependencies}
+            for dependency in [root, *replies]:
+                identifier = getattr(dependency, "id", None)
+                if (type(identifier) is int and identifier > 0 and identifier not in known_dependencies
+                        and len(dependencies) < MAX_WARNING_THREAD_ADS * (MAX_WARNING_THREAD_REPLIES + 1)):
+                    dependencies.append({"source": "warning_context", "text": text_of(dependency),
+                                         **_message_metadata(dependency, now)})
+                    known_dependencies.add(identifier)
             advert["warning_reply_ids"] = [
                 reply.id for reply in replies if WARNING.search(text_of(reply))
             ]
             advert["warning_search_complete"] = True
             advert["warning_search_scope"] = "complete_reply_thread"
         except Exception as exc:
+            if self.efficiency and self._error(result, "warning_reply_thread", exc):
+                return True
             if _flood_wait(exc):
                 return self._error(result, "warning_reply_thread", exc)
             result["unknowns"].append("warning_reply_query_unavailable")
@@ -1162,7 +1579,65 @@ class EvidenceCollector:
         now: datetime,
         *,
         verify_threads: bool = False,
+        _identity_plan: bool = True,
+        _local_chat_only: bool = False,
     ) -> dict[str, Any]:
+        if self.efficiency and _identity_plan:
+            # No participant lookup for ordinary conversation. Verify the
+            # highest-value advertising candidate and necessary rule sources.
+            relevant = [m for m in all_messages if possible_rule(text_of(m)) or WARNING.search(text_of(m))]
+            adverts = [m for m in all_messages if looks_like_ad(text_of(m)) and m not in relevant]
+            def already_consumed(message: Any) -> bool:
+                outcome = self.candidate_outcomes.get(str(message.id)) or {}
+                edited = naive(getattr(message, "edit_date", None))
+                return bool(outcome.get("excluded") and outcome.get("content") == content_key(text_of(message))
+                            and outcome.get("edited_at") == (edited.isoformat() if edited else None))
+            adverts = [m for m in adverts if not already_consumed(m)]
+            adverts.sort(key=lambda m: ((evidence_age(m, now) or 0) < 24,
+                                       -float(evidence_age(m, now) or 0)))
+            chosen = adverts[:1]
+            selected = {id(m) for m in [*relevant, *chosen]}
+            self.skipped_chat_ids.update(m.id for m in all_messages if id(m) not in selected)
+            result["valid_messages_complete"] = False
+            value = await self._classify_history(entity, result, [*relevant, *chosen], now,
+                verify_threads=verify_threads, _identity_plan=False, _local_chat_only=True)
+            remaining = [m for m in adverts if m not in chosen]
+            if remaining and not value.get("root_ad_history_sufficient"):
+                value["candidate_validation_pending"] = True
+                value["discovery_exhausted"] = False
+                value.setdefault("collection_progress", {})["pending_message_ids"] = [remaining[0].id]
+            return value
+        if self.enable_on_demand_identity and _identity_plan:
+            related = [message for message in all_messages
+                       if possible_rule(text_of(message)) or looks_like_ad(text_of(message))
+                       or WARNING.search(text_of(message))]
+            if related:
+                # Resolve decision-bearing authors first. Unrelated identities
+                # may be omitted only after a live sufficient positive proof
+                # rules out every independent exit arm. Negative/unknown
+                # branches retain the original complete identity collection.
+                probe = await self._classify_history(
+                    entity, copy.deepcopy(result), related, now,
+                    verify_threads=True, _identity_plan=False,
+                )
+                if probe.get("collection_halted"):
+                    return probe
+                positive = (
+                    probe.get("root_ad_history_sufficient")
+                    and probe.get("ordinary_advertising_last_48h_count", 0) > 0
+                    and probe.get("quality_status") == "qualified"
+                    and probe.get("member_count_verified") is True
+                    and type(probe.get("member_count")) is int and probe["member_count"] >= 50
+                    and type(probe.get("online_count")) is int and probe["online_count"] >= 2
+                    and probe.get("online_count_source") in {"full_chat.online_count", "messages.getOnlines"}
+                    and not probe.get("technical_errors")
+                    and set(probe.get("unknowns") or []) <= {"history_coverage_incomplete"}
+                )
+                return await self._classify_history(
+                    entity, result, all_messages, now,
+                    verify_threads=verify_threads or bool(positive),
+                    _identity_plan=False, _local_chat_only=bool(positive),
+                )
         cutoff = now - timedelta(hours=WINDOW_HOURS)
         seen_text: set[str] = set()
         seen_targets: set[str] = set()
@@ -1191,8 +1666,25 @@ class EvidenceCollector:
                 if getattr(message, "media", None):
                     result["unknowns"].append("media_without_readable_caption")
                 continue
+            relevant = possible_rule(text) or looks_like_ad(text) or bool(WARNING.search(text))
+            sender_id = getattr(message, "sender_id", None)
+            local_role = self.roles.get(sender_id) or (
+                self.read_context.role(self.client, entity, sender_id)
+                if type(sender_id) is int and sender_id > 0 else None
+            )
+            sender = getattr(message, "sender", None)
+            locally_known = (local_role is not None or sender_id in self.own_user_ids
+                             or (sender is not None and getattr(sender, "bot", False))
+                             or type(sender_id) is not int or sender_id <= 0)
             try:
-                role = await self.role(entity, message)
+                if _local_chat_only and not relevant and not locally_known:
+                    role = "not_evaluated"
+                    result["valid_messages_complete"] = False
+                    result["unknowns"].append("chat_identity_not_evaluated")
+                    self.skipped_chat_ids.add(message.id)
+                    self._optimization("fast_path")
+                else:
+                    role = await self.role(entity, message)
             except Exception as exc:
                 if self._error(result, "sender_identity", exc):
                     return self._finish(result)
@@ -1246,6 +1738,7 @@ class EvidenceCollector:
                     "promotion_key": promotion_key(text),
                     "promotion_targets": sorted(targets),
                     "warning_reply_ids": [],
+                    **({"history_cached": True} if getattr(message, "_vanguard_history_evidence", False) else {}),
                     "content_forms": ["text"]
                     + (["media"] if metadata["has_media"] else [])
                     + (["url_text"] if URL.search(text) else []),
@@ -1257,7 +1750,8 @@ class EvidenceCollector:
                 for item in feedback
                 if item["reply_to_message_id"] == advert["message_id"]
             ]
-            advert["warning_search_complete"] = result["history_complete"] and not self.role_errors
+            advert["warning_search_complete"] = (result["history_complete"] and not self.role_errors
+                                                  and not advert.get("history_cached"))
         selected, deduplicated_count = select_advertising_evidence(adverts)
         result["advertising_candidates_by_role"] = {
             role: sum(item["sender_role"] == role for item in adverts)

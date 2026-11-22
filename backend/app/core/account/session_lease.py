@@ -54,6 +54,25 @@ end
 return 0
 """
 
+_CLAIM_QUARANTINED_LUA = """-- quarantine_probe_claim_v1
+if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('get', KEYS[3]) == ARGV[2] then
+  redis.call('set', KEYS[1], ARGV[3], 'EX', ARGV[4])
+  redis.call('set', KEYS[2], ARGV[5], 'EX', ARGV[4])
+  return 1
+end
+return 0
+"""
+
+_RESTORE_QUARANTINED_LUA = """-- quarantine_probe_release_v1
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('set', KEYS[1], ARGV[2])
+  redis.call('set', KEYS[3], ARGV[3])
+  redis.call('del', KEYS[2])
+  return 1
+end
+return 0
+"""
+
 
 @dataclass(slots=True)
 class SessionLease:
@@ -64,6 +83,7 @@ class SessionLease:
     ttl_seconds: int = 90
     namespace: str = "vanguard:telegram:lease"
     token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
+    quarantine_token: str | None = None
     _renew_task: asyncio.Task[None] | None = field(default=None, init=False)
     _lost: asyncio.Event = field(default_factory=asyncio.Event, init=False)
 
@@ -84,13 +104,26 @@ class SessionLease:
     async def acquire(self) -> bool:
         # Rotate the owner token for every new generation.  A stale task from
         # a prior connection must never be able to act as the new owner.
+        from .session_quarantine import current
+
+        fence = await current(self.account_id, self.redis)
+        if fence is not None and fence != self.quarantine_token:
+            return False
         self.token = secrets.token_urlsafe(24)
-        ok = await self.redis.set(
-            self.key,
-            self.token,
-            nx=True,
-            ex=max(10, int(self.ttl_seconds)),
-        )
+        if self.quarantine_token is not None:
+            ok = await self.redis.eval(
+                _CLAIM_QUARANTINED_LUA, 3, self.key, self.owner_key,
+                f"vanguard:telegram:quarantine:{self.account_id}",
+                f"quarantine:{self.quarantine_token}", self.quarantine_token,
+                self.token, max(10, int(self.ttl_seconds)), PROCESS_ID,
+            )
+        else:
+            ok = await self.redis.set(
+                self.key,
+                self.token,
+                nx=True,
+                ex=max(10, int(self.ttl_seconds)),
+            )
         if not ok:
             from app.core.metrics import record_session_contention
             await record_session_contention()
@@ -100,6 +133,14 @@ class SessionLease:
             PROCESS_ID,
             ex=max(10, int(self.ttl_seconds)),
         )
+        try:
+            fence = await current(self.account_id, self.redis)
+            if fence is not None and fence != self.quarantine_token:
+                await self.release()
+                return False
+        except BaseException:
+            await self.release()
+            raise
         self._lost.clear()
         return True
 
@@ -120,14 +161,21 @@ class SessionLease:
 
     async def release(self) -> bool:
         self.stop_renewal()
-        result = await self.redis.eval(
-            _RELEASE_LUA,
-            2,
-            self.key,
-            self.owner_key,
-            self.token,
-            PROCESS_ID,
-        )
+        if self.quarantine_token is not None:
+            result = await self.redis.eval(
+                _RESTORE_QUARANTINED_LUA, 3, self.key, self.owner_key,
+                f"vanguard:telegram:quarantine:{self.account_id}", self.token,
+                f"quarantine:{self.quarantine_token}", self.quarantine_token,
+            )
+        else:
+            result = await self.redis.eval(
+                _RELEASE_LUA,
+                2,
+                self.key,
+                self.owner_key,
+                self.token,
+                PROCESS_ID,
+            )
         self._lost.set()
         return bool(result)
 

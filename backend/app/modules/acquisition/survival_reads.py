@@ -12,8 +12,9 @@ class SurvivalReadBatch:
     """Keep one leased client; each RPC still passes through its normal governor.
 
     Rotate after five records or 60 seconds, at the next record boundary. Each
-    inspection has its own 60-second timeout. No permissions or message facts are
-    cached, and no lease/client escapes the caller's batch.
+    inspection has its own 60-second timeout. Enabled accounts share metadata
+    within this connection/batch; every due message existence is still read.
+    No lease/client escapes the caller's batch.
     """
 
     def __init__(self, pool: Any, *, raise_on_lease_failure: bool = True) -> None:
@@ -23,11 +24,13 @@ class SurvivalReadBatch:
         self.key: tuple[int, str] | None = None
         self.started_at = 0.0
         self.records = 0
+        self.read_context: Any = None
 
     async def close(self) -> None:
         wrapper, self.wrapper = self.wrapper, None
         self.key = None
         self.records = 0
+        self.read_context = None
         if wrapper is not None:
             await self.pool.release(wrapper)
 
@@ -53,6 +56,12 @@ class SurvivalReadBatch:
                     raise RuntimeError("account_unavailable")
                 self.key = key
                 self.started_at = time.monotonic()
+                from app.modules.acquisition.qualification_engine import enabled_for
+                if enabled_for(account_id):
+                    from app.modules.acquisition.qualification_read_context import (
+                        QualificationReadContext,
+                    )
+                    self.read_context = QualificationReadContext(enabled=True, ttl_seconds=60)
             self.records += 1
             yield self.wrapper
         except BaseException:

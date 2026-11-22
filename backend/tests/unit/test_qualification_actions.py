@@ -61,9 +61,9 @@ class Client:
         return self.permissions
 
     async def get_messages(self, entity, *, ids):
-        if set(ids) & {101, 102}:
-            return [item for item in self.precedents if item.id in ids]
-        return [item for item in [*self.old_admin, *self.history] if item is None or item.id in ids]
+        messages = {item.id: item for item in [*self.precedents, *self.old_admin, *self.history]
+                    if item is not None}
+        return [messages[mid] for mid in ids if mid in messages]
 
     async def __call__(self, request):
         return Obj(full_chat=self.full)

@@ -90,13 +90,6 @@ class ReplyEngine:
             self.logger.warning("group_ai_interaction_setting_unavailable", error=str(exc))
             return dict(DEFAULT_GROUP_AI_INTERACTION_SETTINGS)
 
-    async def _ai_enabled(self) -> bool:
-        settings = await self._group_ai_settings()
-        return bool(
-            settings.get("enabled")
-            and settings.get("allowKeywordTriggeredReply", True)
-        )
-
     async def should_reply(self, message_text: str) -> bool:
         """
         Determine if a message should be replied to.

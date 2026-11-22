@@ -480,6 +480,10 @@ async def _run_second_hop(
 
 
 async def run_verifications(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import run
+        return await run(service, "review_and_verify", account_id, limit=limit)
     """Claim durably before acquiring Telegram; re-read state before every action."""
     config = await policy(service.db, fresh=True)
     result: dict[str, Any] = {"checked": 0, "attempted": 0, "details": []}

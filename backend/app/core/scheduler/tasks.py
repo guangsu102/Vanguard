@@ -52,6 +52,8 @@ async def _run_with_worker_cleanup(awaitable: Awaitable[Any]) -> Any:
     from app.core.account.pool import close_account_pool
 
     await redis_module.init_redis()
+    from app.core.account.read_metrics import start_metrics_health, stop_metrics_health
+    start_metrics_health()
     try:
         return await awaitable
     finally:
@@ -62,8 +64,11 @@ async def _run_with_worker_cleanup(awaitable: Awaitable[Any]) -> Any:
                 if redis_module.redis_client is not None:
                     await redis_module.close_redis()
             finally:
-                if db_module.engine is not None:
-                    await db_module.close_db()
+                try:
+                    if db_module.engine is not None:
+                        await db_module.close_db()
+                finally:
+                    await stop_metrics_health()
 
 
 def _run_async(awaitable: Awaitable[Any]) -> Any:
@@ -1450,6 +1455,9 @@ def recover_orphaned_groups_task(
     dry_run: bool = False,
     target_account_ids: list[int] | None = None,
 ):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info("recover_orphaned_groups_task", task="recover_orphaned_groups_task")
     try:
         from app.modules.acquisition.failover import run_group_failover_with_db
@@ -1475,6 +1483,9 @@ def recover_orphaned_groups_task(
 
 @celery_app.task
 def group_ai_warmup_task(max_groups: Optional[int] = None, dry_run: bool = False):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info("group_ai_warmup_task", task="group_ai_warmup_task")
     reservation = _run_async(_reserve_group_ai_warmup_execution())
     if not reservation.get("should_run"):
@@ -1560,6 +1571,9 @@ def deliver_ads_task(max_deliveries: Optional[int] = None, dry_run: bool = False
 
 @celery_app.task
 def check_ad_survival_task(limit: Optional[int] = None):
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "reason": "survival_review_disabled"}
     logger.info("check_ad_survival_task", task="check_ad_survival_task")
     try:
         from app.modules.acquisition.automation import run_ad_survival_check_with_db
@@ -1580,6 +1594,9 @@ def check_ad_survival_task(limit: Optional[int] = None):
 
 @celery_app.task
 def audit_group_ad_policies_task(limit: int = 20, dry_run: bool = False):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info("audit_group_ad_policies_task", task="audit_group_ad_policies_task", limit=limit)
     try:
         from app.modules.acquisition.automation import run_group_ad_policy_audit_with_db
@@ -1605,6 +1622,9 @@ def auto_probe_unknown_group_ad_policies_task(
     limit: Optional[int] = None,
     dry_run: bool = False,
 ):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info(
         "auto_probe_unknown_group_ad_policies_task",
         task="auto_probe_unknown_group_ad_policies_task",
@@ -1635,6 +1655,9 @@ def evaluate_ad_only_candidates_task(
     limit: int = 200,
     force: bool = False,
 ):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info(
         "evaluate_ad_only_candidates_task",
         task="evaluate_ad_only_candidates_task",
@@ -1662,6 +1685,9 @@ def evaluate_ad_only_candidates_task(
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def dispatch_ad_only_join_queue_task(self, limit: int = 10):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info(
         "dispatch_ad_only_join_queue_task",
         task="dispatch_ad_only_join_queue_task",
@@ -1693,6 +1719,9 @@ def dispatch_ad_only_join_queue_task(self, limit: int = 10):
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
 def execute_ad_only_handover_task(self, handover_id: int):
+    from app.core.config import settings as growth_settings
+    if growth_settings.GROWTH_SIMPLIFIED_ENABLED:
+        return {"processed": 0, "skipped": 1, "reason": "retired_growth_stage"}
     logger.info(
         "execute_ad_only_handover_task",
         task="execute_ad_only_handover_task",
@@ -1961,9 +1990,10 @@ def cleanup_completed_tasks():
 def group_qualification_task():
     """Read-only evidence plus model review on an isolated queue."""
     async def run(db):
+        from app.core.config import settings
         from app.modules.acquisition.automation import AcquisitionAutomationService
         from app.modules.acquisition.qualification_service import policy, run_reviews
-        if not (await policy(db, fresh=True)).get("enabled"):
+        if not settings.GROWTH_SIMPLIFIED_ENABLED and not (await policy(db, fresh=True)).get("enabled"):
             return {"processed": 0, "reason": "qualification_disabled"}
         return await run_reviews(AcquisitionAutomationService(db), limit=2)
     return _run_async(_run_with_db(run))

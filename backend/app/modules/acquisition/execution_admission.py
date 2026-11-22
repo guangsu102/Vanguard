@@ -28,6 +28,17 @@ async def execution_plan(
     now: datetime,
     account_id: int | None = None,
 ) -> dict:
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return {"remaining": 1, "reason": None, "pending": 0, "account_id": account_id,
+                "scope": "disabled", "enabled": False}
+    from app.modules.acquisition.qualification_engine import enabled_for, initial_slots
+    if account_id is not None and enabled_for(account_id):
+        pending = await initial_slots(db, account_id)
+        slots = max(0, 2 - pending)
+        return {"remaining": slots, "reason": None if slots else "join_initial_collection_capacity",
+                "pending": pending, "concurrency": 2, "scope": "efficiency_first_collection",
+                "account_id": account_id, "engine_version": "efficiency_v1"}
     from app.core.group.models import GroupAccountMembership as Member
     from app.core.scheduler.growth_dispatch import eligible_accounts
     from app.modules.acquisition.models import GroupQualificationAudit as Audit

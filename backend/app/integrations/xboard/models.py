@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -30,4 +30,8 @@ class XBoardCallback(Base):
     trace_id: Mapped[str] = mapped_column(String(128), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     request_body: Mapped[str] = mapped_column(Text, nullable=False)
+    attributed_account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    attribution_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

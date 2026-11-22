@@ -16,7 +16,9 @@ async def repair(db: Any, client: Any, now: datetime) -> dict[str, int]:
     from app.core.scheduler.growth_dispatch import eligible_accounts
     from app.modules.acquisition.models import GroupQualificationAudit as Audit
     from app.modules.acquisition.qualification_due import current_clause
-    from app.modules.acquisition.qualification_events import queue_due_gaps, retire_legacy_synthetic_gaps
+    from app.modules.acquisition.qualification_events import (
+        queue_due_gaps, queue_terminal_technical_events, retire_legacy_synthetic_gaps,
+    )
     from app.modules.acquisition.qualification_identity_refresh import queue_identity_refreshes
     from app.modules.acquisition.qualification_service import _ids, ensure_membership_reviews, policy
     from app.modules.acquisition.review_waits import budget_wait_ids
@@ -28,14 +30,19 @@ async def repair(db: Any, client: Any, now: datetime) -> dict[str, int]:
              "stale_claims_recovered": 0,
              "missing_reviews": 0,
              "identity_refreshes": 0, "budget_wakeups": 0, "event_reviews": 0,
-             "legacy_gaps_retired": 0}
+             "legacy_gaps_retired": 0, "technical_event_reviews": 0}
     from app.modules.acquisition.review_retention import retire_obsolete_reviews
     await retire_obsolete_reviews(db, limit=500)
+    from app.modules.acquisition.qualification_local_recovery import finish_local_reviews
+    stats["local_finalized"] = await finish_local_reviews(db, now, limit=32)
     stats["stale_claims_recovered"] = await _recover_stale_claims(db, now=now, limit=32)
     config = await policy(db, fresh=True)
     if not config.get("enabled") or not config.get("execute_reviews", True):
         await db.commit()
         return stats
+    from app.modules.acquisition.qualification_ai import recover_preflight_reviews
+
+    stats["ai_preflight_recovered"] = len(await recover_preflight_reviews(db, config))
     stats["missing_reviews"] = len(await ensure_membership_reviews(db, config, limit=32))
     stats["identity_refreshes"] = await queue_identity_refreshes(db, config, limit=2)
     accounts = list((await db.scalars(eligible_accounts(now).order_by(
@@ -45,7 +52,11 @@ async def repair(db: Any, client: Any, now: datetime) -> dict[str, int]:
     for account_id in accounts:
         if config.get("exit_all_accounts") is True or not config.get("account_ids") or account_id in _ids(config["account_ids"]):
             stats["legacy_gaps_retired"] += await retire_legacy_synthetic_gaps(db, account_id)
-            stats["event_reviews"] += await queue_due_gaps(db, account_id, limit=2)
+            technical_events = await queue_terminal_technical_events(db, account_id, limit=2)
+            stats["technical_event_reviews"] += technical_events
+            stats["event_reviews"] += technical_events
+            if technical_events < 2:
+                stats["event_reviews"] += await queue_due_gaps(db, account_id, limit=2-technical_events)
         ids = await budget_wait_ids(db, account_id, now=now)
         legacy = list((await db.scalars(select(Audit.id).where(
             Audit.account_id == account_id, current_clause(),
@@ -116,7 +127,14 @@ async def _recover_stale_claims(db: Any, *, now: datetime, limit: int = 32) -> i
             .where(GroupAccountMembership.id == row.membership_id)
             .with_for_update(skip_locked=True)
         )
-        action = recover_stale_review_row(row, membership, now=now)
+        if row.decision == "reject":
+            from app.modules.acquisition.qualification_local_recovery import finish_local_review
+            from app.modules.acquisition.qualification_service import _payload
+            if _payload(row).get("ai_final") is True:
+                action = await finish_local_review(db, row, now)
+                recovered += int(action in {"terminal_ai_closed", "terminal_ai_requeued", "snapshot_scope_requeued"})
+                continue
+        recover_stale_review_row(row, membership, now=now)
         if row.next_retry_at is None:
             await clear(db, row.id)
         else:

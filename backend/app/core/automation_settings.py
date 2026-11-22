@@ -2095,6 +2095,8 @@ def normalize_ad_delivery_execution_settings(payload: dict[str, Any] | None) -> 
             max_value=1800,
         ),
         "growth_group_global_cooldown_seconds": cooldown_seconds,
+        "send_failure_exit_threshold": _int_setting(raw.get("send_failure_exit_threshold", 3), 3, min_value=1, max_value=10),
+        "send_failure_retry_seconds": _int_setting(raw.get("send_failure_retry_seconds", 1800), 1800, min_value=60, max_value=86400),
     }
 
 

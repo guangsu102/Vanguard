@@ -1374,6 +1374,9 @@ async def dispatch_outbox_once(
     become durable reconciliation tasks and are never replayed automatically.
     """
 
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        return None
     now = now or datetime.utcnow()
     row = await claim_outbox(
         db,

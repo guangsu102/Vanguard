@@ -11,15 +11,18 @@ from datetime import datetime
 
 import structlog
 from aiohttp import web
+from sqlalchemy import or_, select
 
 from app.core.account import reconciliation_stream as stream
 from app.core.account.budget_ledger import write_snapshots
+from app.core.account.control_models import ReconciliationTask
 from app.core.account.reconciliation_handlers import execute_task
 from app.core.config import settings
 from app.core.database import close_db, get_db_session, init_db
 from app.core.redis import close_redis, get_redis, init_redis
 
 logger = structlog.get_logger()
+STREAM_READ_BATCH_SIZE = 100
 
 
 async def process(task, owner: str) -> dict:
@@ -52,7 +55,46 @@ async def _process_owned(task, owner: str) -> dict:
         )
 
 
+async def _claimable_task_keys(keys: set[str]) -> set[str]:
+    """Read a bounded wake-up batch against the authoritative task outbox."""
+    if not keys:
+        return set()
+    now = datetime.utcnow()
+    async with get_db_session() as db:
+        return set((await db.scalars(
+            select(ReconciliationTask.task_key).where(
+                ReconciliationTask.task_key.in_(keys),
+                stream.rollout_filter(ReconciliationTask.account_id),
+                ReconciliationTask.state.in_(["pending", "leased"]),
+                or_(
+                    ReconciliationTask.state == "pending",
+                    ReconciliationTask.lease_expires_at.is_(None),
+                    ReconciliationTask.lease_expires_at <= now,
+                ),
+                ReconciliationTask.available_at <= now,
+            )
+        )).all())
+
+
 async def consume_messages(cache, messages: list, consumer: str) -> int:
+    # Streams are only lossy wake-ups: old shadow-mode entries can describe
+    # terminal, future or already leased tasks. Retire those in one read/ACK,
+    # while every live candidate still obtains its own sequential claim CAS.
+    # A singleton already costs just one claim, so retain that fast path.
+    if len(messages) > 1:
+        claimable = await _claimable_task_keys({
+            fields["task_key"] for _, fields in messages if fields.get("task_key")
+        })
+        stale_ids = [
+            message_id for message_id, fields in messages
+            if fields.get("task_key") not in claimable
+        ]
+        if stale_ids:
+            await cache.xack(stream.STREAM_KEY, stream.CONSUMER_GROUP, *stale_ids)
+        messages = [
+            (message_id, fields) for message_id, fields in messages
+            if fields.get("task_key") in claimable
+        ]
     processed = 0
     for message_id, fields in messages:
         key = fields.get("task_key")
@@ -92,6 +134,7 @@ async def consume_messages(cache, messages: list, consumer: str) -> int:
                 retry_after=outcome.get("retry_after", 60),
                 next_verification_at=(datetime.fromisoformat(outcome["next_verification_at"])
                                       if outcome.get("next_verification_at") else None),
+                result=outcome,
             )
         if committed and (outcome.get("state") in {"succeeded", "manual_required", "cancelled"}
                           or outcome.get("observed") and outcome.get("next_verification_at")):
@@ -178,6 +221,8 @@ async def run() -> None:
     consumer = f"reconciliation-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     cache = await get_redis()
     metrics_runner = await _serve_metrics(cache)
+    from app.core.account.read_metrics import start_metrics_health, stop_metrics_health
+    start_metrics_health()
     maintenance_task = asyncio.create_task(maintenance())
     try:
         while True:
@@ -186,22 +231,27 @@ async def run() -> None:
                 continue
             try:
                 messages = await stream.reclaim(cache, consumer=consumer)
-                messages += await stream.read_group(cache, consumer=consumer, count=1)
+                messages += await stream.read_group(
+                    cache, consumer=consumer, count=STREAM_READ_BATCH_SIZE
+                )
                 if messages:
                     await consume_messages(cache, messages, consumer)
             except Exception as exc:
                 logger.warning("reconciliation_consumer_deferred", error_type=type(exc).__name__)
                 await asyncio.sleep(5)
     finally:
-        maintenance_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await maintenance_task
-        await metrics_runner.cleanup()
-        from app.core.account.pool import get_account_pool
+        try:
+            maintenance_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await maintenance_task
+            await metrics_runner.cleanup()
+            from app.core.account.pool import get_account_pool
 
-        await get_account_pool().close_all()
-        await close_redis()
-        await close_db()
+            await get_account_pool().close_all()
+            await close_redis()
+            await close_db()
+        finally:
+            await stop_metrics_health()
 
 
 if __name__ == "__main__":

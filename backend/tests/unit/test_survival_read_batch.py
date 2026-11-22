@@ -181,3 +181,25 @@ async def test_cancelled_worker_releases_batch_without_advancing_unread_message(
     service.account_pool.release.assert_awaited_once()
     await test_db.refresh(first)
     assert first.survived_two_minute_at is None and first.survival_stage == "two_minute"
+
+
+async def test_efficiency_batch_reuses_group_facts_but_reads_both_due_messages(test_db, monkeypatch):
+    monkeypatch.setattr("app.modules.acquisition.qualification_engine.enabled_for", lambda _: True)
+    service, wrapper, first, second, now = await two_logs(test_db, monkeypatch)
+    client = AsyncMock(return_value=Obj(full_chat=Obj(ttl_period=0)))
+    client.is_connected = Mock(return_value=True)
+    client.get_entity = AsyncMock(return_value=types.Channel(
+        id=first.telegram_group_id, title="current", photo=types.ChatPhotoEmpty(), date=now, megagroup=True))
+    client.get_me = AsyncMock(return_value=Obj(id=200, deleted=False))
+    client.get_permissions = AsyncMock(return_value=Obj(
+        is_admin=False, has_left=False, participant=Obj(banned_rights=None)))
+    client.get_messages = AsyncMock(side_effect=lambda entity, ids: Obj(id=ids, out=True, date=first.sent_at))
+    wrapper.client = client
+    result = await service.check_ad_survival()
+    await test_db.refresh(first)
+    assert result["processed"] == 2 and result.get("pending_one_hour") == 2, first.survival_error
+    assert client.get_permissions.await_count == 1 and client.await_count == 1
+    assert [c.kwargs["ids"] for c in client.get_messages.await_args_list] == [19, 20]
+    for log in [first, second]:
+        await test_db.refresh(log)
+        assert log.survived_two_minute_at == now and log.survival_stage == "one_hour"

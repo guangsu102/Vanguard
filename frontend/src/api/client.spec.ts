@@ -38,4 +38,14 @@ describe('getApiErrorMessage', () => {
   it('falls back for unknown response bodies', () => {
     expect(getApiErrorMessage({ detail: { reason: 'unknown' } })).toBe('Request failed')
   })
+
+  it('explains recovery failures without exposing arbitrary server details', () => {
+    expect(getApiErrorMessage({ detail: { reason: 'session_reauthentication_required', status: 'error' } }))
+      .toBe('登录授权已失效，请重新登录绑定')
+    expect(getApiErrorMessage({ detail: { reason: 'read_budget_wait', status: 'error' } }))
+      .toBe('正在等待读取预算，请到期后重试')
+    expect(getApiErrorMessage({ detail: { reason: 'identity_mismatch', status: 'error' } }))
+      .toBe('会话手机号与账号不一致，请重新绑定正确账号')
+    expect(getApiErrorMessage({ detail: { reason: 'private raw credential value' } })).toBe('Request failed')
+  })
 })

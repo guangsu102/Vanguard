@@ -69,6 +69,10 @@ class JournalQueue(asyncio.Queue):
 
     def recover(self) -> None:
         # Called only while disconnected, before the SDK update consumer starts.
+        from app.modules.acquisition.review_history_dependencies import tracker
+        dependencies = tracker(self)
+        if dependencies is not None:
+            dependencies.invalidate()
         self._queue.clear()
         self._unfinished_tasks = 0
         self._finished.set()
@@ -105,14 +109,21 @@ class JournalQueue(asyncio.Queue):
         # No cursor is advanced by this append. If storage fails, fail closed.
         cursor = self.session._cursor()
         try:
-            from app.core.account.listener_protocol import compact, dependencies, updates_in
             from app.core.account.listener_interest import fresh, project
+            from app.core.account.listener_protocol import compact, dependencies, updates_in
             policy = self.policy()
+            from app.modules.acquisition.review_history_dependencies import observe_envelope
+            observe_envelope(self, item, policy)
+            from app.modules.acquisition.review_evidence_ingest import submit_envelope
+            from app.modules.acquisition.review_read_runtime import attach_event_refs
+            evidence_refs, evidence_gaps = submit_envelope(item, policy)
+            self._store_facts(cursor, evidence_gaps)
             if fresh(policy):
                 item, discarded, facts = project(item, policy)
+                attach_event_refs(facts, evidence_refs)
                 self._store_facts(cursor, facts)
                 if len(discarded) == len(updates_in(item)):
-                    if facts:
+                    if facts or evidence_gaps:
                         SQLiteSession.save(self.session)
                     self._put_protocol(item)
                     return
@@ -167,9 +178,16 @@ class JournalQueue(asyncio.Queue):
         with BinaryReader(payload) as reader:
             item = reader.tgread_object()
         discarded = json.loads(discarded_json)
+        from app.modules.acquisition.review_history_dependencies import observe_envelope
+        observe_envelope(self, item, self.policy())
         from app.core.account.listener_interest import fresh, project
+        from app.modules.acquisition.review_evidence_ingest import submit_envelope
+        from app.modules.acquisition.review_read_runtime import attach_event_refs
+        evidence_refs, evidence_gaps = submit_envelope(item, self.policy())
+        self._store_facts(cursor, evidence_gaps)
         if fresh(self.policy()):
             item, projected, facts = project(item, self.policy())
+            attach_event_refs(facts, evidence_refs)
             self._store_facts(cursor, facts)
             discarded = sorted(set(discarded) | set(projected))
             for index in discarded:
@@ -239,8 +257,20 @@ class JournalQueue(asyncio.Queue):
                 if fact['kind'] == 'deletion_candidates':
                     ids = sorted(set(old['ids']) | set(fact['ids']))
                     fact = {**fact, 'ids': ids[-512:], 'overflow': old.get('overflow', False) or fact.get('overflow', False) or len(ids)>512}
-                elif old['at'] >= fact['at']:
+                elif old['at'] > fact['at']:
                     continue
+                elif old['at'] == fact['at']:
+                    if (fact['kind'] != 'rules'
+                            or old.get('evidence_refs') == fact.get('evidence_refs')):
+                        continue
+                    # Telegram timestamps have second precision. Different
+                    # versions at the same time cannot be ordered by hash or
+                    # replay arrival; keep a cue and require a live read.
+                    fact = {**fact, 'message_ids': sorted(set(old.get('message_ids', []))
+                                                        | set(fact.get('message_ids', [])))[-32:],
+                            'evidence_refs': {}, 'version_conflict': True}
+                    if old == fact:
+                        continue
             cursor.execute('INSERT INTO vanguard_listener_facts VALUES(?,?) ON CONFLICT(fact_key) DO UPDATE SET value=excluded.value',
                            (fact['key'], json.dumps(fact, sort_keys=True)))
 
@@ -306,6 +336,7 @@ class JournalQueue(asyncio.Queue):
     def park_global_protocol(self) -> None:
         """Discard only projected protocol input; preserve its real recovery need."""
         from collections import deque
+
         from app.core.account.listener_protocol import channel_only
 
         self.hold_global_protocol = True
@@ -358,7 +389,12 @@ class JournalQueue(asyncio.Queue):
             for identity, payload, old_discarded, state, consumed in rows:
                 with BinaryReader(payload) as reader:
                     item = reader.tgread_object()
+                from app.modules.acquisition.review_evidence_ingest import submit_envelope
+                from app.modules.acquisition.review_read_runtime import attach_event_refs
+                evidence_refs, evidence_gaps = submit_envelope(item, policy)
+                self._store_facts(cursor, evidence_gaps)
                 item, ignored, facts = project(item, policy)
+                attach_event_refs(facts, evidence_refs)
                 self._store_facts(cursor, facts)
                 ignored = sorted(set(ignored) | set(json.loads(old_discarded)))
                 if len(ignored) == len(updates_in(item)):
@@ -473,6 +509,8 @@ class JournalQueue(asyncio.Queue):
             "source": "live",
             "replayed_envelopes": self.replayed,
             "storage_error": self.failure,
+            "protocol_checkpoint_safe": not self.observed and not self.protocol_recovery and self.session._cursor().execute(
+                "SELECT 1 FROM vanguard_raw_updates WHERE state NOT IN ('checkpointed','discarded_irrelevant') LIMIT 1").fetchone() is None,
             "awaiting_checkpoint": len(self.observed),
             "queued_for_sdk": self.qsize(),
             "protocol_only_compacted_or_dropped": self.protocol_discarded,

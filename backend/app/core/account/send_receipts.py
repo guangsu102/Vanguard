@@ -168,6 +168,12 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         AccountOutboundAttempt.message_id.is_not(None),
         AccountOutboundAttempt.message_id > 0,
     ))
+    matching_recorded_id = exists(select(AccountOutboundAttempt.id).where(
+        AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
+        AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
+        AccountOutboundAttempt.message_id == AdDeliveryLog.telegram_message_id,
+        AccountOutboundAttempt.message_id > 0,
+    ))
     unknown_attempt_exists = exists(select(AccountOutboundAttempt.id).where(
         AccountOutboundAttempt.account_id == AdDeliveryLog.account_id,
         AccountOutboundAttempt.attempt_key == literal("ad:") + AdDeliveryLog.reservation_token,
@@ -186,7 +192,8 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
                 proof_exists,
             ),
         ),
-        AdDeliveryLog.telegram_message_id.is_(None),
+        or_(AdDeliveryLog.telegram_message_id.is_(None),
+            and_(AdDeliveryLog.status != "success", matching_recorded_id)),
         # Only a write whose outcome is explicitly unknown may enter this
         # recovery lane.  A fresh, not-yet-sent reservation must never be
         # converted into a manual failure by a maintenance sweep.
@@ -226,6 +233,7 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
         True if independent else legacy_account_filter(AdDeliveryLog.account_id),
     ).order_by(AdDeliveryLog.id).limit(limit))).all()
     recovered = waiting = manual = 0
+    recovered_receipts: dict[int, int] = {}
     for log, schedule in logs:
         attempt_key = "ad:" + str(log.reservation_token or "")
         attempt = await db.scalar(select(AccountOutboundAttempt).where(
@@ -258,6 +266,7 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
             except Exception:
                 pass
             recovered += 1
+            recovered_receipts[log.id] = log.account_id
             if schedule is not None:
                 await db.delete(schedule)
             context["send_reconciliation"] = {
@@ -301,6 +310,18 @@ async def recover_missing_receipts(db: Any, now: datetime, account_id: int | Non
             manual += int(changed)
             waiting += 0
     await db.commit()
+    if recovered_receipts:
+        try:
+            from app.modules.acquisition.ad_opportunities import observe_committed_receipts
+
+            await observe_committed_receipts(recovered_receipts)
+        except Exception as exc:
+            import structlog
+
+            structlog.get_logger(__name__).warning(
+                "ad_recovered_receipt_measurement_unavailable",
+                receipt_log_ids=sorted(recovered_receipts), error=type(exc).__name__, gap_recorded=False,
+            )
     return {
         "receipt_ids_recovered": recovered,
         "receipt_evidence_required": waiting,

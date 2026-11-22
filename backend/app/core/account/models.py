@@ -594,13 +594,13 @@ class AccountSpamCheckOperation(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+        DateTime, default=datetime.utcnow, server_default=text("CURRENT_TIMESTAMP"), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
@@ -653,13 +653,13 @@ class AccountSpamCheckItem(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+        DateTime, default=datetime.utcnow, server_default=text("CURRENT_TIMESTAMP"), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
@@ -723,13 +723,13 @@ class AccountProfileUpdateOperation(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+        DateTime, default=datetime.utcnow, server_default=text("CURRENT_TIMESTAMP"), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
@@ -785,13 +785,13 @@ class AccountProfileUpdateItem(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, server_default="CURRENT_TIMESTAMP", nullable=False
+        DateTime, default=datetime.utcnow, server_default=text("CURRENT_TIMESTAMP"), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
@@ -836,7 +836,7 @@ class AccountProfileUpdateQueueLease(Base):
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 
@@ -1297,14 +1297,14 @@ class ManagedBotProvision(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        server_default="CURRENT_TIMESTAMP",
+        server_default=text("CURRENT_TIMESTAMP"),
         nullable=False,
     )
 

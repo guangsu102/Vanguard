@@ -57,11 +57,14 @@ class CandidatePreview:
     online_count: int | None = None
     member_count_source: str = "unknown"
     evidence_collected_at: str | None = None
+    efficiency_mode: bool = False
 
     @property
     def exclusion_reason(self) -> str | None:
         if self.status in {"identity_mismatch", "not_joinable"}:
             return self.status
+        if self.efficiency_mode:
+            return None
         if self.member_count is not None and self.member_count < 50:
             return "prejoin_members_below_50"
         if (
@@ -125,6 +128,7 @@ async def public_candidate_preview(
     now: datetime | None = None,
     progress: dict | None = None,
     checkpoint: Callable[[dict], Awaitable[None]] | None = None,
+    efficiency_mode: bool = False,
 ) -> CandidatePreview:
     """Validate the peer and public metadata; qualification runs only after joining."""
     now = naive(now) or datetime.utcnow()
@@ -148,6 +152,7 @@ async def public_candidate_preview(
             "online_count": saved.get("online_count"),
             "member_count_source": saved.get("member_count_source", "unknown"),
             "evidence_collected_at": saved.get("evidence_collected_at") or saved.get("checked_at"),
+            "efficiency_mode": efficiency_mode,
         }
         return CandidatePreview(**fields)
     try:
@@ -160,14 +165,14 @@ async def public_candidate_preview(
             or actual[0] != expected[0]
             or (expected[1] is not None and actual[1] != expected[1])
         ):
-            return CandidatePreview(status="identity_mismatch")
+            return CandidatePreview(status="identity_mismatch", efficiency_mode=efficiency_mode)
         if not is_joinable_telegram_entity(entity):
-            return CandidatePreview(status="not_joinable")
+            return CandidatePreview(status="not_joinable", efficiency_mode=efficiency_mode)
     except Exception as exc:
         if isinstance(exc, RpcDeferred):
             raise
         raise_if_flood_wait(exc, operation="join_candidate_preview_entity")
-        return CandidatePreview(status="entity_unknown")
+        return CandidatePreview(status="entity_unknown", efficiency_mode=efficiency_mode)
 
     checked = saved.get("checked_at")
     try:
@@ -198,7 +203,7 @@ async def public_candidate_preview(
             online = getattr(full, "online_count", None)
             if isinstance(online, int) and not isinstance(online, bool) and online >= 0:
                 facts["online_count"] = online
-            if facts.get("member_count", 50) < 50:
+            if not efficiency_mode and facts.get("member_count", 50) < 50:
                 return CandidatePreview(status="sampled", **facts)
             about = str(getattr(full, "about", "") or "").strip()
             combined = about
@@ -217,12 +222,12 @@ async def public_candidate_preview(
             if isinstance(exc, RpcDeferred):
                 raise
             raise_if_flood_wait(exc, operation="join_candidate_preview_rules")
-            return CandidatePreview(status="preview_error", **facts)
+            return CandidatePreview(status="preview_error", efficiency_mode=efficiency_mode, **facts)
         if checkpoint is not None and rules_readable:
             await checkpoint({"checked_at": now.isoformat(), "namespace": actual[1], "entity_id": actual[0],
                               "facts": facts, "rules_readable": rules_readable, "rule_signal": rule_signal})
 
     return CandidatePreview(
-        status="metadata_checked", **facts,
+        status="metadata_checked", efficiency_mode=efficiency_mode, **facts,
         rules_readable=rules_readable, rule_signal=rule_signal,
     )

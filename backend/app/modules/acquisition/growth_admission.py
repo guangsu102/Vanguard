@@ -70,7 +70,23 @@ async def review_debt(db: Any, account_id: int, now: datetime, end: datetime) ->
     return reads, count
 
 
-async def admission_plan(db: Any, account_id: int, now: datetime, rpc: dict | None = None) -> dict:
+async def admission_plan(db: Any, account_id: int, now: datetime, rpc: dict | None = None,
+                         *, group_id: int | None = None, candidate: Any = None,
+                         read_plan: Any = None) -> dict:
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        from app.core.account.rpc_governor import snapshot
+        state = rpc if rpc is not None else await snapshot(db, account_id, now)
+        blocked = state.get("state") in {"cooldown", "unavailable"}
+        return {"remaining": 0 if blocked else 1, "reason": state.get("reason") if blocked else None,
+                "retry_after_seconds": state.get("retry_after_seconds", 0), "budget_enabled": False,
+                "review_reads_due": None, "pending_reviews": None, "available_reads": None,
+                "new_group_read_cost": None, "remaining_read_cost": None, "window_end": None,
+                "execution": {"scope": "rpc_pacing", "remaining": 0 if blocked else 1}}
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if enabled_for(account_id):
+        return await _next_step_admission(db, account_id, now, rpc, group_id=group_id,
+                                          candidate=candidate, read_plan=read_plan)
     from app.core.account.read_work import current
     from app.core.account.reserved_reads import (
         allocations,
@@ -120,3 +136,54 @@ async def admission_plan(db: Any, account_id: int, now: datetime, rpc: dict | No
             'execution': execution,
             'review_reads_due': debt, 'pending_reviews': pending, 'available_reads': room,
             'new_group_read_cost': lifecycle, 'remaining_read_cost': outstanding, 'window_end': end.isoformat()}
+
+
+async def _next_step_admission(db: Any, account_id: int, now: datetime, rpc: dict | None,
+                                *, group_id: int | None, candidate: Any, read_plan: Any) -> dict:
+    """Admit one target's next dependency, independent of historical debt.
+
+    This is a forecast only. The account/target lock and existing Redis Lua
+    retain the final authority over concurrent joins and actual spending.
+    """
+    from app.modules.acquisition.qualification_engine import initial_slots
+
+    pending = await initial_slots(db, account_id)
+    slots = max(0, 2 - pending)
+    result = {"remaining": slots, "reason": None if slots else "join_initial_collection_capacity",
+              "retry_after_seconds": 0 if slots else 60,
+              "execution": {"remaining": slots, "pending": pending, "concurrency": 2,
+                            "scope": "efficiency_first_collection", "account_id": account_id},
+              "review_reads_due": 0, "pending_reviews": pending,
+              "available_reads": None, "new_group_read_cost": 0,
+              "remaining_read_cost": 0, "window_end": None,
+              "engine_version": "efficiency_v1"}
+    # Discovery has no chosen target: do not read Telegram or reserve a
+    # fictitious lifecycle cost before a plan can name its missing facts.
+    if not slots or group_id is None:
+        return result
+    from app.modules.acquisition.review_read_plan import for_join
+    from app.core.account.critical_fairness import purpose_budget
+    from app.core.account.read_work import minimum_wait
+    from app.core.account.rpc_governor import snapshot
+
+    plan = read_plan if read_plan is not None else await for_join(db, account_id, group_id, now, candidate=candidate)
+    result.update(new_group_read_cost=plan.required_reads,
+                  remaining_read_cost=plan.required_reads, plan_scope=plan.scope,
+                  plan_version=plan.version, missing_dependencies=list(plan.missing_dependencies))
+    if plan.ready_at is not None and plan.ready_at > now:
+        return {**result, "remaining": 0, "reason": plan.reason or "join_dependency_wait",
+                "retry_after_seconds": max(1, int((plan.ready_at-now).total_seconds())),
+                "ready_at": plan.ready_at.isoformat()}
+    budget = rpc if rpc is not None else await snapshot(db, account_id, now)
+    if budget.get("state") in {"cooldown", "unavailable", "budget_wait"}:
+        return {**result, "remaining": 0, "reason": budget.get("reason") or "telegram_read_budget",
+                "retry_after_seconds": max(1, int(budget.get("retry_after_seconds") or 60))}
+    purpose = purpose_budget(budget, "auto_join")
+    room = max(0, int(purpose.get("remaining", 0)))
+    result["available_reads"] = room
+    if purpose.get("retry_after_seconds", 0) or room < plan.required_reads:
+        delay = max(int(purpose.get("retry_after_seconds") or 0),
+                    minimum_wait(budget, "auto_join", plan.required_reads) if room < plan.required_reads else 0)
+        return {**result, "remaining": 0, "reason": "telegram_read_budget",
+                "retry_after_seconds": max(1, delay)}
+    return result

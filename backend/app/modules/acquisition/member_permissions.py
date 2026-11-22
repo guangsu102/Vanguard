@@ -20,8 +20,8 @@ class Permission:
 def inspect_permission(entity: Any, permissions: Any, now: datetime) -> Permission:
     if permissions is None or not hasattr(permissions, "is_admin"):
         return Permission(None, None, "permission_unknown", now + timedelta(minutes=10))
-    if not telegram_member(entity, permissions) or getattr(permissions, "is_banned", False):
-        return Permission(False, False, "banned_in_channel" if getattr(permissions, "is_banned", False) else "not_member", exit_required=True)
+    if not telegram_member(entity, permissions):
+        return Permission(False, False, "not_member")
     if getattr(permissions, "is_admin", False) or getattr(permissions, "is_creator", False):
         return Permission(True, False, "owned_group_protected")
     participant = getattr(permissions, "participant", None)
@@ -52,6 +52,17 @@ def inspect_permission(entity: Any, permissions: Any, now: datetime) -> Permissi
 
 
 def apply_permission(member: Any, fact: Permission, now: datetime) -> None:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED and fact.member is True and member.verification_status == "complete":
+        member.permission_checked_at, member.permission_reason = now, fact.reason
+        member.can_send_text = fact.writable
+        member.review_next_at = None
+        if fact.reason in {"owned_group_protected", "paid_messages_not_authorized"}:
+            member.review_status, member.ad_status = "rejected", "blocked"
+        else:
+            member.review_status, member.ad_status = "approved", "active"
+            member.next_ad_allowed_at = member.next_ad_allowed_at or now
+        return
     member.permission_checked_at = now
     member.can_send_text = fact.writable
     member.permission_reason = fact.reason
@@ -61,7 +72,7 @@ def apply_permission(member: Any, fact: Permission, now: datetime) -> None:
         member.review_status, member.ad_status = "rejected", "blocked"
     elif fact.writable is True and member.verification_status == "complete":
         member.review_status, member.ad_status = "approved", "active"
-        member.review_next_at = now + timedelta(days=1)
+        member.review_next_at = None
         member.warmup_status = "ad_eligible"
         member.first_ad_allowed_at = now
         member.next_ad_allowed_at = member.next_ad_allowed_at or now

@@ -873,7 +873,7 @@ class TelegramWorker:
             try:
                 async with get_db_session() as db:
                     if not await relevant_ad_deletion(db, account_id, chat_id, ids):
-                        self._growth_irrelevant_deletions += 1
+                        self._growth_irrelevant_deletions = getattr(self, "_growth_irrelevant_deletions", 0) + 1
                         return
             except asyncio.CancelledError:
                 raise
@@ -1137,6 +1137,22 @@ class TelegramWorker:
             else:
                 journal.reconcile_batch()
                 rows = journal.facts()
+            if not offline:
+                info = journal.snapshot()
+                safe = info.get("protocol_checkpoint_safe") and not info.get("business_facts_pending") and not info.get("awaiting_checkpoint") and not info.get("protocol_recovery_markers")
+                marks = getattr(self, "_send_result_retention_marks", {})
+                if safe and time.monotonic() - marks.get(account_id, 0) > 3600:
+                    from app.core.settings_models import SystemSetting
+                    async with get_db_session() as db:
+                        key = f"growth.event_retention.watermark.{account_id}"
+                        row = await db.get(SystemSetting, key)
+                        value = json.dumps({"before": datetime.utcnow().isoformat(), "protocol_checkpoint_safe": True})
+                        if row:
+                            row.value = value
+                        else:
+                            db.add(SystemSetting(key=key, value=value))
+                    marks[account_id] = time.monotonic()
+                    self._send_result_retention_marks = marks
             if not rows:
                 continue
             async with get_db_session() as db:

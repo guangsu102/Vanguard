@@ -1,4 +1,4 @@
-"""Two bounded growth loops with short transactions and post-RPC result writes.
+"""Bounded growth from confirmed send results, with crash-safe attempt records.
 
 The pool and SDK governor own Telegram sessions. Redis owns execution leases
 and pacing; memberships own eligibility. Historical audits never authorize ads.
@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 import structlog
-from sqlalchemy import case, exists, func, or_, select
+from sqlalchemy import case, exists, func, or_, select, update
 from sqlalchemy.orm import aliased, lazyload
 
 from app.core.account.models import AccountOperationConfig, TelegramAccount
@@ -23,14 +23,15 @@ from app.core.group.identity import is_owned_group_target
 from app.core.group.models import Group
 from app.core.group.models import GroupAccountMembership as Member
 from app.core.redis import get_redis
-from app.modules.acquisition.adaptive_frequency import canonical, interval_seconds
+from app.modules.acquisition.adaptive_frequency import canonical
+from app.modules.acquisition.send_result_policy import (POLICY, COUNTED, EXIT_REASON, classify, next_due)
 from app.modules.acquisition.growth_policy import (
     URL,
     account_block_reason,
     manually_protected,
     policy,
 )
-from app.modules.acquisition.growth_results import profile_result, risk_failure, risk_record
+from app.modules.acquisition.growth_results import risk_failure, risk_record
 from app.modules.acquisition.member_permissions import (
     Permission,
     apply_permission,
@@ -42,8 +43,6 @@ from app.modules.acquisition.models import (
     AdCreative,
     AdDeliveryLog,
     AutoJoinAttempt,
-    GroupAdFrequency,
-    GroupAdFrequencyEvent,
     GroupAdProfile,
 )
 from app.modules.acquisition.simple_limits import (
@@ -56,7 +55,7 @@ from app.modules.acquisition.simple_limits import (
 )
 
 logger = structlog.get_logger()
-STAGES = {"ads": 60, "join": 300, "review_and_verify": 60, "daily_survival_and_exit": 600}
+STAGES = {"ads": 60, "join": 300, "review_and_verify": 60, "exit": 60}
 # A chat permission failure keeps at least this much account spacing before the
 # next ad attempt, whatever the allocator rolled back.
 PERMISSION_FAILURE_SPACING_SECONDS = 600
@@ -102,6 +101,17 @@ class GrowthService:
         config = await self.db.scalar(select(AccountOperationConfig).where(
             AccountOperationConfig.account_id == account_id).execution_options(populate_existing=True))
         reason = account_block_reason(account, datetime.utcnow())
+        from app.core.settings_models import SystemSetting
+        if account_id in {33, 34, 35} and config and config.enabled:
+            pilot = await self.db.get(SystemSetting, f"growth.canary.account.{account_id}")
+            if not pilot or not json.loads(pilot.value).get("send_result_started_at"):
+                raise Deferred("observation_activation_required")
+        pause = await self.db.get(SystemSetting, f"growth.diagnostic_pause.account.{account_id}")
+        if pause:
+            marker = json.loads(pause.value)
+            cleared = account and account.spam_check_status == "clear" and account.spam_checked_at and account.spam_checked_at > datetime.fromisoformat(marker["at"])
+            if not cleared and marker.get("until") and datetime.fromisoformat(marker["until"]) > datetime.utcnow():
+                raise Deferred("account_diagnostic_pause")
         if reason or not config or not config.enabled:
             raise Deferred(reason or "account_operation_paused")
         if config.operation_mode == "ad_only":
@@ -120,8 +130,9 @@ class GrowthService:
         return account, config
 
     async def protected(self, member: Member, group: Group) -> bool:
-        config = await policy(self.db)
-        profile = await self.db.scalar(select(GroupAdProfile).where(GroupAdProfile.group_id == group.id))
+        config = await policy(self.db, fresh=True)
+        profile = await self.db.scalar(select(GroupAdProfile).where(
+            GroupAdProfile.group_id == group.id).execution_options(populate_existing=True))
         manual_forbidden = bool(profile and (
             profile.blocked_reason == "manual_ad_policy_forbidden" or
             (profile.ad_policy_source == "manual" and profile.ad_policy_mode in {"forbidden", "approval_required"})))
@@ -135,6 +146,9 @@ class GrowthService:
             await release(self.db)
             async with lease(redis, f"account:{account_id}"):
                 await self.recover_results(account_id)
+                await self.recover_interrupted_ads(account_id)
+                from app.modules.acquisition.send_result_observation import observe
+                await observe(self.db, account_id)
                 await self.account(account_id)
                 if stage == "ads":
                     return await self.ads(account_id)
@@ -142,7 +156,7 @@ class GrowthService:
                     return await self.join(account_id)
                 if stage == "review_and_verify":
                     return await self.review(account_id)
-                if stage == "daily_survival_and_exit":
+                if stage == "exit":
                     return await self.maintenance(account_id)
                 return result("retired_stage")
         except Deferred as exc:
@@ -193,8 +207,6 @@ class GrowthService:
                 await redis.set(key, "completed", ex=172800)
                 await redis.set(completed_key, "completed", ex=172800)
             return False
-        if fact.writable is True:
-            return True
         # Absence of a prompt is not proof that a previously observed challenge passed.
         return member.verification_status != "pending"
 
@@ -210,9 +222,10 @@ class GrowthService:
         query = select(Member).options(lazyload("*")).where(
             Member.account_id == account_id, Member.status == "joined",
             Member.ad_status != "paused", Member.leave_requested_at.is_(None),
+            Member.review_status == "pending",
             or_(Member.review_next_at.is_(None), Member.review_next_at <= now),
-        ).order_by(case((Member.verification_status == "pending", 0), else_=1),
-                   Member.review_next_at.asc().nullsfirst(), Member.id).limit(limit)
+        ).order_by(Member.review_next_at.asc().nullsfirst(),
+                   case((Member.verification_status == "pending", 0), else_=1), Member.id).limit(limit)
         if not review_enabled:
             query = query.where(Member.verification_status == "pending")
         members = list((await self.db.scalars(query)).all())
@@ -249,13 +262,13 @@ class GrowthService:
                     if fact.member is True:
                         complete = await self.verify(wrapper, entity, member, fact, options)
                     if not complete and fact.member is True:
-                        fact = Permission(True, fact.writable, "verification_pending", now + timedelta(minutes=1))
+                        attempts = int(member.review_attempts or 0) + 1
+                        delay = min(1800, 60 * 2 ** min(attempts - 1, 5))
+                        fact = Permission(True, fact.writable, "verification_pending", now + timedelta(seconds=delay))
             except Exception as exc:
                 exc_type = type(exc).__name__
                 if exc_type == "UserNotParticipantError":
                     fact = Permission(False, False, "not_member")
-                elif exc_type in ("UserBannedInChannelError", "ChannelPrivateError", "ChatAdminRequiredError"):
-                    fact = Permission(False, False, exc_type, exit_required=True)
                 else:
                     delay = max(60, int(getattr(exc, "seconds", getattr(exc, "retry_after_seconds", 600))))
                     fact = Permission(None, None, getattr(exc, "reason", exc_type), now + timedelta(seconds=delay))
@@ -266,8 +279,10 @@ class GrowthService:
                     current.telegram_group_id = marked_target
                 if complete:
                     current.verification_status = "complete"
+                    current.review_attempts = 0
                 elif fact.reason == "verification_pending":
                     current.verification_status = "pending"
+                    current.review_attempts = int(current.review_attempts or 0) + 1
                 apply_permission(current, fact, datetime.utcnow())
                 checked += 1
                 approved += int(current.review_status == "approved")
@@ -322,6 +337,10 @@ class GrowthService:
                 group = await self.db.scalar(select(Group).where(Group.group_id.in_(aliases)).limit(1))
                 if await is_owned_group_target(self.db, telegram_group_id=target):
                     raise Deferred("owned_group_protected")
+                if group and await self.db.scalar(select(Member.id).where(
+                        Member.account_id == account_id, Member.group_id == group.id,
+                        Member.leave_error == EXIT_REASON).limit(1)):
+                    raise Deferred("automatic_rejoin_blocked")
                 if group and (await self.protected(Member(), group) or await self.db.scalar(
                         select(Group.id).where(Group.id == group.id, group_occupied(datetime.utcnow())))):
                     raise Deferred("join_target_protected_or_occupied")
@@ -524,7 +543,7 @@ class GrowthService:
         """Recheck mutable controls after entity resolution, immediately before debit/RPC."""
         from app.core.automation_settings import get_auto_join_scheduler_settings
         from app.core.group.identity import telegram_group_id_aliases
-        from app.modules.acquisition.join_budget import JoinRequestBudgetService
+        from app.modules.acquisition.join_budget import JOIN_REQUEST_HARD_CAP, JoinRequestBudgetService
         from app.modules.acquisition.join_claims import group_occupied
         now = datetime.utcnow()
         account, config = await self.account(account_id)
@@ -538,6 +557,10 @@ class GrowthService:
             raise Deferred(reason or "group_capacity")
         if config.next_join_after and config.next_join_after > now:
             raise Deferred("join_cooldown", int((config.next_join_after - now).total_seconds()))
+        if group and await self.db.scalar(select(Member.id).where(
+                Member.account_id == account_id, Member.group_id == group.id,
+                Member.leave_error == EXIT_REASON).limit(1)):
+            raise Deferred("automatic_rejoin_blocked")
         if await is_owned_group_target(self.db, telegram_group_id=target):
             raise Deferred("owned_group_protected")
         if group and (await self.protected(Member(), group) or await self.db.scalar(
@@ -548,8 +571,14 @@ class GrowthService:
         used = await self.db.scalar(select(func.count(AutoJoinAttempt.id)).where(
             AutoJoinAttempt.account_id == account_id, AutoJoinAttempt.telegram_action_attempted.is_(True),
             AutoJoinAttempt.attempted_at >= now.replace(hour=0, minute=0, second=0, microsecond=0)))
+        from app.core.account.outbound_budget import effective_capacity_limits
+        limits = await effective_capacity_limits(self.db, account, config, now)
+        join_cap = min(JOIN_REQUEST_HARD_CAP, limits["join"], max(0, int(config.max_groups_per_day or 0)))
+        join_interval = max(7200 if recovering else 2880, limits["join_interval_seconds"],
+                            int(config.join_interval_min_seconds or 0))
         await release(self.db)
-        return await take_join(await get_redis(), account_id, recovering=recovering, durable_used=used)
+        return await take_join(await get_redis(), account_id, recovering=recovering,
+                               durable_used=used, cap=join_cap, interval=join_interval)
 
     async def persist_join_result(self, data: dict) -> dict:
         from app.core.group.identity import telegram_group_id_aliases
@@ -631,7 +660,7 @@ class GrowthService:
             .options(lazyload("*"))
             .where(Member.account_id == account_id, Member.status == "joined", Member.left_at.is_(None),
                 Member.review_status == "approved", Member.ad_status == "active",
-                Member.can_send_text.is_(True), Member.verification_status == "complete",
+                Member.verification_status == "complete",
                 Member.next_ad_allowed_at <= now, Member.leave_requested_at.is_(None),
                 ~exists().where(other_member.group_id == Member.group_id,
                                 other_member.next_ad_allowed_at > now),
@@ -683,15 +712,11 @@ class GrowthService:
                     # the account is held at the configured minimum spacing and
                     # this stage stops; the group is requeued for review by the
                     # persisted result.
-                    from app.modules.acquisition.simple_limits import revert_ad
-                    await revert_ad(redis, account_id,
-                                    cooldown_seconds=await self._permission_retry_spacing(
-                                        account, config, now))
                     return sent
                 if sent.get("reason") not in (
                     "group_send_interval", "frequency_paused", "permission_refresh_required",
                     "final_gate_denied", "text_profile_required", "delivery_target_removed",
-                    "invalid_group_identity"
+                    "invalid_group_identity", "group_daily_cap"
                 ):
                     return sent
             except Deferred as exc:
@@ -722,18 +747,53 @@ class GrowthService:
         await self.recover_results(account_id)
         async with lease(redis, f"group:{key}"):
             async with self.client(account_id, "ad_delivery") as wrapper:
-                entity = await wrapper.client.get_input_entity(key)
+                try:
+                    entity = await wrapper.client.get_input_entity(key)
+                except Exception as exc:
+                    return await self.resolution_failure(account_id, member_id, campaign_id, creative_id, key, exc)
                 return await self._send(account_id, member_id, campaign_id, creative_id, key, wrapper, entity)
+
+    async def resolution_failure(self, account_id: int, member_id: int, campaign_id: int, creative_id: int, key: int, exc: Exception) -> dict:
+        from app.core.automation_settings import get_ad_delivery_execution_settings
+        account, config = await self.account(account_id)
+        member = await self.db.get(Member, member_id, populate_existing=True)
+        group = await self.db.get(Group, member.group_id) if member else None
+        if not member or not group or member.status != "joined" or await self.protected(member, group):
+            return result("final_gate_denied")
+        settings = await get_ad_delivery_execution_settings(self.db)
+        now = datetime.utcnow()
+        outcome = classify(exc)
+        if outcome == "unknown":
+            outcome = "failed"  # Resolution failed before any advertising write was attempted.
+        data = {"account_id": account_id, "member_id": member_id, "group_id": group.id,
+                "campaign_id": campaign_id, "creative_id": creative_id, "key": key,
+                "attempt": uuid4().hex, "generation": member.joined_at.isoformat() if member.joined_at else None,
+                "sent": now.isoformat(), "gap": settings["send_failure_retry_seconds"],
+                "message_id": None, "outcome": outcome, "error": type(exc).__name__,
+                "retry_seconds": settings["send_failure_retry_seconds"],
+                "exit_threshold": settings["send_failure_exit_threshold"], "admitted_at": None,
+                "wait_seconds": max(0, int(getattr(exc, "seconds", 0))) + 1,
+                "failure": risk_record(exc, "ad_delivery")}
+        saved = await self.persist_ad_result(data)
+        if outcome == "permission_changed":
+            await release(self.db)
+            redis = await get_redis()
+            due = now.replace(tzinfo=UTC).timestamp() + max(600, int(config.message_interval_seconds or 0))
+            previous = float(await redis.get(PREFIX + f"ads:{account_id}:due") or 0)
+            await redis.set(PREFIX + f"ads:{account_id}:due", max(previous, due), ex=86400)
+        return saved
 
     async def _send(self, account_id: int, member_id: int, campaign_id: int, creative_id: int,
                     key: int, wrapper: Any, entity: Any) -> dict:
-        """Single final gate; no reservation rows or active audit grants."""
-        from app.core.automation_settings import get_ad_delivery_execution_settings
+        from app.core.automation_settings import get_ad_delivery_execution_settings, get_ad_delivery_throttle_settings
+        from app.core.account.outbound_budget import effective_capacity_limits
+        from app.core.operating_time import operating_day_start
+        from app.core.group.identity import telegram_group_id_aliases
         now = datetime.utcnow()
-        _account, config = await self.account(account_id)
+        account, config = await self.account(account_id)
         member = await self.db.get(Member, member_id, populate_existing=True)
-        if member is None or member.account_id != account_id or canonical(member.telegram_group_id) != key:
-            return result("membership_identity_changed")
+        if member is None:
+            return result("delivery_target_removed")
         group = await self.db.get(Group, member.group_id, populate_existing=True)
         campaign = await self.db.get(AdCampaign, campaign_id, populate_existing=True)
         creative = await self.db.get(AdCreative, creative_id, populate_existing=True)
@@ -741,113 +801,122 @@ class GrowthService:
             AccountAdBinding.account_id == account_id, AccountAdBinding.ad_campaign_id == campaign_id,
             or_(AccountAdBinding.creative_id == creative_id, AccountAdBinding.creative_id.is_(None)),
             AccountAdBinding.enabled.is_(True)))
+        settings = await get_ad_delivery_execution_settings(self.db)
         if not group or not campaign or not creative:
             return result("delivery_target_removed")
-        if (not config.auto_ads_enabled or not (await get_ad_delivery_execution_settings(self.db))["enabled"]
-                or not binding or not campaign_matches(campaign, group, now)
-                or member.status != "joined" or member.review_status != "approved"
-                or member.ad_status != "active" or member.verification_status != "complete"
-                or member.can_send_text is not True or member.leave_requested_at
-                or (member.ad_pause_until and member.ad_pause_until > now)
+        if (not config.auto_ads_enabled or not settings["enabled"] or not binding
+                or not campaign_matches(campaign, group, now) or member.status != "joined"
+                or member.review_status != "approved" or member.ad_status != "active"
+                or member.verification_status != "complete"
+                or member.leave_requested_at or (member.ad_pause_until and member.ad_pause_until > now)
                 or (group.ad_delivery_account_id and group.ad_delivery_account_id != account_id)
                 or (member.next_ad_allowed_at and member.next_ad_allowed_at > now)
-                or self.service._in_quiet_hours(config, now)
-                or await self.protected(member, group)):
+                or self.service._in_quiet_hours(config, now) or await self.protected(member, group)):
             return result("final_gate_denied")
         if (not creative.enabled or creative.creative_type != "text" or not creative.content.strip()
                 or creative.media_url or creative.link_url or URL.search(creative.content)):
             return result("text_profile_required")
-        if member.permission_checked_at is None or member.permission_checked_at < now - timedelta(days=1):
-            member.review_status, member.review_next_at = "pending", now
-            await self.db.commit()
-            return result("permission_refresh_required")
-        frequency = await self.db.get(GroupAdFrequency, key)
-        quota = frequency.quota if frequency else 1
-        if frequency and (frequency.status != "active" or (frequency.pause_until and frequency.pause_until > now)):
-            return result("frequency_paused")
         if campaign.send_mode == "scheduled" and self.service._scheduled_slot_start(campaign, now) is None:
             return result("scheduled_time_not_due")
-        from app.core.group.identity import telegram_group_id_aliases
+        aliases = telegram_group_id_aliases(key)
         shared_due = await self.db.scalar(select(func.max(Member.next_ad_allowed_at)).where(
-            Member.telegram_group_id.in_(telegram_group_id_aliases(key))))
+            Member.telegram_group_id.in_(aliases)))
         if shared_due and shared_due > now:
             return result("group_send_interval")
-        from app.core.automation_settings import get_ad_delivery_execution_settings
-        execution_settings = await get_ad_delivery_execution_settings(self.db)
-        global_group_cooldown = int(execution_settings.get("growth_group_global_cooldown_seconds") or 10800)
-        gap = max(global_group_cooldown, int(campaign.interval_minutes or 0) * 60)
-        if campaign.max_sends_per_group_per_day:
-            gap = max(gap, interval_seconds(campaign.max_sends_per_group_per_day))
-        from app.core.account.outbound_budget import effective_capacity_limits
-        from app.core.automation_settings import get_ad_delivery_throttle_settings
-        limits = await effective_capacity_limits(self.db, _account, config, now)
+        counted = (AdDeliveryLog.status.in_(COUNTED), AdDeliveryLog.created_at >= operating_day_start(now))
+        group_used = await self.db.scalar(select(func.count(AdDeliveryLog.id)).where(
+            *counted, AdDeliveryLog.telegram_group_id.in_(aliases), AdDeliveryLog.ad_campaign_id == campaign_id)) or 0
+        own_used = await self.db.scalar(select(func.count(AdDeliveryLog.id)).where(
+            *counted, AdDeliveryLog.account_id == account_id, AdDeliveryLog.group_id == group.id)) or 0
+        if (group_used >= campaign.max_sends_per_group_per_day
+                or own_used >= member.account_group_daily_cap):
+            member.next_ad_allowed_at = operating_day_start(now) + timedelta(days=1)
+            await self.db.commit()
+            return result("group_daily_cap")
+        gap = max(int(settings["growth_group_global_cooldown_seconds"]), int(campaign.interval_minutes or 0) * 60)
+        limits = await effective_capacity_limits(self.db, account, config, now)
         if limits["action_pauses"].get("ad"):
             return result("ad_flood_wait")
         cap = min(limits["ad"], campaign.max_sends_per_account_per_day, limits["total"])
         throttle = await get_ad_delivery_throttle_settings(self.db)
         account_gap = max(limits["ad_interval_seconds"],
                           throttle["growth_min_interval_seconds"] if throttle["enabled"] else 0)
-        body, group_id, generation = creative.content, group.id, member.joined_at
-        attempt = uuid4().hex
+        data = {"account_id": account_id, "member_id": member_id, "group_id": group.id,
+                "campaign_id": campaign_id, "creative_id": creative_id, "key": key,
+                "attempt": uuid4().hex, "generation": member.joined_at.isoformat() if member.joined_at else None,
+                "sent": now.isoformat(), "gap": gap, "quota": 0, "message_id": None, "message_ttl": None,
+                "outcome": "unknown", "error": None, "failure": None, "admitted_at": None,
+                "failure_spacing": max(account_gap, PERMISSION_FAILURE_SPACING_SECONDS),
+                "retry_seconds": settings["send_failure_retry_seconds"],
+                "exit_threshold": settings["send_failure_exit_threshold"], "wait_seconds": 0,
+                "automatic_expiry_known": False, "policy": POLICY}
+        body = creative.content
         await release(self.db)
         redis = await get_redis()
-        message_id = None
-        message_ttl = None
-        outcome, error, failure = "unknown", None, None
+        async with lease(redis, f"outbound-admission:{account_id}"):
+            durable_used = await durable_outbound_used(self.db, account_id, now)
+            durable_ads = await self.db.scalar(select(func.count(AdDeliveryLog.id)).where(
+                AdDeliveryLog.account_id == account_id, *counted)) or 0
+            await release(self.db)
+            data["admitted_at"] = datetime.utcnow().isoformat()
+            await take_ad(redis, account_id, key, cap=cap, account_interval=account_gap,
+                          group_interval=gap, total_cap=limits["total"], durable_used=durable_used,
+                          durable_ads=durable_ads, attempt_id=data["attempt"])
+            try:
+                current = await self.db.scalar(select(Member).options(lazyload("*")).where(
+                    Member.id == member_id).execution_options(populate_existing=True).with_for_update(of=Member))
+                _, final_config = await self.account(account_id)
+                final_settings = await get_ad_delivery_execution_settings(self.db)
+                final_group = await self.db.get(Group, data["group_id"], populate_existing=True)
+                final_campaign = await self.db.get(AdCampaign, campaign_id, populate_existing=True)
+                final_creative = await self.db.get(AdCreative, creative_id, populate_existing=True)
+                final_binding = await self.db.scalar(select(AccountAdBinding.id).where(
+                    AccountAdBinding.account_id == account_id, AccountAdBinding.ad_campaign_id == campaign_id,
+                    or_(AccountAdBinding.creative_id == creative_id, AccountAdBinding.creative_id.is_(None)),
+                    AccountAdBinding.enabled.is_(True)))
+                if (not current or current.status != "joined" or current.ad_status != "active"
+                        or current.review_status != "approved" or current.verification_status != "complete"
+                        or (current.joined_at.isoformat() if current.joined_at else None) != data["generation"]
+                        or current.leave_requested_at
+                        or (current.ad_pause_until and current.ad_pause_until > datetime.utcnow())
+                        or not final_config.auto_ads_enabled or not final_settings["enabled"]
+                        or not final_binding or self.service._in_quiet_hours(final_config, datetime.utcnow())
+                        or not final_group or not final_campaign
+                        or not campaign_matches(final_campaign, final_group, datetime.utcnow())
+                        or (final_group.ad_delivery_account_id and final_group.ad_delivery_account_id != account_id)
+                        or not final_creative or not final_creative.enabled or final_creative.content != body
+                        or final_creative.creative_type != "text" or final_creative.media_url or final_creative.link_url
+                        or await self.protected(current, final_group)):
+                    raise Deferred("final_gate_denied")
+                self.db.add(AdDeliveryLog(account_id=account_id, group_id=data["group_id"],
+                    telegram_group_id=key, ad_campaign_id=campaign_id, creative_id=creative_id,
+                    reservation_token=data["attempt"], status="sending", created_at=now,
+                    survival_status="not_required", survival_stage="complete",
+                    qualification_context_json=json.dumps({"policy": POLICY, "attempt_context": data})))
+                current.next_ad_allowed_at = next_due(now, gap, "unknown", data["retry_seconds"])
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                from app.modules.acquisition.simple_limits import revert_ad
+                await revert_ad(redis, account_id, attempt_id=data["attempt"],
+                                admitted_at=datetime.fromisoformat(data["admitted_at"]),
+                                cooldown_seconds=data["failure_spacing"])
+                raise
         cancelled = False
         try:
-            # Entity resolution has finished before the final business gate above.
-            # All remaining database reads are released before Redis admission/RPC.
-            if wrapper:
-                async with lease(redis, f"outbound-admission:{account_id}"):
-                    durable_used = await durable_outbound_used(self.db, account_id, datetime.utcnow())
-                    from app.core.operating_time import operating_day_start
-                    durable_ads = await self.db.scalar(select(func.count(AdDeliveryLog.id)).where(
-                        AdDeliveryLog.account_id == account_id, AdDeliveryLog.created_at >= operating_day_start(),
-                        AdDeliveryLog.status == "success"))
-                    await release(self.db)
-                    await take_ad(redis, account_id, key, cap=cap, account_interval=account_gap,
-                                  group_interval=gap, total_cap=limits["total"],
-                                  durable_used=durable_used, durable_ads=durable_ads)
-                try:
-                    message = await wrapper.client.send_message(entity, body, parse_mode=None, link_preview=False)
-                    value = getattr(message, "id", None)
-                    message_id = value if isinstance(value, int) and value > 0 else None
-                    message_ttl = getattr(message, "ttl_period", None)
-                    outcome = "success" if message_id else "unknown"
-                    error = None if message_id else "message_id_missing"
-                except asyncio.CancelledError:
-                    outcome, error, cancelled = "unknown", "operation_cancelled", True
-                except Exception as exc:
-                    failure = exc
-                    error = type(exc).__name__
-                    outcome = "unknown" if isinstance(exc, (TimeoutError, OSError)) else "failed"
-                    if error == "SlowModeWaitError":
-                        gap = max(gap, int(exc.seconds) + 1)
-                    if error in {"ChatWriteForbiddenError", "ChatRestrictedError",
-                                 "UserBannedInChannelError", "ChannelPrivateError"}:
-                        outcome = "permission_changed"
-        except Deferred:
-            raise
-        data = {
-            'account_id': account_id,
-            'member_id': member_id,
-            'group_id': group_id,
-            'campaign_id': campaign_id,
-            'creative_id': creative_id,
-            'key': key,
-            'attempt': attempt,
-            'generation': generation.isoformat() if generation else None,
-            'sent': datetime.utcnow().isoformat(),
-            'gap': gap,
-            'quota': quota,
-            'message_id': message_id,
-            'message_ttl': message_ttl,
-            'outcome': outcome,
-            'error': error,
-            'automatic_expiry_known': hasattr(message, "ttl_period") if message_id else False,
-            'failure': risk_record(failure, "ad_delivery"),
-        }
+            message = await wrapper.client.send_message(entity, body, parse_mode=None, link_preview=False)
+            value = getattr(message, "id", None)
+            data["message_id"] = value if type(value) is int and value > 0 else None
+            data["outcome"] = "success" if data["message_id"] else "unknown"
+            data["error"] = None if data["message_id"] else "message_id_missing"
+        except asyncio.CancelledError:
+            data["error"], cancelled = "operation_cancelled", True
+        except Exception as exc:
+            data["outcome"], data["error"] = classify(exc), type(exc).__name__
+            data["wait_seconds"] = max(0, int(getattr(exc, "seconds", 0))) + (1 if hasattr(exc, "seconds") else 0)
+            data["failure"] = risk_record(exc, "ad_delivery")
+            if data["outcome"] == "rate_limited" and data["error"] != "SlowModeWaitError":
+                data["failure_spacing"] = max(data["failure_spacing"], data["wait_seconds"])
         saved = await self.save_result(data)
         if cancelled:
             raise asyncio.CancelledError()
@@ -862,6 +931,7 @@ class GrowthService:
         except Exception:
             logger.exception("growth_result_journal_unavailable", attempt=attempt, message_id=data.get("message_id"))
         saved = await (self.persist_join_result(data) if data.get("kind") == "join" else self.persist_ad_result(data))
+        await self.settle_admission(data)
         await release(self.db)
         await redis.hdel(journal, attempt)
         return saved
@@ -876,162 +946,104 @@ class GrowthService:
             name = "join-target" if data.get("kind") == "join" else "group"
             async with lease(redis, f"{name}:{canonical(data['key'])}"):
                 await (self.persist_join_result(data) if name == "join-target" else self.persist_ad_result(data))
+                await self.settle_admission(data)
                 await release(self.db)
                 await redis.hdel(journal, attempt)
         if len(pending) > limit:
             raise Deferred("result_commit_backlog", 15)
 
+    async def settle_admission(self, data: dict) -> None:
+        """Release a definite failure once; keep unknown writes and all cooldowns."""
+        if data.get("outcome") not in {"failed", "permission_changed", "content_invalid", "not_member", "rate_limited"} or not data.get("admitted_at"):
+            return
+        from app.modules.acquisition.simple_limits import revert_ad
+        await release(self.db)
+        await revert_ad(await get_redis(), data["account_id"], attempt_id=data["attempt"],
+                        admitted_at=datetime.fromisoformat(data["admitted_at"]),
+                        cooldown_seconds=max(PERMISSION_FAILURE_SPACING_SECONDS,
+                                             int(data.get("failure_spacing") or 0)))
+        if data["outcome"] == "permission_changed":
+            from app.modules.acquisition.growth_controls import pause_repeated_permission_failures
+            await pause_repeated_permission_failures(self.db, data["account_id"], datetime.utcnow())
+
     async def persist_ad_result(self, data: dict) -> dict:
-        account_id, member_id, group_id = data["account_id"], data["member_id"], data["group_id"]
-        campaign_id, creative_id, key = data["campaign_id"], data["creative_id"], data["key"]
-        attempt, gap, quota = data["attempt"], data["gap"], data["quota"]
         sent = datetime.fromisoformat(data["sent"])
-        generation = datetime.fromisoformat(data["generation"]) if data["generation"] else None
-        message_id, message_ttl = data["message_id"], data["message_ttl"]
-        outcome, error, failure = data["outcome"], data["error"], data["failure"]
-        # Retry only this result transaction. The Telegram call is outside the loop.
+        generation = datetime.fromisoformat(data["generation"]) if data.get("generation") else None
+        outcome, message_id = data["outcome"], data.get("message_id")
         for retry in range(3):
             try:
-                existing = await self.db.scalar(select(AdDeliveryLog.id).where(AdDeliveryLog.reservation_token == attempt))
-                if existing:
-                    return result(succeeded=int(message_id is not None), message_id=message_id)
-                log = AdDeliveryLog(account_id=account_id, group_id=group_id, telegram_group_id=key,
-                    ad_campaign_id=campaign_id, creative_id=creative_id, reservation_token=attempt,
-                    status=outcome, telegram_message_id=message_id, sent_at=sent if message_id else None, created_at=sent,
-                    error=error, survival_stage="daily", survival_status="pending" if message_id else "not_required",
-                    qualification_context_json=json.dumps({"policy": "writable_v2", "survival_policy": "daily_last_ad",
-                        "sent_quota": quota, "message_ttl_seconds": message_ttl,
-                        "automatic_expiry_known": data["automatic_expiry_known"],
-                        "membership_joined_at": generation.isoformat() if generation else None}))
-                self.db.add(log)
+                log = await self.db.scalar(select(AdDeliveryLog).options(lazyload("*")).where(
+                    AdDeliveryLog.reservation_token == data["attempt"]).with_for_update(of=AdDeliveryLog))
+                if log is not None and log.status != "sending":
+                    return result(succeeded=int(log.status == "success"), message_id=log.telegram_message_id,
+                                  outcome=log.status)
+                if log is None:
+                    log = AdDeliveryLog(account_id=data["account_id"], group_id=data["group_id"],
+                        telegram_group_id=data["key"], ad_campaign_id=data["campaign_id"],
+                        creative_id=data["creative_id"], reservation_token=data["attempt"], created_at=sent)
+                    self.db.add(log)
+                log.status, log.error = outcome, data.get("error")
+                log.telegram_message_id, log.sent_at = message_id, sent if message_id else None
+                log.survival_status, log.survival_stage, log.survival_check_due_at = "not_required", "complete", None
+                log.qualification_context_json = json.dumps({"policy": POLICY, "membership_joined_at": data.get("generation"),
+                    "attempt_context": data, "automatic_resend": False})
                 await self.db.flush()
-                current = await self.db.get(Member, member_id, populate_existing=True)
-                if current and current.joined_at == generation:
-                    current.next_ad_allowed_at = max(current.next_ad_allowed_at or sent, sent + timedelta(seconds=gap))
-                    if outcome == "permission_changed" and current.ad_status != "paused":
-                        if error in ("UserBannedInChannelError", "ChannelPrivateError"):
-                            current.status = "left"
-                            current.left_at = sent
-                            current.review_status = "rejected"
+                current = await self.db.scalar(select(Member).options(lazyload("*")).where(Member.id == data["member_id"]).with_for_update(of=Member))
+                newer = await self.db.scalar(select(AdDeliveryLog.id).where(
+                    AdDeliveryLog.account_id == data["account_id"], AdDeliveryLog.group_id == data["group_id"],
+                    AdDeliveryLog.created_at > sent).limit(1))
+                if current and current.joined_at == generation and not newer and current.status == "joined":
+                    current.next_ad_allowed_at = max(current.next_ad_allowed_at or sent,
+                        next_due(sent, data["gap"], outcome, data.get("retry_seconds", 1800), data.get("wait_seconds", 0)))
+                    if outcome == "success":
+                        current.ad_failure_streak = 0
+                        if current.ad_status != "paused":
+                            current.can_send_text, current.permission_reason = True, "send_confirmed"
+                    elif outcome == "permission_changed" and current.ad_status != "paused":
+                        current.ad_failure_streak = int(current.ad_failure_streak or 0) + 1
+                        current.permission_reason = data.get("error")
+                        if current.ad_failure_streak >= data.get("exit_threshold", 3):
+                            current.leave_requested_at, current.leave_retry_at = sent, sent
+                            current.leave_error, current.leave_attempts = EXIT_REASON, 0
                             current.ad_status = "blocked"
-                            current.permission_reason = error
-                            current.leave_requested_at = sent
-                            current.leave_error = error
-                        else:
-                            current.review_status, current.ad_status = "pending", "blocked"
-                            current.review_next_at = sent
-                if message_id:
-                    state = await self.db.get(GroupAdFrequency, key)
-                    if state is None:
-                        state = GroupAdFrequency(telegram_group_id=key, quota=8, epoch=1,
-                            epoch_started_at=sent, status="active", mature=True)
-                        self.db.add(state)
-                    # The deadline is fixed by the first successful send in the cycle.
-                    if state.daily_review_due_at is None:
-                        state.daily_review_due_at = sent + timedelta(days=1)
-                    if sent < state.daily_review_due_at:
-                        state.daily_review_log_id = log.id
-                    log.survival_check_due_at = state.daily_review_due_at
-                    await profile_result(self.db, group_id, key, quota, sent)
-                await risk_failure(self.db, account_id, "ad_delivery", failure, key, sent)
+                    elif outcome == "not_member":
+                        current.status, current.left_at = "left", sent
+                        current.ad_status, current.review_status = "blocked", "rejected"
+                    elif outcome == "content_invalid":
+                        creative = await self.db.get(AdCreative, data["creative_id"])
+                        if creative:
+                            creative.enabled = False
+                await risk_failure(self.db, data["account_id"], "ad_delivery", data.get("failure"), data["key"], sent)
                 await self.db.commit()
-                return result(succeeded=int(message_id is not None), message_id=message_id, outcome=outcome)
+                return result(succeeded=int(outcome == "success"), message_id=message_id, outcome=outcome,
+                              failed=int(outcome in {"failed", "permission_changed", "content_invalid", "not_member"}),
+                              unknown=int(outcome == "unknown"))
             except Exception:
                 await self.db.rollback()
                 if retry == 2:
-                    logger.error("growth_result_commit_failed", account_id=account_id, group_id=group_id,
-                                 message_id=message_id, attempt=attempt)
                     raise
                 await asyncio.sleep(0.1 * (retry + 1))
 
-    async def maintenance(self, account_id: int, limit: int = 2) -> dict:
-        now = datetime.utcnow()
-        states = list((await self.db.scalars(select(GroupAdFrequency).join(AdDeliveryLog,
-            AdDeliveryLog.id == GroupAdFrequency.daily_review_log_id).where(
-                AdDeliveryLog.account_id == account_id, GroupAdFrequency.status == "active",
-                GroupAdFrequency.daily_review_due_at <= now,
-                or_(GroupAdFrequency.daily_review_retry_at.is_(None), GroupAdFrequency.daily_review_retry_at <= now),
-            ).order_by(GroupAdFrequency.daily_review_due_at).limit(limit))).all())
-        checked = 0
-        for state in states:
-            key, log_id = state.telegram_group_id, state.daily_review_log_id
-            redis = await get_redis()
-            await release(self.db)
-            async with lease(redis, f"group:{key}"):
-                log = await self.db.get(AdDeliveryLog, log_id)
-                member = await self.db.scalar(select(Member).where(Member.account_id == account_id, Member.group_id == log.group_id))
-                group = await self.db.get(Group, log.group_id)
-                if member is None or member.status != "joined" or await self.protected(member, group):
-                    continue
-                member_id, generation, checked_generation = member.id, member.joined_at, member.permission_checked_at
-                fact = None
-                observation, error = "unknown", None
-                try:
-                    async with self.client(account_id, "ad_survival_check") as wrapper:
-                        entity = await wrapper.client.get_entity(key)
-                        rights = await wrapper.client.get_permissions(entity, "me")
-                        fact = inspect_permission(entity, rights, now)
-                        message = await wrapper.client.get_messages(entity, ids=log.telegram_message_id)
-                        if getattr(message, "id", None) == log.telegram_message_id and not getattr(message, "ttl_period", None):
-                            observation = "survived"
-                        elif message is None and fact.member is True and fact.writable is True:
-                            # Missing alone is not deletion: rule out automatic disappearance.
-                            from telethon.tl.functions.channels import GetFullChannelRequest
-                            from telethon.tl.functions.messages import GetFullChatRequest
-                            from telethon.tl.types import Chat
-                            request = GetFullChatRequest(entity.id) if isinstance(entity, Chat) else GetFullChannelRequest(entity)
-                            full = await wrapper.client(request)
-                            sent_context = json.loads(log.qualification_context_json or "{}")
-                            ttl = sent_context.get("message_ttl_seconds")
-                            if (type(ttl) is int and ttl > 0 and log.sent_at
-                                    and log.sent_at + timedelta(seconds=ttl) <= now):
-                                observation = "auto_expired"
-                            elif (sent_context.get("automatic_expiry_known") is True
-                                    and not sent_context.get("message_ttl_seconds")
-                                    and hasattr(full.full_chat, "ttl_period") and full.full_chat.ttl_period in (None, 0)):
-                                observation = "missing"
-                except Exception as exc:
-                    error = type(exc).__name__
-                state = await self.db.get(GroupAdFrequency, key, populate_existing=True)
-                log = await self.db.get(AdDeliveryLog, log_id, populate_existing=True)
-                member = await self.db.get(Member, member_id, populate_existing=True)
-                if (state.daily_review_log_id != log_id or member is None or member.status != "joined"
-                        or member.joined_at != generation or member.permission_checked_at != checked_generation
-                        or member.ad_status == "paused"):
-                    continue
-                if fact and fact.exit_required:
-                    apply_permission(member, fact, now)
-                if observation == "missing":
-                    observation = "deleted" if (state.daily_review_error == "missing_once"
-                        and state.daily_review_checked_at and state.daily_review_checked_at <= now - timedelta(minutes=2)) else "unknown"
-                    error = "missing_once" if observation == "unknown" else None
-                if observation not in {"survived", "deleted", "auto_expired"}:
-                    state.daily_review_error, state.daily_review_retry_at = error or "observation_unknown", now + timedelta(minutes=10)
-                    state.daily_review_checked_at = now
-                    await self.db.commit()
-                    continue
-                old = state.quota
-                if observation == "survived":
-                    state.quota = min(30, old * 2)
-                elif observation == "deleted":
-                    state.quota = max((q for q in (1, 2, 4, 8, 16, 30) if q < old), default=1)
-                state.daily_review_checked_at, state.daily_review_error = now, None
-                state.daily_review_due_at = state.daily_review_log_id = state.daily_review_retry_at = None
-                state.epoch += 1
-                state.epoch_started_at = now
-                log.survival_status, log.survival_checked_at = observation, now
-                log.survival_stage = "complete"
-                self.db.add(GroupAdFrequencyEvent(telegram_group_id=key, log_id=log_id,
-                    kind="daily_" + observation, epoch=state.epoch, old_quota=old, new_quota=state.quota))
-                await profile_result(self.db, log.group_id, key, state.quota, now, observation)
-                if observation == "deleted" and old == 1:
-                    state.status, state.reason = "exit_pending", "deleted_at_minimum"
-                    member.leave_requested_at, member.leave_retry_at, member.leave_error = now, now, "deleted_at_minimum"
-                    member.ad_status = "blocked"
-                await self.db.commit()
-                checked += 1
+    async def recover_interrupted_ads(self, account_id: int) -> int:
+        # Caller owns the account lease. No active request can be replayed here.
+        rows = list((await self.db.scalars(select(AdDeliveryLog).where(
+            AdDeliveryLog.account_id == account_id, AdDeliveryLog.status == "sending",
+            AdDeliveryLog.qualification_context_json.contains(POLICY)
+        ).order_by(AdDeliveryLog.created_at, AdDeliveryLog.id).limit(20))).all())
+        recovered = 0
+        for log in rows:
+            context = json.loads(log.qualification_context_json or "{}")
+            data = context.get("attempt_context")
+            if context.get("policy") != POLICY or not data:
+                continue
+            data.update(outcome="unknown", error="interrupted_without_receipt")
+            await self.persist_ad_result(data)
+            recovered += 1
+        return recovered
+
+    async def maintenance(self, account_id: int, limit: int = 4) -> dict:
         exited = await self.exits(account_id, limit)
-        return result(checked=checked, exited=exited, succeeded=checked + exited)
+        return result(exited=exited, succeeded=0)
 
     async def exits(self, account_id: int, limit: int) -> int:
         from telethon.tl.functions.channels import LeaveChannelRequest
@@ -1043,8 +1055,8 @@ class GrowthService:
             return 0
         members = list((await self.db.scalars(select(Member).where(Member.account_id == account_id,
             Member.status.in_(["joined", "leave_failed"]), Member.leave_requested_at.is_not(None),
-            Member.leave_retry_at <= now,
-            Member.leave_error.in_(["permanent_mute", "temporary_mute", "deleted_at_minimum"]),
+            Member.leave_retry_at <= now, Member.leave_attempts < 3,
+            Member.leave_error.in_([EXIT_REASON, "manual", "manual_exit", "operator_requested"]),
         ).order_by(Member.leave_retry_at).limit(limit))).all())
         exited = 0
         for member in members:
@@ -1052,38 +1064,34 @@ class GrowthService:
             if await self.protected(member, group):
                 continue
             member_id, generation, target = member.id, member.joined_at, group.group_id
-            reason = member.leave_error
+            error, wait = None, 0
             try:
                 async with self.client(account_id, "growth_exit") as wrapper:
                     entity = await wrapper.client.get_entity(target)
-                    if reason in {"permanent_mute", "temporary_mute"}:
-                        fact = inspect_permission(entity, await wrapper.client.get_permissions(entity, "me"), now)
-                        if fact.member is None or fact.writable is None:
-                            member.leave_retry_at = now + timedelta(minutes=10)
-                            await self.db.commit()
-                            continue
-                        if not fact.exit_required:
-                            member.leave_requested_at = member.leave_retry_at = member.leave_error = None
-                            if fact.member is True:
-                                member.status, member.left_at = "joined", None
-                            apply_permission(member, fact, now)
-                            await self.db.commit()
-                            continue
                     request = DeleteChatUserRequest(entity.id, InputUserSelf()) if isinstance(entity, Chat) else LeaveChannelRequest(entity)
                     await wrapper.client(request)
-                error = None
             except Exception as exc:
                 error = None if type(exc).__name__ == "UserNotParticipantError" else type(exc).__name__
-            member = await self.db.get(Member, member_id, populate_existing=True)
-            if member.joined_at != generation:
+                if type(exc).__name__ in {"FloodWaitError", "SlowModeWaitError"}:
+                    wait = max(1, int(exc.seconds)) + 1
+            current = await self.db.get(Member, member_id, populate_existing=True)
+            if current is None or current.joined_at != generation:
                 continue
-            member.ad_status, member.review_status = "paused" if member.ad_status == "paused" else "blocked", "rejected"
-            if error:
-                member.leave_attempts += 1
-                member.leave_retry_at = now + timedelta(minutes=10)
+            current.ad_status = "paused" if current.ad_status == "paused" else "blocked"
+            current.review_status = "rejected"
+            if wait:
+                current.leave_retry_at = now + timedelta(seconds=wait)
+            elif error:
+                current.leave_attempts += 1
+                current.status = "leave_failed"
+                current.leave_retry_at = (now + timedelta(minutes=(10 if current.leave_attempts == 1 else 30))
+                                         if current.leave_attempts < 3 else None)
             else:
-                member.status, member.left_at, member.leave_confirmed_at = "left", now, now
-                member.leave_retry_at = None
+                current.status, current.left_at, current.leave_confirmed_at = "left", now, now
+                current.leave_retry_at = None
+                await self.db.execute(update(Group).where(
+                    Group.id == current.group_id, Group.ad_delivery_account_id == account_id,
+                ).values(ad_delivery_account_id=None).execution_options(synchronize_session=False))
                 exited += 1
             await self.db.commit()
         return exited

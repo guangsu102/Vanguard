@@ -59,6 +59,9 @@ async def _execute(
     account_pool: Any,
     growth_verifier: Any = None,
 ) -> dict:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED and kind in {"growth", "join", "ad"}:
+        return {"state": "cancelled", "error": "growth_reconciliation_retired"}
     if kind == "growth":
         from app.modules.acquisition.p2_outbox import (
             read_only_growth_verifier,
@@ -95,6 +98,11 @@ async def _execute(
                    if source.request_state == "sent" and source.reason == "join_request_still_pending"
                    else {}),
             }
+        # This adapter has only read the source row since execute_task's commit.
+        # Release that snapshot before the service hydrates/borrows Telegram.
+        from app.core.database_transaction_boundary import release_read_transaction
+
+        await release_read_transaction(db, allow_untracked_read_only=True)
         result = await AcquisitionAutomationService(
             db,
             account_pool=account_pool,
@@ -138,6 +146,11 @@ async def _execute(
         source = await db.get(AdDeliveryLog, source_id)
         if source is None or source.account_id != account_id:
             return {"state": "cancelled"}
+        from app.core.account.outbound_reconciliation import reconcile_ad_ledger
+
+        ledger_result = await reconcile_ad_ledger(db, source, now=datetime.utcnow())
+        if ledger_result is not None:
+            return ledger_result
         if source.status == "success":
             return {"state": "succeeded"}
         if source.status not in {"pending", "unknown", "sending", "reconciliation_required"}:

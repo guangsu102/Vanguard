@@ -12,7 +12,8 @@ def workload(purpose: str) -> str:
     return "join" if purpose in JOIN_PURPOSES else "review"
 
 
-def other_hold(base: int, total_used: int, join_used: int, review_used: int, kind: str, join_hold: int = -1) -> int:
+def other_hold(base: int, total_used: int, join_used: int, review_used: int, kind: str, join_hold: int = -1,
+               *, efficiency: bool = False) -> int:
     """Each gets a quarter minimum; half plus borrowed capacity remains shared.
 
     Old, unattributed critical spend is charged across both groups. Introducing
@@ -24,7 +25,10 @@ def other_hold(base: int, total_used: int, join_used: int, review_used: int, kin
     join_used += legacy // 2
     review_used += legacy - legacy // 2
     other = review_used if kind == "join" else join_used
-    hold = max(0, base // 4 - other)
+    # V2 keeps both business lanes funded inside the existing critical cap.
+    # Historical unattributed spend above is retained, never refunded.
+    floor = (base * (60 if kind == "join" else 40) // 100) if efficiency else base // 4
+    hold = max(0, floor - other)
     return min(hold, join_hold) if kind == 'review' and join_hold >= 0 else hold
 
 
@@ -52,11 +56,15 @@ def add_workload_budgets(budget: dict, limits: dict) -> None:
                                     usage.get(f"ad_lent_{window}", {}).get("used", 0),
                                     usage.get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
                                     usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0))
-            caps = lending_caps(caps, used, "critical", limits.get(f"survival_hold_{window}", -1), limits.get(f"sync_hold_{window}", -1), limits.get(f"ad_demand_hold_{window}", -1))
+            listener_floor = (usage.get(f"listener_{window}", {}).get("remaining", 0)
+                              if limits.get("growth_efficiency_v1") else 0)
+            caps = lending_caps(caps, used, "critical", limits.get(f"survival_hold_{window}", -1), limits.get(f"sync_hold_{window}", -1), limits.get(f"ad_demand_hold_{window}", -1),
+                                survival_floor=listener_floor)
             hold = other_hold(base[2], used[2], usage[f"critical_join_{window}"]["used"],
                               usage[f"critical_review_{window}"]["used"], kind,
-                              limits.get(f"join_idle_hold_{window}", -1))
-            room = max(0, available(limits[window], used, caps, "critical") - hold)
+                              limits.get(f"join_idle_hold_{window}", -1),
+                              efficiency=bool(limits.get("growth_efficiency_v1")))
+            room = max(0, available(limits[window], used, caps, "critical", survival_floor=listener_floor) - hold)
             rooms.append(room)
             if room == 0:
                 ttl = usage[window]["ttl_seconds"]

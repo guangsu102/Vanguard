@@ -29,10 +29,37 @@ def trim(items: list[dict], now: datetime) -> list[dict]:
     items = items if isinstance(items, list) else []
     valid = {item["id"]: item for item in items if isinstance(item, dict) and type(item.get("id")) is int and item["id"] > 0
              and (stamp := date(item.get("date"))) is not None and now - timedelta(hours=72) <= stamp <= now}
-    ordered = sorted(valid.values(), key=lambda item: item["date"])
+    ordered = sorted(valid.values(), key=lambda item: date(item["date"]))
     mature = [item for item in ordered if date(item["date"]) <= now - timedelta(hours=24)]
     recent = [item for item in ordered if date(item["date"]) > now - timedelta(hours=24)]
-    return [*mature[-40:], *recent[-40:]]
+    # Keep the nearest unfulfilled deadlines when a busy group fills the cache.
+    # New observations must not evict every candidate about to mature.
+    return [*mature[-40:], *recent[:40]]
+
+
+async def hints(db: Any, member: Any, now: datetime) -> list[dict]:
+    if member is None or member.joined_at is None:
+        return []
+    row = await db.get(SystemSetting, key(member))
+    payload = decode(row.value) if row else {}
+    return trim(payload.get("messages", []), now) if scoped(payload, member) else []
+
+
+async def remove_hints(db: Any, member: Any, message_ids: Any, now: datetime) -> bool:
+    """Drop only named candidate versions; an absent hint is never a live proof."""
+    if member is None or member.joined_at is None:
+        return False
+    row = await db.get(SystemSetting, key(member))
+    payload = decode(row.value) if row else {}
+    if not scoped(payload, member):
+        return False
+    ids = {value for value in message_ids if type(value) is int and value > 0}
+    items = trim(payload.get("messages", []), now)
+    remaining = [item for item in items if item["id"] not in ids]
+    if remaining == items:
+        return False
+    row.value = json.dumps({**payload, "messages": remaining})
+    return True
 
 
 async def save_hint(db: Any, member: Any, fact: dict, now: datetime) -> bool:
@@ -43,6 +70,10 @@ async def save_hint(db: Any, member: Any, fact: dict, now: datetime) -> bool:
     items = previous.get("messages", []) if scoped(previous, member) else []
     items = items if isinstance(items, list) else []
     old_items = trim(items, now)
+    incoming = date(fact.get("message_date"))
+    if any(item["id"] == fact.get("message_id") and incoming is not None
+           and date(item["date"]) > incoming for item in old_items):
+        return False  # A delayed pre-edit callback cannot restore an older age.
     items = trim([*items, {"id": fact.get("message_id"), "date": fact.get("message_date")}], now)
     if not items or items == old_items:
         return False
@@ -56,15 +87,7 @@ async def save_hint(db: Any, member: Any, fact: dict, now: datetime) -> bool:
 
 
 async def hint_ids(db: Any, member: Any, now: datetime) -> list[int]:
-    if member is None or member.joined_at is None:
-        return []
-    row = await db.get(SystemSetting, key(member))
-    if row is None:
-        return []
-    payload = decode(row.value)
-    if not scoped(payload, member):
-        return []
-    items = trim(payload.get("messages", []), now)
+    items = await hints(db, member, now)
     # Mature observations first. Actual visibility, sender identity, rules and
     # reply warnings are still checked by EvidenceCollector against Telegram.
     return [item["id"] for item in items[:6]]

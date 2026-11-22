@@ -198,6 +198,13 @@ class JoinRequestBudgetService:
                 return "join_flood_wait"
         if await self._is_owned_group_owner(account.id):
             return "owned_group_owner_protected"
+        if settings.TELEGRAM_RPC_PACING_ENABLED:
+            return None
+        from app.modules.acquisition.qualification_engine import enabled_for
+        if enabled_for(account.id):
+            from app.modules.acquisition.growth_admission import admission_plan
+            admission = await admission_plan(self.db, account.id, now)
+            return admission["reason"] if admission["remaining"] <= 0 else None
         if getattr(config, "dynamic_capacity_enabled", False):
             from app.modules.acquisition.ad_output_plan import ad_output_plan
             plan = await ad_output_plan(self.db, account, config, now)
@@ -216,6 +223,13 @@ class JoinRequestBudgetService:
             if is_hard_join_admission_blocker(admission['reason']):
                 return admission['reason']
         return None
+
+    @classmethod
+    def _backlog_blocks(cls, config: Any, pending: int) -> bool:
+        if settings.TELEGRAM_RPC_PACING_ENABLED:
+            return False
+        high, low = cls._watermarks(config)
+        return pending >= high or (bool(getattr(config, "join_review_backlog_paused", False)) and pending > low)
 
     @staticmethod
     def _watermarks(config: Any) -> tuple[int, int]:
@@ -456,6 +470,11 @@ class JoinRequestBudgetService:
         account_id: int,
         now: datetime,
     ) -> tuple[int, int]:
+        from app.modules.acquisition.qualification_engine import enabled_for, initial_slots
+        if enabled_for(account_id):
+            # Only explicit first-collection work belongs to the new join
+            # lane. Legacy reviews remain visible in their maintenance queue.
+            return await initial_slots(self.db, account_id), 0
         config = await self.db.scalar(select(AccountOperationConfig).where(AccountOperationConfig.account_id == account_id))
         if config is not None and getattr(config, "dynamic_capacity_enabled", False):
             from app.modules.acquisition.capacity import inventory_snapshot
@@ -526,14 +545,11 @@ class JoinRequestBudgetService:
         if config is None:
             return 0, 0, False
         pending, overdue = await self._review_backlog(account_id, now)
-        paused = pending >= self._watermarks(config)[0] or (
-            bool(config.join_review_backlog_paused)
-            and pending > self._watermarks(config)[1]
-        )
+        paused = self._backlog_blocks(config, pending)
         config.join_review_backlog_paused = paused
         config.join_review_backlog_reason = (
             "join_review_overdue"
-            if overdue > 0 and not getattr(config, "dynamic_capacity_enabled", False)
+            if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue > 0 and not getattr(config, "dynamic_capacity_enabled", False)
             else ("join_review_backlog" if paused else None)
         )
         await self.db.commit()
@@ -608,12 +624,9 @@ class JoinRequestBudgetService:
             reasons.append("daily_join_quota")
         if rolling + reserved >= effective > 0:
             reasons.append("rolling_24h_join_quota")
-        backlog_paused = bool(getattr(config, "join_review_backlog_paused", False))
-        if pending_review >= self._watermarks(config)[0] or (
-            backlog_paused and pending_review > self._watermarks(config)[1]
-        ):
+        if self._backlog_blocks(config, pending_review):
             reasons.append("join_review_backlog")
-        if overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
+        if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
             reasons.append("join_review_overdue")
         if interval_blocked:
             reasons.append("join_interval")
@@ -708,14 +721,11 @@ class JoinRequestBudgetService:
             item.reason = item.reason or "reservation_expired_before_send"
 
         pending_review, overdue_review = await self._review_backlog(account_id, now)
-        backlog_paused = pending_review >= self._watermarks(config)[0] or (
-            bool(config.join_review_backlog_paused)
-            and pending_review > self._watermarks(config)[1]
-        )
+        backlog_paused = self._backlog_blocks(config, pending_review)
         config.join_review_backlog_paused = backlog_paused
         config.join_review_backlog_reason = (
             "join_review_overdue"
-            if overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False)
+            if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False)
             else ("join_review_backlog" if backlog_paused else None)
         )
 
@@ -752,7 +762,7 @@ class JoinRequestBudgetService:
             reasons.append("rolling_24h_join_quota")
         if backlog_paused:
             reasons.append("join_review_backlog")
-        if overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
+        if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
             reasons.append("join_review_overdue")
         if next_allowed_at is not None and next_allowed_at > now:
             reasons.append("join_interval")
@@ -888,19 +898,16 @@ class JoinRequestBudgetService:
         ):
             raise JoinBudgetBlocked("join_outcome_reconciliation_required")
         pending_review, overdue_review = await self._review_backlog(row.account_id, now)
-        backlog_paused = pending_review >= self._watermarks(config)[0] or (
-            bool(config.join_review_backlog_paused)
-            and pending_review > self._watermarks(config)[1]
-        )
+        backlog_paused = self._backlog_blocks(config, pending_review)
         config.join_review_backlog_paused = backlog_paused
         config.join_review_backlog_reason = (
             "join_review_overdue"
-            if overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False)
+            if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False)
             else ("join_review_backlog" if backlog_paused else None)
         )
         if backlog_paused:
             raise JoinBudgetBlocked("join_review_backlog")
-        if overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
+        if not settings.TELEGRAM_RPC_PACING_ENABLED and overdue_review > 0 and not getattr(config, "dynamic_capacity_enabled", False):
             raise JoinBudgetBlocked("join_review_overdue")
         total_limit = self._total_limit(config)
         if total_limit > 0 and await self._live_membership_count(row.account_id) >= total_limit:

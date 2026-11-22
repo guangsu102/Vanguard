@@ -77,12 +77,21 @@ from app.integrations.xboard import close_all_xboard_clients
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan manager for startup and shutdown events."""
     # Startup
+    from app.modules.acquisition import qualification_sla_lifecycle as sla_lifecycle
+    sla_lifecycle.declare_process("backend")
+    from app.modules.acquisition.review_diagnostics import start_maintenance, stop_maintenance
+    await start_maintenance()
     await init_db(create_tables=not settings.is_production)
     try:
         await refresh_persona_configured_gauge_at_startup()
     except Exception:
         pass
     await init_redis()
+    await sla_lifecycle.start("backend")
+    from app.modules.acquisition.review_evidence_ingest import start_ingest_worker
+    await start_ingest_worker()
+    from app.core.account.read_metrics import start_metrics_health
+    start_metrics_health()
     import asyncio
     from app.core.metrics import aggregation_loop
     app.state.metrics_task = asyncio.create_task(aggregation_loop())
@@ -100,13 +109,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.metrics_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await app.state.metrics_task
+    await stop_maintenance()
     await app.state.account_pool.close_all()
+    from app.modules.acquisition.review_evidence_ingest import stop_ingest_worker
+    await stop_ingest_worker()
     await close_all_sub2api_clients()
     await close_all_xboard_clients()
     await stop_redis_bridge()
     await stop_account_proxy_policy_listener()
+    await sla_lifecycle.stop(close_process=True)
     await close_redis()
     await close_db()
+    from app.core.account.read_metrics import stop_metrics_health
+    await stop_metrics_health()
 
 
 # Create FastAPI application
@@ -236,3 +251,6 @@ if __name__ == "__main__":
     )
 
 
+
+from app.modules.acquisition.send_result_metrics import install as install_send_result_metrics
+install_send_result_metrics(app)

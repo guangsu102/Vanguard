@@ -163,14 +163,6 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Build and push bot-matrix
-        uses: docker/build-push-action@v5
-        with:
-          context: ./bot-matrix
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}-bot
-          labels: ${{ steps.meta.outputs.labels }}
-
   # ==================== Deploy to Staging ====================
   deploy-staging:
     name: Deploy to Staging

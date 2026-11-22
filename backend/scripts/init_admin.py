@@ -32,8 +32,8 @@ async def main() -> None:
     password = os.getenv("VANGUARD_ADMIN_PASSWORD") or ""
     if not username or len(username) > 50:
         raise SystemExit("VANGUARD_ADMIN_USERNAME must be 1-50 characters")
-    if len(password) < 16:
-        raise SystemExit("VANGUARD_ADMIN_PASSWORD must contain at least 16 characters")
+    if len(password) < 8:
+        raise SystemExit("VANGUARD_ADMIN_PASSWORD must contain at least 8 characters")
 
     await init_db(create_tables=False)
     try:

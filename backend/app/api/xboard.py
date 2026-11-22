@@ -364,6 +364,33 @@ async def _apply_callback_tracking(db: AsyncSession, payload: CallbackRequest, u
             tracking.converted = True
 
 
+async def _verified_callback_account(db: AsyncSession, payload: CallbackRequest) -> int | None:
+    """Attribute only to an account with recorded inbound contact from the signed peer.
+
+    An unverified payload account ID never creates an attribution. Ambiguous
+    contacts remain unassigned; no empty advertising tracking code is invented.
+    """
+    if not payload.tg_user_id or payload.payload.get("tracking_code"):
+        return None
+    from app.core.account.models import AccountType, TelegramAccount
+    from app.modules.private_chat.models import PrivateChatMessage
+    query = select(PrivateChatMessage.account_id).join(
+        TelegramAccount, TelegramAccount.id == PrivateChatMessage.account_id).where(
+        PrivateChatMessage.peer_telegram_id == payload.tg_user_id,
+        PrivateChatMessage.direction == "inbound",
+        PrivateChatMessage.telegram_message_id > 0,
+        PrivateChatMessage.occurred_at <= _utc_naive(payload.occurred_at),
+        TelegramAccount.account_type == AccountType.PROMOTER,
+    ).distinct()
+    claimed = payload.payload.get("account_id")
+    if claimed is not None:
+        if type(claimed) is not int or claimed <= 0:
+            return None
+        query = query.where(PrivateChatMessage.account_id == claimed)
+    candidates = list((await db.scalars(query.limit(2))).all())
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _apply_acquisition_status(data: dict[str, Any], tracking: AcquisitionTracking) -> None:
     data["tracking_code"] = tracking.tracking_code
     data["external_user_id"] = tracking.external_user_id or data["external_user_id"]
@@ -641,12 +668,17 @@ async def xboard_callback(
     if callback:
         return _response({"accepted": True, "idempotent": True, "callback_id": callback.callback_id}, trace_id=payload.trace_id)
 
+    attributed_account_id = (
+        await _verified_callback_account(db, payload) if settings.GROWTH_SIMPLIFIED_ENABLED else None
+    )
     db.add(
         XBoardCallback(
             callback_id=payload.callback_id,
             trace_id=payload.trace_id,
             event_type=payload.event_type,
             request_body=raw_body,
+            attributed_account_id=attributed_account_id,
+            attribution_source="verified_inbound_account" if attributed_account_id else None,
         )
     )
 

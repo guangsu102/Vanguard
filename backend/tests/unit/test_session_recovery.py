@@ -20,6 +20,11 @@ from app.workers.telegram_worker import TelegramWorker, TelegramWorkerRole
 from tests.test_session_lease import FakeRedis
 
 
+@pytest.fixture(autouse=True)
+def isolated_quarantine_store(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.core.account.session_quarantine._root", lambda: tmp_path)
+
+
 def valid_string_session() -> str:
     session = StringSession()
     session.set_dc(2, "149.154.167.51", 443)
@@ -135,6 +140,105 @@ async def test_replacement_closes_disconnected_guard_before_claiming_new_session
         assert "vanguard:telegram:lease:35" not in redis.values
     finally:
         await old_guard.close()
+
+
+@pytest.mark.asyncio
+async def test_session_quarantine_blocks_reconnect_until_explicit_status_recovery(monkeypatch):
+    pool = AccountPool()
+    wrapper = await pool.add_account(
+        account_id=36,
+        phone="+10000000036",
+        session_name="quarantine-recovery",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        status=AccountStatus.ONLINE,
+        proxy_mode=ProxyMode.NONE,
+    )
+    wrapper.status = AccountStatus.ERROR
+    wrapper.session_quarantined = True
+    wrapper.session_quarantine_persisted = True
+    wrapper.session_quarantine_reason = "wrong session ID"
+
+    monkeypatch.setattr(
+        "app.core.account.pool.get_account_proxy_policy_state",
+        AsyncMock(return_value=None),
+    )
+
+    def db_account(status):
+        return SimpleNamespace(
+            id=36,
+            session_name=wrapper.session_name,
+            status=status,
+            proxy_mode=ProxyMode.NONE,
+            static_proxy_id=None,
+            fingerprint_id=None,
+            session_string=None,
+            api_config_name="default",
+            account_type=wrapper.account_type,
+            country_code="US",
+            device_model=None,
+            system_version=None,
+            app_version=None,
+        )
+
+    # The persisted quarantine is reported as ERROR on refresh and keeps the
+    # local fence in place.
+    await pool.sync_from_db([db_account(AccountStatus.ERROR)])
+    assert wrapper.session_quarantined
+    assert wrapper.status == AccountStatus.ERROR
+    assert await pool.connect_by_id(36, purpose="growth_listener") is None
+
+    # Only an explicit durable status change clears the fence.
+    await pool.sync_from_db([db_account(AccountStatus.ONLINE)])
+    assert not wrapper.session_quarantined
+    assert wrapper.status == AccountStatus.ONLINE
+
+
+@pytest.mark.asyncio
+async def test_session_quarantine_persists_error_status(monkeypatch):
+    pool = AccountPool()
+    wrapper = await pool.add_account(
+        account_id=37,
+        phone="+10000000037",
+        session_name="quarantine-persist",
+        country_code="US",
+        api_id="12345",
+        api_hash="hash",
+        status=AccountStatus.ONLINE,
+        proxy_mode=ProxyMode.NONE,
+    )
+    persisted = SimpleNamespace(status=AccountStatus.ONLINE)
+    failure_events = []
+
+    class FakeDB:
+        def add(self, event):
+            failure_events.append(event)
+
+        async def execute(self, statement):
+            assert statement.compile().params["id_1"] == 37
+            persisted.status = AccountStatus.ERROR
+            return SimpleNamespace(rowcount=1)
+
+        async def commit(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_session():
+        yield FakeDB()
+
+    monkeypatch.setattr("app.core.database.get_db_session", fake_session)
+    await pool._quarantine_session(37, RuntimeError("wrong session ID"))
+
+    assert wrapper.session_quarantined
+    assert wrapper.session_quarantine_persisted
+    assert wrapper.status == AccountStatus.ERROR
+    assert persisted.status == AccountStatus.ERROR
+    assert len(failure_events) == 1
+    assert failure_events[0].event_type == "account_connection_failure"
+    assert failure_events[0].reason == "session_conflict"
+    await pool.set_offline(wrapper.session_name)
+    assert wrapper.status == AccountStatus.ERROR
 
 
 @pytest.mark.asyncio

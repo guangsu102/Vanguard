@@ -77,25 +77,37 @@ onMounted(refresh)
 <template>
   <el-card class="capacity-panel">
     <template #header><div class="heading"><strong>广告产出与执行条件</strong><el-button :loading="busy" @click="refresh">刷新容量</el-button></div></template>
-    <p>额度是上限。实际执行量取当前合格目标、素材、审核与验证余量；时间为当前已知限制的最早解除时间，到期仍需复核资格、预算和实时权限。</p>
+    <p v-if="rows[0]?.mode === 'writable_v2'">已入群、完成验证且可发文字后准入。广告、加群、权限与验证、每日复核与退出分别执行；读取按账号节流，冷却到期后继续检查。</p>
+    <p v-else>额度是上限。实际执行量取当前合格目标、素材、审核与验证余量；时间为当前已知限制的最早解除时间，到期仍需复核资格、预算和实时权限。</p>
     <el-alert v-for="alert in runtime?.alerts || []" :key="alert.code + String(alert.account_id || '')" :title="(alert.account_id ? '#' + alert.account_id + '：' : '') + (alertNames[alert.code] || alert.code)" :type="alert.severity === 'critical' ? 'error' : 'warning'" :closable="false" />
     <el-alert v-if="error" :title="error" type="error" :closable="false" />
     <el-empty v-if="!busy && !rows.length && !error" description="尚未配置动态容量账号" />
-    <el-table :data="rows" v-loading="busy" row-key="account_id" stripe>
+    <el-table v-if="rows[0]?.mode === 'writable_v2'" :data="rows" v-loading="busy" row-key="account_id" stripe>
+      <el-table-column prop="account_id" label="账号" width="85" />
+      <el-table-column label="业务开关"><template #default="{ row }">{{ row.enabled ? '开启' : '暂停' }}</template></el-table-column>
+      <el-table-column label="权限通过"><template #default="{ row }">{{ row.permissions?.counts.approved || 0 }}</template></el-table-column>
+      <el-table-column label="待检查"><template #default="{ row }">{{ row.permissions?.counts.pending || 0 }}</template></el-table-column>
+      <el-table-column label="到期可投成员"><template #default="{ row }">{{ row.permissions?.due || 0 }}</template></el-table-column>
+      <el-table-column label="下次加群"><template #default="{ row }">{{ time(row.next_allowed_at) }}</template></el-table-column>
+      <el-table-column label="冷却原因"><template #default="{ row }">{{ row.cooldown_reason || '无' }}</template></el-table-column>
+      <el-table-column label="冷却结束"><template #default="{ row }">{{ row.next_execution_at ? time(row.next_execution_at) : '—' }}</template></el-table-column>
+    </el-table>
+    <el-table v-else :data="rows" v-loading="busy" row-key="account_id" stripe>
       <el-table-column type="expand"><template #default="{ row }">
         <div class="details">
+          <p v-if="row.read_rpc?.budget_enabled === false">读取预算已停用；单账号读取最小间隔 {{ row.read_rpc.minimum_rpc_interval_seconds ?? 1 }} 秒，Telegram 冷却继续生效。</p>
           <p v-for="(status, business) in row.business_execution || {}" :key="business">
             {{ businessNames[String(business)] || business }}：{{ stateNames[status.state] || status.state }}
             <span v-if="status.resume_at">；下次复核 {{ time(status.resume_at) }}</span>
             <span v-if="status.reason">；{{ reasons[status.reason] || status.reason }}</span>
           </p>
           <p v-if="row.execution?.state === 'cooldown'">当前冷却至 {{ time(row.execution.resume_at) }}；到期自动复核后继续调度，挂起审核 {{ row.inventory.suspended_due ?? 0 }} 项。</p>
-          <p v-if="row.read_rpc">读取预算：每分钟 {{ row.read_rpc.limits.minute }} / 每小时 {{ row.read_rpc.limits.hour }}；预览和资料同步每小时最多 {{ row.read_rpc.limits.background_hour }}。最近限流请求：{{ row.read_rpc.method || '尚无精确记录' }}</p>
-          <p v-if="row.read_rpc?.usage">本小时已用 {{ row.read_rpc.usage.hour?.used ?? 0 }} / {{ row.read_rpc.limits.hour }} 次；当前日窗口已用 {{ row.read_rpc.usage.day?.used ?? 0 }} / {{ row.read_rpc.limits.day }} 次。<span v-if="row.read_rpc.resume_at"> 账号总预算复核时间：{{ time(row.read_rpc.resume_at) }}</span></p>
-          <p v-if="row.read_rpc?.limits.ad_hour != null">广告最低保障：每小时 {{ row.read_rpc.limits.ad_hour }} / 每日 {{ row.read_rpc.limits.ad_day }} 次；其余用途合计每小时最多 {{ row.read_rpc.limits.non_ad_hour }} / 每日 {{ row.read_rpc.limits.non_ad_day }} 次。读取次数不等于广告条数，总预算和 Telegram 冷却仍生效。</p>
+          <p v-if="row.read_rpc?.limits">读取预算：每分钟 {{ row.read_rpc.limits.minute }} / 每小时 {{ row.read_rpc.limits.hour }}；预览和资料同步每小时最多 {{ row.read_rpc.limits.background_hour }}。最近限流请求：{{ row.read_rpc.method || '尚无精确记录' }}</p>
+          <p v-if="row.read_rpc?.usage && row.read_rpc.limits">本小时已用 {{ row.read_rpc.usage.hour?.used ?? 0 }} / {{ row.read_rpc.limits.hour }} 次；当前日窗口已用 {{ row.read_rpc.usage.day?.used ?? 0 }} / {{ row.read_rpc.limits.day }} 次。<span v-if="row.read_rpc.resume_at"> 账号总预算复核时间：{{ time(row.read_rpc.resume_at) }}</span></p>
+          <p v-if="row.read_rpc?.limits?.ad_hour != null">广告最低保障：每小时 {{ row.read_rpc.limits.ad_hour }} / 每日 {{ row.read_rpc.limits.ad_day }} 次；其余用途合计每小时最多 {{ row.read_rpc.limits.non_ad_hour }} / 每日 {{ row.read_rpc.limits.non_ad_day }} 次。读取次数不等于广告条数，总预算和 Telegram 冷却仍生效。</p>
           <p>实际监听连接：{{ listenerFor(row.account_id)?.connected ? "已连接" : "未连接" }}；{{ listenerNames[listenerFor(row.account_id)?.state || 'unknown'] || '等待监听状态' }}<span v-if="listenerFor(row.account_id)?.resume_at">；预计复核时间 {{ time(listenerFor(row.account_id)?.resume_at) }}</span></p>
           <p v-if="listenerFor(row.account_id)?.update_queue_size != null">内存待处理更新 {{ listenerFor(row.account_id)?.update_queue_size }}；连续观测到积压 {{ listenerFor(row.account_id)?.queue_nonempty_seconds ?? 0 }} 秒；读取等待 {{ listenerFor(row.account_id)?.read_wait_seconds ?? 0 }} 秒</p>
-          <p v-if="row.read_rpc?.limits.survival_hour != null">存活核查基础配额：每小时 {{ row.read_rpc.limits.survival_hour }} / 每日 {{ row.read_rpc.limits.survival_day }} 次，占总额度 15%。保留窗口内到期检查额度与应急余量后，空闲部分可供审核等关键任务使用；广告保障、总预算和 Telegram 冷却继续生效。</p>
+          <p v-if="row.read_rpc?.limits?.survival_hour != null">存活核查基础配额：每小时 {{ row.read_rpc.limits.survival_hour }} / 每日 {{ row.read_rpc.limits.survival_day }} 次，占总额度 15%。保留窗口内到期检查额度与应急余量后，空闲部分可供审核等关键任务使用；广告保障、总预算和 Telegram 冷却继续生效。</p>
           <template v-if="listenerFor(row.account_id)?.raw_journal">
             <p v-if="listenerFor(row.account_id)?.raw_journal?.available !== false">磁盘未确认 {{ listenerFor(row.account_id)?.raw_journal?.states?.pending ?? 0 }}；其中尚未处理 {{ listenerFor(row.account_id)?.raw_journal?.queues?.queued_for_sdk?.count ?? '待更新' }}，已进入同步流程、等待确认 {{ listenerFor(row.account_id)?.raw_journal?.queues?.awaiting_checkpoint?.count ?? '待更新' }}；需核验 {{ listenerFor(row.account_id)?.raw_journal?.states?.reconciliation_required ?? 0 }}。{{ listenerFor(row.account_id)?.raw_journal?.source === 'disk' ? '当前显示磁盘记录，连接恢复后继续处理。' : '' }}</p>
             <p v-if="listenerFor(row.account_id)?.raw_journal?.queues?.business_facts">广告删除、权限变化和验证提示待办 {{ listenerFor(row.account_id)?.raw_journal?.queues?.business_facts?.count ?? 0 }}；最老等待 {{ listenerFor(row.account_id)?.raw_journal?.queues?.business_facts?.oldest_seconds ?? 0 }} 秒。普通推广群聊天不作为业务积压保存。</p>

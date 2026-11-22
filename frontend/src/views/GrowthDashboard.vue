@@ -160,6 +160,7 @@ const adExecutionForm = reactive<AdDeliveryExecutionSettings>(createDefaultAdDel
 const adThrottleForm = reactive<AdDeliveryThrottleSettings>(createDefaultAdDeliveryThrottle())
 
 const adCapacityForm = reactive<AdCapacitySettings>(createDefaultAdCapacity())
+const simplifiedGrowth = computed(() => adCapacityForm.growth_mode === 'writable_v2')
 
 const adFailurePolicyForm = reactive<AdFailurePolicy>(createDefaultAdFailurePolicy())
 
@@ -414,7 +415,7 @@ const flowSteps = computed(() => [
     title: '广告',
     enabled: adExecutionForm.enabled,
     status: '账号内串行',
-    detail: `删除广告检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
+    detail: simplifiedGrowth.value ? '发送成功即计数，连续群失败达到阈值退群' : `删除广告检测 ${formatDuration(adCapacityForm.survival_check_delay_seconds)}`,
   },
   {
     key: 'risk',
@@ -926,12 +927,16 @@ onBeforeUnmount(() => {
       </div>
       <el-tabs v-model="activeConfigTab" class="config-tabs">
         <el-tab-pane label="入群与群检测" name="join">
+          <el-alert v-if="simplifiedGrowth" title="自动加群与验证" type="info" :closable="false">
+            每日最多尝试 30 次，按 UTC 自然日计数；正常间隔 48 分钟，恢复期间间隔 2 小时。
+            需要审批的群等待成员事件确认；无法自动完成的验证保留待处理原因。
+          </el-alert>
           <div class="form-grid">
             <el-form label-width="160px" size="small">
               <el-form-item label="自动入群">
                 <el-switch v-model="schedulerForm.enabled" />
               </el-form-item>
-              <el-form-item label="扫描间隔">
+              <el-form-item v-if="!simplifiedGrowth" label="扫描间隔">
                 <el-input-number v-model="schedulerForm.scan_interval_minutes" :min="1" :max="1440" />
               </el-form-item>
               <el-form-item label="标题黑名单">
@@ -951,41 +956,41 @@ onBeforeUnmount(() => {
               <el-form-item label="群检测">
                 <el-switch v-model="schedulerForm.join_verification!.enabled" />
               </el-form-item>
-              <el-form-item label="检测AI">
+              <el-form-item v-if="!simplifiedGrowth" label="检测AI">
                 <el-switch v-model="schedulerForm.join_verification!.ai_enabled" />
               </el-form-item>
               <el-form-item label="可信阈值">
                 <el-input-number v-model="schedulerForm.join_verification!.confidence_threshold" :min="0" :max="1" :step="0.01" />
               </el-form-item>
-              <el-form-item label="消息采样">
+              <el-form-item v-if="!simplifiedGrowth" label="消息采样">
                 <el-input-number v-model="schedulerForm.join_verification!.message_limit" :min="5" :max="100" />
               </el-form-item>
-              <el-form-item label="未知验证">
+              <el-form-item v-if="!simplifiedGrowth" label="未知验证">
                 <el-select v-model="schedulerForm.join_verification!.unknown_challenge_action">
                   <el-option v-for="item in unknownChallengeActionOptions" :key="item.value" :label="item.label" :value="item.value" />
                 </el-select>
               </el-form-item>
             </el-form>
             <el-form label-width="160px" size="small">
-              <el-form-item label="验证后等待">
+              <el-form-item v-if="!simplifiedGrowth" label="验证后等待">
                 <el-input-number v-model="schedulerForm.join_verification!.post_action_wait_seconds" :min="0" :max="120" />
               </el-form-item>
-              <el-form-item label="额外等待">
+              <el-form-item v-if="!simplifiedGrowth" label="额外等待">
                 <el-input-number v-model="schedulerForm.join_verification!.post_action_extra_wait_seconds" :min="0" :max="30" :step="1" />
               </el-form-item>
-              <el-form-item label="复查次数">
+              <el-form-item v-if="!simplifiedGrowth" label="复查次数">
                 <el-input-number v-model="schedulerForm.join_verification!.post_action_recheck_attempts" :min="1" :max="10" />
               </el-form-item>
-              <el-form-item label="AI超时">
+              <el-form-item v-if="!simplifiedGrowth" label="AI超时">
                 <el-input-number v-model="schedulerForm.join_verification!.ai_timeout_seconds" :min="1" :max="45" :step="1" />
               </el-form-item>
               <el-form-item label="操作超时">
                 <el-input-number v-model="schedulerForm.join_verification!.action_timeout_seconds" :min="1" :max="20" :step="1" />
               </el-form-item>
-              <el-form-item label="待同步最小时间">
+              <el-form-item v-if="!simplifiedGrowth" label="待同步最小时间">
                 <el-input-number v-model="schedulerForm.join_verification!.pending_sync_min_age_seconds" :min="30" :max="3600" :step="10" />
               </el-form-item>
-              <el-form-item label="待同步批量">
+              <el-form-item v-if="!simplifiedGrowth" label="待同步批量">
                 <el-input-number v-model="schedulerForm.join_verification!.pending_sync_limit" :min="1" :max="20" />
               </el-form-item>
             </el-form>
@@ -1005,17 +1010,17 @@ onBeforeUnmount(() => {
                   show-word-limit
                 />
               </el-form-item>
-              <el-form-item label="清理无转化群">
+              <el-form-item v-if="!simplifiedGrowth" label="清理无转化群">
                 <el-switch v-model="schedulerForm.group_capacity_cleanup!.enabled" disabled />
                 <el-text type="info" size="small">已关闭，不会因长期无转化自动退群</el-text>
               </el-form-item>
-              <el-form-item label="无转化天数">
+              <el-form-item v-if="!simplifiedGrowth" label="无转化天数">
                 <el-input-number v-model="schedulerForm.group_capacity_cleanup!.no_conversion_days" :min="1" :max="365" disabled />
               </el-form-item>
-              <el-form-item label="最小入群天数">
+              <el-form-item v-if="!simplifiedGrowth" label="最小入群天数">
                 <el-input-number v-model="schedulerForm.group_capacity_cleanup!.min_join_age_days" :min="1" :max="365" disabled />
               </el-form-item>
-              <el-form-item label="单轮清理上限">
+              <el-form-item v-if="!simplifiedGrowth" label="单轮清理上限">
                 <el-input-number v-model="schedulerForm.group_capacity_cleanup!.max_cleanup_per_run" :min="1" :max="15" disabled />
               </el-form-item>
               <el-form-item>
@@ -1316,20 +1321,26 @@ onBeforeUnmount(() => {
               <el-form-item label="投放执行">
                 <el-switch v-model="adExecutionForm.enabled" />
               </el-form-item>
-              <el-form-item label="执行间隔">
+              <el-form-item v-if="!simplifiedGrowth" label="执行间隔">
                 <el-input-number v-model="adExecutionForm.dispatcher_interval_seconds" :min="1" :max="86400" />
               </el-form-item>
-              <el-form-item label="调度分页数">
+              <el-form-item v-if="!simplifiedGrowth" label="调度分页数">
                 <el-input-number v-model="adExecutionForm.dispatcher_batch_size" :min="1" :max="1000" />
               </el-form-item>
-              <el-form-item label="并行账号数">
+              <el-form-item v-if="!simplifiedGrowth" label="并行账号数">
                 <el-input-number v-model="adExecutionForm.max_parallel_accounts" :min="1" :max="20" />
               </el-form-item>
-              <el-form-item label="任务租约秒">
+              <el-form-item v-if="!simplifiedGrowth" label="任务租约秒">
                 <el-input-number v-model="adExecutionForm.job_lease_seconds" :min="60" :max="1800" />
               </el-form-item>
               <el-form-item label="Growth群冷却秒">
                 <el-input-number v-model="adExecutionForm.growth_group_global_cooldown_seconds" :min="3600" :max="604800" />
+              </el-form-item>
+              <el-form-item label="连续群失败退群阈值">
+                <el-input-number v-model="adExecutionForm.send_failure_exit_threshold" :min="1" :max="10" />
+              </el-form-item>
+              <el-form-item label="群失败重试冷却秒">
+                <el-input-number v-model="adExecutionForm.send_failure_retry_seconds" :min="60" :max="86400" />
               </el-form-item>
               <el-form-item label="节流策略">
                 <el-switch v-model="adThrottleForm.enabled" />
@@ -1337,11 +1348,15 @@ onBeforeUnmount(() => {
               <el-form-item label="Growth最小间隔秒">
                 <el-input-number v-model="adThrottleForm.growth_min_interval_seconds" :min="600" :max="86400" />
               </el-form-item>
-              <el-form-item label="历史随机上限（停用）">
+              <el-form-item v-if="!simplifiedGrowth" label="历史随机上限（停用）">
                 <el-input-number v-model="adThrottleForm.growth_max_interval_seconds" :min="600" :max="86400" disabled />
               </el-form-item>
             </el-form>
-            <el-form label-width="150px" size="small">
+            <el-alert v-if="simplifiedGrowth" title="成员权限投放" type="info" :closable="false">
+              已入群、验证完成且可发送文字即可投放。新群每日 1 条，每日复核后按 1、2、4、8、16、30 条调整。
+              人工禁投、账号风控、纯文字无链接限制及账号和群发送间隔持续生效。
+            </el-alert>
+            <el-form v-else label-width="150px" size="small">
               <el-form-item label="群许可风控">
                 <el-switch v-model="adCapacityForm.enabled" />
               </el-form-item>

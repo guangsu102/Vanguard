@@ -547,23 +547,6 @@ class PrivateHandler:
 
         return message
 
-    async def _ensure_client(self, account) -> Optional[object]:
-        """Ensure an account has a connected Telegram client."""
-        client = getattr(account, "client", None)
-        if client is not None:
-            return client
-
-        connect = getattr(account, "connect", None)
-        if callable(connect):
-            try:
-                client = await connect()
-                if client is not None:
-                    account.client = client
-                    return client
-            except Exception as exc:
-                self.logger.warning("ensure_client_failed", session_name=getattr(account, 'session_name', None), error=str(exc))
-        return None
-
     def _extract_tracking_code(self, command: str) -> Optional[str]:
         """Extract tracking code from /start command."""
         parts = command.split(maxsplit=1)

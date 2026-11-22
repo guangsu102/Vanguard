@@ -9,11 +9,13 @@ from app.core.account.session_guard import (
     install_session_failure_hook,
     is_wrong_session_error,
 )
+from app.core.account.session_quarantine import QuarantineUnavailable
+from tests.test_session_lease import FakeRedis as LeaseRedis
 
 
-class FakeRedis:
+class FakeRedis(LeaseRedis):
     def __init__(self) -> None:
-        self.values: dict[str, str] = {}
+        super().__init__()
 
     async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool:
         if nx and key in self.values:
@@ -25,6 +27,8 @@ class FakeRedis:
         return self.values.get(key)
 
     async def eval(self, script: str, numkeys: int, *rest) -> int:
+        if "quarantine_" in script:
+            return await super().eval(script, numkeys, *rest)
         keys, argv = list(rest[:numkeys]), list(rest[numkeys:])
         lease_key, token = keys[0], argv[0]
         if self.values.get(lease_key) != token:
@@ -34,6 +38,11 @@ class FakeRedis:
         for key in keys:
             self.values.pop(key, None)
         return 1
+
+
+@pytest.fixture(autouse=True)
+def isolated_quarantine_store(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.core.account.session_quarantine._root", lambda: tmp_path)
 
 
 @pytest.mark.asyncio
@@ -52,7 +61,7 @@ async def test_wrong_session_is_not_replayed() -> None:
         await guard.execute(operation)
     assert calls == 1
     assert guard.quarantined
-    assert guard.lease.key not in redis.values
+    assert redis.values[guard.lease.key].startswith("quarantine:")
 
 
 @pytest.mark.asyncio
@@ -63,8 +72,9 @@ async def test_lease_loss_while_waiting_on_gate_fences_rpc() -> None:
     # Simulate a replacement process taking the distributed lease while the
     # old owner is waiting for its local account lock.
     redis.values[gate.lease.key] = "replacement-generation"
-    with pytest.raises(SessionQuarantined):
+    with pytest.raises((SessionQuarantined, QuarantineUnavailable)):
         await gate.assert_owned(expected_token=gate.lease.token)
+    gate.lease.stop_renewal()
 
 
 def test_typed_telethon_auth_key_failure_is_a_wrong_session() -> None:

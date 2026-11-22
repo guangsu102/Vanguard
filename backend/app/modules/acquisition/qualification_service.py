@@ -6,12 +6,13 @@ import asyncio
 import hashlib
 import json
 import re
+import traceback
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import and_, case, desc, exists, func, or_, select
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, raiseload
 
 from app.core.account.models import TelegramAccount
 from app.core.config import settings
@@ -28,6 +29,12 @@ from app.modules.acquisition.group_qualification import (
     trial_evidence,
     trial_proof,
 )
+
+# Historical callers keep these imports while P2 retires their execution paths.
+from app.modules.acquisition.growth_policy import SETTING_KEY as SETTING_KEY
+from app.modules.acquisition.growth_policy import account_block_reason as account_block_reason
+from app.modules.acquisition.growth_policy import manually_protected as manually_protected
+from app.modules.acquisition.growth_policy import policy as policy
 from app.modules.acquisition.models import AdDeliveryLog, AutoJoinAttempt, GroupQualificationAudit
 from app.modules.acquisition.qualification_identity import (
     PeerIdentity,
@@ -48,7 +55,6 @@ from app.modules.acquisition.send_restriction import (
     verified_long_restriction,
 )
 
-SETTING_KEY = "automation.group_qualification"
 AI_REVIEW_INCOMPLETE_REASONS = {
     "group_rules_ai_unavailable",
     "group_rules_ai_provider_content_rejected",
@@ -80,6 +86,63 @@ STALE_CLAIM_ESCALATION_ATTEMPTS = 3
 STALE_CLAIM_GRACE_SECONDS = 90
 STALE_REVIEW_RETRY_SECONDS = 60
 ACTIVE_REVIEW_STATES = frozenset({"running", "reviewing_ai", "waiting_ai"})
+
+
+TECHNICAL_STAGES = {name: index for index, name in enumerate((
+    "collection_reuse", "account_acquire", "entity", "self_identity", "system_identity",
+    "collection_plan", "candidate_hints", "candidate_seed", "evidence_collect",
+    "candidate_retain", "snapshot_finalize", "quality_decision", "review_assess",
+), 1)}
+TECHNICAL_MODULES = {"app.modules.acquisition." + name: index for index, name in enumerate((
+    "qualification_service", "group_qualification", "qualification_read_context",
+    "review_read_runtime", "review_evidence_store", "review_history_progress",
+    "review_read_plan", "review_collection_progress", "review_evidence_ingest",
+    "qualification_events", "qualification_system_identity", "qualification_reads",
+    "review_read_flags", "qualification_ai", "review_evidence_handoff",
+), 1)}
+TECHNICAL_MODULES.update({"app.core.account." + name: index for index, name in enumerate((
+    "read_metrics", "read_work", "rpc_governor", "listener_protocol", "pool",
+), 101)})
+TECHNICAL_FUNCTIONS = {name: index for index, name in enumerate((
+    "_assess", "assess", "collect", "_collect", "_history", "_classify_history", "role",
+    "_finish", "select_advertising_evidence", "candidate_ids", "cached_hint_messages",
+    "cached_event_messages", "retain_candidates", "list_observations_sync", "hint_refs_sync",
+    "dependency_records_sync", "admit_observation_sync", "_run", "operation", "fingerprint",
+    "load", "save", "get_messages", "get_message", "_read", "_invoke", "_client_key",
+    "current_permissions", "covered_system_ids", "finish_candidate", "_run_reviews",
+), 1)}
+
+
+def technical_diagnostic(exc: Exception, stage: str) -> dict[str, Any]:
+    """Fixed numeric diagnostics only: no exception arguments, names or locals."""
+    frames = []
+    for frame, line in traceback.walk_tb(exc.__traceback__):
+        module = frame.f_globals.get("__name__", "")
+        function = frame.f_code.co_name
+        if (isinstance(module, str) and module.startswith("app.")
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,159}", module)
+                and re.fullmatch(r"[A-Za-z_<][A-Za-z0-9_<>]{0,79}", function)):
+            frames.append({"module_code": TECHNICAL_MODULES.get(module, 0),
+                           "function_code": TECHNICAL_FUNCTIONS.get(function, 0), "line": int(line)})
+    name = type(exc).__name__
+    reasons = {"KeyError", "ValueError", "TypeError", "AttributeError", "RuntimeError",
+               "TimeoutError", "OSError", "RpcDeferred", "AccountOperationLeaseBusy"}
+    counts = {"stage_code": TECHNICAL_STAGES.get(stage, 0),
+              **(frames[-1] if frames else {"module_code": 0, "function_code": 0, "line": 0})}
+    for index, frame in enumerate(frames[-8:]):
+        counts.update({f"frame_{index}_{field}": value for field, value in frame.items()})
+    return {"counts": counts, "reason": name if name in reasons else "other"}
+
+
+def record_technical_diagnostic(exc: Exception, stage: str) -> dict[str, Any]:
+    diagnostic = technical_diagnostic(exc, stage)
+    try:
+        from app.modules.acquisition.review_diagnostics import append
+
+        append("review_collection_error", **diagnostic)
+    except Exception:
+        pass  # Optional diagnostics cannot replace the original business error.
+    return diagnostic
 
 
 def stale_claim_action(row: Any, *, now: datetime) -> str | None:
@@ -191,40 +254,6 @@ def recover_stale_review_row(row: Any, membership: Any | None, *, now: datetime)
     return action
 
 
-async def policy(db: Any, *, fresh: bool = False) -> dict[str, Any]:
-    row = (
-        await db.get(SystemSetting, SETTING_KEY, populate_existing=True)
-        if fresh
-        else await db.get(SystemSetting, SETTING_KEY)
-    )
-    config = json.loads(row.value) if row and row.value else {"enabled": False, "execute_exits": False}
-    if config.get("verification_active_promoters") is True:
-        from app.core.account.models import AccountOperationConfig, AccountType
-        config["verification_account_ids"] = list((await db.scalars(
-            select(AccountOperationConfig.account_id).join(
-                TelegramAccount, TelegramAccount.id == AccountOperationConfig.account_id
-            ).where(
-                AccountOperationConfig.enabled.is_(True),
-                AccountOperationConfig.auto_join_enabled.is_(True),
-                TelegramAccount.account_type == AccountType.PROMOTER,
-            )
-        )).all())
-    if config.get("promotion_active_promoters") is True:
-        from app.core.account.models import AccountOperationConfig, AccountType
-        active = list((await db.scalars(select(AccountOperationConfig.account_id).join(
-            TelegramAccount, TelegramAccount.id == AccountOperationConfig.account_id,
-        ).where(
-            AccountOperationConfig.enabled.is_(True),
-            AccountOperationConfig.auto_ads_enabled.is_(True),
-            TelegramAccount.account_type == AccountType.PROMOTER,
-        ))).all())
-        config["promotion_account_ids"] = active
-        rollout = config.setdefault("rollout_accounts", {})
-        for account_id in active:
-            # Explicit pauses remain pauses; a newly enabled promoter inherits
-            # the global rules without requiring a second static allowlist edit.
-            rollout.setdefault(str(account_id), {"phase": "dynamic"})
-    return config
 
 
 def exit_scope_filters(config: dict[str, Any]) -> tuple[set[int] | None, set[str] | None]:
@@ -294,7 +323,7 @@ def _checkpoint_data(row: GroupQualificationAudit | None) -> dict[str, Any]:
 
 
 def checkpoint_reusable(row: GroupQualificationAudit | None, *, stage: str, revision: str) -> bool:
-    if not checkpoints_enabled() or row is None:
+    if row is None or (not checkpoints_enabled() and not getattr(row, "_efficiency_claim", None)):
         return False
     data = _checkpoint_data(row)
     if data.get("version") == 1:
@@ -304,7 +333,7 @@ def checkpoint_reusable(row: GroupQualificationAudit | None, *, stage: str, revi
 
 
 def checkpoint_payload(row: GroupQualificationAudit | None, *, stage: str | None = None) -> dict[str, Any]:
-    if not checkpoints_enabled() or row is None:
+    if row is None or (not checkpoints_enabled() and not getattr(row, "_efficiency_claim", None)):
         return {}
     data = _checkpoint_data(row)
     if data.get("version") == 1:
@@ -316,11 +345,15 @@ def checkpoint_payload(row: GroupQualificationAudit | None, *, stage: str | None
 
 def checkpoint_collection_current(row: Any, previous: dict, now: datetime) -> bool:
     """Only unfinished work may resume; due observations start a new cycle."""
-    if not checkpoints_enabled() or row is None or row.decision not in {"unknown", "technical_wait", "observe"}:
+    if row is None or (not checkpoints_enabled() and not getattr(row, "_efficiency_claim", None)) or row.decision not in {"unknown", "technical_wait", "observe"}:
         return False
     if row.decision == "observe" and not (previous.get("ai_pending") or previous.get("ai_review_incomplete")):
         return False
     saved = checkpoint_payload(row, stage="collection")
+    if saved.get("rules_evaluation_status") == "NOT_EVALUATED":
+        # This proof path skipped the rule/history dependencies; refresh live
+        # permissions and proof before an interrupted attempt can authorize.
+        return False
     collected = _date(saved.get("collected_at"))
     maturity = _date(previous.get("next_evidence_maturity_at"))
     return bool(saved.get("collection_complete") is True and collected is not None
@@ -358,7 +391,7 @@ async def save_checkpoint(
     payload: dict[str, Any] | None = None,
 ) -> None:
     """Persist a stage result without incrementing review attempts."""
-    if not checkpoints_enabled():
+    if not checkpoints_enabled() and not getattr(row, "_efficiency_claim", None):
         return
     data = _checkpoint_data(row)
     stages = dict(data.get("stages") or {}) if data.get("version") == 1 else {}
@@ -371,6 +404,11 @@ async def save_checkpoint(
     row.checkpoint_revision = revision
     row.checkpoint_json = json.dumps({"version": 1, "stages": stages}, ensure_ascii=False, default=str)
     row.checkpoint_updated_at = datetime.utcnow()
+    if getattr(row, "_efficiency_claim", None):
+        if stage == "collection":
+            row.evidence_json = json.dumps(payload or {}, ensure_ascii=False, default=str)
+        from app.modules.acquisition.qualification_engine import checkpoint_draft
+        await checkpoint_draft(db, row)
     try:
         from app.core.metrics import record_checkpoint
         await record_checkpoint("write")
@@ -410,20 +448,6 @@ def verification_account_allowed(config: dict[str, Any], account_id: int) -> boo
     )
 
 
-def manually_protected(
-    config: dict[str, Any], group: Group, membership: GroupAccountMembership | None
-) -> bool:
-    """Manual protection is separate from permission to advertise."""
-    return (
-        group.id in _ids(config.get("manual_protected_group_ids"))
-        or bool(
-            set(telegram_group_id_aliases(group.group_id))
-            & _ids(config.get("protected_telegram_group_ids"))
-        )
-        or (
-            membership is not None and membership.id in _ids(config.get("protected_membership_ids"))
-        )
-    )
 
 
 def scope_matches(
@@ -560,6 +584,9 @@ async def qualification_peer_history(
         (
             await db.execute(
                 select(Group, GroupQualificationAudit)
+                # Qualification history consumes scalar facts only. Avoid the
+                # Group selectin loader and its joined account graph on each RPC.
+                .options(raiseload(Group.account_memberships))
                 .join(GroupQualificationAudit, GroupQualificationAudit.group_id == Group.id)
                 .where(Group.group_id.in_(identity_aliases(identity)))
                 .order_by(GroupQualificationAudit.id.desc())
@@ -567,6 +594,29 @@ async def qualification_peer_history(
             )
         ).all()
     )
+
+
+def fast_path_history_requires_full(
+    history: list[tuple[Group, GroupQualificationAudit]],
+) -> bool:
+    """Queued/unknown rows are not re-entry or negative-history dependencies."""
+    for _group, review in history:
+        snapshot = _payload(review)
+        if (
+            review.decision == "reject"
+            or snapshot.get("exit_group_rule_ban") is True
+            or snapshot.get("qualification_exit_history")
+            or confirmed_group_bans(snapshot)
+            or any(
+                check.get("decision") == "reject"
+                or check.get("quality_status") == "reject"
+                or check.get("exit_group_rule_ban") is True
+                for check in snapshot.get("previous_checks", [])
+                if isinstance(check, dict)
+            )
+        ):
+            return True
+    return False
 
 
 def group_ban_cleared(
@@ -622,19 +672,6 @@ def annotate_newcomer_restriction(snapshot: dict, joined_at: datetime | None, no
         permissions["newcomer_until"] = (joined_at + timedelta(hours=48)).isoformat()
 
 
-def account_block_reason(account: TelegramAccount | None, now: datetime) -> str | None:
-    if account is None or not account.is_active:
-        return "account_unavailable"
-    status = str(getattr(account.status, "value", account.status)).lower()
-    if status in {"banned", "restricted", "error"}:
-        return "account_status_unavailable"
-    if account.spam_check_status in {"restricted", "flagged"}:
-        return "account_spam_restricted"
-    if account.risk_pause_until and account.risk_pause_until > now:
-        return "account_risk_paused"
-    if account.risk_level not in {"normal", "watch"}:
-        return "account_risk_level_not_allowed"
-    return None
 
 
 def restricted_evidence_read_allowed(
@@ -715,8 +752,12 @@ async def current_authorization(
         target_aliases is not None and member.telegram_group_id not in target_aliases
     ):
         return AuthorizationResolution(reason="qualification_membership_identity_changed")
-    from app.modules.acquisition.qualification_continuity import effective_review
-    row = await effective_review(db, member.id)
+    from app.modules.acquisition.qualification_engine import active_authorization, enabled_for
+    if enabled_for(account_id):
+        row = await active_authorization(db, member, group=group)
+    else:
+        from app.modules.acquisition.qualification_continuity import effective_review
+        row = await effective_review(db, member.id)
     return AuthorizationResolution(
         row, group, member, reason="qualification_review_required" if row is None else None
     )
@@ -954,7 +995,35 @@ def review_schedule(
 ) -> tuple[str, str, str, datetime | None]:
     from app.modules.acquisition.evidence_progress import evidence_maturity, progress_retry
 
+    if previous.get("technical_recovery_event_key"):
+        snapshot.setdefault("technical_recovery_event_key", previous["technical_recovery_event_key"])
     original_reason = snapshot["reason"]
+    if snapshot.get("efficiency_v1") and snapshot.get("ai_pending") and snapshot.get("ai_request_started"):
+        snapshot.update(ai_final=False, ai_decision=None, ai_review_incomplete=False,
+                        decision="observe", review_trigger="provider_pending")
+        return "observe", original_reason, "waiting_ai", now+timedelta(seconds=30)
+    if original_reason in {"qualification_candidate_full_required", "qualification_history_refresh_required"}:
+        # Completing a bounded collection stage is not a failed qualification.
+        # Preserve business timers and hand the missing facts to the old queue.
+        snapshot["technical_failures"] = int(previous.get("technical_failures", 0))
+        for field in ("technical_recovery_started_at", "technical_recovery_deadline_at"):
+            if previous.get(field):
+                snapshot[field] = previous[field]
+        snapshot["review_trigger"] = "collection_continuation"
+        return "technical_wait", original_reason, "completed", now + timedelta(seconds=60)
+    from app.modules.acquisition.qualification_ai import PRECALL_FAILURES
+
+    if original_reason in PRECALL_FAILURES and snapshot.get("ai_request_started") is False:
+        # No provider request was made. Keep evidence and the waiting lane;
+        # this is neither a semantic rejection nor a group technical failure.
+        snapshot.update(ai_final=False, ai_pending=True, ai_decision=None,
+                        ai_review_incomplete=False, decision="observe",
+                        review_trigger="ai_preflight_retry")
+        snapshot["technical_failures"] = int(previous.get("technical_failures", 0))
+        snapshot["ai_review_failures"] = int(previous.get("ai_review_failures", 0))
+        return "observe", original_reason, "waiting_ai", now + timedelta(
+            seconds=max(60, int(snapshot.get("ai_retry_after_seconds") or 300))
+        )
     # AI recognition is single shot for one material set. A provider failure
     # closes that material immediately, while a genuinely changed rule/evidence
     # set is allowed to enter one fresh recognition attempt. ``ai_material_key``
@@ -1205,11 +1274,14 @@ def ai_evidence_reusable(previous: dict, account: Any, now: datetime, change: di
     from app.modules.acquisition.evidence_progress import evidence_maturity
     from app.modules.acquisition.qualification_ai import profile_fingerprint
     from app.modules.acquisition.qualification_events import same_evidence_event
+    from app.modules.acquisition.qualification_engine import enabled_for
 
     collected_at = _date(previous.get("collected_at"))
     maturity = evidence_maturity(previous, now)
     return bool(
         not previous.get("ai_final")
+        and previous.get("rules_evaluation_status") != "NOT_EVALUATED"
+        and previous.get("history_evaluation_status") != "NOT_EVALUATED"
         and not (maturity and maturity <= now + timedelta(seconds=1))
         and (previous.get("ai_pending") or previous.get("ai_review_incomplete"))
         and not previous.get("collection_needs_refresh")
@@ -1221,7 +1293,7 @@ def ai_evidence_reusable(previous: dict, account: Any, now: datetime, change: di
         and previous.get("quality_status") == "qualified"
         and not previous.get("invalidated_at")
         and not previous.get("technical_errors")
-        and automatic_exit_reason(previous) is None
+        and (enabled_for(getattr(account, "id", None)) or automatic_exit_reason(previous) is None)
     )
 
 
@@ -1229,15 +1301,49 @@ async def assess(
     service: Any, account_id: int, group: Group, *,
     row: GroupQualificationAudit | None = None, force_refresh: bool = False
 ) -> Any:
+    from app.modules.acquisition.qualification_engine import enabled_for, enqueue
+    if enabled_for(account_id) and not getattr(row, "_efficiency_claim", None):
+        from app.modules.acquisition.automation import JoinedGroupAuditResult
+        member = await service.db.scalar(select(GroupAccountMembership).where(
+            GroupAccountMembership.account_id == account_id, GroupAccountMembership.group_id == group.id,
+        ))
+        if member is None:
+            return JoinedGroupAuditResult(passed=False, reason="qualification_membership_missing")
+        work = await enqueue(service.db, member, reason="manual" if force_refresh else "initial")
+        return JoinedGroupAuditResult(passed=False, reason="qualification_work_pending",
+                                      verification_details={"work_id": work.id})
     from app.core.account.read_work import operation
     scope = f"{row.membership_id}:{row.membership_joined_at.isoformat()}" if row is not None and row.membership_joined_at else ""
     async with operation(account_id, group.id, "review", scope=scope) as work:
+        from app.modules.acquisition.qualification_engine import initial_join_budget_current
+        claim = getattr(row, "_efficiency_claim", None)
+        if await initial_join_budget_current(service.db, claim, account_id, group.id):
+            work.budget_workload, work.budget_claim = "join", claim
         import asyncio
         async with asyncio.timeout(240):
             result = await _assess(service, account_id, group, row=row, force_refresh=force_refresh)
         if work.outcome == "interrupted":
             work.outcome = "allowed" if result.passed else (result.reason or "technical_wait")
         return result
+
+
+def _efficiency_read_plan_payload(read_plan: Any, row: Any) -> dict[str, Any]:
+    """Persist the already computed local plan, including pre-acquire waits."""
+    claim = getattr(row, "_efficiency_claim", None)
+    from app.core.account.read_work import current
+    work = current(getattr(row, "account_id", None))
+    return {
+        "phase": read_plan.phase, "operation": getattr(read_plan, "operation", read_plan.phase),
+        "required_reads": read_plan.reads, "reason": read_plan.reason, "bounded": read_plan.bounded,
+        "scope": getattr(read_plan, "scope", None), "version": getattr(read_plan, "version", None),
+        "ready_at": getattr(read_plan, "ready_at", None), "deadline": getattr(read_plan, "deadline", None),
+        "missing_dependencies": list(getattr(read_plan, "missing_dependencies", ())),
+        "wake_conditions": list(getattr(read_plan, "wake_conditions", ())),
+        "claim_revision": getattr(claim, "revision", None),
+        "claim_scope_key": getattr(claim, "scope_key", None),
+        "claim_event_version": getattr(claim, "event_version", None),
+        "budget_workload": getattr(work, "budget_workload", None) or "review",
+    }
 
 
 async def _assess(
@@ -1248,6 +1354,7 @@ async def _assess(
     from app.modules.acquisition.automation import GroupAdRulesAuditResult, JoinedGroupAuditResult
 
     now = datetime.utcnow()
+    use_checkpoints = checkpoints_enabled() or bool(getattr(row, "_efficiency_claim", None))
     previous = _payload(row)
     membership = await service.db.scalar(
         select(GroupAccountMembership).where(
@@ -1263,6 +1370,8 @@ async def _assess(
 
         snapshot_fact_version = await current_fact_version(service.db, str(group.group_id))
     account = await service.db.get(TelegramAccount, account_id, populate_existing=True)
+    from app.modules.acquisition import qualification_sla_runtime
+    qualification_sla_runtime.observe_account_health(account, service)
     restricted_read = restricted_evidence_read_allowed(account, config, now)
     snapshot: dict[str, Any] = {}
     verdict = "unknown"
@@ -1306,16 +1415,19 @@ async def _assess(
 
         previous = _payload(row)
         previous = previous.get("pending_collection") or previous
+        if previous.get("scope_collection_refresh"):
+            force_refresh = True
+            previous = {}  # Persisted foreign material cannot seed fresh collection or AI reuse.
         from app.modules.acquisition.qualification_events import pending
         collection_event = await pending(service.db, membership) if membership is not None else None
         checkpoint_current = checkpoint_collection_current(row, previous, now) and not force_refresh
         checkpointed_collection = checkpoint_payload(row, stage="collection") if checkpoint_current else {}
-        cycle = checkpointed_collection.get("checkpoint_cycle") or (
+        cycle = checkpointed_collection.get("checkpoint_cycle") or getattr(row, "_efficiency_cycle", None) or (
             f"{row.id}:{row.batch_id}:{row.checked_at or row.created_at}" if row is not None else now.isoformat()
         )
         checkpoint_rules = None
         checkpoint_limits = None
-        if checkpoints_enabled():
+        if use_checkpoints:
             from app.modules.acquisition.qualification_ai import SEMANTIC_VERSION
             _, system_identity = await covered_system_ids(service.db, config, account_id=account_id)
             checkpoint_limits = dict(await get_ad_capacity_settings(service.db))
@@ -1331,6 +1443,9 @@ async def _assess(
             collection_event,
             profile=profile_fingerprint(account), rules_identity=checkpoint_rules, review_cycle=cycle,
         )
+        from app.core.account.read_metrics import lock_business_complexity
+        lock_business_complexity(previous, collection_event,
+                                 force_refresh=force_refresh or restricted_read)
         from app.core.account.idempotency import operation_key
         from app.modules.acquisition.qualification_events import same_evidence_event
         event_version = hashlib.sha256(
@@ -1344,13 +1459,14 @@ async def _assess(
         )
         collection_reuse = bool(
             not force_refresh
+            and previous.get("rules_evaluation_status") != "NOT_EVALUATED"
             and row is not None
             and row.decision in {"unknown", "technical_wait", "observe"}
             and previous.get("collection_complete") is True
             and previous.get("collection_operation_key") == collection_operation_key
             and same_evidence_event(previous.get("collection_event"), collection_event)
         )
-        if checkpoints_enabled():
+        if use_checkpoints:
             collection_reuse = checkpoint_current and checkpoint_reusable(
                 row, stage="collection", revision=evidence_revision
             )
@@ -1367,7 +1483,7 @@ async def _assess(
                 await record_checkpoint("hit")
             except Exception:
                 pass
-        elif checkpoints_enabled() and row is not None and not force_refresh:
+        elif use_checkpoints and row is not None and not force_refresh:
             try:
                 from app.core.metrics import record_checkpoint
                 await record_checkpoint("miss")
@@ -1399,7 +1515,7 @@ async def _assess(
             effective_review,
             own_proof_valid,
         )
-        if row is not None and row.decision == "unknown" and not force_refresh:
+        if row is not None and row.decision == "unknown" and not force_refresh and not getattr(row, "_efficiency_claim", None):
             approved = await effective_review(service.db, membership.id)
             old = _payload(approved)
             if (approved is not None and approved.id != row.id
@@ -1433,19 +1549,33 @@ async def _assess(
                     row.evidence_json = json.dumps(payload, ensure_ascii=False, default=str)
             return renewed
         reuse = not force_refresh and not restricted_read and ai_evidence_reusable(previous, account, now, collection_event)
-        if checkpoints_enabled():
-            reuse = reuse and collection_reuse
+        if use_checkpoints:
+            reuse = reuse and (collection_reuse or bool(getattr(row, "_efficiency_claim", None)
+                and (previous.get("ai_pending") or previous.get("ai_review_incomplete"))))
         from app.core.account.read_work import current
-        from app.modules.acquisition.review_cost import review_shape
+        from app.modules.acquisition.review_read_plan import apply as apply_read_plan
+        from app.modules.acquisition.review_read_plan import for_review
         active_work = current(account_id)
+        read_plan = await for_review(
+            service.db, previous, row, membership, group, account, collection_event, now,
+            force_refresh=force_refresh or restricted_read,
+        )
         if active_work is not None:
-            active_work.phase, active_work.requested_reads = review_shape(
-                previous, row, membership, account, collection_event, now,
-                force_refresh=force_refresh or restricted_read)
+            apply_read_plan(active_work, read_plan, account_id)
+        if getattr(row, "_efficiency_claim", None) and read_plan.reads == 0 and read_plan.phase in {"maturity", "event"}:
+            snapshot = {**previous, "reason": read_plan.reason, "efficiency_v1": True,
+                        "read_plan": _efficiency_read_plan_payload(read_plan, row)}
+            if read_plan.ready_at is not None:
+                snapshot["maturity_at"] = read_plan.ready_at.isoformat()
+            row.evidence_json, row.reason, row.decision = json.dumps(snapshot, ensure_ascii=False, default=str), read_plan.reason, "technical_wait"
+            return JoinedGroupAuditResult(passed=False, reason=read_plan.reason)
         from app.modules.acquisition.review_batch import current_batch
         batch = current_batch.get()
         wrapper = None
+        read_context = None
         verdict = "technical_wait"
+        failure_stage = "collection_reuse"
+        identity_mismatch = False
         try:
             if reuse or collection_reuse:
                 checkpointed = checkpoint_payload(row, stage="collection") if collection_reuse and checkpoint_current else {}
@@ -1460,6 +1590,7 @@ async def _assess(
                 else:
                     snapshot["collection_reused"] = True
             else:
+                failure_stage = "account_acquire"
                 await service.db.commit()
                 await service.account_pool.add_account_from_db(account)
                 wrapper = (await batch.acquire(account_id, restricted=restricted_read) if batch else
@@ -1469,15 +1600,25 @@ async def _assess(
                 if wrapper is None or wrapper.client is None:
                     raise RuntimeError("account_unavailable")
                 client = wrapper.client
-                entity = await client.get_entity(group.username or group.group_id)
+                from app.modules.acquisition.review_fact_owner import (
+                    bind_context, create_context,
+                )
+                from app.modules.acquisition.review_read_flags import stage_enabled
+                read_context = create_context(account_id, wrapper)
+                failure_stage = "entity"
+                entity = await read_context.get_entity(client, group.username or group.group_id)
                 if not service._telegram_entity_matches_group_id(entity, group.group_id):
+                    identity_mismatch = True
                     raise RuntimeError("group_identity_mismatch")
-                self_user = await client.get_me()
+                failure_stage = "self_identity"
+                self_user = await read_context.get_me(client)
                 self_user_id = int(self_user.id)
+                failure_stage = "system_identity"
                 own_ids, identity_fingerprint = await covered_system_ids(
                     service.db, config, account_id=account_id, live_user_id=self_user_id
                 )
                 own_ids.add(self_user_id)
+                failure_stage = "collection_plan"
                 progress_valid = (
                     previous.get("account_id") == account_id
                     and previous.get("telegram_group_id") == group.group_id
@@ -1486,7 +1627,10 @@ async def _assess(
                     and not force_refresh
                 )
                 from app.modules.acquisition.qualification_events import same_evidence_event
-                if not same_evidence_event(previous.get("collection_event"), collection_event):
+                if getattr(row, "_efficiency_claim", None) or stage_enabled(account_id, "resume"):
+                    from app.modules.acquisition.review_collection_progress import for_event
+                    previous = for_event(previous, collection_event)
+                elif not same_evidence_event(previous.get("collection_event"), collection_event):
                     # Message hints remain useful, but a new event invalidates
                     # skipped-page cursors and all assumptions about coverage.
                     previous = {**previous, "collection_progress": {
@@ -1496,14 +1640,90 @@ async def _assess(
                 # Unfinished identities retain message IDs for fresh continuation.
                 collector = EvidenceCollector(
                     client, own_user_ids=own_ids, identity_limit=12, priority_identities=8,
+                    read_context=read_context, account_id=account_id,
                 )
+                collector.history_scope = {
+                    "membership_id": membership.id,
+                    "joined_at": membership.joined_at.isoformat() if membership.joined_at else None,
+                    "event": {key: value for key, value in (collection_event or {}).items() if key != "queued"},
+                    "policy": {"version": POLICY_VERSION, "settings": config},
+                    "profile": profile_fingerprint(account),
+                    "system_identity": identity_fingerprint,
+                }
+                await bind_context(read_context, entity, collector.history_scope, previous)
                 from app.modules.acquisition.callback_evidence import hint_ids
-                collector.callback_message_ids = await hint_ids(service.db, membership, now)
+                collector.callback_message_ids = list(dict.fromkeys([
+                    *((collection_event or {}).get("message_ids") or []),
+                    *await hint_ids(service.db, membership, now),
+                ]))[:32]
+                from app.modules.acquisition.review_read_runtime import candidate_ids, enabled_for
+                if enabled_for(account_id):
+                    from telethon.utils import get_peer_id
+
+                    failure_stage = "candidate_hints"
+                    protected_ids = await candidate_ids(membership, now, group_id=get_peer_id(entity))
+                    collector.callback_message_ids = list(dict.fromkeys(
+                        [*protected_ids, *collector.callback_message_ids]
+                    ))[:6]
+                    collector.enable_fast_path = bool(
+                        (getattr(row, "_efficiency_claim", None) or stage_enabled(account_id, "fast_path")) and identity_fingerprint is not None
+                        and not restricted_read and not force_refresh and collection_event is None
+                        and membership is not None and membership.status == "joined"
+                    )
+                    if collector.enable_fast_path or getattr(row, "_efficiency_claim", None) or stage_enabled(account_id, "demand_identity"):
+                        from app.modules.acquisition.qualification_identity import entity_identity
+
+                        # Historical re-entry and delivery branches may consume
+                        # full history counts. Keep the original path for them.
+                        full_history_required = not getattr(row, "_efficiency_claim", None) and (fast_path_history_requires_full(await qualification_peer_history(
+                            service.db, entity_identity(entity),
+                        )) or await service.db.scalar(select(AdDeliveryLog.id).where(
+                            AdDeliveryLog.account_id == account_id,
+                            AdDeliveryLog.group_id == group.id,
+                        ).limit(1)) is not None)
+                        collector.enable_fast_path = collector.enable_fast_path and not full_history_required
+                        collector.enable_on_demand_identity = (
+                            (bool(getattr(row, "_efficiency_claim", None)) or stage_enabled(account_id, "demand_identity")) and not full_history_required
+                        )
+                    if read_plan.phase == "candidate":
+                        collector.candidate_only = True
+                        collector.callback_message_ids = list(read_plan.candidate_ids)
+                        collector.previous = {**previous, "evidence": [
+                            item for item in previous.get("evidence", [])
+                            if item.get("message_id") in read_plan.candidate_ids
+                        ]}
+                    if (getattr(row, "_efficiency_claim", None) or stage_enabled(account_id, "push")) and membership is not None:
+                        failure_stage = "candidate_seed"
+                        from app.modules.acquisition.review_read_runtime import cached_hint_messages
+                        seeds = await cached_hint_messages(
+                            account_id=account_id, group_id=get_peer_id(entity),
+                            joined_at=membership.joined_at, message_ids=collector.callback_message_ids,
+                            client=client,
+                        )
+                        read_context.remember_messages(client, entity, seeds)
                 collector.stop_on_permanent_mute = bool(membership.joined_at and membership.joined_at <= now - timedelta(hours=48))
-                if progress_valid:
+                if progress_valid and read_plan.phase != "candidate":
                     collector.previous = previous
                 await service.db.commit()
+                failure_stage = "evidence_collect"
                 snapshot = await collector.collect(entity, now=now)
+                if ((snapshot.get("collection_progress") or {}).get("history_resume_refresh_required")
+                        and not snapshot.get("root_ad_history_sufficient")):
+                    snapshot["local_rpc_defer_reason"] = "qualification_history_refresh_required"
+                    snapshot["retry_after_seconds"] = 60
+                snapshot["read_plan"] = {
+                    "phase": read_plan.phase, "required_reads": read_plan.reads,
+                    "reason": read_plan.reason, "bounded": read_plan.bounded,
+                    "ready_at": getattr(read_plan, "ready_at", None),
+                    "deadline": getattr(read_plan, "deadline", None),
+                    "missing_dependencies": list(getattr(read_plan, "missing_dependencies", ())),
+                }
+                if enabled_for(account_id):
+                    failure_stage = "candidate_retain"
+                    from app.modules.acquisition.review_read_runtime import retain_candidates
+
+                    await retain_candidates(membership, snapshot, group_id=get_peer_id(entity))
+                failure_stage = "snapshot_finalize"
                 annotate_newcomer_restriction(snapshot, membership.joined_at, now)
                 snapshot["system_identity_coverage"] = identity_fingerprint is not None
                 snapshot["system_identity_fingerprint"] = identity_fingerprint
@@ -1514,14 +1734,24 @@ async def _assess(
                         TelegramAccount.account_type == AccountType.PROMOTER,
                     ).order_by(TelegramAccount.id)
                 )).all())
-                snapshot["collected_at"] = now.isoformat()
+                history_source_at = _date(snapshot.get("history_source_oldest_at"))
+                snapshot["collected_at"] = min(now, history_source_at or now).isoformat()
                 snapshot["profile_fingerprint"] = profile_fingerprint(account)
                 snapshot["collection_event"] = collection_event
+                from app.modules.acquisition.qualification_events import recovery_event_key
+                snapshot["technical_recovery_event_key"] = recovery_event_key(collection_event)
                 snapshot["collection_operation_key"] = collection_operation_key
+                complete_for_decision = snapshot.get("collection_complete") is True
                 snapshot["collection_complete"] = not bool(
                     (snapshot.get("collection_progress") or {}).get("pending_message_ids")
                 ) and not snapshot.get("local_rpc_defer_reason")
-                if checkpoints_enabled():
+                if getattr(row, "_efficiency_claim", None):
+                    snapshot["collection_complete"] = bool(snapshot["collection_complete"] and (
+                        complete_for_decision or snapshot.get("discovery_exhausted")
+                    ))
+                from app.modules.acquisition.review_fact_owner import publish_context
+                await publish_context(read_context, snapshot)
+                if use_checkpoints:
                     snapshot["checkpoint_cycle"] = cycle
                 if row is not None and snapshot.get("collection_complete"):
                     await save_checkpoint(
@@ -1531,29 +1761,42 @@ async def _assess(
                         revision=evidence_revision,
                         payload=snapshot,
                     )
+            failure_stage = "quality_decision"
             reason, verdict = snapshot["quality_reason"], snapshot["quality_status"]
             if snapshot.get("local_rpc_defer_reason"):
                 reason, verdict = snapshot["local_rpc_defer_reason"], "technical_wait"
         except Exception as exc:
+            from app.modules.acquisition.qualification_events import recovery_event_key
+
+            record_technical_diagnostic(exc, failure_stage)
             snapshot = {
                 "quality_status": "technical_wait",
                 "technical_errors": [type(exc).__name__],
+                "collection_event": collection_event,
+                "technical_recovery_event_key": recovery_event_key(collection_event),
             }
             if "Flood" in type(exc).__name__ or "SlowModeWait" in type(exc).__name__:
                 snapshot["retry_after_seconds"] = max(1, int(getattr(exc, "seconds", 0) or 60))
-            verdict, reason = "technical_wait", type(exc).__name__
+            # This fixed reason comes only from the exact identity guard above.
+            verdict, reason = "technical_wait", (
+                "group_identity_mismatch" if identity_mismatch else type(exc).__name__
+            )
             from app.core.account.rpc_governor import RpcDeferred
             if isinstance(exc, RpcDeferred):
                 reason = exc.reason
                 snapshot["retry_after_seconds"] = exc.retry_after_seconds
-                if previous.get("collection_progress") or previous.get("evidence"):
-                    snapshot["pending_collection"] = previous
+            if previous.get("collection_progress") or previous.get("evidence"):
+                snapshot["pending_collection"] = previous
         finally:
             if wrapper is not None:
                 if batch is None:
                     await service.account_pool.release(wrapper)
                 elif verdict == "technical_wait":
                     await batch.close()
+        # Admission may have deferred before an entity read or collector snapshot.
+        snapshot["read_plan"] = _efficiency_read_plan_payload(read_plan, row)
+        from app.modules.acquisition.review_read_plan import finish_candidate
+        finish_candidate(read_plan, snapshot)
         from app.core.account.read_work import current, release
         cost = current(account_id)
         if cost is not None:
@@ -1656,10 +1899,13 @@ async def _assess(
                     "reviewing_ai",
                     datetime.utcnow() + timedelta(seconds=300),
                 )
+                if getattr(row, "_efficiency_claim", None):
+                    from app.modules.acquisition.qualification_engine import checkpoint_draft
+                    await checkpoint_draft(service.db, row)
                 await service.db.commit()
             # Keep the literal group-rule ban as a separate exit fact. A visible
             # ordinary-member ad may permit sending, but cannot erase C in C&D.
-            snapshot["exit_group_rule_ban"] = bool(
+            snapshot["exit_group_rule_ban"] = None if snapshot.get("rules_evaluation_status") == "NOT_EVALUATED" else bool(
                 ad_result.ad_allowed is False
                 and ad_result.policy_mode == "forbidden"
                 and not topic_only_denial(evidence)
@@ -1742,7 +1988,7 @@ async def _assess(
                             revision=ai_revision,
                             payload={"ad_result": ad_result.__dict__, "snapshot": snapshot, "complete": True},
                         )
-                snapshot["exit_group_rule_ban"] = bool(
+                snapshot["exit_group_rule_ban"] = None if snapshot.get("rules_evaluation_status") == "NOT_EVALUATED" else bool(
                     ad_result.ad_allowed is False
                     and ad_result.policy_mode == "forbidden"
                     and not topic_only_denial(evidence)
@@ -1794,7 +2040,7 @@ async def _assess(
                 snapshot.setdefault("unknowns", []).append(
                     ad_result.reason if ad_result.reason in AI_REVIEW_INCOMPLETE_REASONS else reason
                 )
-            snapshot["group_level_advertising_ban"] = bool(
+            snapshot["group_level_advertising_ban"] = None if snapshot.get("rules_evaluation_status") == "NOT_EVALUATED" else bool(
                 ad_result.ad_allowed is False and mode == "forbidden" and verdict == "reject"
             )
             # Prior unexplained disappearance or account punishment needs fresh operator review.
@@ -1823,6 +2069,10 @@ async def _assess(
     # must come from this collection, not a reused model-review snapshot.
     snapshot["advertising_audit"] = ad_result.details()
     exit_reason = automatic_exit_reason(snapshot)
+    if snapshot.get("efficiency_v1") and exit_reason not in {
+        "account_permanent_send_restriction", "account_long_send_restriction",
+    }:
+        exit_reason = None
     collected_at = _date(snapshot.get("collected_at"))
     if (
         exit_reason is not None
@@ -1857,7 +2107,22 @@ async def _assess(
             "advertising_audit": ad_result.details(),
         }
     )
-    if membership is not None:
+    if membership is not None and getattr(row, "_efficiency_claim", None):
+        # The transient audit carries this invocation's result only. Progress
+        # belongs to Work; the runner appends an Audit after the claim fence.
+        from app.modules.acquisition.qualification_ai import profile_fingerprint
+        snapshot["profile_fingerprint"] = profile_fingerprint(account)
+        snapshot["engine_scope_key"] = row._efficiency_claim.scope_key
+        snapshot["qualification_work_family"] = "qualification"
+        snapshot["checked_at"] = now.isoformat()
+        verdict, reason, row.state, row.next_retry_at = review_schedule(snapshot, previous, now)
+        row.decision, row.reason, row.checked_at = verdict, reason, now
+        row.evidence_hash = snapshot_hash(snapshot, account_id, row.content_scope)
+        row.expires_at = evidence_expiry(_date(snapshot.get("collected_at")) or now, now)
+        if verdict in {"allowed", "trial"}:
+            snapshot["authorization_mode"] = "events"
+        row.evidence_json = json.dumps(snapshot, ensure_ascii=False, default=str)
+    if membership is not None and not getattr(row, "_efficiency_claim", None):
         # An unsuccessful recheck is a job result, not a revocation of an
         # existing approval. Preserve its timestamp, deadline and evidence.
         if (not restricted_read and row is not None and row.decision in {"allowed", "trial"}
@@ -1948,6 +2213,8 @@ async def _assess(
             snapshot["read_cost"] = work.summary()
         row.evidence_hash = snapshot_hash(snapshot, account_id, row.content_scope)
         row.checked_at = now
+        from app.core.account.review_completions import stage_completion
+        await stage_completion(service.db, row, work, kind="review")
         if verdict in {"allowed", "trial"}:
             snapshot["authorization_mode"] = "events"
         row.expires_at = evidence_expiry(_date(snapshot.get("collected_at")) or now, now)
@@ -2005,6 +2272,9 @@ async def enqueue_membership_review(
     db: Any, member: GroupAccountMembership, *, batch_id: str
 ) -> GroupQualificationAudit:
     """Queue in the caller's membership/Join transaction; never commit or do I/O."""
+    from app.modules.acquisition.qualification_engine import enabled_for, enqueue
+    if enabled_for(member.account_id):
+        return await enqueue(db, member, reason="initial", initial_collection_pending=batch_id.startswith("join-attempt:"))
     await db.flush()
     row = await db.scalar(
         select(GroupQualificationAudit).where(
@@ -2043,6 +2313,11 @@ async def enqueue_membership_review(
 
 
 async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[int]:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import enqueue
+        return await enqueue(db, account_ids, batch_id)
+    from app.modules.acquisition.qualification_engine import enabled_for, enqueue
     requested = sorted(set(account_ids))
     if not requested:
         raise ValueError("qualification_accounts_required")
@@ -2077,8 +2352,9 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
             raise ValueError("idempotency_account_scope_mismatch")
         return [item.id for item in existing]
     if marker:
-        return []  # An empty batch is also an idempotent result.
-    db.add(SystemSetting(key=batch_key, value=json.dumps({"account_ids": requested})))
+        return json.loads(marker.value).get("audit_ids", [])
+    marker = SystemSetting(key=batch_key, value=json.dumps({"account_ids": requested}))
+    db.add(marker)
     members = list(
         (
             await db.scalars(
@@ -2094,8 +2370,13 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
         ).all()
     )
     rows = []
+    work_ids = []
     now = datetime.utcnow()
     for member in members:
+        if enabled_for(member.account_id):
+            work = await enqueue(db, member, reason="manual", now=now)
+            work_ids.append(work.id)
+            continue
         from app.modules.acquisition.qualification_continuity import effective_review
         active_authorization = await effective_review(db, member.id)
         keep_approval = bool(
@@ -2138,12 +2419,23 @@ async def queue_reviews(db: Any, account_ids: list[int], batch_id: str) -> list[
         member.review_started_at = member.review_deadline_at = member.review_next_at = None
         member.review_attempts = 0
     await db.flush()
+    marker.value = json.dumps({"account_ids": requested, "audit_ids": [item.id for item in rows], "work_ids": work_ids})
     return [item.id for item in rows]
 
 
 async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100, account_id: int | None = None) -> list[int]:
     """Recover missing confirmed-membership work; preserve deliberate terminal holds."""
     from app.modules.acquisition.review_retention import retire_obsolete_reviews
+    from app.modules.acquisition.qualification_engine import enabled_account_ids, enabled_for, bootstrap_member
+
+    if account_id is not None and enabled_for(account_id):
+        members = (await db.scalars(select(GroupAccountMembership).where(
+            GroupAccountMembership.account_id == account_id,
+            GroupAccountMembership.status == "joined",
+        ).order_by(GroupAccountMembership.id).limit(max(1, min(limit, 500))))).all()
+        works = [await bootstrap_member(db, member) for member in members]
+        await db.commit()
+        return [work.id for work in works]
 
     await retire_obsolete_reviews(db, limit=500)
     recovered = []
@@ -2163,6 +2455,8 @@ async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100, 
     if config.get("exit_all_accounts") is not True and "account_ids" in config:
         manual_query = manual_query.where(GroupQualificationAudit.account_id.in_(_ids(config["account_ids"])))
     for audit in (await db.scalars(manual_query)).all():
+        if enabled_for(audit.account_id):
+            continue
         member = await db.get(GroupAccountMembership, audit.membership_id)
         group = await db.get(Group, audit.group_id)
         if group is None or manually_protected(config, group, member) or await is_owned_group_target(
@@ -2196,6 +2490,8 @@ async def ensure_membership_reviews(db: Any, config: dict, *, limit: int = 100, 
         ),
         ~current,
     )
+    if enabled_account_ids():
+        query = query.where(GroupAccountMembership.account_id.not_in(enabled_account_ids()))
     if config.get("exit_all_accounts") is not True and "account_ids" in config:
         query = query.where(GroupAccountMembership.account_id.in_(_ids(config["account_ids"])))
     if account_id is not None:
@@ -2366,10 +2662,54 @@ async def priority_account_ids(db: Any, config: dict, now: datetime) -> set[int]
 
 
 async def run_reviews(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        from app.modules.acquisition.simple_runtime import run
+        return await run(service, "review_and_verify", account_id, limit=limit)
+    from app.modules.acquisition.qualification_engine import enabled_for
+    if account_id == 33 and enabled_for(account_id):
+        from app.modules.acquisition.review_evidence_handoff import request_owner_maintenance
+        request_owner_maintenance(account_id)
+    else:
+        from app.modules.acquisition.review_evidence_handoff import maintain_evidence_store
+        await maintain_evidence_store(account_id=account_id)
     from app.modules.acquisition.review_batch import ReviewBatch, current_batch
     batch = ReviewBatch(getattr(service, "account_pool", None))
     token = current_batch.set(batch)
     try:
+        from app.modules.acquisition import qualification_engine
+        if account_id is None and qualification_engine.enabled_account_ids():
+            combined = {"processed": 0, "results": []}
+            cursor_key = "qualification.efficiency_account_cursor"
+            cursor = await service.db.get(SystemSetting, cursor_key)
+            after = int(cursor.value) if cursor and str(cursor.value).isdigit() else 0
+            accounts = sorted(qualification_engine.enabled_account_ids())
+            accounts = [item for item in accounts if item > after] + [item for item in accounts if item <= after]
+            for target_account in accounts:
+                if combined["processed"] >= max(0, limit):
+                    break
+                from app.core.account.session_exec import current_actor_account
+                if current_actor_account() == target_account:
+                    outcome = await qualification_engine.run_reviews(service, account_id=target_account, limit=limit-combined["processed"])
+                else:
+                    queued = await qualification_engine.bootstrap_account(service.db, target_account, limit=limit-combined["processed"])
+                    qualification_engine._stage_wake(service.db, target_account)
+                    await service.db.commit()
+                    outcome = {"processed": 0, "results": [{"account_id": target_account,
+                        "reason": "session_owner_required", "queued": queued}]}
+                combined["processed"] += outcome["processed"]
+                combined["results"].extend(outcome["results"])
+                cursor = await service.db.get(SystemSetting, cursor_key)
+                if cursor is None:
+                    service.db.add(SystemSetting(key=cursor_key, value=str(target_account)))
+                else:
+                    cursor.value = str(target_account)
+                await service.db.commit()
+            if combined["processed"] < max(0, limit):
+                old = await _run_reviews(service, limit=limit-combined["processed"])
+                combined["processed"] += old["processed"]
+                combined["results"].extend(old["results"])
+            return combined
         return await _run_reviews(service, limit=limit, account_id=account_id)
     finally:
         current_batch.reset(token)
@@ -2377,6 +2717,9 @@ async def run_reviews(service: Any, *, limit: int = 1, account_id: int | None = 
 
 
 async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None = None) -> dict[str, Any]:
+    from app.modules.acquisition import qualification_engine
+    if account_id is not None and qualification_engine.enabled_for(account_id):
+        return await qualification_engine.run_reviews(service, account_id=account_id, limit=limit)
     result: dict[str, Any] = {"processed": 0, "results": []}
     config = await policy(service.db, fresh=True)
     if not config.get("enabled"):
@@ -2425,6 +2768,7 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         except RpcDeferred:
             pass
     deferred_review_ids: set[int] = set()
+    deferred_review_families: set[int] = set()
     reconsider_renewal_ids = []
     if account_id is not None:
         from app.core.account.rpc_governor import RpcDeferred, check_read_ready
@@ -2489,6 +2833,8 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         # Exit workers collect fresh evidence themselves. Ordinary reviews must
         # not consume their due rows and clear the membership's exit state.
         query = select(GroupQualificationAudit).where(current_clause(), due, ~busy_account, ~exiting_membership)
+        if qualification_engine.enabled_account_ids():
+            query = query.where(GroupQualificationAudit.account_id.not_in(qualification_engine.enabled_account_ids()))
         if account_id is not None:
             query = query.where(GroupQualificationAudit.account_id == account_id)
         if deferred_review_ids:
@@ -2542,7 +2888,7 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         order = (priority_rank, GroupQualificationAudit.next_retry_at, renewal_rank, GroupQualificationAudit.id)
         if account_id is not None:
             family_order = qualification_queue.ordering(
-                await qualification_queue.cursor(service.db, account_id), renewal_rank
+                await qualification_queue.scan_cursor(service.db, account_id), renewal_rank
             )
             # A row parked for many hours is stale maintenance.  Keep it out
             # of the first cursor turn so a currently qualified membership can
@@ -2560,7 +2906,10 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
                 ),
                 else_=0,
             )
-            order = (stale_rank, *family_order)
+            # Try another family after a local admission deferral, while
+            # keeping successful-claim turns unchanged across quanta.
+            deferred_family_rank = case((renewal_rank.in_(deferred_review_families), 1), else_=0)
+            order = (stale_rank, deferred_family_rank, *family_order)
         selected = (await service.db.execute(
             query.add_columns(renewal_rank).order_by(*order)
             .with_for_update(skip_locked=True)
@@ -2633,6 +2982,23 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
                 None,
             )
             await service.db.commit()
+            continue
+        # Finish local terminal states before quota admission or a new claim.
+        # This helper rechecks current scope under audit -> membership locks.
+        from app.modules.acquisition.qualification_local_recovery import finish_local_review
+        from app.modules.acquisition.qualification_events import queue_terminal_technical_events
+        if row.decision == "technical_wait":
+            await queue_terminal_technical_events(service.db, row.account_id, limit=1, audit_id=row.id)
+        local_action = await finish_local_review(service.db, row, now)
+        if local_action is not None:
+            if local_action == "technical_new_event_pending":
+                await queue_terminal_technical_events(service.db, row.account_id, limit=1, audit_id=row.id)
+            deferred_review_ids.add(row.id)
+            if local_action in {"terminal_ai_closed", "terminal_ai_requeued", "technical_exhausted", "technical_new_event_pending", "snapshot_scope_requeued"}:
+                result["local_finalized"] = result.get("local_finalized", 0) + 1
+                await service.db.commit()
+            else:
+                await service.db.rollback()
             continue
         # Serialize the claim across different memberships of the same account.
         # The row lock lasts through the durable running-state commit.
@@ -2771,12 +3137,19 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         local_ai = (not restricted_evidence_read_allowed(account, config, now)
                     and ai_evidence_reusable(previous, account, now, change))
         from app.core.account.read_work import review_required
-        from app.modules.acquisition.review_cost import review_shape
-        phase, fallback = review_shape(previous, row, membership, account, change, now,
-                                      force_refresh=restricted_evidence_read_allowed(account, config, now))
+        from app.modules.acquisition.review_read_plan import for_review
+        read_plan = await for_review(
+            service.db, previous, row, membership, group, account, change, now,
+            renewal=light_renewal,
+            force_refresh=(restricted_evidence_read_allowed(account, config, now)
+                           or bool(previous.get("scope_collection_refresh"))),
+        )
+        phase, fallback = read_plan.phase, read_plan.reads
         work_scope = f"{membership.id}:{membership.joined_at.isoformat()}" if membership.joined_at else ""
-        required = 16 if light_renewal else await review_required(row.account_id, group.id, work_scope,
-                                                                 phase=phase, fallback=fallback)
+        required = (fallback if light_renewal else await review_required(
+            row.account_id, group.id, work_scope, phase=phase, fallback=fallback,
+            planned_reads=read_plan.reads if read_plan.bounded else None,
+        ))
         pause = None if local_ai or local_grant else await read_wait(
             service.db, row.account_id, now,
             purpose=REFRESH_PURPOSE if light_renewal else "group_qualification",
@@ -2802,6 +3175,10 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
                 saved['renewal_wait_reason'] = pause[0]
                 row.evidence_json = json.dumps(saved, ensure_ascii=False)
             deferred_review_ids.add(row.id)
+            deferred_review_families.add(review_family)
+            # Admission deferrals advance only the bounded scan position.
+            # The account row lock serializes this with successful claims.
+            await qualification_queue.scanned(service.db, row.account_id, row.id, review_family)
             await service.db.commit()
             continue
         # Account quanta have a six-minute hard deadline. Their abandoned claim
@@ -2812,11 +3189,16 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
         row.state, row.next_retry_at = "running", now + timedelta(seconds=claim_seconds)
         row.attempts = (row.attempts or 0) + 1
         claimed_id, claimed_attempt = row.id, row.attempts
+        claimed_checked_at = row.checked_at
+        await qualification_queue.scanned(service.db, row.account_id, row.id, review_family)
         await qualification_queue.claimed(service.db, row.account_id, row.id, review_family)
         await service.db.commit()
         claims += 1
         try:
-            audit = await assess(service, row.account_id, group, row=row)
+            if previous.get("scope_collection_refresh"):
+                audit = await assess(service, row.account_id, group, row=row, force_refresh=True)
+            else:
+                audit = await assess(service, row.account_id, group, row=row)
         except asyncio.CancelledError:
             await service.db.rollback()
             current = await service.db.get(GroupQualificationAudit, claimed_id, with_for_update=True)
@@ -2845,8 +3227,12 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
                 current.next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
                 if current.decision not in {"allowed", "trial"}:
                     prior = _payload(current)
+                    record_technical_diagnostic(exc, "review_assess")
                     failure = {"decision": "technical_wait", "reason": "review_exception:" + type(exc).__name__,
                                "technical_errors": [type(exc).__name__]}
+                    from app.modules.acquisition.qualification_events import recovery_event_key
+                    failure["collection_event"] = change
+                    failure["technical_recovery_event_key"] = recovery_event_key(change)
                     decision, reason, state, retry = review_schedule(failure, prior, datetime.utcnow())
                     current.decision, current.reason, current.state = decision, reason, state
                     current.next_retry_at = min(retry, current.next_retry_at) if retry else None
@@ -3001,6 +3387,13 @@ async def _run_reviews(service: Any, *, limit: int = 1, account_id: int | None =
                 and decision == "technical_wait" else "review_2h"
             )
         await service.db.commit()
+        if row.checked_at is not None and row.checked_at != claimed_checked_at:
+            from app.core.account.read_metrics import record_committed_review
+            from app.modules.acquisition.review_read_flags import measurement_stage
+            await record_committed_review(
+                row.account_id, row.decision, stage=measurement_stage(row.account_id),
+                elapsed_seconds=max(0, (datetime.utcnow()-now).total_seconds()),
+            )
         result["processed"] += 1
         result["results"].append(
             {"audit_id": row.id, "decision": row.decision, "reason": row.reason}
@@ -3030,6 +3423,9 @@ async def authorize_leave(
     ):
         return False, "qualification_account_outside_configured_scope"
     row, current_group, current_member = await current_authorization(db, account_id, group.group_id)
+    from app.modules.acquisition.qualification_engine import business_decision, enabled_for
+    if enabled_for(account_id) and current_member is not None:
+        row = await business_decision(db, current_member)
     if row is not None:
         await db.refresh(row)
     if current_group is None or current_member is None or current_member.id != membership.id:
@@ -3143,7 +3539,9 @@ async def send_gate(
     if not authorization_current(row, now):
         return "qualification_expired"
     from app.modules.acquisition.qualification_events import pending
-    if await pending(db, member):
+    from app.modules.acquisition.qualification_engine import enabled_for, event_blocks_authorization
+    change = await pending(db, member)
+    if change and (not enabled_for(account_id) or event_blocks_authorization(_payload(row), change)):
         return "qualification_event_pending"
     if not scope_matches(row, group, member):
         return "qualification_scope_changed"

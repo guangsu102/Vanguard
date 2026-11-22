@@ -695,6 +695,28 @@ async def join_group_by_link(
     _current_user: dict = Depends(require_admin),
 ) -> GroupResponse:
     """Join by Telegram link, then persist the resolved group and membership."""
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        import json
+        from uuid import uuid4
+
+        from app.core.account.session_exec import forward, owner_id
+        from app.core.redis import get_redis
+        from app.modules.acquisition.simple_growth import release
+        from app.modules.acquisition.simple_limits import PREFIX
+        cache = await get_redis()
+        if not await owner_id(cache, request.account_id):
+            raise HTTPException(409, "session_owner_required")
+        token = uuid4().hex
+        await cache.set(PREFIX + f"manual_join:{request.account_id}:{token}",
+                        json.dumps({"link": request.group_link}), ex=300)
+        await release(db)
+        reply = await forward(request.account_id, "join_link:" + token)
+        outcome = (reply or {}).get("result") or {}
+        if not outcome.get("group_id"):
+            raise HTTPException(409, outcome.get("reason") or outcome.get("outcome") or "join_outcome_unconfirmed")
+        group = await db.get(Group, outcome["group_id"])
+        return _group_to_response(group)
     account_result = await db.execute(
         select(TelegramAccount).where(TelegramAccount.id == request.account_id)
     )

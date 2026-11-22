@@ -17,6 +17,12 @@ from app.modules.acquisition.models import AutoJoinAttempt as Attempt
 
 def active_request(now: datetime) -> Any:
     """Unknown sent results never expire merely because their timer has elapsed."""
+    from app.core.config import settings
+    if settings.GROWTH_SIMPLIFIED_ENABLED:
+        # Post-RPC uncertainty still owns the target. A second account must
+        # not race into a group just because no pre-RPC intent exists anymore.
+        return and_(Attempt.telegram_action_attempted.is_(True),
+                    Attempt.status.in_(["unknown", "pending"]))
     unresolved = Attempt.reconciliation_status.notin_(["confirmed", "resolved"])
     return or_(
         and_(
@@ -26,16 +32,18 @@ def active_request(now: datetime) -> Any:
                 Attempt.reservation_expires_at > now,
             ),
         ),
+        # Historical rows used "resolved" for a completed reconciliation
+        # read even when approval was still pending. That label, and absent
+        # SDK metrics on pre-cutover rows, prove no terminal write outcome.
+        Attempt.request_state == "outcome_unknown",
         and_(
-            unresolved,
+            Attempt.request_state == "sent",
             or_(
-                Attempt.request_state == "outcome_unknown",
+                Attempt.status == "pending",
                 and_(
-                    Attempt.request_state == "sent",
-                    or_(
-                        Attempt.status == "pending",
-                        and_(Attempt.status == "success", Attempt.joined_at.is_(None)),
-                    ),
+                    unresolved,
+                    Attempt.status == "success",
+                    Attempt.joined_at.is_(None),
                 ),
             ),
         ),

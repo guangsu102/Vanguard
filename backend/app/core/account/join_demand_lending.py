@@ -188,12 +188,18 @@ async def add_join_demand_headroom(
     from app.core.scheduler.growth_dispatch import eligible_accounts
     from app.modules.acquisition.growth_admission import admission_plan
     from app.modules.acquisition.models import AutoJoinAttempt
+    from app.modules.acquisition.qualification_engine import enabled_for
+    from app.core.account.reserved_reads import allocations
+
+    efficiency = enabled_for(account_id)
+    floors = {window: allocations(limits[window])[2] * 40 // 100 for window in ("hour", "day")}
 
     def apply(hold: int, reason: str, **details: Any) -> None:
-        limits.update(join_idle_hold_hour=hold, join_idle_hold_day=hold)
+        holds = floors if efficiency and hold == 12 else {"hour": hold, "day": hold}
+        limits.update(join_idle_hold_hour=holds["hour"], join_idle_hold_day=holds["day"])
         budget["join_idle_lending"] = {
             "reason": reason,
-            "holds": {"hour": hold, "day": hold},
+            "holds": holds,
             **details,
         }
 
@@ -221,7 +227,7 @@ async def add_join_demand_headroom(
     if await db.scalar(eligible_accounts(now).where(TelegramAccount.id == account_id)) is None:
         apply(0, "account_not_eligible")
         return
-    due = await maintenance_due(db, account_id, now)
+    due = [] if efficiency else await maintenance_due(db, account_id, now)
     if due:
         apply(12, "due_join_maintenance", due=due)
         return
@@ -242,7 +248,7 @@ async def add_join_demand_headroom(
     if config.next_join_after and config.next_join_after > now:
         apply(0, "join_interval", next_join_after=config.next_join_after.isoformat())
         return
-    if config.join_review_backlog_paused or await initial_pending(db, account_id, 0):
+    if not efficiency and (config.join_review_backlog_paused or await initial_pending(db, account_id, 0)):
         apply(0, "join_wait_pending_review")
         return
     if not (await get_auto_join_scheduler_settings(db))["enabled"]:
@@ -254,7 +260,7 @@ async def add_join_demand_headroom(
     if admission["remaining"] <= 0:
         apply(0, admission["reason"], admission=admission)
         return
-    demand = await _join_demand_snapshot(db, account_id, now)
+    demand = await _join_demand_snapshot(db, account_id, now, stop_when_executable=efficiency)
     if demand["active_request_reservation"]:
         apply(12, "active_join_or_review_reservation", candidate_inventory=demand)
     elif demand["executable"]:

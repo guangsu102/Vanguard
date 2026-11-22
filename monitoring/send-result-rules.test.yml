@@ -1,0 +1,55 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 30s
+tests:
+  - interval: 30s
+    input_series:
+      - series: vanguard_send_result_inbox_oldest_age_seconds
+        values: '300x20'
+      - series: vanguard_send_result_sending_oldest_age_seconds
+        values: '600x20'
+      - series: 'vanguard_send_result_memberships{state="exit_failed"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: VanguardSendResultInboxStalled
+        exp_alerts:
+          - exp_labels: {severity: warning, service: inbox}
+            exp_annotations:
+              summary: A live inbox event has been waiting over two minutes
+              description: Inspect the event consumer; terminal unknown and expired events are excluded.
+      - eval_time: 3m
+        alertname: VanguardSendResultSettlementStalled
+        exp_alerts:
+          - exp_labels: {severity: critical, service: growth}
+            exp_annotations:
+              summary: A sending result has not settled within five minutes
+              description: Inspect database-only recovery and account leases; do not resend the original operation.
+      - eval_time: 3m
+        alertname: VanguardSendResultExitNeedsAttention
+        exp_alerts:
+          - exp_labels: {state: exit_failed, severity: warning, service: growth}
+            exp_annotations:
+              summary: Automatic departure exhausted its retry limit
+              description: Inspect the recorded departure reason and resolve it manually; automatic retries remain stopped.
+  - interval: 30s
+    input_series:
+      - series: vanguard_send_result_survival_enabled
+        values: '0x240'
+      - series: vanguard_ad_unresolved_oldest_age_seconds
+        values: '9000x240'
+      - series: vanguard_survival_overdue
+        values: '10x240'
+      - series: vanguard_send_result_inbox_oldest_age_seconds
+        values: '0x240'
+      - series: vanguard_send_result_sending_oldest_age_seconds
+        values: '0x240'
+      - series: 'vanguard_send_result_memberships{state="exit_failed"}'
+        values: '0x240'
+    alert_rule_test:
+      - {eval_time: 1h, alertname: VanguardAdUnknownWarning, exp_alerts: []}
+      - {eval_time: 1h, alertname: VanguardAdUnknownCritical, exp_alerts: []}
+      - {eval_time: 1h, alertname: VanguardSurvivalOverdue, exp_alerts: []}
+      - {eval_time: 1h, alertname: VanguardSendResultInboxStalled, exp_alerts: []}
+      - {eval_time: 1h, alertname: VanguardSendResultSettlementStalled, exp_alerts: []}
+      - {eval_time: 1h, alertname: VanguardSendResultExitNeedsAttention, exp_alerts: []}

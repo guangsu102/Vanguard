@@ -354,6 +354,8 @@ class AutoJoinAttempt(Base):
     reservation_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="未发送预留失效时间"
     )
+    sdk_entered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    platform_responded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     request_sent_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True, comment="实际发出 Telegram 加群请求时间"
     )
@@ -1868,8 +1870,12 @@ class GroupQualificationAudit(Base):
     __tablename__ = "group_qualification_audit"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     batch_id: Mapped[str] = mapped_column(String(128), nullable=False)
-    membership_id: Mapped[int] = mapped_column(ForeignKey("group_account_membership.id"), nullable=False)
-    account_id: Mapped[int] = mapped_column(ForeignKey("telegram_account.id"), nullable=False)
+    membership_id: Mapped[int] = mapped_column(
+        ForeignKey("group_account_membership.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="CASCADE"), nullable=False
+    )
     group_id: Mapped[int] = mapped_column(ForeignKey("group.id"), nullable=False)
     policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     content_scope: Mapped[str] = mapped_column(String(64), default="text_profile", nullable=False)
@@ -1896,4 +1902,71 @@ class GroupQualificationAudit(Base):
         Index("idx_group_qualification_due", "state", "next_retry_at"),
         Index("idx_group_qualification_member", "membership_id", "checked_at"),
         Index("idx_group_qualification_checkpoint", "membership_id", "checkpoint_revision", "checkpoint_stage"),
+    )
+
+
+class QualificationActiveGrant(Base):
+    """Current authorization pointer; final audit evidence is never job state."""
+    __tablename__ = "qualification_active_grant"
+    membership_id: Mapped[int] = mapped_column(
+        ForeignKey("group_account_membership.id", ondelete="CASCADE"), primary_key=True
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="CASCADE"), nullable=False
+    )
+    group_id: Mapped[int] = mapped_column(ForeignKey("group.id"), nullable=False)
+    audit_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("group_qualification_audit.id", ondelete="SET NULL"), nullable=True
+    )
+    scope_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    membership_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    invalidated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    invalidated_reason: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (Index("idx_qualification_grant_account", "account_id", "invalidated_at"),)
+
+
+class QualificationWork(Base):
+    """One restart-safe initial/renewal job per membership incarnation and scope."""
+    __tablename__ = "qualification_work"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    membership_id: Mapped[int] = mapped_column(
+        ForeignKey("group_account_membership.id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("telegram_account.id", ondelete="CASCADE"), nullable=False
+    )
+    group_id: Mapped[int] = mapped_column(ForeignKey("group.id"), nullable=False)
+    membership_joined_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    engine_version: Mapped[str] = mapped_column(String(32), default="efficiency_v1", nullable=False)
+    family: Mapped[str] = mapped_column(String(32), default="qualification", nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    profile_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), default="initial", nullable=False)
+    state: Mapped[str] = mapped_column(String(32), default="READY", nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    event_version: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    event_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    progress_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    checkpoint_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    checkpoint_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    checkpoint_revision: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claim_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    ready_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    deadline_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    next_step_reads: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    missing_dependencies_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    initial_collection_pending: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    __table_args__ = (
+        Index("idx_qualification_work_due", "account_id", "state", "ready_at"),
+        Index("idx_qualification_work_member", "membership_id", "scope_key"),
     )

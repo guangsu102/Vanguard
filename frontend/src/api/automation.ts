@@ -63,6 +63,10 @@ export interface JoinRequestRuntime {
 }
 
 export interface DynamicCapacitySnapshot {
+  mode?: string
+  permissions?: { counts: Record<string, number>; due: number }
+  cooldown_reason?: string | null
+  next_execution_at?: string | null
   account_id: number
   enabled: boolean
   configured: Record<string, number>
@@ -72,7 +76,7 @@ export interface DynamicCapacitySnapshot {
   remaining: Record<string, number>
   execution?: { state: string; resume_at?: string | null; reason?: string | null }
   business_execution?: Record<string, { state: string; resume_at?: string | null; reason?: string | null }>
-  read_rpc?: { state: string; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; lanes?: Record<string, { remaining: number; retry_after_seconds: number; resume_at?: string | null }>; limits: Record<string, number> }
+  read_rpc?: { state: string; budget_enabled?: boolean; minimum_rpc_interval_seconds?: number; method?: string; resume_at?: string | null; usage?: Record<string, { used: number; limit: number; remaining: number }>; lanes?: Record<string, { remaining: number; retry_after_seconds: number; resume_at?: string | null }>; limits: Record<string, number> | null }
   quota_remaining?: Record<string, number>
   executable?: Record<string, number>
   executable_now?: Record<string, number>
@@ -313,6 +317,8 @@ export interface AdDeliveryThrottleSettings {
 }
 
 export interface AdDeliveryExecutionSettings {
+  send_failure_exit_threshold: number
+  send_failure_retry_seconds: number
   enabled: boolean
   dispatcher_interval_seconds: number
   dispatcher_batch_size: number
@@ -331,6 +337,7 @@ export interface ProbeQueue {
 }
 
 export interface AdCapacitySettings {
+  growth_mode?: 'writable_v2' | 'legacy'
   enabled: boolean
   timezone_offset_hours: number
   window_start_hour: number

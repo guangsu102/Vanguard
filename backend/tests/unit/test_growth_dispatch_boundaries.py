@@ -89,6 +89,7 @@ async def test_periodic_wakeup_is_coalesced_before_broker_publish(monkeypatch):
 async def test_each_execution_stage_preserves_account_scope(test_db, monkeypatch):
     from app.core.scheduler import growth_dispatch as scheduler
     from app.core import automation_settings
+    from app.core.account import session_exec
     from app.modules.acquisition import automation, qualification_service
     await add_accounts(test_db, 1)
     actor = Obj(run_auto_join=AsyncMock(return_value={}), run_ad_delivery=AsyncMock(return_value={}))
@@ -97,12 +98,16 @@ async def test_each_execution_stage_preserves_account_scope(test_db, monkeypatch
         "enabled": True, "scan_interval_minutes": 5}))
     monkeypatch.setattr(automation_settings, "get_ad_delivery_execution_settings", AsyncMock(return_value={
         "enabled": True, "dispatcher_interval_seconds": 60}))
-    await scheduler.execute(test_db, "join", 1)
-    await scheduler.execute(test_db, "ads", 1)
+    monkeypatch.setattr(session_exec, "owner_id", AsyncMock(return_value=session_exec.PROCESS_ID))
+    monkeypatch.setattr("app.core.redis.get_redis", AsyncMock(return_value=Obj()))
+    pool = Obj(get_account_by_id=AsyncMock(return_value=Obj()))
+    monkeypatch.setattr(scheduler, "ensure_growth_account_pool", AsyncMock())
+    await scheduler.execute(test_db, "join", 1, account_pool=pool)
+    await scheduler.execute(test_db, "ads", 1, account_pool=pool)
     assert actor.run_auto_join.await_args.kwargs["account_id"] == 1
     assert actor.run_ad_delivery.await_args.kwargs == {"account_id": 1, "max_deliveries": 1}
     monkeypatch.setattr(automation_settings, "get_auto_join_scheduler_settings", AsyncMock(return_value={"enabled": False}))
-    result, _ = await scheduler.execute(test_db, "join", 1)
+    result, _ = await scheduler.execute(test_db, "join", 1, account_pool=pool)
     assert result["reason"] == "scheduler_disabled"
     assert actor.run_auto_join.await_count == 1
 

@@ -93,6 +93,7 @@ const router = useRouter()
 const lastResult = ref<AutomationRunResult | null>(null)
 const creatives = ref<AdCreative[]>([])
 const campaigns = ref<AdCampaign[]>([])
+const simplifiedGrowth = ref(false)
 const bindings = ref<AccountAdBinding[]>([])
 const targetGroups = ref<Group[]>([])
 let groupProfilesRefreshTimer: number | null = null
@@ -564,6 +565,8 @@ const campaignTargetGroups = (campaign: any) =>
     .filter((group: Group | undefined): group is Group => Boolean(group));
 
 const campaignFrequencyText = (campaign: any) => {
+  if (simplifiedGrowth.value && campaign.delivery_policy !== "ad_only")
+    return "每日复核调频，遵守计划和账号发送间隔";
   if (campaign.delivery_policy !== "ad_only") return "群全局冷却 24 小时";
   if (campaign.send_mode === "after_join")
     return `入群 ${campaign.min_wait_after_join_minutes} 分钟后`;
@@ -702,6 +705,7 @@ const campaignTargetLabel = (campaign: any) => {
     return campaign.target_group_ids.map(targetGroupLabel).join('、')
   }
   if (campaign.delivery_policy === 'ad_only') return '在 Ad-only 专属账号中持续添加'
+  if (simplifiedGrowth.value) return '所有权限通过的群（含未评级群）'
   return `等级 ${campaign.target_group_levels?.join('/') || '-'}`
 }
 
@@ -1098,15 +1102,17 @@ const clearBatchAccounts = () => {
 const refreshData = async () => {
   loading.value = true
   try {
-    const [creativesRes, campaignsRes, bindingsRes, groupProfilesRes] = await Promise.all([
+    const [creativesRes, campaignsRes, bindingsRes, groupProfilesRes, capacityRes] = await Promise.all([
       automationApi.getCreatives({ page_size: 50 }),
       automationApi.getCampaigns({ page_size: 50 }),
       automationApi.getBindings(),
       automationApi.getGroupAdProfiles(),
+      automationApi.getAdCapacity(),
     ])
     const dynamicStatusRes = await automationApi.getAdDynamicStatus()
     creatives.value = creativesRes.data.data
     campaigns.value = campaignsRes.data.data
+    simplifiedGrowth.value = capacityRes.data.data.growth_mode === 'writable_v2'
     bindings.value = bindingsRes.data.data
     groupAdProfiles.value = groupProfilesRes.data.data
     dynamicStatuses.value = dynamicStatusRes.data.data
@@ -1891,7 +1897,7 @@ onBeforeUnmount(() => {
             <div>
               <span>Growth 群全局冷却</span>
               <strong>{{ Math.round(adDeliveryExecutionForm.growth_group_global_cooldown_seconds / 3600) }} 小时</strong>
-              <small>群控失败达到阈值后退群 {{ adFailurePolicyForm.leave_on_group_control_failure ? "开启" : "关闭" }}</small>
+              <small>连续群发送失败 {{ adDeliveryExecutionForm.send_failure_exit_threshold }} 次后退群</small>
             </div>
           </section>
 <el-tabs v-model="adWorkspaceView" class="ad-workspace-tabs">
@@ -1966,6 +1972,7 @@ onBeforeUnmount(() => {
                             class="text-warning"
                             >在“群与专属账号”中持续添加</strong
                           >
+                          <strong v-else-if="simplifiedGrowth">所有权限通过的群（含未评级群）</strong>
                           <strong v-else
                             >按等级
                             {{
@@ -2060,6 +2067,7 @@ onBeforeUnmount(() => {
                         <strong v-else-if="row.delivery_policy === 'ad_only'"
                           >等待添加群</strong
                         >
+                        <strong v-else-if="simplifiedGrowth">权限通过的群</strong>
                         <strong v-else
                           >等级
                           {{
@@ -2562,7 +2570,7 @@ onBeforeUnmount(() => {
                 </div>
               </el-form-item>
               <el-form-item
-                v-if="campaignForm.delivery_policy === 'growth' && !campaignForm.target_group_ids.length"
+                v-if="!simplifiedGrowth && campaignForm.delivery_policy === 'growth' && !campaignForm.target_group_ids.length"
                 label="目标等级"
               >
                 <el-checkbox-group v-model="campaignForm.target_group_levels">
@@ -2571,6 +2579,12 @@ onBeforeUnmount(() => {
                   <el-checkbox-button value="C">C级群</el-checkbox-button>
                 </el-checkbox-group>
               </el-form-item>
+              <el-alert
+                v-if="simplifiedGrowth && campaignForm.delivery_policy === 'growth'"
+                title="按成员文字权限准入，群等级不参与投放筛选。填写指定群时，仅向这些群投放。"
+                type="info"
+                :closable="false"
+              />
               <div
                 v-if="campaignForm.target_group_ids.length"
                 class="selected-target-summary"

@@ -13,6 +13,7 @@ Features:
 """
 
 import asyncio
+import secrets
 import time
 import weakref
 from collections.abc import Awaitable, Callable
@@ -43,6 +44,7 @@ from app.core.account.session_crypto import decrypt_session_string
 from app.core.account.session_files import resolve_telegram_session_file
 from app.core.account.session_guard import (
     AccountSessionGuard,
+    SessionQuarantined,
     install_session_failure_hook,
 )
 from app.core.network.fingerprint import FingerprintManager
@@ -50,13 +52,14 @@ from app.modules.owned_group.security import safe_exception_message
 
 if TYPE_CHECKING:
     from app.core.account.models import TelegramAccount
+    from app.core.account.recovery import RecoveryResult
 
 StaticProxyResolver = Callable[[int], Awaitable[ResolvedProxy]]
 
 logger = structlog.get_logger()
 _ACCOUNT_POOLS = weakref.WeakSet()
 
-TELEGRAM_CONNECTION_RETRIES = 10
+TELEGRAM_CONNECTION_RETRIES = 0
 TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS = 2
 TELEGRAM_CONNECTION_TIMEOUT_SECONDS = 20
 
@@ -115,6 +118,7 @@ class TelegramAccountWrapper:
     proxy_mode: ProxyMode = ProxyMode.DYNAMIC
     static_proxy_id: Optional[int] = None
     static_proxy: Optional[ResolvedProxy] = field(default=None, repr=False)
+    database_updated_at: Any = field(default=None, repr=False)
     proxy_policy_version: int = field(default=0, repr=False)
     device_model: Optional[str] = None
     system_version: Optional[str] = None
@@ -126,6 +130,13 @@ class TelegramAccountWrapper:
     operation_lease: Optional[AccountOperationLeaseHandle] = field(default=None, repr=False)
     operation_lease_renewal_task: Optional[asyncio.Task[None]] = field(default=None, repr=False)
     operation_lease_lost: bool = field(default=False, repr=False)
+    # A wrong Telegram session response is a safety boundary. Keep the
+    # account fenced locally even when the next database refresh still shows
+    # the old ONLINE status.
+    session_quarantined: bool = field(default=False, repr=False)
+    session_quarantine_persisted: bool = field(default=False, repr=False)
+    session_quarantine_reason: Optional[str] = field(default=None, repr=False)
+    session_quarantine_token: Optional[str] = field(default=None, repr=False)
     session_guard: Optional[AccountSessionGuard] = field(default=None, repr=False)
     release_status_override: Optional[AccountStatus] = field(default=None, repr=False)
     active_purpose: str = field(default="listener", repr=False)
@@ -161,8 +172,10 @@ class TelegramAccountWrapper:
     def is_available(self) -> bool:
         """Check if account is available for use."""
         pause = getattr(self.client, "_vanguard_listener_pause", None)
-        return self.status in [AccountStatus.IDLE, AccountStatus.ONLINE] and not (
-            pause is not None and pause.reason is not None
+        return (
+            not self.session_quarantined
+            and self.status in [AccountStatus.IDLE, AccountStatus.ONLINE]
+            and not (pause is not None and pause.reason is not None)
         )
 
     @property
@@ -408,7 +421,8 @@ class AccountPool:
         account.current_proxy_country = None
         account.static_proxy = None
         account.keep_connected = False
-        account.status = AccountStatus.OFFLINE
+        if not account.session_quarantined:
+            account.status = AccountStatus.OFFLINE
         if client is not None:
             try:
                 if client.is_connected():
@@ -627,7 +641,7 @@ class AccountPool:
             proxy_mode=proxy_mode,
             static_proxy_id=static_proxy_id,
         )
-        return await self.add_account(
+        wrapper = await self.add_account(
             account_id=account.id,
             phone=account.phone,
             session_name=account.session_name,
@@ -646,6 +660,29 @@ class AccountPool:
             device_model=account.device_model,
             system_version=account.system_version,
             app_version=account.app_version,
+        )
+        wrapper.database_updated_at = getattr(account, "updated_at", None)
+        return wrapper
+
+    async def _record_connection_failure(
+        self, account: TelegramAccountWrapper, error: BaseException,
+    ) -> bool:
+        """Persist one ERROR episode before ordinary callers can retry.
+
+        The DB snapshot comparison prevents a stale transport failure from
+        overwriting operator changes. Subsequent attempts keep this generation.
+        """
+        if account.session_quarantined or account.database_updated_at is None:
+            return False
+        from app.core.account.recovery import connection_failure_reason
+        from app.core.account.session_quarantine import persist_error
+
+        reason = connection_failure_reason(error)
+        if reason in {"read_budget_wait", "telegram_cooldown", "lease_busy", "lease_unavailable"}:
+            return False
+        return await persist_error(
+            account.account_id, failure_reason=reason,
+            expected_updated_at=account.database_updated_at,
         )
 
     async def remove_account(self, session_name: str) -> bool:
@@ -776,7 +813,14 @@ class AccountPool:
                 await self._release_operation_lease(selected)
                 raise
             except Exception as e:
-                selected.status = AccountStatus.ERROR
+                from app.core.account.recovery import recovery_failure
+
+                waiting = recovery_failure(e) in {
+                    "read_budget_wait", "telegram_cooldown", "lease_busy", "lease_unavailable",
+                }
+                selected.status = previous_status if waiting else AccountStatus.ERROR
+                if not waiting:
+                    await self._record_connection_failure(selected, e)
                 await self._release_operation_lease(selected)
                 self.logger.warning(
                     "account_acquire_failed",
@@ -844,6 +888,16 @@ class AccountPool:
             if selected is None:
                 self.logger.warning("account_not_in_pool", account_id=account_id, purpose=purpose)
                 self._unavailability_reasons[int(account_id)] = "account_not_in_pool"
+                return None
+
+            if selected.session_quarantined:
+                self.logger.warning(
+                    "account_session_quarantined",
+                    account_id=account_id,
+                    purpose=purpose,
+                    reason=selected.session_quarantine_reason,
+                )
+                self._unavailability_reasons[int(account_id)] = "telegram_session_quarantined"
                 return None
 
             allowed_statuses = [
@@ -925,12 +979,18 @@ class AccountPool:
                     await self._release_operation_lease(selected)
                 raise
             except Exception as e:
+                from app.core.account.recovery import recovery_failure
+
+                waiting = recovery_failure(e) in {
+                    "read_budget_wait", "telegram_cooldown", "lease_busy", "lease_unavailable",
+                }
                 selected.status = (
-                    AccountStatus.RESTRICTED
-                    if previous_status == AccountStatus.RESTRICTED
+                    previous_status if waiting or previous_status == AccountStatus.RESTRICTED
                     else AccountStatus.ERROR
                 )
                 selected.release_status_override = None
+                if selected.status == AccountStatus.ERROR:
+                    await self._record_connection_failure(selected, e)
                 if operation_lease is None:
                     await self._release_operation_lease(selected)
                 self.logger.warning(
@@ -1008,6 +1068,16 @@ class AccountPool:
                 self._unavailability_reasons[int(account_id)] = "account_not_in_pool"
                 return None
 
+            if selected.session_quarantined:
+                self.logger.warning(
+                    "account_session_quarantined",
+                    account_id=account_id,
+                    purpose=purpose,
+                    reason=selected.session_quarantine_reason,
+                )
+                self._unavailability_reasons[int(account_id)] = "telegram_session_quarantined"
+                return None
+
             if selected.status in [AccountStatus.ERROR, AccountStatus.BANNED, AccountStatus.RESTRICTED]:
                 self.logger.warning(
                     "account_not_connectable",
@@ -1028,6 +1098,7 @@ class AccountPool:
                 return None
 
             previous_keep_connected = selected.keep_connected
+            previous_status = selected.status
             try:
                 pause = getattr(selected.client, "_vanguard_listener_pause", None)
                 if pause is not None:
@@ -1073,7 +1144,14 @@ class AccountPool:
                 raise
             except Exception as e:
                 selected.keep_connected = previous_keep_connected
-                selected.status = AccountStatus.ERROR
+                from app.core.account.recovery import recovery_failure
+
+                waiting = recovery_failure(e) in {
+                    "read_budget_wait", "telegram_cooldown", "lease_busy", "lease_unavailable",
+                }
+                selected.status = previous_status if waiting else AccountStatus.ERROR
+                if not waiting:
+                    await self._record_connection_failure(selected, e)
                 self.logger.warning(
                     "account_connect_by_id_failed",
                     account_id=account_id,
@@ -1092,8 +1170,151 @@ class AccountPool:
             )
             return selected
 
-    async def _create_client(self, account: TelegramAccountWrapper) -> TelegramClient:
+    async def verify_error_account(
+        self, account_id: int, *, expected_phone: str, expected_proxy_id: int,
+        quarantine_token: str | None = None,
+    ) -> "RecoveryResult":
+        """One explicit ERROR recovery probe; never makes the account available.
+
+        AccountRecoveryService owns database eligibility and the eventual
+        status commit. Ordinary acquire/connect gates remain unchanged.
+        """
+        from app.core.account.recovery import (
+            RecoveryCheckFailed,
+            RecoveryResult,
+            normalized_phone,
+            recovery_result,
+        )
+        from app.core.account.session_guard import _disconnect_client
+        phone = normalized_phone(expected_phone)
+        if phone is None:
+            return RecoveryResult(False, "identity_unavailable")
+        async with self._lock:
+            selected = next((item for item in self._accounts.values() if item.account_id == account_id), None)
+            if selected is None or selected.status != AccountStatus.ERROR:
+                return RecoveryResult(False, "account_not_error")
+            if (selected.proxy_mode != ProxyMode.STATIC or selected.static_proxy_id != expected_proxy_id
+                    or normalized_phone(selected.phone) != phone):
+                return RecoveryResult(False, "recovery_scope_mismatch")
+            if (selected.operation_lease is not None
+                    or (selected.client is not None and selected.client.is_connected())):
+                return RecoveryResult(False, "lease_busy")
+            if not selected.session_exists:
+                return RecoveryResult(False, "session_missing")
+            if getattr(selected, "_recovery_in_progress", False):
+                return RecoveryResult(False, "lease_busy")
+            selected._recovery_in_progress = True
+        previous = selected.active_purpose, selected.keep_connected
+        result, cancelled = RecoveryResult(False, "verification_failed"), False
+        claimed = False
+        operation_handle = None
+        try:
+            async with asyncio.timeout(45):
+                await self._claim_operation_lease(selected, "account_recovery", raise_on_failure=True)
+                claimed = True
+                operation_handle = selected.operation_lease
+                selected.active_purpose, selected.keep_connected = "account_recovery", False
+                await self._assert_proxy_policy_current(selected)
+                await self._ensure_proxy(selected)
+                if selected.current_proxy is None:
+                    raise RecoveryCheckFailed("session_lease_required")
+                selected.client = await self._create_client(
+                    selected, recovery_probe=True, quarantine_token=quarantine_token,
+                )
+                guard = selected.session_guard
+                if guard is None:
+                    raise RecoveryCheckFailed("session_lease_required")
+                await guard.assert_owned()
+                if (selected.operation_lease_lost
+                        or not await self._operation_lease_manager.refresh(selected.operation_lease)):
+                    raise RecoveryCheckFailed("operation_lease_lost")
+                if hasattr(selected.client, "_vanguard_recovery_identity"):
+                    me = selected.client._vanguard_recovery_identity
+                    del selected.client._vanguard_recovery_identity
+                else:
+                    me = await selected.client.get_me()
+                if me is None or not normalized_phone(getattr(me, "phone", None)):
+                    raise RecoveryCheckFailed("identity_unavailable")
+                if normalized_phone(me.phone) != phone or getattr(me, "bot", False):
+                    raise RecoveryCheckFailed("identity_mismatch")
+                if getattr(me, "restricted", False) or getattr(me, "deleted", False):
+                    raise RecoveryCheckFailed("account_frozen")
+                await guard.assert_owned()
+                if (selected.operation_lease_lost
+                        or not await self._operation_lease_manager.refresh(selected.operation_lease)):
+                    raise RecoveryCheckFailed("operation_lease_lost")
+                result = RecoveryResult(True, "identity_verified")
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as error:
+            result = recovery_result(error)
+        finally:
+            # Always close the probe before a caller can publish ONLINE.
+            probe_closed = False
+            try:
+                client, guard = selected.client, selected.session_guard
+                if claimed:
+                    async with asyncio.timeout(10):
+                        try:
+                            if client is not None:
+                                await _disconnect_client(client)
+                        finally:
+                            if guard is not None:
+                                await guard.close()
+                        if client is not None and client.is_connected():
+                            raise RecoveryCheckFailed("cleanup_failed")
+                        if guard is not None:
+                            current = await guard.lease.redis.get(guard.lease.key)
+                            if isinstance(current, bytes):
+                                current = current.decode()
+                            if current == guard.lease.token:
+                                raise RecoveryCheckFailed("cleanup_failed")
+                        probe_closed = True
+            except Exception:
+                result = RecoveryResult(False, "cleanup_failed")
+            finally:
+                if claimed:
+                    if probe_closed:
+                        selected.client, selected.session_guard = None, None
+                    try:
+                        async with asyncio.timeout(10):
+                            await self._release_operation_lease(selected)
+                            # The shared release API is best effort and clears
+                            # its local handle even when Redis release fails.
+                            # Recovery must prove its exact generation is gone
+                            # before the service can publish ONLINE.
+                            redis = self._operation_lease_manager._client()
+                            if redis is None or operation_handle is None:
+                                raise RecoveryCheckFailed("cleanup_failed")
+                            current = await redis.get(operation_handle.key)
+                            if isinstance(current, bytes):
+                                current = current.decode()
+                            if current == operation_handle.token:
+                                raise RecoveryCheckFailed("cleanup_failed")
+                    except Exception:
+                        result = RecoveryResult(False, "cleanup_failed")
+                selected.active_purpose, selected.keep_connected = previous
+                selected.status = AccountStatus.ERROR
+                selected._recovery_in_progress = False
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    async def _create_client(
+        self, account: TelegramAccountWrapper, *, recovery_probe: bool = False,
+        quarantine_token: str | None = None,
+    ) -> TelegramClient:
         """Create a Telethon client bound to the account session."""
+        from app.core.account.session_guard import _disconnect_client
+        from app.core.account.session_quarantine import current
+        from app.core.redis import redis_client
+
+        fence = await current(account.account_id, redis_client)
+        if fence is not None and (not recovery_probe or fence != quarantine_token):
+            account.session_quarantined = True
+            account.session_quarantine_token = fence
+            account.status = AccountStatus.ERROR
+            raise SessionQuarantined("telegram_session_quarantined")
         # Retained budget pauses reconnect their existing client in connect_by_id.
         # Other replacements must close the disconnected generation before
         # acquiring another lease, including when its client reference was lost.
@@ -1166,13 +1387,16 @@ class AccountPool:
         # has succeeded, so every failure path below can release it safely.
         try:
             from app.core.redis import redis_client
+            if recovery_probe and redis_client is None:
+                raise AccountOperationLeaseUnavailable("session_lease_unavailable")
             if redis_client is not None:
                 session_guard = AccountSessionGuard(
                     redis=redis_client,
                     account_id=account.account_id,
                     on_quarantine=lambda account_id, error: self._quarantine_session(
-                        account_id, error
+                        account_id, error, generation_token=session_guard.lease.token,
                     ),
+                    quarantine_token=quarantine_token if recovery_probe else None,
                 )
                 if not await session_guard.acquire():
                     raise AccountSessionLeaseBusy(
@@ -1189,8 +1413,7 @@ class AccountPool:
                     await session_guard.close()
             raise
         except Exception as exc:
-            # Redis may be temporarily unavailable. Preserve the existing
-            # guarded-client fallback, but release a partially acquired token.
+            # A connection without a confirmed ownership/fence check is unsafe.
             if session_guard is not None:
                 with suppress(Exception):
                     await session_guard.close()
@@ -1199,6 +1422,7 @@ class AccountPool:
                 account_id=account.account_id,
                 error=safe_exception_message(exc, max_length=300),
             )
+            raise AccountOperationLeaseUnavailable("session_lease_unavailable") from exc
         try:
             client = TelegramClient(
                 session,
@@ -1210,8 +1434,8 @@ class AccountPool:
                 app_version=app_version,
                 lang_code=lang_code,
                 system_lang_code=lang_code,
-                auto_reconnect=True,
-                connection_retries=TELEGRAM_CONNECTION_RETRIES,
+                auto_reconnect=not recovery_probe,
+                connection_retries=0 if recovery_probe else TELEGRAM_CONNECTION_RETRIES,
                 retry_delay=TELEGRAM_CONNECTION_RETRY_DELAY_SECONDS,
                 timeout=TELEGRAM_CONNECTION_TIMEOUT_SECONDS,
                 base_logger=f"vanguard.telethon.account.{account.account_id}",
@@ -1219,6 +1443,7 @@ class AccountPool:
                 receive_updates=account.keep_connected,
                 sequential_updates=account.keep_connected,
                 catch_up=account.keep_connected,
+                **({"request_retries": 0} if recovery_probe else {}),
             )
             if session_guard is not None:
                 session_guard.client = client
@@ -1250,26 +1475,62 @@ class AccountPool:
                 if account.session_guard is session_guard:
                     account.session_guard = None
             raise
+        recovery_identity = []
+        original_get_me = None
         try:
             await client._vanguard_governor.before([])
             client._vanguard_governor.bootstrapping = account.keep_connected
+            if recovery_probe:
+                original_get_me = client.get_me
+
+                async def observe_identity(*args: Any, **kwargs: Any) -> Any:
+                    if recovery_identity:
+                        from app.core.account.recovery import RecoveryCheckFailed
+                        raise RecoveryCheckFailed("probe_read_limit")
+                    me = await original_get_me(*args, **kwargs)
+                    recovery_identity.append(me)
+                    return me
+
+                client.get_me = observe_identity
             await client.connect()
-            if not await client.is_user_authorized():
+            if recovery_probe and recovery_identity:
+                if recovery_identity[0] is None:
+                    raise RuntimeError("recovery session is not authorized")
+                # Telethon's natural cold bootstrap already requested self.
+                # Consume that same raw result instead of reading self twice.
+                client._vanguard_recovery_identity = recovery_identity[0]
+            elif not await client.is_user_authorized():
                 raise RuntimeError(f"account {account.session_name} is not authorized")
             return client
-        except BaseException:
-            with suppress(Exception):
-                await client.disconnect()
+        except BaseException as error:
+            cleanup_failed = False
+            try:
+                await _disconnect_client(client)
+            except Exception:
+                cleanup_failed = True
             if session_guard is not None:
-                with suppress(Exception):
+                try:
                     await session_guard.close()
-                if account.session_guard is session_guard:
+                except Exception:
+                    cleanup_failed = True
+                if not cleanup_failed and account.session_guard is session_guard:
                     account.session_guard = None
+            if cleanup_failed:
+                # A timed-out SDK Future can still own a live transport.
+                # Keep both references for a later controlled cleanup.
+                account.client, account.session_guard = client, session_guard
+                if not isinstance(error, asyncio.CancelledError):
+                    from app.core.account.recovery import RecoveryCheckFailed
+                    raise RecoveryCheckFailed("cleanup_failed") from error
             raise
         finally:
             client._vanguard_governor.bootstrapping = False
+            if original_get_me is not None:
+                client.get_me = original_get_me
 
-    async def _quarantine_session(self, account_id: int | str, error: BaseException) -> None:
+    async def _quarantine_session(
+        self, account_id: int | str, error: BaseException, *, generation_token: str | None = None,
+    ) -> None:
         """Mark a wrong-session account unavailable without replaying work."""
         account = next(
             (item for item in self._accounts.values() if item.account_id == int(account_id)),
@@ -1277,14 +1538,61 @@ class AccountPool:
         )
         if account is None:
             return
+        guard = account.session_guard
+        if (generation_token is not None
+                and (guard is None or guard.lease.token != generation_token)):
+            return
+        reason = safe_exception_message(error, max_length=500)
+        account.session_quarantined = True
+        account.session_quarantine_reason = reason
+        account.session_quarantine_persisted = False
         account.release_status_override = AccountStatus.ERROR
         account.status = AccountStatus.ERROR
         account.operation_lease_lost = True
         self.logger.error(
             "telegram_session_quarantined",
             account_id=account.account_id,
-            error=safe_exception_message(error, max_length=500),
+            error=reason,
         )
+
+        from app.core.account.recovery import connection_failure_reason
+        from app.core.account.session_lease import PROCESS_ID
+        from app.core.account.session_quarantine import persist_error, publish
+        from app.core.redis import redis_client
+
+        token = (getattr(guard, "_quarantine_token", None)
+                 or account.session_quarantine_token or secrets.token_hex(16))
+        try:
+            published = await publish(
+                account_id, redis_client, token=token,
+                lease_token=getattr(getattr(guard, "lease", None), "token", None),
+                owner=PROCESS_ID,
+            )
+            account.session_quarantine_token = published.token
+            if guard is not None and published.sentinel_confirmed:
+                guard._fence_confirmed = True
+        except Exception as exc:
+            from app.core.account.session_quarantine import StaleQuarantineOwner
+
+            if isinstance(exc, StaleQuarantineOwner):
+                return
+            self.logger.warning(
+                "telegram_session_quarantine_fence_failed",
+                account_id=account.account_id,
+                error_type=type(exc).__name__,
+            )
+        # Each attempt owns only a short independent session. Failed sessions
+        # close before backoff; there is no Telegram or Redis wait in the TX.
+        account.session_quarantine_persisted = await persist_error(
+            account_id, token=token, redis=redis_client,
+            failure_reason=connection_failure_reason(error),
+        )
+        if not account.session_quarantine_persisted:
+            self.logger.warning(
+                "telegram_session_quarantine_persist_failed",
+                account_id=account.account_id,
+                reason="bounded_database_retry_exhausted",
+            )
 
     async def pause_listener(self, account: TelegramAccountWrapper, client: Any) -> None:
         """Stop the transport when idle, retaining queue/session for recovery."""
@@ -1413,6 +1721,14 @@ class AccountPool:
                 if self._decodo_client is None:
                     self._decodo_client = get_decodo_client()
                 proxies = await self._decodo_client.get_proxy_for_account(account.country_code)
+            elif provider == "trustsource":
+                from app.core.account.trustsource import get_trustsource_client
+
+                proxies = await get_trustsource_client().get_proxy_for_account(
+                    account.country_code,
+                    account_key=self._proxy_account_key(account),
+                    account_id=account.account_id,
+                )
             else:
                 if self._evomi_client is None:
                     self._evomi_client = get_evomi_client()
@@ -1749,13 +2065,29 @@ class AccountPool:
                         and existing.client.is_connected()
                     )
                 )
-                if not keep_runtime_status:
+                if existing.session_quarantined:
+                    # A database refresh must not turn a locally fenced
+                    # session back into an ONLINE listener. Once the fence
+                    # was durably written, an operator changing the DB status
+                    # away from ERROR is the explicit recovery signal.
+                    if (existing.session_quarantine_persisted
+                            and existing.session_quarantine_token is None
+                            and account.status != AccountStatus.ERROR):
+                        existing.session_quarantined = False
+                        existing.session_quarantine_persisted = False
+                        existing.session_quarantine_reason = None
+                        existing.operation_lease_lost = False
+                        existing.status = account.status
+                    else:
+                        existing.status = AccountStatus.ERROR
+                elif not keep_runtime_status:
                     existing.status = account.status
                 existing.fingerprint_id = account.fingerprint_id
                 existing.session_string = decrypt_session_string(account.session_string)
                 existing.api_id = api_id or existing.api_id
                 existing.api_hash = api_hash or existing.api_hash
                 existing.account_type = getattr(account, "account_type", existing.account_type)
+                existing.database_updated_at = getattr(account, "updated_at", None)
                 existing.country_code = account.country_code
                 try:
                     static_proxy = await self._resolve_account_static_proxy(

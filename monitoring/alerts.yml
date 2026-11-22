@@ -51,7 +51,7 @@ groups:
           description: Inspect the reconciliation stream consumer and database leases.
 
       - alert: VanguardAdUnknownWarning
-        expr: vanguard_ad_unresolved_oldest_age_seconds > 900
+        expr: (vanguard_ad_unresolved_oldest_age_seconds > 900) unless on() (vanguard_send_result_survival_enabled == 0)
         for: 5m
         labels: {severity: warning, service: growth}
         annotations:
@@ -59,7 +59,7 @@ groups:
           description: Unknown outcomes remain fenced and require fact verification.
 
       - alert: VanguardAdUnknownCritical
-        expr: vanguard_ad_unresolved_oldest_age_seconds > 3600
+        expr: (vanguard_ad_unresolved_oldest_age_seconds > 3600) unless on() (vanguard_send_result_survival_enabled == 0)
         for: 5m
         labels: {severity: critical, service: growth}
         annotations:
@@ -67,7 +67,7 @@ groups:
           description: Escalate the evidence workflow in the monitoring console.
 
       - alert: VanguardSurvivalOverdue
-        expr: vanguard_survival_overdue > 0
+        expr: (vanguard_survival_overdue > 0) unless on() (vanguard_send_result_survival_enabled == 0)
         for: 5m
         labels: {severity: critical, service: growth}
         annotations:
@@ -196,7 +196,7 @@ groups:
           max(vanguard_p4_pacing_score) - min(vanguard_p4_pacing_score) > 0
           and on() count(vanguard_p4_pacing_score) > 0
           and on() sum(rate(vanguard_p4_pacing_decisions_total{reason="selected"}[1h]))
-              by () / clamp_min(sum(rate(vanguard_p4_pacing_decisions_total[reason="eligible"]}[1h])), 0.001) > 0.8
+              by () / clamp_min(sum(rate(vanguard_p4_pacing_decisions_total{reason="eligible"}[1h])), 0.001) > 0.8
         for: 1h
         labels: {severity: warning, service: p4}
         annotations:
@@ -237,3 +237,30 @@ groups:
         annotations:
           summary: P5 rollout gate is holding the release
           description: A release metric regressed against the pre-release baseline (or a fairness/trend hold fired); do not expand the cohort until the gate passes again.
+
+  - name: vanguard-send-result
+    interval: 30s
+    rules:
+      - alert: VanguardSendResultInboxStalled
+        expr: vanguard_send_result_inbox_oldest_age_seconds > 120
+        for: 5m
+        labels: {severity: warning, service: inbox}
+        annotations:
+          summary: A live inbox event has been waiting over two minutes
+          description: Inspect the event consumer; terminal unknown and expired events are excluded.
+
+      - alert: VanguardSendResultSettlementStalled
+        expr: vanguard_send_result_sending_oldest_age_seconds > 300
+        for: 2m
+        labels: {severity: critical, service: growth}
+        annotations:
+          summary: A sending result has not settled within five minutes
+          description: Inspect database-only recovery and account leases; do not resend the original operation.
+
+      - alert: VanguardSendResultExitNeedsAttention
+        expr: vanguard_send_result_memberships{state="exit_failed"} > 0
+        for: 2m
+        labels: {severity: warning, service: growth}
+        annotations:
+          summary: Automatic departure exhausted its retry limit
+          description: Inspect the recorded departure reason and resolve it manually; automatic retries remain stopped.

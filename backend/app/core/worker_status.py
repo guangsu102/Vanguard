@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import BigInteger, Boolean, UniqueConstraint, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, UniqueConstraint, DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -101,6 +101,10 @@ class TelegramEventInbox(Base):
         UniqueConstraint("account_id", "event_key", name="uq_telegram_event_inbox_identity"),
         Index("ix_telegram_event_inbox_pending", "state", "next_attempt_at", "id"),
         Index("ix_telegram_event_inbox_peer", "account_id", "chat_id", "id"),
+        Index("ix_telegram_event_inbox_live_peer", "account_id", "chat_id", "id",
+              postgresql_where=text("state IN ('pending', 'processing', 'executing', 'reconciliation_required')")),
+        Index("ix_telegram_event_inbox_live_account", "account_id", "id",
+              postgresql_where=text("state = 'pending'")),
         Index("ix_telegram_event_inbox_lane_ready", "lane", "state", "available_at", "id"),
         Index("ix_telegram_event_inbox_claim_lease", "state", "claim_lease_expires_at"),
         Index("ix_telegram_event_inbox_coalesce", "account_id", "coalesce_key", "state"),

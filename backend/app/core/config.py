@@ -120,6 +120,34 @@ class Settings(BaseSettings):
     RECONCILIATION_ACCOUNT_IDS: str = "34"
     METRICS_SCRAPE_TOKEN: str | None = None
 
+    # Account-scoped qualification work/grant separation. Empty scope fails closed.
+    TELEGRAM_RPC_PACING_ENABLED: bool = False
+    TELEGRAM_RPC_MIN_INTERVAL_SECONDS: float = Field(default=1.0, ge=0.5, le=10.0)
+    GROWTH_SIMPLIFIED_ENABLED: bool = False
+    GROWTH_EFFICIENCY_ENABLED: bool = False
+    GROWTH_EFFICIENCY_ACCOUNT_IDS: str = ""
+
+    # V5 qualification read optimization. Existing grants and Telegram read
+    # limits are independent of these reversible, account-scoped switches.
+    REVIEW_READ_OPTIMIZATION_ENABLED: bool = False
+    REVIEW_READ_OPTIMIZATION_ACCOUNT_IDS: str = ""
+    REVIEW_READ_REUSE: bool = False
+    REVIEW_READ_RESUME: bool = False
+    REVIEW_READ_DEMAND_IDENTITY: bool = False
+    REVIEW_READ_MINIMAL_PLAN: bool = False
+    REVIEW_READ_PUSH: bool = False
+    REVIEW_READ_FAST_PATH: bool = False
+    REVIEW_READ_FACT_HANDOFF: bool = False
+    REVIEW_READ_DEPENDENCY_RESUME: bool = False
+    REVIEW_EVIDENCE_STORE_ENABLED: bool = False
+    REVIEW_EVIDENCE_STORE_PATH: str = ""
+    REVIEW_READ_METRICS_ENABLED: bool = False
+    REVIEW_READ_METRICS_PATH: str = ""
+    REVIEW_READ_METRICS_ROLE: str = ""
+    REVIEW_DIAGNOSTICS_PATH: str = ""
+    REVIEW_READ_PUBLIC_SHARE: bool = False
+    REVIEW_READ_METRICS_EXPECTED_ROLES: str = ""
+
     # P1 runtime reliability rollout.  These controls are deliberately
     # additive and fail closed: the existing P0 allocation and inbox path
     # remain active until the rollout is explicitly enabled.
@@ -523,7 +551,10 @@ class Settings(BaseSettings):
     )
 
     # Proxy Service
-    PROXY_PROVIDER: str = Field(default="evomi", description="Proxy provider for promoter accounts: evomi/decodo")
+    PROXY_PROVIDER: str = Field(
+        default="evomi",
+        description="Proxy provider for promoter accounts: evomi/decodo/trustsource",
+    )
     PROMOTER_PROXY_REQUIRED: bool = Field(default=True, description="Require proxy before promoter account connects")
     RISK_GUARD_FAIL_CLOSED: bool = Field(default=False, description="Block high-risk account actions when Redis risk budget is unavailable")
 
@@ -653,6 +684,8 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_defaults(self):
         """Fail fast if production is started with development secrets."""
+        if self.GROWTH_SIMPLIFIED_ENABLED and not self.TELEGRAM_RPC_PACING_ENABLED:
+            raise ValueError("GROWTH_SIMPLIFIED_ENABLED requires TELEGRAM_RPC_PACING_ENABLED")
         if not self.LLM_FAST_MODEL.strip():
             self.LLM_FAST_MODEL = self.LLM_MODEL
 

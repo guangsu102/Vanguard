@@ -3,17 +3,21 @@ API Security Module
 
 Centralized authentication dependencies for Vanguard API endpoints.
 """
-from datetime import datetime, timedelta, timezone
-
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import settings
 from app.core.database import get_db
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import column, select, table
+from sqlalchemy.ext.asyncio import AsyncSession
 
 security = HTTPBearer()
+_AUTH_USER = table(
+    "admin_user", *(column(name) for name in (
+        "id", "username", "role", "email", "avatar", "created_at", "is_active"
+    ))
+)
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
@@ -21,7 +25,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     import jwt
 
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + (
+    expire = datetime.now(UTC) + (
         expires_delta or timedelta(hours=settings.JWT_EXPIRATION_HOURS)
     )
     to_encode.update({"exp": expire})
@@ -93,11 +97,7 @@ async def get_current_user(
     user_id = _get_user_id_from_payload(payload)
 
     result = await db.execute(
-        text(
-            "SELECT id, username, role, email, avatar, created_at, is_active "
-            "FROM admin_user WHERE id = :user_id"
-        ),
-        {"user_id": user_id}
+        select(*_AUTH_USER.c).where(_AUTH_USER.c.id == user_id)
     )
     user = result.fetchone()
 

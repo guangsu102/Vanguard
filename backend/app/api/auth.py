@@ -38,7 +38,7 @@ class UpdatePasswordRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     old_password: str = Field(alias="oldPassword", min_length=1)
-    new_password: str = Field(alias="newPassword", min_length=16)
+    new_password: str = Field(alias="newPassword", min_length=8)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:

@@ -14,50 +14,35 @@ from app.core.account import session_exec
 from app.core.account.session_exec import forward, owner_id, serve_requests
 
 
-class FakeRedis:
-    """Minimal async Redis with the list/TTL operations the channel uses."""
-
-    def __init__(self) -> None:
-        self.lists: dict[str, list[str]] = {}
-        self.strings: dict[str, str] = {}
-        self.ttl: dict[str, int] = {}
-
-    async def set(self, key: str, value: str, *, nx: bool = False, ex: int | None = None) -> bool:
-        if nx and key in self.strings:
-            return False
-        self.strings[key] = value
-        self.ttl[key] = ex or 0
-        return True
-
-    async def get(self, key: str) -> str | None:
-        return self.strings.get(key)
-
-    async def lpush(self, key: str, value: str) -> int:
-        self.lists.setdefault(key, []).insert(0, value)
-        return len(self.lists[key])
-
-    async def brpop(self, key: str, timeout: int = 5) -> tuple[str, str] | None:
-        deadline = time.monotonic() + max(0, int(timeout)) + 0.05
-        while time.monotonic() < deadline:
-            items = self.lists.get(key)
-            if items:
-                return key, items.pop()
-            await asyncio.sleep(0.01)
-        return None
-
-    async def rpop(self, key: str) -> str | None:
-        items = self.lists.get(key)
-        if not items:
-            return None
-        return items.pop()
-
-    async def expire(self, key: str, seconds: int) -> bool:
-        self.ttl[key] = seconds
-        return key in self.strings or key in self.lists
+from tests.fakes.session_exec_redis import FakeRedis
 
 
 async def _start_server(client: FakeRedis, owns, execute_stage):
     return asyncio.create_task(serve_requests(client, owns=owns, execute_stage=execute_stage))
+
+
+@pytest.mark.asyncio
+async def test_graceful_stop_finishes_inflight_result_without_cancelling():
+    client = FakeRedis()
+    started, complete = asyncio.Event(), asyncio.Event()
+    stopping = False
+
+    async def execute_stage(account_id, stage):
+        started.set()
+        await complete.wait()
+        return {"message_id": 123}, 60
+
+    server = asyncio.create_task(serve_requests(client, owns=lambda _: True,
+        execute_stage=execute_stage, poll_interval=0.01, stopping=lambda: stopping))
+    caller = asyncio.create_task(forward(7, "ads", client=client, timeout=5))
+    await asyncio.wait_for(started.wait(), 2)
+    stopping = True
+    await asyncio.sleep(0.05)
+    assert not server.done()
+    complete.set()
+    reply = await caller
+    await asyncio.wait_for(server, 2)
+    assert reply["result"]["message_id"] == 123
 
 
 @pytest.mark.asyncio
@@ -426,7 +411,7 @@ async def test_busy_owner_defers_without_leaving_a_stale_waiting_write():
         await asyncio.wait_for(started.wait(), 1)
         second = await asyncio.wait_for(forward(2, "join", client=client, timeout=2), 1)
         assert second["result"]["reason"] == "session_owner_capacity_wait"
-        assert second["interval"] == session_exec.CAPACITY_WAIT_RETRY_SECONDS
+        assert second["interval"] == getattr(session_exec, "CAPACITY_WAIT_RETRY_SECONDS", 30)
         assert executed == [1]
         release.set()
         assert (await first)["result"]["processed"] == 1

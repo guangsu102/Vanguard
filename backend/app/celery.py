@@ -11,6 +11,20 @@ from celery import Celery
 from celery.schedules import crontab
 
 from app.core.config import settings
+from app.modules.acquisition.qualification_sla_lifecycle import install_celery_signals
+
+install_celery_signals()
+
+# Celery installs its own handlers after importing this module. Add only the
+# finite V5 diagnostic route to those handlers; preserve Celery's log policy.
+from celery.signals import after_setup_logger, after_setup_task_logger
+
+
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _route_review_diagnostics(**_kwargs):
+    from app.modules.acquisition.review_diagnostics import install_logging_filters
+    install_logging_filters()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -88,27 +102,6 @@ celery_app.conf.update(
 # Beat Schedule - Second-level Precision Tasks
 # =============================================================================
 celery_app.conf.beat_schedule = {
-    "runtime-recovery-every-minute": {
-        "task": "app.core.scheduler.tasks.runtime_recovery_task", "schedule": 60.0,
-        "options": {"queue": "growth_maintenance", "expires": 55},
-    },
-    "group-qualification-every-minute": {
-        "task": "app.core.scheduler.tasks.group_qualification_task",
-        "schedule": 60.0,
-        "options": {"queue": "qualification", "expires": 55},
-    },
-    "qualification-verification-every-minute": {
-        "task": "app.core.scheduler.tasks.group_verification_task", "schedule": 60.0,
-        "options": {"queue": "growth_maintenance", "expires": 55},
-    },
-    "join-reconciliation-every-minute": {
-        "task": "app.core.scheduler.tasks.reconcile_join_requests_task", "schedule": 60.0,
-        "options": {"queue": "growth_maintenance", "expires": 55},
-    },
-    "qualification-exits-every-two-minutes": {
-        "task": "app.core.scheduler.tasks.qualification_exits_task", "schedule": 120.0,
-        "options": {"queue": "automation", "expires": 110},
-    },
     # -------------------------------------------------------------------------
     # Second-level Tasks
     # -------------------------------------------------------------------------
@@ -151,32 +144,11 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(minute="*/10"),
         "options": {"queue": "default"},
     },
-    "auto-join-groups-dispatcher-every-5min": {
-        "task": "app.core.scheduler.tasks.auto_join_groups_task",
-        "schedule": crontab(minute="*/5"),
-        "kwargs": {
-            "scheduled": True,
-            "max_accounts": 26,
-            "keywords_per_account": 30,
-            "max_groups_per_keyword": 50,
-        },
-        "options": {"queue": "automation", "rate_limit": "12/h"},
-    },
     "recover-orphaned-groups-every-5min": {
         "task": "app.core.scheduler.tasks.recover_orphaned_groups_task",
         "schedule": crontab(minute="*/5"),
         "kwargs": {"max_tasks": 20},
         "options": {"queue": "automation", "rate_limit": "12/h"},
-    },
-    "deliver-ads-dispatcher-every-minute": {
-        "task": "app.core.scheduler.tasks.deliver_ads_task",
-        "schedule": 60.0,
-        "options": {"queue": "automation", "rate_limit": "60/h"},
-    },
-    "check-ad-survival-every-2min": {
-        "task": "app.core.scheduler.tasks.check_ad_survival_task",
-        "schedule": 120.0,
-        "options": {"queue": "growth_maintenance", "rate_limit": "30/h"},
     },
     "audit-group-ad-policies-hourly": {
         "task": "app.core.scheduler.tasks.audit_group_ad_policies_task",
@@ -196,12 +168,6 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,
         "kwargs": {"limit": 10},
         "options": {"queue": "automation", "rate_limit": "1/m"},
-    },
-    "auto-probe-unknown-ad-policies-every-5min": {
-        "task": "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task",
-        # Offset from auto-join's 5-minute boundary to avoid account lease contention.
-        "schedule": crontab(minute="2-59/5"),
-        "options": {"queue": "automation", "rate_limit": "12/h"},
     },
     "group-ai-warmup-dispatcher-every-30min": {
         "task": "app.core.scheduler.tasks.group_ai_warmup_task",
@@ -329,6 +295,12 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,
         "options": {"queue": "default", "expires": 55},
     },
+    "replenish-keywords-every-6h": {
+        "task": "app.core.scheduler.tasks.replenish_keywords_task",
+        "schedule": crontab(hour="*/6", minute=15),
+        "kwargs": {"auto_approve": True},
+        "options": {"queue": "default"},
+    },
 }
 
 # =============================================================================
@@ -336,20 +308,18 @@ celery_app.conf.beat_schedule = {
 # =============================================================================
 # Business state is polled once and coalesced into bounded account quanta.
 # Keep the old task entry points callable for explicit/manual operations only.
-for _entry in (
-    "runtime-recovery-every-minute",
-    "group-qualification-every-minute", "qualification-verification-every-minute",
-    "join-reconciliation-every-minute", "qualification-exits-every-two-minutes",
-    "auto-join-groups-dispatcher-every-5min", "deliver-ads-dispatcher-every-minute",
-    "check-ad-survival-every-2min",
-    "auto-probe-unknown-ad-policies-every-5min",
-):
-    celery_app.conf.beat_schedule.pop(_entry)
 celery_app.conf.beat_schedule["growth-account-dispatch-every-15s"] = {
     "task": "app.core.scheduler.growth_dispatch.dispatch_growth_task",
     "schedule": 15.0,
     "options": {"queue": "growth_dispatch", "expires": 30},
 }
+if settings.GROWTH_SIMPLIFIED_ENABLED:
+    for _entry in (
+        "recover-orphaned-groups-every-5min", "audit-group-ad-policies-hourly",
+        "evaluate-ad-only-candidates-hourly", "dispatch-ad-only-join-queue-every-minute",
+        "group-ai-warmup-dispatcher-every-30min",
+    ):
+        celery_app.conf.beat_schedule.pop(_entry, None)
 celery_app.conf.task_routes = {
     "app.core.scheduler.tasks.auto_probe_unknown_group_ad_policies_task": {"queue": "automation"},
     "app.core.scheduler.growth_dispatch.dispatch_growth_task": {"queue": "growth_dispatch"},

@@ -28,7 +28,7 @@ async def test_identical_material_has_one_provider_attempt_even_after_restart(te
     call = AsyncMock(return_value=result)
     if outcome in {"exception", "cancelled"}:
         call.side_effect = RuntimeError("offline") if outcome == "exception" else asyncio.CancelledError()
-    service = Obj(db=test_db, _ad_policy_llm=lambda: None, _evaluate_group_ad_rules_with_ai=call)
+    service = Obj(db=test_db, _ad_policy_llm=lambda: Obj(), _evaluate_group_ad_rules_with_ai=call)
     if outcome == "cancelled":
         with pytest.raises(asyncio.CancelledError):
             await ai.review_semantics(service, snapshot, account, GroupAdRulesAuditResult(), {})
@@ -50,7 +50,7 @@ async def test_existing_failed_material_is_adopted_without_repeating_provider_ca
     old = {"raw_peer_id": 42, "evidence": [{"source": "full_about", "text": "rules"}],
            "profile_fingerprint": ai.profile_fingerprint(account),
            "advertising_audit": {"reason": "group_rules_ai_provider_content_rejected"}}
-    service = Obj(db=test_db, _ad_policy_llm=lambda: None, _evaluate_group_ad_rules_with_ai=AsyncMock())
+    service = Obj(db=test_db, _ad_policy_llm=lambda: Obj(), _evaluate_group_ad_rules_with_ai=AsyncMock())
     result = await ai.review_semantics(service, deepcopy(old), account, GroupAdRulesAuditResult(), {}, previous=old)
     assert result.ad_allowed is False and result.cache_hit
     service._evaluate_group_ad_rules_with_ai.assert_not_awaited()

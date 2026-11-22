@@ -712,6 +712,8 @@ async def test_missing_reply_metadata_does_not_claim_complete_warning_search():
 @pytest.mark.asyncio
 async def test_reply_query_failure_keeps_ad_evidence_unknown():
     recent, first, second = busy_history_with_two_old_ads()
+    first.replies = Obj(replies=1)
+    second.replies = Obj(replies=1)
 
     class FailedThreadClient(ReplyThreadClient):
         async def iter_messages(self, entity, **kwargs):

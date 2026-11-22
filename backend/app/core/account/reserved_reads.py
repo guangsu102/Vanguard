@@ -14,6 +14,13 @@ def listener_reserve(total: int) -> int:
     return max(3, (total * 2 + 99) // 100)
 
 
+def listener_floor(limits: dict, usage: dict, window: str) -> int:
+    """Protect future control reads without undoing any historical donor loan."""
+    if not limits.get("growth_efficiency_v1"):
+        return 0
+    return max(0, listener_reserve(limits[window]) - usage.get(f"listener_{window}", {}).get("used", 0))
+
+
 COUNTERS = ("ad", "survival", "join_reserved", "sync_reserved", "flex_reserved")
 
 
@@ -66,23 +73,25 @@ def classified(total: int, measured: list[int], caps: list[int]) -> list[int]:
     return used
 
 
-def available(total: int, used: list[int], caps: list[int], lane: str) -> int:
+def available(total: int, used: list[int], caps: list[int], lane: str, *, survival_floor: int = 0) -> int:
     index = LANE_INDEX[lane]
     remaining = max(0, total - sum(used))
     protected_other = 0
     for i in (1, 0, 2, 3):
-        claim = min(remaining, max(0, caps[i] - used[i]))
+        demand = max(0, caps[i] - used[i], survival_floor if i == 1 else 0)
+        claim = min(remaining, demand)
         remaining -= claim
         if i != index:
             protected_other += claim
     return max(0, total - sum(used) - protected_other)
 
 
-def lending_caps(caps: list[int], used: list[int], lane: str, hold: int = -1, sync_hold: int = -1, ad_hold: int = -1) -> list[int]:
+def lending_caps(caps: list[int], used: list[int], lane: str, hold: int = -1, sync_hold: int = -1, ad_hold: int = -1,
+                 *, survival_floor: int = 0) -> list[int]:
     """Keep the survival work buffer; only critical work receives the excess."""
     adjusted = list(caps)
     if lane == "critical" and hold >= 0:
-        loan = max(0, caps[1] - used[1] - hold)
+        loan = max(0, caps[1] - used[1] - max(hold, survival_floor))
         adjusted[1] -= loan
         adjusted[2] += loan
     if lane == "critical" and sync_hold >= 0:
@@ -174,6 +183,7 @@ def reservation_args(account_id: int, limits: dict, lane: str, reads: int, pace:
             int(limits.get("sync_idle_lending", 0) == 1),
             int(settings.GROWTH_METRICS_ENABLED),
             int(limits.get("sync_target_enforced", 0)),
+            int(limits.get("growth_efficiency_v1", 0)),
         ]
     return keys, args
 
@@ -189,6 +199,7 @@ local sync_ad_loans={0,0}
 local sync_survival_loans={0,0}
 local mode=ARGV[26] or 'read'
 local completing=tonumber(ARGV[39] or '0')==1
+local efficiency=tonumber(ARGV[47] or '0')==1
 if completing and (lane~=2 or mode~='read' or tonumber(ARGV[20])==1) then return 60000 end
 local token=ARGV[25] or ''
 local held_token=redis.call('HGET',KEYS[23],'token')
@@ -212,6 +223,9 @@ end
 for i=1,3 do
  local used=tonumber(redis.call('GET',KEYS[i]) or '0')
  local protected_work=0;if not owns then protected_work=held end
+ -- A pre-rollout reservation may have held the control floor. Keep its
+ -- ledger intact, but revalidate its future spend after control traffic.
+ if efficiency and tonumber(ARGV[20])==1 then protected_work=0 end
  if used+cost+protected_work>tonumber(ARGV[4+i]) then delay=math.max(delay,ttl(i)) end
 end
 for w=1,2 do
@@ -250,19 +264,20 @@ for w=1,2 do
   cap[1]=cap[1]-pending_ad
   cap[3]=cap[3]+pending_survival+pending_sync+pending_ad
  end
+ local recovery_used=tonumber(redis.call('GET',KEYS[16+w]) or '0')
+ if redis.call('EXISTS',KEYS[w+1])==0 then recovery_used=0 end
+ local recovery=math.max(0,tonumber(ARGV[20+w])-recovery_used)
  local function protected()
   local reserved=0; local remaining=math.max(0,tonumber(ARGV[5+w])-total)
   for _,i in ipairs({2,1,3,4}) do
    local demand=math.max(0,cap[i]-used[i])
+   if efficiency and i==2 then demand=math.max(demand,recovery) end
    if i==held_lane and not owns then demand=math.max(demand,held) end
    local claim=math.min(remaining,demand);remaining=remaining-claim
    if i~=lane then reserved=reserved+claim end
   end
   return reserved
  end
- local recovery_used=tonumber(redis.call('GET',KEYS[16+w]) or '0')
- if redis.call('EXISTS',KEYS[w+1])==0 then recovery_used=0 end
- local recovery=math.max(0,tonumber(ARGV[20+w])-recovery_used)
  local listener=tonumber(ARGV[20])==1
  if listener and cost>recovery then delay=math.max(delay,ttl(w+1)) end
  local hold=tonumber(ARGV[17+w] or '-1')
@@ -278,7 +293,12 @@ for w=1,2 do
   local legacy=math.max(0,used[3]-joins-reviews)
   joins=joins+math.floor(legacy/2);reviews=reviews+legacy-math.floor(legacy/2)
   local other=joins;if group==1 then other=reviews end
-  local other_min=math.max(0,math.floor(tonumber(ARGV[10+(w-1)*5])/4)-other)
+  local floor=math.floor(tonumber(ARGV[10+(w-1)*5])/4)
+  if efficiency then
+   local share=40;if group==1 then share=60 end
+   floor=math.floor(tonumber(ARGV[10+(w-1)*5])*share/100)
+  end
+  local other_min=math.max(0,floor-other)
   local idle_hold=tonumber(ARGV[32+w] or '-1')
   if group==2 and idle_hold>=0 then other_min=math.min(other_min,idle_hold) end
   local opposite=(group==1 and held_kind=='review') or (group==2 and held_kind=='join')
@@ -306,6 +326,7 @@ for w=1,2 do
   local allowed=0
   if owns then allowed=pending_survival
   elseif hold>=0 then allowed=math.max(0,cap[2]-used[2]-hold) end
+  if efficiency then allowed=math.min(allowed,math.max(0,cap[2]-used[2]-recovery)) end
   loans[w]=borrow(2,allowed)
   local sync_hold=tonumber(ARGV[30+w] or '-1')
   allowed=0
@@ -347,7 +368,7 @@ for w=1,2 do
   sync_survival_loans[w]=borrow_sync(2,allowed)
  end
  local reserved=protected()+critical_hold
- if lane~=3 and lane==held_lane and not owns then reserved=reserved+held end
+ if lane~=3 and lane==held_lane and not owns and not (efficiency and listener) then reserved=reserved+held end
  if lane==2 and not listener then reserved=reserved+recovery end
  if completing then
   local completed=tonumber(redis.call('GET',KEYS[27+w]) or '0')

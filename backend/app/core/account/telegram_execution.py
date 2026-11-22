@@ -1608,7 +1608,8 @@ class TelegramExecutionService:
         return getattr(result, "id", getattr(result, "message_id", None))
 
     async def _validate_qualification_join(
-        self, entity: Any, *, action: AccountRiskAction = AccountRiskAction.JOIN
+        self, entity: Any, *, action: AccountRiskAction = AccountRiskAction.JOIN,
+        account_id: int | None = None,
     ) -> None:
         # Owned-group resource workflows have their own operation/owner protections.
         # No caller-controlled source string can bypass a normal JOIN action.
@@ -1620,7 +1621,7 @@ class TelegramExecutionService:
         from app.modules.acquisition.qualification_join_gate import qualification_join_gate
 
         try:
-            reason = await qualification_join_gate(db, entity)
+            reason = await qualification_join_gate(db, entity, account_id=account_id)
         except Exception as exc:
             raise TelegramExecutionError("qualification_join_check_unavailable") from exc
         if reason:
@@ -1681,7 +1682,7 @@ class TelegramExecutionService:
 
             from telethon.tl.functions.channels import JoinChannelRequest
 
-            await self._validate_qualification_join(entity)
+            await self._validate_qualification_join(entity, account_id=getattr(account, "account_id", None))
             await self._notify_join_request_attempted(on_join_request_attempted)
             await client(JoinChannelRequest(entity))
 
@@ -1719,7 +1720,7 @@ class TelegramExecutionService:
                 target_id=risk_target,
                 details={"source": source, "link_type": parsed.kind, "join_reservation_key": join_reservation_key},
             ):
-                await self._validate_qualification_join(entity, action=action)
+                await self._validate_qualification_join(entity, action=action, account_id=getattr(account, "account_id", None))
                 await self._notify_join_request_attempted(on_join_request_attempted)
                 try:
                     await client(JoinChannelRequest(entity))
@@ -1738,6 +1739,9 @@ class TelegramExecutionService:
                 )
             if isinstance(preview, ChatInviteAlready):
                 entity = existing_chat
+                from app.core.config import settings
+                if settings.GROWTH_SIMPLIFIED_ENABLED:
+                    await self._validate_qualification_join(entity, action=action, account_id=getattr(account, "account_id", None))
             else:
                 if getattr(preview, "broadcast", False) and not (
                     getattr(preview, "megagroup", False)
@@ -1753,7 +1757,7 @@ class TelegramExecutionService:
                     target_id=risk_target,
                     details={"source": source, "link_type": parsed.kind, "join_reservation_key": join_reservation_key},
                 ):
-                    await self._validate_qualification_join(existing_chat, action=action)
+                    await self._validate_qualification_join(existing_chat, action=action, account_id=getattr(account, "account_id", None))
                     await self._notify_join_request_attempted(
                         on_join_request_attempted
                     )

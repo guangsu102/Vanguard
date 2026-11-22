@@ -292,6 +292,27 @@ describe('Accounts view', () => {
     confirmAction.mockReset().mockResolvedValue('confirm' as never)
   })
 
+  it('offers verified recovery for an active ERROR account without requiring disconnect first', async () => {
+    const wrapper = mount(Accounts, {
+      global: {
+        ...globalConfig,
+        stubs: {
+          ...globalStubs,
+          TableCard: {
+            template: '<div><slot name="actions" :row="account" /></div>',
+            setup: () => ({ account: makeAccount(135, { status: 'error', is_active: true }) }),
+          },
+        },
+      },
+    })
+    const recover = wrapper.findAll('button').find((button) => button.text() === '核验恢复')
+    expect(recover).toBeDefined()
+    await recover!.trigger('click')
+    await flushPromises()
+    expect(enable).toHaveBeenCalledWith(135)
+    expect(disable).not.toHaveBeenCalled()
+  })
+
   it('renders page and account row', () => {
     const wrapper = mount(Accounts, {
       global: globalConfig,

@@ -63,25 +63,6 @@ services:
       - ./data/logs:/app/logs
       - ./data/uploads:/app/uploads
 
-  # ==================== Bot Matrix ====================
-  bot:
-    profiles:
-      - legacy-bot
-    build:
-      context: .
-      dockerfile: Dockerfile.bot
-    container_name: vanguard-bot
-    restart: unless-stopped
-    environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - API_BASE_URL=http://backend:8000
-      - REDIS_URL=${REDIS_URL}
-    depends_on:
-      - backend
-      - redis
-    networks:
-      - vanguard-network
-
   napcat:
     profiles:
       - qq

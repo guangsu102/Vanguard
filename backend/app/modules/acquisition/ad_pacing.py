@@ -8,7 +8,7 @@ from typing import Any
 
 def pacing_deadline(rpc: dict, *, capacity: int, delivery_cost: int,
                     last_sent: datetime | None, now: datetime) -> datetime | None:
-    limits, usage = rpc.get("limits", {}), rpc.get("usage", {})
+    limits, usage = rpc.get("limits") or {}, rpc.get("usage") or {}
     day = usage.get("day", {})
     ad = usage.get("ad_day", {})
     if not limits.get("ad_day") or capacity <= 0:
@@ -35,6 +35,9 @@ def pacing_deadline(rpc: dict, *, capacity: int, delivery_cost: int,
 
 
 async def account_pacing_deadline(db: Any, config: Any, now: datetime, last_sent: datetime | None) -> datetime | None:
+    from app.core.config import settings
+    if settings.TELEGRAM_RPC_PACING_ENABLED:
+        return None
     if getattr(config, "dynamic_capacity_enabled", False) is not True:
         return None
     from sqlalchemy.ext.asyncio import AsyncSession

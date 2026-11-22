@@ -44,10 +44,13 @@ def setup_logging() -> None:
     )
 
     handlers: list[logging.Handler] = []
+    from app.modules.acquisition.review_diagnostics import DiagnosticLogFilter, route_event
+    diagnostic_filter = DiagnosticLogFilter()
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(stdout_level)
     stdout_handler.addFilter(TelegramAccountLogContextFilter())
     handlers.append(stdout_handler)
+    stdout_handler.addFilter(diagnostic_filter)
 
     if settings.LOG_FILE:
         log_path = Path(settings.LOG_FILE)
@@ -64,6 +67,7 @@ def setup_logging() -> None:
         file_handler.setLevel(log_level)
         file_handler.addFilter(TelegramAccountLogContextFilter())
         handlers.append(file_handler)
+        file_handler.addFilter(diagnostic_filter)
 
     root_level = min(handler.level for handler in handlers)
 
@@ -77,6 +81,7 @@ def setup_logging() -> None:
     # Configure structlog
     structlog.configure(
         processors=[
+            route_event,
             structlog.stdlib.filter_by_level,
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,

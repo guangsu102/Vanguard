@@ -44,7 +44,7 @@ def day_blocked_listener(item: dict, limits: dict, budget: dict) -> bool:
     wait. Never lend the daily sync share or infer recovery from a connected
     socket alone. The listener must be durably checkpointing its input.
     """
-    from app.core.account.reserved_reads import allocations, available, transferred_caps
+    from app.core.account.reserved_reads import allocations, available, listener_floor, transferred_caps
 
     journal = item.get('raw_journal') or {}
     if not (
@@ -74,7 +74,8 @@ def day_blocked_listener(item: dict, limits: dict, budget: dict) -> bool:
                             usage.get('sync_borrowed_ad_day', {}).get('used', 0),
                             usage.get('sync_borrowed_survival_day', {}).get('used', 0))
     used = [usage[lane + '_day']['used'] for lane in ('ad', 'survival', 'critical', 'sync', 'routine')]
-    return used[3] >= caps[3] and available(limits['day'], used, caps, 'sync') == 0
+    return used[3] >= caps[3] and available(limits['day'], used, caps, 'sync',
+                                         survival_floor=listener_floor(limits, usage, 'day')) == 0
 
 
 async def add_idle_sync_headroom(
@@ -96,6 +97,7 @@ async def add_idle_sync_headroom(
         allocations,
         available,
         lending_caps,
+        listener_floor,
         sync_target_limit,
         transferred_caps,
     )
@@ -152,10 +154,12 @@ async def add_idle_sync_headroom(
             usage.get(f"sync_borrowed_ad_{window}", {}).get("used", 0),
             usage.get(f"sync_borrowed_survival_{window}", {}).get("used", 0),
         )
+        control = listener_floor(limits, usage, window)
         adjusted = lending_caps(
-            caps, used, "critical", limits.get(f"survival_hold_{window}", -1), holds[window]
+            caps, used, "critical", limits.get(f"survival_hold_{window}", -1), holds[window],
+            survival_floor=control,
         )
-        room = available(limits[window], used, adjusted, "critical")
+        room = available(limits[window], used, adjusted, "critical", survival_floor=control)
         rooms.append(room)
         loans[window] = caps[3] - adjusted[3]
         if room <= 0:

@@ -202,7 +202,7 @@ async def operational_snapshot(db) -> dict:
                     "code": "telegram_cooldown",
                     "account_id": account.id,
                     "severity": "warning",
-                    "resume_at": rpc["pause_until"],
+                    "resume_at": rpc.get("resume_at") or rpc.get("pause_until"),
                 }
             )
         elif rpc.get("pause_until"):
