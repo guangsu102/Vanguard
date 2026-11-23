@@ -9,6 +9,7 @@ import ECharts from '@/components/ECharts.vue'
 import dayjs from 'dayjs'
 
 const statsStore = useStatsStore()
+const chartHeight = '320px'
 
 const loading = ref(true)
 const autoRefresh = ref(false)
@@ -281,7 +282,10 @@ onUnmounted(() => {
 
       <el-col :span="6">
         <el-card class="stat-card small" shadow="hover">
-          <el-statistic title="活跃用户" :value="stats.activeUsers" suffix="人">
+          <el-statistic title="活跃用户" :value="stats.activeUsers">
+            <template #suffix>
+              <span class="stat-unit">人</span>
+            </template>
           </el-statistic>
         </el-card>
       </el-col>
@@ -299,9 +303,9 @@ onUnmounted(() => {
           <ECharts
             v-if="statsStore.dashboardStats?.weeklyTrend?.length"
             :option="trendChartOption"
-            height="320px"
+            :height="chartHeight"
           />
-          <el-empty v-else description="暂无数据" />
+          <el-empty v-else :style="{ height: chartHeight }" description="暂无数据" />
         </el-card>
       </el-col>
 
@@ -315,9 +319,9 @@ onUnmounted(() => {
           <ECharts
             v-if="statsStore.dashboardStats?.accountDistribution?.length"
             :option="distributionChartOption"
-            height="320px"
+            :height="chartHeight"
           />
-          <el-empty v-else description="暂无数据" />
+          <el-empty v-else :style="{ height: chartHeight }" description="暂无数据" />
         </el-card>
       </el-col>
     </el-row>
@@ -393,6 +397,10 @@ export default {
 .header-actions {
   display: flex;
   gap: 12px;
+
+  :deep(.el-button + .el-button) {
+    margin-left: 0;
+  }
 }
 
 .stats-row {

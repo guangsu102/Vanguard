@@ -280,6 +280,7 @@ const toggleCollapse = () => {
   font-size: 20px;
   cursor: pointer;
   color: #606266;
+  box-sizing: content-box;
   padding: 8px;
   border-radius: 4px;
   transition: all 0.3s;

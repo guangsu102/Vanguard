@@ -5,17 +5,20 @@ import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 
+// main.ts already imports the complete Element Plus stylesheet.
+const elementPlusResolver = ElementPlusResolver({ importStyle: false })
+
 export default defineConfig({
   root: __dirname,
   plugins: [
     vue(),
     AutoImport({
       imports: ['vue', 'vue-router', 'pinia'],
-      resolvers: [ElementPlusResolver()],
+      resolvers: [elementPlusResolver],
       dts: 'src/auto-imports.d.ts',
     }),
     Components({
-      resolvers: [ElementPlusResolver()],
+      resolvers: [elementPlusResolver],
       dts: 'src/components.d.ts',
     }),
   ],
@@ -42,6 +45,8 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+    // Load view styles with the app so a failed route preload cannot leave an unstyled page.
+    cssCodeSplit: false,
     rollupOptions: {
       output: {
         manualChunks: {
